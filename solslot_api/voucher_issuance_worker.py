@@ -7,6 +7,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
+import httpx
+
 from chia.types.blockchain_format.coin import Coin
 from chia.types.blockchain_format.program import Program
 from chia.types.coin_spend import make_spend
@@ -28,10 +30,13 @@ from solslot_puzzles.payment_artifacts_v2 import (
     purchase_artifact_from_json,
 )
 from solslot_puzzles.payment_artifacts_v3 import (
+    PurchaseKind,
     purchase_artifact_v3_from_json,
     stripe_evidence_to_json,
     stripe_receipt_from_json,
 )
+from solslot_puzzles.mint_publish_driver import deed_singleton_struct
+from solslot_puzzles.protocol_deployment import singleton_struct
 from solslot_puzzles.voucher_presale_v2 import (
     VoucherSeriesState,
     series_terms_from_json,
@@ -67,6 +72,7 @@ from solslot_puzzles.primary_purchase_v2_driver import (
 
 from .config import Settings
 from .faucet import Faucet
+from .governed_output_index import EvaluatedBundleOutputs
 from .kos_exact_execution import KeyOfSolomonExactExecutor
 from .payment_purchase_store import PaymentPurchaseStore
 from .protocol_submission import ProtocolBundleSubmitter
@@ -80,9 +86,10 @@ from .presale_endpoints import (
     StripeVoucherRefundChainEvidence,
 )
 from .presale_endpoints import _confirmed_coin_and_lineage
-from .native_purchases import _load_context
+from .native_purchases import _load_context, _load_context_group
 from .public_artifact import load_signed_public_artifact
 from .stripe_voucher_execution import (
+    parse_stripe_terminal_execution,
     prepare_and_dispatch_stripe_terminal,
     resume_stripe_terminal,
 )
@@ -1310,12 +1317,30 @@ class VoucherIssuanceWorker:
         series: dict[str, Any],
         voucher_json: dict[str, Any],
     ) -> str:
-        _submitter, exact_executor = self._stripe_execution_services()
         stored = self.purchases.get(str(voucher_json["purchaseId"]))
         purchase = purchase_artifact_v3_from_json(stored.purchase_artifact)
         execution_json = voucher_json.get("terminalExactExecution")
         if not isinstance(execution_json, Mapping):
             raise RuntimeError("Stripe voucher exact execution is missing")
+        execution_json = parse_stripe_terminal_execution(
+            execution_json,
+            expected_purchase_id=purchase.purchase_id,
+            expected_artifact_hash=purchase.artifact_hash,
+        )
+        if execution_json["mode"] == "REDEEM":
+            try:
+                confirmed = await self._confirm_redemption_if_ready(
+                    series, voucher_json, external_rail="STRIPE_USD",
+                    retained_execution=execution_json,
+                )
+            except httpx.HTTPError:
+                # Preserve exact retry when the primary node is unavailable.
+                # Integrity failures above/below are not transport failures.
+                logger.warning("Stripe voucher confirmation unavailable; retrying retained execution")
+                confirmed = False
+            if confirmed:
+                return "STRIPE_DEED_DELIVERED"
+        _submitter, exact_executor = self._stripe_execution_services()
         execution, observed_at = await resume_stripe_terminal(
             exact_executor=exact_executor,
             execution=execution_json,
@@ -1418,18 +1443,30 @@ class VoucherIssuanceWorker:
         deadline = int(series.get("deliveryDeadline") or 0)
         if series.get("state") != "LIVE" or int(time.time()) >= deadline:
             return False
-        context = await _load_context(
+        stored, receipt, evidence_hash = self._stripe_payment_evidence(
+            voucher_json
+        )
+        group = await _load_context_group(
             self.settings,
             self.coinset,
             str(voucher_json["purchaseId"]),
             require_live=False,
             allowed_rails=(PaymentRail.STRIPE,),
         )
+        if (
+            group.batch is not None
+            or len(group.contexts) != 1
+            or group.contexts[0].purchase != receipt.artifact
+            or group.contexts[0].purchase.purchase_kind != PurchaseKind.PRESALE
+        ):
+            raise RuntimeError(
+                "Stripe voucher differs from its single canonical reservation"
+            )
+        context = group.contexts[0]
         if context.reservation is None:
             raise RuntimeError("Stripe voucher inventory reservation is missing")
-        stored, receipt, evidence_hash = self._stripe_payment_evidence(
-            voucher_json
-        )
+        if int(time.time()) >= context.reservation.expires_at:
+            raise RuntimeError("Stripe voucher inventory reservation has expired")
         terms = series_terms_from_json(series["terms"])
         voucher = voucher_commitment_v3_from_json(voucher_json["commitment"])
         if (
@@ -1587,25 +1624,21 @@ class VoucherIssuanceWorker:
                 [valid.aggregated_signature, quorum.aggregated_signature]
             ),
         )
-        additions = [
-            addition
-            for spend in bundle.coin_spends
-            for addition in compute_additions(spend)
-        ]
+        evaluated = EvaluatedBundleOutputs(bundle)
         treasury_output = _one_output(
-            additions,
+            evaluated.additions,
             context.terms.protocol_puzhash,
             1,
             "Stripe voucher coordination output",
         )
-        deed_output = _one_output(
-            additions,
-            _deed_vault_full_puzzle_hash(
-                context.purchase.deed_launcher_id,
-                context.purchase.vault_launcher_id,
-            ),
-            1,
-            "vault SmartDeed delivery",
+        deed_output = evaluated.find_exact_descendant(
+            ancestor_coin_id=context.deed_coin.name(),
+            puzzle_hash=SINGLETON_MOD.curry(
+                context.deed_struct,
+                puzzle_for_p2_vault(context.purchase.vault_launcher_id),
+            ).get_tree_hash(),
+            amount=1,
+            label="vault SmartDeed delivery",
         )
         submitter, exact_executor = self._stripe_execution_services()
         execution, observed_at = await prepare_and_dispatch_stripe_terminal(
@@ -2166,7 +2199,29 @@ class VoucherIssuanceWorker:
         voucher: dict[str, Any],
         *,
         external_rail: str | None = None,
+        retained_execution: Mapping[str, Any] | None = None,
     ) -> bool:
+        if retained_execution is not None:
+            if (
+                external_rail != "STRIPE_USD"
+                or retained_execution.get("mode") != "REDEEM"
+                or voucher.get("terminalExactExecution") != retained_execution
+            ):
+                raise RuntimeError("Stripe voucher retained redemption changed")
+            # Project the sealed bindings for read-only chain validation. Do not
+            # record submission until the complete outcome is independently seen.
+            roles = retained_execution["outputRoles"]
+            bindings = retained_execution["bindings"]
+            voucher = dict(voucher,
+                redemptionBundleId=retained_execution["prepared"]["spendBundleId"],
+                redemptionTreasuryOutputCoinId=roles["coordination"],
+                redemptionDeedOutputCoinId=roles["deed"],
+                redemptionTerminalVoucherCoinId=roles["terminalVoucher"],
+                redemptionSeriesOutputCoinId=roles["series"],
+                redemptionSeriesInputCoinId=bindings["seriesInputCoinId"],
+                redemptionDeedInputCoinId=bindings["deedInputCoinId"],
+                externalSettlementEvidenceHash=bindings["externalSettlementEvidenceHash"],
+            )
         expected_rail = external_rail or "CHIA_XCH"
         if voucher.get("paymentRail") != expected_rail:
             raise RuntimeError("voucher redemption payment rail changed")
@@ -2257,9 +2312,13 @@ class VoucherIssuanceWorker:
             )  # type: ignore[union-attr]
         ):
             raise RuntimeError("voucher redemption changed treasury payment")
-        expected_deed_puzzle_hash = _deed_vault_full_puzzle_hash(
-            voucher_commitment.deed_launcher_id,
-            voucher_commitment.approved_vault_launcher_id,
+        expected_deed_puzzle_hash = (
+            self._stripe_redemption_destination(voucher, coins)
+            if stripe
+            else _deed_vault_full_puzzle_hash(
+                voucher_commitment.deed_launcher_id,
+                voucher_commitment.approved_vault_launcher_id,
+            )
         )
         if (
             deed_output.puzzle_hash != expected_deed_puzzle_hash  # type: ignore[union-attr]
@@ -2316,6 +2375,10 @@ class VoucherIssuanceWorker:
             raise RuntimeError(
                 "external redemption is missing settlement evidence"
             )
+        if retained_execution is not None:
+            self._record_stripe_terminal_submission(
+                series, voucher, retained_execution, int(time.time()),
+            )
         self.presales.confirm_redemption(
             str(series["termsHash"]),
             int(voucher["serial"]),
@@ -2337,6 +2400,75 @@ class VoucherIssuanceWorker:
             ),
         )
         return True
+
+    def _stripe_redemption_destination(
+        self, voucher: Mapping[str, Any], coins: Mapping[str, Coin | None],
+    ) -> bytes32:
+        """Confirm retained exact delivery without reauthorizing an expired quote.
+
+        The input is already spent. Use its sealed bundle and the canonical DID,
+        not the unspent-inventory loader or the historical generic launcher.
+        Chain records are independently checked for exact IDs and atomic heights
+        by the caller before this read model can mark the voucher redeemed.
+        """
+        _, receipt, evidence_hash = self._stripe_payment_evidence(voucher)
+        purchase = receipt.artifact
+        commitment = voucher_commitment_v3_from_json(voucher["commitment"])
+        if (
+            purchase.network != self.settings.network
+            or purchase.rail != PaymentRail.STRIPE
+            or purchase.purchase_kind != PurchaseKind.PRESALE
+            or purchase.artifact_hash != commitment.purchase_artifact_hash
+            or purchase.presale_terms_hash != commitment.series_terms_hash
+            or purchase.deed_launcher_id != commitment.deed_launcher_id
+            or purchase.vault_launcher_id != commitment.approved_vault_launcher_id
+            or _hex32(evidence_hash) != voucher.get("externalSettlementEvidenceHash")
+        ):
+            raise RuntimeError("Stripe voucher confirmation changed paid commitments")
+        raw = voucher.get("terminalExactExecution")
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("Stripe voucher exact redemption evidence is missing")
+        execution = parse_stripe_terminal_execution(
+            raw, expected_purchase_id=purchase.purchase_id,
+            expected_artifact_hash=purchase.artifact_hash,
+        )
+        roles = execution["outputRoles"]
+        bindings = execution["bindings"]
+        if (
+            execution["mode"] != "REDEEM"
+            or execution["prepared"]["spendBundleId"] != voucher["redemptionBundleId"]
+            or bindings["deedInputCoinId"] != voucher["redemptionDeedInputCoinId"]
+            or bindings["seriesInputCoinId"] != voucher["redemptionSeriesInputCoinId"]
+            or bindings["externalSettlementEvidenceHash"] != _hex32(evidence_hash)
+            or roles != {
+                "coordination": voucher["redemptionTreasuryOutputCoinId"],
+                "deed": voucher["redemptionDeedOutputCoinId"],
+                "series": voucher["redemptionSeriesOutputCoinId"],
+                "terminalVoucher": voucher["redemptionTerminalVoucherCoinId"],
+            }
+        ):
+            raise RuntimeError("Stripe voucher confirmation differs from exact execution")
+        bundle = SpendBundle.from_json_dict(execution["prepared"]["spendBundle"])
+        removals = {coin.name(): coin for coin in bundle.removals()}
+        for name in ("series_input", "voucher_input", "payment_input", "deed_input"):
+            coin = coins[name]
+            if coin is None or removals.get(coin.name()) != coin:
+                raise RuntimeError("Stripe voucher confirmation changed an exact input")
+        genesis = load_signed_public_artifact(self.settings)
+        deed_struct = deed_singleton_struct(
+            deed_launcher_id=purchase.deed_launcher_id,
+            protocol_did_singleton_struct=singleton_struct(_b32(genesis["launcherIds"]["did"])),
+        )
+        destination = SINGLETON_MOD.curry(
+            deed_struct, puzzle_for_p2_vault(purchase.vault_launcher_id),
+        ).get_tree_hash()
+        output = EvaluatedBundleOutputs(bundle).find_exact_descendant(
+            ancestor_coin_id=_b32(voucher["redemptionDeedInputCoinId"]),
+            puzzle_hash=destination, amount=1, label="vault SmartDeed delivery",
+        )
+        if output != coins["deed_output"]:
+            raise RuntimeError("Stripe voucher confirmation changed SmartDeed destination")
+        return bytes32(destination)
 
     async def _confirm_base_redemption_if_ready(
         self,
