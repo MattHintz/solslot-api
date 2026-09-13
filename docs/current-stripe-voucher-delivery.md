@@ -42,8 +42,20 @@ holdings visibility or an OS wallet journey. Nothing is deployed by this change.
 Initial reservation expiry cannot exceed quote or authorization expiry. This
 is enforced by the validator, Python driver and both available-inventory CLSP
 versions. Presale quotes end by the sale close, while paid voucher delivery
-occurs after launch. The API currently attempts an initial reservation through
-`launchDeadline + deliveryWindowSeconds`; that cannot pass these controls.
+occurs after launch. The API now selects the earlier original quote or vault
+authorization deadline for an initial reservation, retaining the existing
+governed-series and delivery-window checks. The launch deadline does not grant
+initial reservation authority. Confirmed reservation evidence is not rewritten.
+
+`tests/test_presale_initial_reservation.py` exercises that initial path through
+the real API loader, private validator verifier and SQLite signature ledger.
+Local BLS signatures and the Chia consensus evaluator verify the resulting V2
+reservation and its expiry; synthetic node records exercise confirmation and
+store reopening. Both fresh inventory after authorization expiry and inventory
+returned by timeout are covered, along with expired quotes, ended or mismatched
+series, expired delivery windows, paused writes and missing service credentials.
+Authority, registry, node and fee transport are fixtures. This proves neither
+public-chain inclusion nor durable fee-funded submission or extension.
 
 V5 contains a separately signed extension transition. The tests execute an
 initial short V2 reservation and timely extension, check the resulting coin,
@@ -51,6 +63,8 @@ signatures and expiry conditions, and reject a raw long initial reservation.
 The extension must occur before the current reservation expires. Its successor
 has a different parent, coin ID and lineage. Current API orchestration,
 independent authorization and durable successor reconciliation remain missing.
+Payment eligibility for extension must be settled before implementing a new
+signing path; the inspected documents do not authorize unpaid holds to renew.
 The long-lived snapshot tests are not evidence that this upstream path works.
 Presale alpha readiness remains blocked until that lifecycle is completed.
 
