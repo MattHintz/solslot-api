@@ -14,7 +14,11 @@ confirmed atomic coin set. Confirmation does not reload already-spent inventory
 or require the original quote to remain live.
 
 The exact-execution handoff continues to persist the signed, fee-funded bundle
-before dispatch. A lost executor response resumes those same bytes. Expiry does
+before dispatch. Recovery first checks the exact confirmed chain outcome. It
+can record delivery while the executor remains unavailable; incomplete or
+inconsistent chain evidence cannot mark delivery. If still unconfirmed, a lost
+executor response resumes those same bytes. A node transport outage preserves
+that exact executor retry. Expiry does
 not authorize a replacement purchase or a second terminal transaction.
 
 ## Evidence boundaries

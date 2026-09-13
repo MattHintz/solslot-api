@@ -9,6 +9,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 import sqlite3
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from chia.types.blockchain_format.coin import Coin
@@ -253,6 +254,62 @@ async def test_restart_keeps_exact_signed_voucher_and_confirms_after_deadline(tm
     assert saved["state"] == "REDEEMED" and saved["redemptionConfirmedHeight"] == 220
     assert saved["deliveryOutputCoinId"] == saved["redemptionDeedOutputCoinId"]
     assert await case.voucher_worker.reconcile_once() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_executor", [False, True])
+async def test_confirmed_voucher_recovers_while_executor_stays_unavailable(tmp_path, monkeypatch, missing_executor):
+    case = voucher_case(tmp_path, monkeypatch)
+    case.fail[0] = True
+    with pytest.raises(ProtocolSubmissionError, match="response lost"):
+        await submit(case)
+    confirm_records(case, case.dispatched[0])
+    case.voucher_worker.presales = PresaleStore(case.presale_path)
+    case.voucher_worker.purchases = PaymentPurchaseStore(case.purchases.path)
+    if missing_executor:
+        case.voucher_worker.exact_executor = None
+    case.clock[0] = NOW + 200_000
+    result = await case.voucher_worker.reconcile_once()
+    assert result == [{"termsHash": case.current["termsHash"], "serial": 0, "status": "STRIPE_DEED_DELIVERED"}]
+    assert len(case.dispatched) == len(case.prepared_bundles) == len(case.voucher_claims) == 1
+    assert case.voucher_worker.presales.voucher(case.current["termsHash"], 0)["state"] == "REDEEMED"
+    assert await case.voucher_worker.reconcile_once() == []
+
+
+@pytest.mark.asyncio
+async def test_node_outage_preserves_exact_executor_retry(tmp_path, monkeypatch):
+    case = voucher_case(tmp_path, monkeypatch)
+    case.fail[0] = True
+    with pytest.raises(ProtocolSubmissionError, match="response lost"):
+        await submit(case)
+    async def unavailable(_coin_id):
+        raise httpx.ConnectError("local node unavailable")
+    monkeypatch.setattr(case.worker.provider, "get_coin_record_by_name", unavailable)
+    case.fail[0] = False
+    result = await case.voucher_worker._resume_stripe_terminal_execution(
+        case.presales.get(case.current["termsHash"]), case.presales.voucher(case.current["termsHash"], 0))
+    assert result == "STRIPE_REDEMPTION_SUBMITTED"
+    assert len(case.dispatched) == 2 and bytes(case.dispatched[0]) == bytes(case.dispatched[1])
+    assert len(case.prepared_bundles) == len(case.voucher_claims) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unsafe", ["partial", "non_atomic"])
+async def test_recovery_does_not_record_submission_from_incomplete_chain_evidence(tmp_path, monkeypatch, unsafe):
+    case = voucher_case(tmp_path, monkeypatch)
+    case.fail[0] = True
+    with pytest.raises(ProtocolSubmissionError, match="response lost"):
+        await submit(case)
+    confirm_records(case, case.dispatched[0])
+    role = case.presales.voucher(case.current["termsHash"], 0)["terminalExactExecution"]["outputRoles"]["deed"]
+    if unsafe == "partial":
+        case.records.pop(role)
+    else:
+        case.records[role]["confirmed_block_index"] = 221
+    await case.voucher_worker.reconcile_once()
+    saved = case.presales.voucher(case.current["termsHash"], 0)
+    assert saved["state"] == "REDEEMING" and saved["redemptionBundleId"] is None
+    assert case.presales.get(case.current["termsHash"])["chainState"]["redeemedCount"] == 0
 
 
 @pytest.mark.asyncio

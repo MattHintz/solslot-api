@@ -7,6 +7,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
+import httpx
+
 from chia.types.blockchain_format.coin import Coin
 from chia.types.blockchain_format.program import Program
 from chia.types.coin_spend import make_spend
@@ -1315,12 +1317,30 @@ class VoucherIssuanceWorker:
         series: dict[str, Any],
         voucher_json: dict[str, Any],
     ) -> str:
-        _submitter, exact_executor = self._stripe_execution_services()
         stored = self.purchases.get(str(voucher_json["purchaseId"]))
         purchase = purchase_artifact_v3_from_json(stored.purchase_artifact)
         execution_json = voucher_json.get("terminalExactExecution")
         if not isinstance(execution_json, Mapping):
             raise RuntimeError("Stripe voucher exact execution is missing")
+        execution_json = parse_stripe_terminal_execution(
+            execution_json,
+            expected_purchase_id=purchase.purchase_id,
+            expected_artifact_hash=purchase.artifact_hash,
+        )
+        if execution_json["mode"] == "REDEEM":
+            try:
+                confirmed = await self._confirm_redemption_if_ready(
+                    series, voucher_json, external_rail="STRIPE_USD",
+                    retained_execution=execution_json,
+                )
+            except httpx.HTTPError:
+                # Preserve exact retry when the primary node is unavailable.
+                # Integrity failures above/below are not transport failures.
+                logger.warning("Stripe voucher confirmation unavailable; retrying retained execution")
+                confirmed = False
+            if confirmed:
+                return "STRIPE_DEED_DELIVERED"
+        _submitter, exact_executor = self._stripe_execution_services()
         execution, observed_at = await resume_stripe_terminal(
             exact_executor=exact_executor,
             execution=execution_json,
@@ -2179,7 +2199,29 @@ class VoucherIssuanceWorker:
         voucher: dict[str, Any],
         *,
         external_rail: str | None = None,
+        retained_execution: Mapping[str, Any] | None = None,
     ) -> bool:
+        if retained_execution is not None:
+            if (
+                external_rail != "STRIPE_USD"
+                or retained_execution.get("mode") != "REDEEM"
+                or voucher.get("terminalExactExecution") != retained_execution
+            ):
+                raise RuntimeError("Stripe voucher retained redemption changed")
+            # Project the sealed bindings for read-only chain validation. Do not
+            # record submission until the complete outcome is independently seen.
+            roles = retained_execution["outputRoles"]
+            bindings = retained_execution["bindings"]
+            voucher = dict(voucher,
+                redemptionBundleId=retained_execution["prepared"]["spendBundleId"],
+                redemptionTreasuryOutputCoinId=roles["coordination"],
+                redemptionDeedOutputCoinId=roles["deed"],
+                redemptionTerminalVoucherCoinId=roles["terminalVoucher"],
+                redemptionSeriesOutputCoinId=roles["series"],
+                redemptionSeriesInputCoinId=bindings["seriesInputCoinId"],
+                redemptionDeedInputCoinId=bindings["deedInputCoinId"],
+                externalSettlementEvidenceHash=bindings["externalSettlementEvidenceHash"],
+            )
         expected_rail = external_rail or "CHIA_XCH"
         if voucher.get("paymentRail") != expected_rail:
             raise RuntimeError("voucher redemption payment rail changed")
@@ -2332,6 +2374,10 @@ class VoucherIssuanceWorker:
         if external_rail is not None and not external_evidence_hash:
             raise RuntimeError(
                 "external redemption is missing settlement evidence"
+            )
+        if retained_execution is not None:
+            self._record_stripe_terminal_submission(
+                series, voucher, retained_execution, int(time.time()),
             )
         self.presales.confirm_redemption(
             str(series["termsHash"]),
