@@ -6,6 +6,7 @@ Historical signatures and transaction bytes remain evidence after retirement.
 from __future__ import annotations
 
 from dataclasses import asdict
+from types import SimpleNamespace
 from typing import Any
 from chia.consensus.condition_tools import conditions_dict_for_solution, pkm_pairs_for_conditions_dict
 from chia.types.blockchain_format.program import Program
@@ -65,17 +66,17 @@ async def reconcile_inventory_authorization_expiry(*, store, node, purchase_id: 
     except ValueError as exc:
         raise PaymentPurchaseConflict(str(exc)) from exc
     authorize()
-    stored = store.get(purchase_id)
+    snapshot = store.inventory_status_snapshot(purchase_id)
+    stored, rows, _, _ = snapshot
     if stored.inventory_state == 'AUTHORIZATION_EXPIRED':
-        if store.inventory_expiry_evidence(purchase_id) is None:
-            raise PaymentPurchaseConflict('expired authorization is missing its retained evidence')
+        from .inventory_status import validated_recovery_receipt
+        validated_recovery_receipt(snapshot, network='testnet11')
         return stored
     if stored.external_message is not None:
         raise PaymentPurchaseConflict('external payment evidence requires separate settlement or refund reconciliation')
     if stored.inventory_state not in {'PREPARED', 'SUBMITTED'} or stored.inventory_confirmation_height is not None:
         raise PaymentPurchaseConflict('only never-confirmed authorizations may expire; reconcile confirmed timeout separately')
-    items = timeout_items(store, purchase_id)
-    rows = store.inventory_items(purchase_id)
+    items = timeout_items(SimpleNamespace(get=lambda _: stored, inventory_items=lambda _: rows), purchase_id)
     bundle = WalletSpendBundle.from_json_dict(stored.inventory_bundle)
     public_keys, messages = [], []
     for item, row in zip(items, rows, strict=True):

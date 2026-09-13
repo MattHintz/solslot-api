@@ -241,6 +241,26 @@ class InventoryReservationResponse(NativePurchaseModel):
     items: list[InventoryReservationItemResponse] = Field(default_factory=list)
 
 
+@router.get("/inventory/{purchase_id}")
+async def inventory_purchase_status(
+    purchase_id: str,
+    settings: Annotated[Settings, Depends(get_settings)],
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    """Retained, service-only receipts; available while new sales are closed."""
+    from .inventory_status import retained_inventory_status
+    _require_server_to_server_token(settings, authorization)
+    normalized = "0x" + _hex_bytes(purchase_id, 32, "purchaseId").hex()
+    store = get_payment_purchase_store(settings.payment_purchase_db_path)
+    try:
+        return retained_inventory_status(store.inventory_status_snapshot(normalized),
+            environment=settings.runtime_environment + "-alpha", network=settings.network)
+    except PaymentPurchaseNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (PaymentPurchaseConflict, ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(status_code=409, detail="Inventory evidence is incomplete. The purchase remains held for review.") from exc
+
+
 @router.post("/inventory/reconcile-timeout")
 async def reconcile_inventory_timeout(
     payload: InventoryReservationRequest,
@@ -255,8 +275,12 @@ async def reconcile_inventory_timeout(
     purchase_id = "0x" + _hex_bytes(payload.purchase_id, 32, "purchaseId").hex()
     store = get_payment_purchase_store(settings.payment_purchase_db_path)
     try:
+        def authorize():
+            _require_server_to_server_token(settings, authorization)
+            require_minting_writes(settings)
+            require_operation_gate(settings, "purchases")
         result = await reconcile_timeout_release(store, request.app.state.coinset,
-                                                 purchase_id, settings.network)
+                                                 purchase_id, settings.network, authorize=authorize)
     except PaymentPurchaseNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PaymentPurchaseConflict as exc:

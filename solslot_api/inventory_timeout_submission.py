@@ -116,6 +116,7 @@ async def advance_inventory_timeout(*, store: PaymentPurchaseStore, node: Any, s
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         raise PaymentPurchaseConflict("timeout artifact binding is incomplete") from exc
     if stored.inventory_state == "RELEASED":
+        await reconcile_timeout_release(store, node, purchase_id, network, authorize=authorize)
         return dict(purchaseId=purchase_id, state="RELEASED", items=[],
                     releaseEvidence=store.inventory_release_evidence(purchase_id))
     items = timeout_items(store, purchase_id)
@@ -182,7 +183,7 @@ async def advance_inventory_timeout(*, store: PaymentPurchaseStore, node: Any, s
         finally:
             store.finish_inventory_timeout_attempt(purchase_id, item.ordinal, owner=owner, receipt=receipt)
     if all(status == "CONFIRMED" for status in statuses):
-        result = await reconcile_timeout_release(store, node, purchase_id, network)
+        result = await reconcile_timeout_release(store, node, purchase_id, network, authorize=authorize)
         return dict(purchaseId=purchase_id, state=result.inventory_state, items=outcomes,
                     releaseEvidence=store.inventory_release_evidence(purchase_id))
     return dict(purchaseId=purchase_id, state="RECOVERY_PENDING", items=outcomes, releaseEvidence=None)
