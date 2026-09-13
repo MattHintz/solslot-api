@@ -7,6 +7,7 @@ timeout spends may advance the available-coin cursor.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Mapping
 
 from chia.types.blockchain_format.coin import Coin
@@ -226,11 +227,16 @@ async def release_peak(node: Any, network: str) -> tuple[int, str]:
 
 
 async def reconcile_timeout_release(store: PaymentPurchaseStore, node: Any,
-                                    purchase_id: str, network: str):
-    stored = store.get(purchase_id)
+                                    purchase_id: str, network: str, *, authorize=None):
+    if authorize is not None:
+        authorize()
+    snapshot = store.inventory_status_snapshot(purchase_id)
+    stored, rows, _, _ = snapshot
     if stored.inventory_state == "RELEASED":
+        from .inventory_status import validated_recovery_receipt
+        validated_recovery_receipt(snapshot, network=network)
         return stored
-    items = timeout_items(store, purchase_id)
+    items = timeout_items(SimpleNamespace(get=lambda _: stored, inventory_items=lambda _: rows), purchase_id)
     if any(p.network != network for p in (purchase_batch_from_json(stored.purchase_artifact).artifacts
            if stored.purchase_artifact.get("schema") == "solslot.purchase-batch.v1"
            else (purchase_artifact_v3_from_json(stored.purchase_artifact),))):
@@ -263,7 +269,9 @@ async def reconcile_timeout_release(store: PaymentPurchaseStore, node: Any,
             releaseSpend=canonical.to_json_dict()))
     if await release_peak(node, network) != peak:
         raise PaymentPurchaseConflict("chain tip changed during inventory recovery; retry reconciliation")
+    if authorize is not None:
+        authorize()
     return store.record_inventory_released(purchase_id, evidence={
         "schema": "solslot.inventory-timeout-release.v1", "network": network,
         "peakHeight": peak[0], "peakHash": peak[1], "items": evidence,
-    })
+    }, expected_snapshot=stored, expected_items=rows)

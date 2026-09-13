@@ -362,6 +362,23 @@ class PaymentPurchaseStore:
         assert row is not None
         return _record(row)
 
+    def inventory_status_snapshot(self, purchase_id: str):
+        """Read parent, items and recovery receipts from one SQLite snapshot."""
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            row = connection.execute("SELECT * FROM payment_purchases WHERE purchase_id=?", (purchase_id,)).fetchone()
+            if row is None:
+                raise PaymentPurchaseNotFound("Purchase was not found")
+            items = connection.execute("SELECT * FROM payment_purchase_inventory_items WHERE purchase_id=? ORDER BY ordinal", (purchase_id,)).fetchall()
+            expired = connection.execute("SELECT evidence_json FROM payment_inventory_expiries WHERE purchase_id=?", (purchase_id,)).fetchone()
+            released = connection.execute("SELECT evidence_json FROM payment_inventory_releases WHERE purchase_id=?", (purchase_id,)).fetchone()
+            connection.execute("COMMIT")
+        try:
+            return (_record(row), tuple(_inventory_item(item) for item in items),
+                    json.loads(expired[0]) if expired else None, json.loads(released[0]) if released else None)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise PaymentPurchaseConflict("Inventory evidence is malformed; keep the purchase for review") from exc
+
     def inventory_items(
         self,
         purchase_id: str,
@@ -762,7 +779,9 @@ class PaymentPurchaseStore:
         return next(item for item in json.loads(row[0])["items"]
                     if item["deedLauncherId"] == deed_launcher_id)
 
-    def record_inventory_released(self, purchase_id: str, *, evidence: Mapping[str, Any]) -> StoredPaymentPurchase:
+    def record_inventory_released(self, purchase_id: str, *, evidence: Mapping[str, Any],
+                                  expected_snapshot: StoredPaymentPurchase | None = None,
+                                  expected_items: tuple[StoredPaymentInventoryItem, ...] | None = None) -> StoredPaymentPurchase:
         """Commit a complete, independently reconciled timeout batch and its cursor.
 
         This internal persistence method accepts only the reconciler's exact
@@ -779,10 +798,15 @@ class PaymentPurchaseStore:
                     raise PaymentPurchaseNotFound("purchase artifact was not found")
                 old = connection.execute("SELECT evidence_json FROM payment_inventory_releases WHERE purchase_id=?", (purchase_id,)).fetchone()
                 if old is not None:
-                    if old[0] != encoded:
+                    if (old[0] != encoded or parent["inventory_state"] != "RELEASED"
+                            or not rows or any(row["state"] != "RELEASED" for row in rows)):
                         raise PaymentPurchaseConflict("confirmed release evidence cannot be changed")
                     connection.execute("COMMIT")
                     return _record(parent)
+                if (expected_snapshot is None or expected_items is None
+                        or _record(parent) != expected_snapshot
+                        or tuple(_inventory_item(row) for row in rows) != expected_items):
+                    raise PaymentPurchaseConflict("reservation changed during timeout proof; retry reconciliation")
                 items = evidence.get("items")
                 if (evidence.get("schema") != "solslot.inventory-timeout-release.v1"
                         or not isinstance(items, list) or not rows or len(items) != len(rows)
