@@ -82,6 +82,7 @@ from solslot_puzzles.stripe_settlement_v1_driver import (
     curry_purchase_batch_settlement_receipt,
     curry_stripe_settlement_receipt,
     inventory_reservation_message,
+    inventory_terms_for_puzzle_hash,
     make_inventory_available_inner,
     make_mint_offer_v5_inner,
     validate_chia_buyer_batch_offer_v3,
@@ -157,6 +158,7 @@ from .validator_quorum import (
     PrimaryPurchaseClaim,
     StripeSettlementClaim,
     ValidatorClaim,
+    PermitValidatorClaim,
     VoucherIssuanceClaim,
     VoucherSeriesPhaseClaim,
     VoucherTransitionClaim,
@@ -164,6 +166,7 @@ from .validator_quorum import (
 )
 from .validator_settings import ValidatorSettings
 from .zkpassport_enrollments import _fetch_verified_evm_attestation
+from .bridge_coin_policy import BridgeCoinPolicy
 
 
 class ValidatorEvidenceError(RuntimeError):
@@ -300,6 +303,13 @@ def load_validator_artifact(
     for observed, expected, label in checks:
         if observed != expected:
             raise ValidatorEvidenceError(f"signed artifact {label} does not match signer config")
+    from solslot_puzzles.enrollment_activation import activation_from_artifact
+    try:
+        activation = activation_from_artifact(artifact, environment=settings.deployment_environment)
+    except ValueError as exc:
+        raise ValidatorEvidenceError(str(exc)) from exc
+    if activation != settings.enrollment_activation:
+        raise ValidatorEvidenceError("signed enrollment activation differs from signer configuration")
     return artifact, release
 
 
@@ -484,15 +494,13 @@ def _verify_bridge_coin(
     artifact: Mapping[str, Any],
     claim: ValidatorClaim,
 ) -> None:
-    if claim.bridge_amount != 1:
-        raise ValidatorEvidenceError("V2 genesis bridge coins must contain exactly one mojo")
-    bridge = artifact.get("bridgePolicy")
-    if not isinstance(bridge, Mapping):
-        raise ValidatorEvidenceError("artifact bridge policy is missing")
-    parent_ids = {str(value).lower() for value in bridge.get("parentCoinIds", [])}
-    coin_ids = {str(value).lower() for value in bridge.get("bridgeCoinIds", [])}
-    if claim.bridge_parent_id not in parent_ids or claim.bridge_coin_id not in coin_ids:
-        raise ValidatorEvidenceError("bridge lineage is not committed by the signed artifact")
+    try:
+        BridgeCoinPolicy.from_artifact(artifact).require_coin(
+            policy_hash=claim.bridge_policy_hash, parent_id=claim.bridge_parent_id,
+            amount=claim.bridge_amount, coin_id=claim.bridge_coin_id,
+        )
+    except ValueError as exc:
+        raise ValidatorEvidenceError(str(exc)) from exc
     record = _fetch_coin(settings, claim.bridge_coin_id, "bridge coin")
     coin = _coin_from_record(record, "bridge coin")
     expected = Coin(
@@ -534,6 +542,23 @@ def verify_validator_claim(
     if claim.canonical_hash() != claim_hash.lower():
         raise ValidatorEvidenceError("claim hash does not match canonical evidence")
     artifact, release = load_validator_artifact(settings)
+    from solslot_puzzles.enrollment_activation import activation_from_artifact
+    from .enrollment_permit_runtime import validate_record_permit
+    try:
+        activation = activation_from_artifact(artifact, environment=settings.deployment_environment)
+        if (activation is not None) != isinstance(claim, PermitValidatorClaim):
+            raise ValueError("claim version differs from the signed enrollment deployment")
+        permit_record = None
+        if isinstance(claim, PermitValidatorClaim):
+            permit_record = dict(enrollmentPermit=claim.enrollment_permit,
+                permitIssuerSignature=claim.permit_issuer_signature, permitIssuanceStatus="issued",
+                vaultLauncherId=claim.vault_launcher_id, bridgeCoinId=claim.bridge_coin_id,
+                bridgePolicyHash=claim.bridge_policy_hash, network=claim.network, policyVersion=claim.policy_version)
+            permit = validate_record_permit(permit_record, artifact, owner_auth_type=claim.owner_auth_type,
+                owner_key=claim.owner_key, current_vault_coin_id=claim.current_vault_coin_id, now=int(time.time()))
+            permit.require_live(claim.current_timestamp)
+    except (ValueError, TypeError) as exc:
+        raise ValidatorEvidenceError(str(exc)) from exc
     if claim.network != settings.network:
         raise ValidatorEvidenceError("claim network does not match signer")
     if claim.artifact_hash != str(artifact.get("artifactHash", "")).lower():
@@ -547,6 +572,7 @@ def verify_validator_claim(
         _coordinator_settings(settings, artifact),
         transaction_hash=claim.evm_transaction_hash,
         expected_vault_launcher_id=claim.vault_launcher_id,
+        **(dict(authenticated_artifact=artifact, permit_record=permit_record) if activation is not None else {}),
     )
     event_fields = {
         "vault_launcher_id": claim.vault_launcher_id,
@@ -801,14 +827,14 @@ def verify_inventory_reservation_claim(
             deed_struct,
             make_inventory_available_inner(terms),
         )
-        available_coin = _coin_from_record(
-            _fetch_coin(
+        available_record = _fetch_coin(
                 settings,
                 claim.available_coin_id,
                 "available SmartDeed coin",
-            ),
-            "available SmartDeed coin",
-        )
+            )
+        available_coin = _coin_from_record(available_record, "available SmartDeed coin")
+        terms = inventory_terms_for_puzzle_hash(terms, deed_struct, available_coin.puzzle_hash)
+        available_puzzle = SINGLETON_MOD.curry(deed_struct, make_inventory_available_inner(terms))
         reservation = InventoryReservationV1(
             artifact=purchase,
             expires_at=claim.reservation_expires_at,
@@ -822,7 +848,7 @@ def verify_inventory_reservation_claim(
             "reservation mint terms cannot be reconstructed"
         ) from exc
     if (
-        available_coin.parent_coin_info != purchase.deed_launcher_id
+        "0x" + available_coin.name().hex() != claim.available_coin_id
         or int(available_coin.amount) != 1
         or available_coin.puzzle_hash != available_puzzle.get_tree_hash()
         or claim.available_puzzle_hash
@@ -832,6 +858,27 @@ def verify_inventory_reservation_claim(
         raise ValidatorEvidenceError(
             "reservation does not spend the exact available governed SmartDeed"
         )
+    if available_coin.parent_coin_info != purchase.deed_launcher_id:
+        _verify_released_inventory_parent(settings, available_record, available_coin, deed_struct, terms)
+
+
+def _verify_released_inventory_parent(settings, record, coin, deed_struct, terms):
+    """Independent canonical lineage verification; never trust the API cursor."""
+    from .inventory_recovery import record_coin, timeout_successor_lineage
+    from .payment_purchase_store import PaymentPurchaseConflict
+    parent_id = "0x" + coin.parent_coin_info.hex()
+    parent_record = _fetch_coin(settings, parent_id, "inventory timeout parent", require_unspent=False)
+    parent = _coin_from_record(parent_record, "inventory timeout parent")
+    try:
+        child_height, child_spent = record_coin(record, coin)
+        _, spent_height = record_coin(parent_record, parent)
+        if parent.name() != coin.parent_coin_info or child_spent or not spent_height or spent_height != child_height:
+            raise PaymentPurchaseConflict("inventory timeout lineage is not atomic")
+        spend = _fetch_coin_spend(settings, parent, spent_height, "inventory timeout parent")
+        return timeout_successor_lineage(parent_spend=spend, successor=coin,
+                                         deed_struct=deed_struct, terms=terms)
+    except PaymentPurchaseConflict as exc:
+        raise ValidatorEvidenceError(str(exc)) from exc
 
 
 def sign_inventory_reservation_claim(
@@ -841,6 +888,18 @@ def sign_inventory_reservation_claim(
     claim_hash: str,
 ) -> str:
     verify_inventory_reservation_claim(settings, claim, claim_hash)
+    retirement = None
+    old = ledger.active_inventory_authorization(claim.available_coin_id)
+    if old is not None and old['claim_hash'] != claim_hash.lower():
+        from .validator_inventory_expiry import prove_inventory_retirement
+        retirement = prove_inventory_retirement(settings, old, claim)
+        # A quote may expire during independent node reads. Recheck before signing.
+        try:
+            purchase_artifact_v3_from_json(claim.purchase_artifact).assert_live(int(time.time()))
+        except (PaymentArtifactError, ValueError) as exc:
+            raise ValidatorEvidenceError('replacement purchase expired during proof') from exc
+        if claim.reservation_expires_at <= int(time.time()):
+            raise ValidatorEvidenceError('replacement authorization expired during proof')
     signature = "0x" + bytes(
         AugSchemeMPL.sign(
             load_validator_private_key(settings),
@@ -854,6 +913,8 @@ def sign_inventory_reservation_claim(
             purchase_id=claim.purchase_id(),
             available_coin_id=claim.available_coin_id,
             signature=signature,
+            retire_claim_hash=old['claim_hash'] if retirement is not None else None,
+            retirement_evidence=retirement,
         )
     except ValidatorLedgerConflict as exc:
         raise ValidatorEvidenceError(str(exc)) from exc
@@ -1068,6 +1129,10 @@ def verify_primary_purchase_claim(
                 child.authorization_expires_at,
             ):
                 raise ValueError("reservation outlives purchase authorization")
+            terms = inventory_terms_for_puzzle_hash(
+                terms, deed_struct, bytes32.fromhex(item.deed_puzzle_hash.removeprefix("0x")),
+                reservation=reservation,
+            )
             expected_puzzle = SINGLETON_MOD.curry(
                 deed_struct,
                 make_mint_offer_v5_inner(terms, reservation),
@@ -1857,6 +1922,10 @@ def verify_stripe_settlement_claim(
                 raise PaymentArtifactError(
                     "reservation outlives purchase authorization"
                 )
+            mint_terms = inventory_terms_for_puzzle_hash(
+                mint_terms, deed_struct, bytes32.fromhex(item.deed_puzzle_hash.removeprefix("0x")),
+                reservation=reservation,
+            )
             expected_deed_puzzle = SINGLETON_MOD.curry(
                 deed_struct,
                 make_mint_offer_v5_inner(mint_terms, reservation),
@@ -3206,6 +3275,10 @@ def verify_voucher_transition_claim(
                 reservation = InventoryReservationV1(
                     artifact=purchase,
                     expires_at=claim.reservation_expires_at,
+                )
+                mint_terms = inventory_terms_for_puzzle_hash(
+                    mint_terms, deed_struct, bytes32.fromhex(claim.deed_puzzle_hash.removeprefix("0x")),
+                    reservation=reservation,
                 )
                 expected_deed_puzzle = SINGLETON_MOD.curry(
                     deed_struct,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Any
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -29,6 +29,8 @@ class ValidatorSettings(BaseSettings):
         extra="ignore",
     )
 
+    deployment_environment: Literal["staging-alpha", "production-alpha"] | None = None
+
     signer_index: int = Field(..., ge=0, le=2)
     seed_file: str
     ledger_db_path: str = "./state/validator_signatures_v2.db"
@@ -38,7 +40,8 @@ class ValidatorSettings(BaseSettings):
     network: Literal["testnet11"] = "testnet11"
     coinset_base_url: str = "https://testnet11.api.coinset.org"
     evm_rpc_url: str
-    evm_chain_id: int = Field(11155111, ge=11155111, le=11155111)
+    evm_chain_id: int = 11155111
+    enrollment_activation: dict[str, Any] | None = None
     evm_min_confirmations: int = Field(12, ge=12, le=12)
     proof_max_age_seconds: int = Field(7 * 24 * 60 * 60, ge=3600, le=7 * 24 * 60 * 60)
     claim_clock_skew_seconds: int = Field(90, ge=10, le=300)
@@ -58,6 +61,16 @@ class ValidatorSettings(BaseSettings):
     stripe_mode: Literal["test", "live"] = "test"
     stripe_restricted_key_file: str = ""
     stripe_api_url: str = "https://api.stripe.com"
+
+    @field_validator("evm_chain_id", mode="before")
+    @classmethod
+    def _enrollment_chain(cls, value: Any) -> int:
+        # BaseSettings receives numeric environment values as text.
+        if isinstance(value, str) and value in ("11155111", "84532"):
+            return int(value)
+        if type(value) is int and value in (11155111, 84532):
+            return value
+        raise ValueError("enrollment chain must be Ethereum Sepolia or selected Base Sepolia")
 
     @field_validator("bridge_policy_hash")
     @classmethod
@@ -88,6 +101,28 @@ class ValidatorSettings(BaseSettings):
         if not _ADDRESS_RE.fullmatch(value):
             raise ValueError("EVM addresses must be 0x-prefixed 20-byte values")
         return value.lower()
+
+    @model_validator(mode="after")
+    def _permit_deployment(self) -> "ValidatorSettings":
+        if self.enrollment_activation is None:
+            if self.evm_chain_id != 11155111:
+                raise ValueError("Base Sepolia enrollment requires complete activation evidence")
+            return self
+        from solslot_puzzles.enrollment_activation import validate_enrollment_activation
+        value = self.enrollment_activation
+        if self.evm_chain_id != 84532 or self.deployment_environment is None:
+            raise ValueError("permit signer requires an explicit alpha environment and Base Sepolia")
+        try:
+            checked = validate_enrollment_activation(value, source_shas=value["sourceShas"],
+                ceremony_id=value["deploymentId"], emitter=self.evm_attestation_emitter_address,
+                validator_pubkeys=[bytes.fromhex(k[2:]) for k in self.roster_pubkeys],
+                environment=self.deployment_environment)
+        except (KeyError, TypeError) as exc:
+            raise ValueError("permit signer activation evidence is incomplete") from exc
+        if checked["bridgePolicyHash"] != self.bridge_policy_hash:
+            raise ValueError("permit signer bridge policy does not reconstruct")
+        self.enrollment_activation = checked
+        return self
 
     @model_validator(mode="after")
     def _https_endpoints(self) -> "ValidatorSettings":

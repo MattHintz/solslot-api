@@ -123,6 +123,9 @@ class CompleteRedemption(ApiModel):
     aggregated_signature: str | None = Field(
         default=None, alias="aggregatedSignature", min_length=194, max_length=194
     )
+    vault_owner_authorization: str | None = Field(
+        default=None, alias="vaultOwnerAuthorization", pattern=r"^0x[0-9a-fA-F]{130}$"
+    )
 
 
 class SubmitRedemptionFunding(ApiModel):
@@ -388,7 +391,7 @@ def create_funded_redemption(
         raise HTTPException(status_code=503, detail="Funded redemptions are disabled.")
     try:
         collection = collections.get(body.collection_id)
-        deeds = collection.get("deedAllocation")
+        deeds = collection.get("deeds")
         if not isinstance(deeds, list) or not deeds:
             raise ValueError("Collection has no governed SmartDeed allocation.")
         shares: dict[bytes32, int] = {}
@@ -924,12 +927,7 @@ def _find_redemption(
 ) -> tuple[GovernanceQueueRecord, FundedRedemptionAllocation]:
     settlement = _hex32(_b32(settlement_id, "settlement ID"))
     deed = _b32(deed_launcher_id, "deed launcher ID")
-    matches = [
-        item for item in queue.list(public=True)
-        if item.kind == "FUNDED_REDEMPTION"
-        and item.state == "EXECUTED"
-        and str(item.bill.get("settlementId", "")).lower() == settlement
-    ]
+    matches = queue.find_executed_redemptions(settlement)
     if len(matches) != 1:
         raise HTTPException(status_code=404, detail="Funded redemption is unavailable.")
     plan = _funded_redemption_plan(matches[0])

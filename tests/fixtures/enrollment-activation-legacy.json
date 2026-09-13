@@ -1,0 +1,725 @@
+{
+  "schemaVersion": 4,
+  "protocolVersion": "solslot-v2-rc23",
+  "network": "testnet11",
+  "evmChainId": 11155111,
+  "reviewClass": "internal-engineering-testnet",
+  "testOnly": true,
+  "auditStatus": "pending-external-review",
+  "buildTimestamp": "2026-07-29T00:00:00+00:00",
+  "sourceManifestVersion": 4,
+  "ceremony": {
+    "ceremonyId": "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "planHash": "0xd61044804b6643dfaf7a8f9c66da6aa3cdae465ec0a6a250e03c02431569b2c7",
+    "spendBundleId": "0x9191919191919191919191919191919191919191919191919191919191919191",
+    "confirmedBlockIndex": 1234,
+    "requiredChiaConfirmations": 3
+  },
+  "genesisPlan": {
+    "schema": "solslot-genesis-plan-v4",
+    "protocolVersion": "solslot-v2-rc23",
+    "ceremonyId": "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "network": "testnet11",
+    "evmChainId": 11155111,
+    "expiresAt": 1800000000,
+    "sourceManifestVersion": 4,
+    "sourceShas": {
+      "protocol": "1111111111111111111111111111111111111111",
+      "evm": "2222222222222222222222222222222222222222",
+      "omnichain": "3333333333333333333333333333333333333333",
+      "api": "4444444444444444444444444444444444444444",
+      "legacyBackend": "5555555555555555555555555555555555555555",
+      "keyOfSolomon": "6666666666666666666666666666666666666666",
+      "samuel": "7777777777777777777777777777777777777777",
+      "customerWeb": "8888888888888888888888888888888888888888",
+      "adminPortal": "9999999999999999999999999999999999999999"
+    },
+    "recoveryDependencyManifestHash": "0x66c4d3c002311ef964e3326cafc87922e277babbf1c1dba8888c980b4cf8d1a1",
+    "evmAddresses": {
+      "forwarder": "0x1111111111111111111111111111111111111111",
+      "verifierAdapter": "0x2222222222222222222222222222222222222222",
+      "attestationEmitter": "0x3333333333333333333333333333333333333333"
+    },
+    "faucetPuzzleHash": "0x739b03c3259b991927ac874ac6a2deff8063766ae47817668c18119baf0b84bb",
+    "governanceBlsPubkey": "0x515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151",
+    "kosMintExecutePubkey": "0xac5669419e8eb7d00814692207ddf331e45835ee441260f6309fd564e7e92a60555e5be793654a9b5f949c7f74de8174",
+    "fundingCoinIds": {
+      "sgt": "0xd3807f9f6124128615f50e8da3ade5d479534360d3cb4f35d079b845487445b7",
+      "pool": "0x9bfdf7e478ed27624e5b129f5480cc3b7309d74a5106c55d0538160a893d1330",
+      "did": "0x03fa215baec35b69550af1d6614535ca9c1ebd867bb0b3912c58d2c2563c02c6",
+      "governance": "0x1a0495d79138df098f893a872b0c2c05c02804f79f0975ecaa2c605414fc3b08",
+      "statutes": "0x320bd22914bc946f7657435758a0a45f13491abd53a6af498951fc6456cc2f53",
+      "protocol_config": "0xa1a85a7293d7a2022ccfeaaf023368fd8b1ece7486ca939b9bb6032d7b7d282b",
+      "admin_authority": "0xbeafda65d518fb7d5504138e5c15147c6bfb96a4e20a63513f41bccfdebba653",
+      "vault_version_registry": "0xeacef496af3b896ff3c4f61c1f88e2b78b9a01610a5ac0e1bc180904e5b2931e",
+      "bridge_batch": "0x941efbc63e2b356eae612ee14582b223c9b3da0d73f6ae2453aa3560ee061010"
+    },
+    "launcherIds": {
+      "pool": "0x231141ec06f9ec832ccfc82f9c17048f678d1a006edb0f7b3ce9711f9cff8eb3",
+      "did": "0x45fbc66619f43371222170d68c4d87b8f8586ce623c36ca7c59289199f901104",
+      "governance": "0x0e819572412d473ee2fc5b1a42516b9edcf9cf3263baee4417589643e3e69c6f",
+      "statutes": "0x5d2d1c6ad3b871da7370418808d44c74933be93497c0a25c9ed4ee285107e3d5",
+      "protocolConfig": "0x81b93d44c2f5ac95b63668f9f4f1565013e2dec1e498322fcc84873e9b18d1e5",
+      "adminAuthority": "0xbf6b93876c020a7ce9b3193614c17d3c4606fc3d9e83199bd1c23dccb4900d8b",
+      "adminIdentity0": "0xb68d5830ee374d2d49c886f1350f6e8da6d1f322682593a93e34736b733fad54",
+      "adminIdentity1": "0x1b0177ad225b8d871e4c03b1156608d235f074cb4bd749201734cb480b3e68f6",
+      "adminIdentity2": "0x41e03c403817d8433b91eee08c88761990edf59239a514912b17b0d1e612194a",
+      "vaultVersionRegistry": "0x7de495d111dc95b2a1454bde3065621576e28ebb1375497d01d24729c93a70b6",
+      "propertyRegistry": "0x461ce839f681cc35983b4fe184b7d78509a26c6988fab8a494cac6441e7fe030"
+    },
+    "solsReserveSeed": {
+      "amount": 1,
+      "puzzleHash": "0x1f914c7543011475c41b9a5c9b8b17067475a0e543a48334399d584701210c3b",
+      "coinId": "0x29e7dd702acd85300df6bf6eb9b465369a1b3d1ab8ac9fc71db138cb53155fc0",
+      "circulating": false,
+      "purpose": "permanent-cat-lineage-anchor"
+    },
+    "puzzleHashes": {
+      "poolInnerMod": "0x1d4be5fec4d196e6920d8e04f7680e813e310040348ce153b49191e633650768",
+      "poolInner": "0xbf66660c5bb4554dd8b73d51d0e77014ed336dbcf50d4926601128baba7e196b",
+      "poolFull": "0x7aef06d091a7d1564bc1e9a3ad72cd413cf64c8c7e9890d0b071a50e103b9dac",
+      "governanceInner": "0x009d72f311bebb8e3702357f821679e8e98c81651288ea75da6ad34b84f001bc",
+      "governanceFull": "0x05667195b4671f6bdee4b84ae996f01790464856d6d630d02e3614c05d083f7c",
+      "statutesInnerMod": "0x1862f5f4301fe00a4f1801f412774b5514b03b6c528b3783b0ebc61cd451e11d",
+      "statutesInner": "0xeba9510d596246dc8d8923e30b9cbdaf9e01cbf9d6520744326a6a77e43cf764",
+      "statutesFull": "0x9cf6f510f1692778d8cf537f4f84c0effa5110c63dab6f6dfa04d60bed470454",
+      "didInner": "0x97e1e8b16def79d291b6fb1b11fbcfdd07650269a56ac3d97bb7a03ffb6f6aed",
+      "didFull": "0xf6c7c7577c32ce59e44961981de94c743ae7ee60031b9af7e8197fb228d1d488",
+      "protocolConfigInner": "0xbc8d540f635c43cf22b7d264d14b71c31f19cf66272d2c4fd1f8cc509a652361",
+      "protocolConfigFull": "0x2d1671a239a80e39e6788d7a8d47ee39ca7b2d86221392d1842df7735c0a5622",
+      "adminAuthorityInner": "0x024d71c3103b178f6b7d6ca9d35c05eb7996241edfd10aca110fdfec90a34055",
+      "adminAuthorityFull": "0x8532f1e11821cb82c3958e6ec692e2f928d43f2cf6fd8b3a44d32929371b2d3f",
+      "adminAuthorityInnerMod": "0xa8f01fcd5869ce286d4504531d786e055ebca36fcb9ecd1b8aaf118564c286ae",
+      "adminIdentityCustody": [
+        "0x1edb95a613dc90de86acf286577c82309572011fbfab409b0e4b02cbc038a359",
+        "0xcff3602871af972be59d7d53a36b18d9f9420f685ab6c7df1be50d78b397ca30",
+        "0xf4e069a1941c5ae9dbd988587545c62e13a7dec909c9a6b7bf5be5e87f593a20"
+      ],
+      "adminIdentityFull": [
+        "0xab76640f309bc16732edb45d225ff9599941a28a9de5e44aeb335cfe32771687",
+        "0x76e8b7d63884ae10fc150393ff71a6469dc0052669810a4afadce9ee3f2d648b",
+        "0x53ffe60f1b94e39c78692a5fa7de7f83693a7279da50f17858914c3d411a064e"
+      ],
+      "vaultVersionRegistryInner": "0x529663bba10358d6218f93dc12c9a2f351f2eb9f82ec17eb7c2b1fe78f55d3a0",
+      "vaultVersionRegistryFull": "0x9c8f9962df375f619806ec78bb4b07faef43ae2da4261bae39ee839b316873ab",
+      "propertyRegistryInner": "0xf05fad62349dc3fd797dc834c3ff32a40a3dddd798fddd47875da98c1c12aa07",
+      "propertyRegistryFull": "0xfcaaee69673da1540bb8eaa69c99d15d03861f805f9823d0b58ca254d9f23e4e",
+      "sgtTail": "0x7952a54a92b75890925273c1584e3becf479fdcb34ea85532802ad9cbfb348e9",
+      "sgtReserveInner": "0x6a1384e1a0c4923967c9b1930936b6c3ce61ee47b57e9e1395a5b762591405bb",
+      "solsTail": "0xf79adfc9005049932c99fe90e6290e3591a895b2f5b934ba47781480999c3139",
+      "bridgePolicy": "0x190fbd2cc96c4d2dffd2610f1f83def745b2750cc8477d9f7f72204244aff555"
+    },
+    "protocolParameters": {
+      "votingWindowSeconds": 300,
+      "quorumBps": 5000,
+      "minProposalStake": 10000,
+      "navValiditySeconds": 86400,
+      "oracleMaxAgeSeconds": 600,
+      "exchangeFeeBps": 100,
+      "protocolFeeBps": 30,
+      "sgtRewardsFeeBps": 70,
+      "rewardEpochSeconds": 86400,
+      "sgtTotalSupply": 1000000
+    },
+    "permanentRules": {
+      "sgtTailHash": "0x7952a54a92b75890925273c1584e3becf479fdcb34ea85532802ad9cbfb348e9",
+      "sgtTotalSupply": 1000000,
+      "solsTailHash": "0xf79adfc9005049932c99fe90e6290e3591a895b2f5b934ba47781480999c3139",
+      "zkPassportPolicyHash": "0x190fbd2cc96c4d2dffd2610f1f83def745b2750cc8477d9f7f72204244aff555",
+      "protocolTreasuryPuzzleHash": "0x6262626262626262626262626262626262626262626262626262626262626262",
+      "networkId": "0x37a90eb5185a9c4439a91ddc98bbadce7b4feba060d50116a067de66bf236615",
+      "maxExchangeFeeBps": 100,
+      "upgradeDelaySeconds": 86400,
+      "voteConservation": true,
+      "replayProtection": true,
+      "treasuryNonWithdrawal": true,
+      "protocolOnlySmartDeedSolsExchange": true,
+      "zkPassportRequired": true,
+      "solsSupplyNeverMelted": true,
+      "solsPrimaryPurchasesDisabled": true
+    },
+    "state": {
+      "statutesVersion": 1,
+      "statutesContentHash": "0xd19434980a80d8322e5987ef40d133af2741a530a8a9e9ace1edd50d7e943289",
+      "statutesRoots": {
+        "parameters": "0x523b227efc98c025f2ec9ca3dbd3b9d64aa65345aab75f5c218623dcbab155aa",
+        "collections": "0x4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+        "oracles": "0x4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+        "bridgeRoutes": "0x4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+        "liquidityVenues": "0x4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+        "pauses": "0x4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a"
+      },
+      "poolVersion": 1,
+      "poolCommitmentHash": "0x20259c5163c7e2be7361bc74195d2d191721587ca154544bd1b2f1ee23fc985d",
+      "protocolConfigVersion": 1,
+      "adminAuthorityVersion": 1,
+      "vaultVersion": 2,
+      "propertyRegistryVersion": 0
+    },
+    "adminAuthority": {
+      "version": 3,
+      "threshold": 2,
+      "policy": "owner-plus-one",
+      "ownerIndex": 0,
+      "coadminIndices": [
+        1,
+        2
+      ],
+      "coadminThreshold": 1,
+      "sourceManifestHash": "0xf4bdb18ec5b525b343909c7a5023f796e544bdab40bb98b01e2c7f7eefd0c04e",
+      "operationalMipsRootHash": "0xf7e643b7da06ce318ff15eabcd3a28e80e307dcc47665517b69c13b5e21e2d91",
+      "lostRecoveryMipsRootHashes": [
+        "0x8bb7bba919f5b77434d6446ed3864a16c166407daa370736c943a4214b8015e5",
+        "0xe4600205138d4fd537f2aa18bfdb94ab25e52133aa25a7fb4d67e05fdb5724ca",
+        "0x0889f9c9e9267f53f5c54bca13826a281d6585023660e85494e9a1ff9d20dc87"
+      ],
+      "routineDelaySeconds": 86400,
+      "lostKeyDelaySeconds": 604800,
+      "pending": false,
+      "identityVaults": [
+        {
+          "slot": 0,
+          "launcherAmount": 3,
+          "launcherId": "0xb68d5830ee374d2d49c886f1350f6e8da6d1f322682593a93e34736b733fad54",
+          "dailyCompressedPubkey": "0x021111111111111111111111111111111111111111111111111111111111111111",
+          "dailyMemberHash": "0x4739f3e2fd1eafd8579ad15204676f9e181d3cfa0c412b239f9989f095d0dfe9",
+          "recoveryMemberHash": "0x7650dcbbad551b7f56653ab2f846e83385470883f313ed364fd9b798e30e89e4",
+          "recoveryBlsPubkey": "0xaefe1789d6476f60439e1168f588ea16652dc321279f05a805fbc63933e88ae9c175d6c6ab182e54af562e1a0dce41bb",
+          "custodyHash": "0x1edb95a613dc90de86acf286577c82309572011fbfab409b0e4b02cbc038a359",
+          "fullPuzzleHash": "0xab76640f309bc16732edb45d225ff9599941a28a9de5e44aeb335cfe32771687"
+        },
+        {
+          "slot": 1,
+          "launcherAmount": 5,
+          "launcherId": "0x1b0177ad225b8d871e4c03b1156608d235f074cb4bd749201734cb480b3e68f6",
+          "dailyCompressedPubkey": "0x032222222222222222222222222222222222222222222222222222222222222222",
+          "dailyMemberHash": "0xb3d911b0f5d2588c06715a0c3ca7e8e64122943475006264b9daf40cbad35c4d",
+          "recoveryMemberHash": "0x0733dce7450335a2adc6d20cc556ccf67302572a52a94d3e4499d2b4f13ea457",
+          "recoveryBlsPubkey": "0xb6144137baa6440c17386d1a407fb3670d3b3627b4fa8bf4b56433f861eaba4e076cefac1d9365de56a0e5d976ad7354",
+          "custodyHash": "0xcff3602871af972be59d7d53a36b18d9f9420f685ab6c7df1be50d78b397ca30",
+          "fullPuzzleHash": "0x76e8b7d63884ae10fc150393ff71a6469dc0052669810a4afadce9ee3f2d648b"
+        },
+        {
+          "slot": 2,
+          "launcherAmount": 7,
+          "launcherId": "0x41e03c403817d8433b91eee08c88761990edf59239a514912b17b0d1e612194a",
+          "dailyCompressedPubkey": "0x023333333333333333333333333333333333333333333333333333333333333333",
+          "dailyMemberHash": "0x918e61024c6b1cc2755e4de331bdc56efedd5e6982b82c3f616e4f84c029cd97",
+          "recoveryMemberHash": "0x4d5619b22d0e86cb3945a003adc6abd33ed504732b9974c5ef743e37ed074043",
+          "recoveryBlsPubkey": "0x954a331766f0584949a2376fbd96ac5a1f0a9e90c916383a5a16762b11c29120f5a072ea43f64774d77ad1ac4ba98dac",
+          "custodyHash": "0xf4e069a1941c5ae9dbd988587545c62e13a7dec909c9a6b7bf5be5e87f593a20",
+          "fullPuzzleHash": "0x53ffe60f1b94e39c78692a5fa7de7f83693a7279da50f17858914c3d411a064e"
+        }
+      ],
+      "compressedPubkeys": [
+        "0x021111111111111111111111111111111111111111111111111111111111111111",
+        "0x032222222222222222222222222222222222222222222222222222222222222222",
+        "0x023333333333333333333333333333333333333333333333333333333333333333"
+      ],
+      "adminsHash": "0xbf3528a3ccf8d89cb4beff676ba45786b8f2cff91b3c6a821ed3a8ffffcd6f6c",
+      "fundingAmount": 16
+    },
+    "adminRecoveryKits": [
+      {
+        "slot": 0,
+        "revision": 1,
+        "evmGuardian": "0x8181818181818181818181818181818181818181",
+        "recoveryBlsPubkey": "0xaefe1789d6476f60439e1168f588ea16652dc321279f05a805fbc63933e88ae9c175d6c6ab182e54af562e1a0dce41bb",
+        "recoveryBlsCommitment": "0x11354b840ab34f61ad7844760caa14e155a988a902a62409412f87e3b4b3964d",
+        "drillChallengeHash": "0x9191919191919191919191919191919191919191919191919191919191919191"
+      },
+      {
+        "slot": 1,
+        "revision": 1,
+        "evmGuardian": "0x8282828282828282828282828282828282828282",
+        "recoveryBlsPubkey": "0xb6144137baa6440c17386d1a407fb3670d3b3627b4fa8bf4b56433f861eaba4e076cefac1d9365de56a0e5d976ad7354",
+        "recoveryBlsCommitment": "0xe503f0f589242a8dae0489a55b2cc89f1250fd7af39d87066fa2acb9f090bcc3",
+        "drillChallengeHash": "0x9292929292929292929292929292929292929292929292929292929292929292"
+      },
+      {
+        "slot": 2,
+        "revision": 1,
+        "evmGuardian": "0x8383838383838383838383838383838383838383",
+        "recoveryBlsPubkey": "0x954a331766f0584949a2376fbd96ac5a1f0a9e90c916383a5a16762b11c29120f5a072ea43f64774d77ad1ac4ba98dac",
+        "recoveryBlsCommitment": "0xe878c4877b5393ba4a14508ceb6da23e5127001088878b3960bb898c6bac355b",
+        "drillChallengeHash": "0x9393939393939393939393939393939393939393939393939393939393939393"
+      }
+    ],
+    "validatorSet": {
+      "threshold": 2,
+      "pubkeys": [
+        "0x414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141",
+        "0x424242424242424242424242424242424242424242424242424242424242424242424242424242424242424242424242",
+        "0x434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343"
+      ]
+    },
+    "bridgeBatch": {
+      "fundingAmount": 530,
+      "parentOutputAmount": 528,
+      "propertyRegistryLauncherAmount": 1,
+      "bufferFeeAmount": 1,
+      "changeAmount": 0,
+      "networkFeeSource": "separate-fountain-fee-till",
+      "count": 32,
+      "lowWaterMark": 8,
+      "parentCoinIds": [
+        "0x16df08cf78c4494f504ba9eaa21cba6fdf902af55d4e96b0774d9e6b186f986d",
+        "0x5bafc696ebae20ecb165a59df0adadbb4f512b1ea525b26005f73f3b141df2f6",
+        "0x07660cac3a8a3c7866d0427e39beb948f18a3a6ef758caf5a70470c649cdb70e",
+        "0xbd7609a16cad03220604c985d467ed93f80ef372103269a36cce9390760af270",
+        "0xc0127eb052f244322f4ab0e79e6d26f13677c8523b4047ed4ccb6054d47445bf",
+        "0x5b1a18336676eca0229035c9625c49ec0d0aa6a5d65ffcb0e634267fa4eadf50",
+        "0x9f462041751cf356d0c51947dcc664ba115838aff101fdf6e01565ad281be3e4",
+        "0xaa5e28d0810d1ee49200075ac44eef35293cc2d539caa283b26889948af7f037",
+        "0x216d07c5b2dd0e86de0d63248cefb2083542ec14c9942f38998929f9edfba53b",
+        "0x1ad0a9ad0b17848af368ecc89704b87e5a95182da69fde4e99bda5395dbc4d96",
+        "0x98b47b435327248fdb736535889dfc90ef74ceb28125604d67018271d51a5397",
+        "0xf8983ea8a4226c64668d909b05e8e48eddc7fb29b47b42ab0e278ac3d3bda281",
+        "0x9f6c56d186a4b63f1fff5b50dbcb7789405036dcfb653c14edc76cb3c6da29eb",
+        "0xf9903749550f7de82429f12870aea0fb54acd10465c15d331f92fd02593b6483",
+        "0x487cb6aa8a7bf63e876f8e8f8cb81253143b47a40789ea50cd92e88a54fe8ed3",
+        "0x557210a3d527a57ae7dcad076fda91c51a5f1986fb67be1eee63568c70ae4ac4",
+        "0x035d1313f5aaeb31558c5748c6910c37d42e5fefaaffeede48869af5bb74b3df",
+        "0x9991b822969d8a230aaefcecaeab26aed0e294f865e9d92273480c8972c5cc3f",
+        "0xf4721500f6aaa2e5f7f0445cb07a61b3bede9be05a41dfaff90cac2cd4ecaf1e",
+        "0x09823dff0abe4d492e04df83484334d7655a147765eac99a5b4d80cb65b77211",
+        "0x783e04929c7d9b88aacda90f1ccd31f388a19474c8ec4707a146bbb652203cab",
+        "0xc773a99101b69dad0c060e45d4f7408440b3c2b2a2292a45d63be973f6ecb5c7",
+        "0x76336dda4103e0062dcb3a2179525e8c706c2f3ed878ff2db85789210e882848",
+        "0x01a54d7bf9d8f049c157b31bebee8e2a39431e8bc660c60ef90761f538c7701d",
+        "0x58206afd044198a874ce9ac31556c1b3dbace40ae6794017be843ed3d1b9e13e",
+        "0x35cd3f9122eb3cedd9dded1ac717c5a40d46d43d7de120a80093c10f094d2d17",
+        "0x5b9ae8a489510af6909b42fef1e24f9fbfde0672616a5fcf47a6a4a8ac90e24d",
+        "0xc64c225afc97657759fa6f43baddac1c0b2fc07cc5b2073f7f44aa95783d6195",
+        "0x27f06e2e4838ef06c24b44803984a5939a8d178811d87d5c04a45e773220fd20",
+        "0x288361a6aa572ba860f2356e2ba7bca0adbd1d3e16a072070e2dc1dcf515be7a",
+        "0xad7938d448cc86e4e8b8027158f1bc04d4a118534b4636e62e17ec5a9ca513e9",
+        "0xf1c5597d7d077d9f3b2adc55a1a1f151ccc755aa116e0f0205ed7240a606be3e"
+      ],
+      "bridgeCoinIds": [
+        "0xe6abe3260af0d6a74e3ba5fe3d3c698f669af2b98d7975137020ede2253b180b",
+        "0xec46929273800f3cdd6462afc44d5f9f9d6514a0b03746145487f773c305b53b",
+        "0x12d5d7a0ef526e2eac722ea12858999999491e66e9c8c145841e9ab175adbead",
+        "0xe8160ac18aca56e329c76fdf3b3844c2a3fb95806d78763636448a5991bf9bfe",
+        "0xe82fdab618bb59af725c9b402ed507d7f94ea93412587e3c2c5362c9ab2a5c93",
+        "0xe59498a6e8be543a964de2a07c48f622b929120935470f5ddd0b8c254da7ae8b",
+        "0xbb4c1b1a716c83a771e9b82a14b8c447c2e4956e9ea38ea844c9afce9fef6a58",
+        "0xb36d85ca7b2d9d87ac8d71cffb43c544e452463f87a5ddc8f521bcafc55c2290",
+        "0x6f996948701dea05b86e93333f1cd9cb17dd323eb00afd4485134c8a4784492b",
+        "0xdd7be3488dec510cab61ee7b0a154753537752d058e1fe0cadd4e8029b41ba32",
+        "0x244731df9e569b8b1c9199cd3f2a9521d3a7ffc39d7b922ffc508b2b8dc0d4be",
+        "0xaea42c82d8e2c0bde365df28829ecb06a63dac155941ec5a30a696eedff211c2",
+        "0x8157b5e1162b02ae7211d679ebd6959a9bae3b71e53eb40270209cb997777f8e",
+        "0x75231103d2b17251ba3be1ebbaa302512e0667944c809f0f11e05b74973f2e50",
+        "0xb37decd913b1845431f3df62beec15c00719772f507d81376bf53e1f39568cc9",
+        "0xce23ec016f2b54071b661c4fdb5f0f5a9cb6d7cb0bde1d960c6cdcf1db836265",
+        "0xd33f465cc99a550005a5b46ec85cb864d95580378d6142390e2fda9578d884e6",
+        "0x144f25efb146d2fe70e6056723e4883bfe221a8bba78fa6d6180d43f5d10cc41",
+        "0xfbce1b9a17d463b87a2b8197a6614c3db91d23873ac9904288bcdab351b7c035",
+        "0xc6ec90140d686e0f882cf7b8e1b826edf33212eb09317d9c421a7754cfefdc5b",
+        "0xb9e0c6c02c70a854b06f312de471b09c093f16f5425247fd06f54a68f4e11c31",
+        "0xd9bf59d9dce000351d3e52da9fa3ec3f23182d8731aac7f025349ab8619db4ab",
+        "0x15fa5361f97f8611ca497bf25c3df76ff1e3a6a1dd4bc5ad5efd1d28242f535b",
+        "0xa9562ceb02a62c1066f3243271c397cde60fea9881dc866e44560c84c437814c",
+        "0xa96442b5a47a3e8bcb2ab94491358022fd97849c4af192d21f89365f42d54577",
+        "0x80f787c572c3b42f1ef09a7279ea538f73ec08f26732bb01e602ad7dea4fb00a",
+        "0x956173e0022261797725faf20cc8a4ccc3df21affb25c97463eebb864e936585",
+        "0x071ad87d93cf5670eb94c76400edc92501f5ca90127b4bd21f0066236a8326cb",
+        "0x2ccbc85160355471b8c92c69bafa667e4c0a84e9d2cd9761e9af26e56a3b4c0c",
+        "0xdecdb017e5b7e179d7ab1956851130ecaaaefcddf9691e27b67185be21faefea",
+        "0xc9e2e89a3103f38bac5c6910212475255efaba2474cfa6efc77ee60127391f46",
+        "0x7fab8cd5d8f87dfbf282b530db5187287715a5a82a5f8e57f1439383d157c039"
+      ]
+    },
+    "trustedDestinations": {
+      "treasuryReservePuzzleHash": "0x6161616161616161616161616161616161616161616161616161616161616161",
+      "protocolTreasuryPuzzleHash": "0x6262626262626262626262626262626262626262626262626262626262626262",
+      "companySgtSaleTreasuryPuzzleHash": "0x6565656565656565656565656565656565656565656565656565656565656565",
+      "governanceRewardsPuzzleHash": "0x6363636363636363636363636363636363636363636363636363636363636363",
+      "governanceRewardsRoot": "0x6464646464646464646464646464646464646464646464646464646464646464"
+    },
+    "trustedAssets": {
+      "wusdcBAssetId": "0x6666666666666666666666666666666666666666666666666666666666666666"
+    },
+    "canonicalVaultParamsHash": "0x0c331d9ea7e52d91e160f20fa44aec48bc64da860c2ec83213cdd41fa247b5b5",
+    "retiredCoordinates": [
+      "0x7171717171717171717171717171717171717171717171717171717171717171"
+    ],
+    "planHash": "0xd61044804b6643dfaf7a8f9c66da6aa3cdae465ec0a6a250e03c02431569b2c7"
+  },
+  "sourceShas": {
+    "protocol": "1111111111111111111111111111111111111111",
+    "evm": "2222222222222222222222222222222222222222",
+    "omnichain": "3333333333333333333333333333333333333333",
+    "api": "4444444444444444444444444444444444444444",
+    "legacyBackend": "5555555555555555555555555555555555555555",
+    "keyOfSolomon": "6666666666666666666666666666666666666666",
+    "samuel": "7777777777777777777777777777777777777777",
+    "customerWeb": "8888888888888888888888888888888888888888",
+    "adminPortal": "9999999999999999999999999999999999999999"
+  },
+  "puzzleHashes": {
+    "poolInnerModHash": "0x1d4be5fec4d196e6920d8e04f7680e813e310040348ce153b49191e633650768",
+    "poolInnerPuzzleHash": "0xbf66660c5bb4554dd8b73d51d0e77014ed336dbcf50d4926601128baba7e196b",
+    "poolFullPuzzleHash": "0x7aef06d091a7d1564bc1e9a3ad72cd413cf64c8c7e9890d0b071a50e103b9dac",
+    "poolTokenTailHash": "0xf79adfc9005049932c99fe90e6290e3591a895b2f5b934ba47781480999c3139",
+    "smartDeedInnerModHash": "0x66b8c1098f6953b20496a84a17653b3e0ab200b0c6049f3e383e0e3709bd190b",
+    "p2PoolModHash": "0xa871d51b4a5b97dd34076fccb3123dc339c7fb60d317b8f04a2ce203760609c0",
+    "deedLauncherPuzzleHash": "0xac3a8c29109bac597bc0b93cfad8f8390b062af93ed7b05930fb97090bbef3a4",
+    "p2VaultModHash": "0x8d3f524a4837d943d9734df0f01add9d81808b0c72ee017a4e01c5d91699f807",
+    "vaultInnerModHash": "0x34a8ecbe7aa044ca809c04438ad084c439fbfba1714dabaec0e52d206640eb1e",
+    "didInnerPuzzleHash": "0x97e1e8b16def79d291b6fb1b11fbcfdd07650269a56ac3d97bb7a03ffb6f6aed",
+    "didFullPuzzleHash": "0xf6c7c7577c32ce59e44961981de94c743ae7ee60031b9af7e8197fb228d1d488",
+    "governanceInnerPuzzleHash": "0x009d72f311bebb8e3702357f821679e8e98c81651288ea75da6ad34b84f001bc",
+    "governanceFullPuzzleHash": "0x05667195b4671f6bdee4b84ae996f01790464856d6d630d02e3614c05d083f7c",
+    "statutesInnerModHash": "0x1862f5f4301fe00a4f1801f412774b5514b03b6c528b3783b0ebc61cd451e11d",
+    "statutesInnerPuzzleHash": "0xeba9510d596246dc8d8923e30b9cbdaf9e01cbf9d6520744326a6a77e43cf764",
+    "statutesFullPuzzleHash": "0x9cf6f510f1692778d8cf537f4f84c0effa5110c63dab6f6dfa04d60bed470454",
+    "protocolConfigInnerPuzzleHash": "0xbc8d540f635c43cf22b7d264d14b71c31f19cf66272d2c4fd1f8cc509a652361",
+    "protocolConfigFullPuzzleHash": "0x2d1671a239a80e39e6788d7a8d47ee39ca7b2d86221392d1842df7735c0a5622",
+    "adminAuthorityInnerPuzzleHash": "0x024d71c3103b178f6b7d6ca9d35c05eb7996241edfd10aca110fdfec90a34055",
+    "adminAuthorityFullPuzzleHash": "0x8532f1e11821cb82c3958e6ec692e2f928d43f2cf6fd8b3a44d32929371b2d3f",
+    "vaultVersionRegistryInnerPuzzleHash": "0x529663bba10358d6218f93dc12c9a2f351f2eb9f82ec17eb7c2b1fe78f55d3a0",
+    "vaultVersionRegistryFullPuzzleHash": "0x9c8f9962df375f619806ec78bb4b07faef43ae2da4261bae39ee839b316873ab",
+    "propertyRegistryInnerPuzzleHash": "0xf05fad62349dc3fd797dc834c3ff32a40a3dddd798fddd47875da98c1c12aa07",
+    "propertyRegistryFullPuzzleHash": "0xfcaaee69673da1540bb8eaa69c99d15d03861f805f9823d0b58ca254d9f23e4e",
+    "sgtTailHash": "0x7952a54a92b75890925273c1584e3becf479fdcb34ea85532802ad9cbfb348e9",
+    "solsTailHash": "0xf79adfc9005049932c99fe90e6290e3591a895b2f5b934ba47781480999c3139",
+    "solsReserveSeedPuzzleHash": "0x1f914c7543011475c41b9a5c9b8b17067475a0e543a48334399d584701210c3b",
+    "bridgePolicy": "0x190fbd2cc96c4d2dffd2610f1f83def745b2750cc8477d9f7f72204244aff555",
+    "adminAuthorityInnerMod": "0xa8f01fcd5869ce286d4504531d786e055ebca36fcb9ecd1b8aaf118564c286ae",
+    "adminAuthorityInner": "0x024d71c3103b178f6b7d6ca9d35c05eb7996241edfd10aca110fdfec90a34055",
+    "adminAuthorityFull": "0x8532f1e11821cb82c3958e6ec692e2f928d43f2cf6fd8b3a44d32929371b2d3f",
+    "adminIdentityCustody": [
+      "0x1edb95a613dc90de86acf286577c82309572011fbfab409b0e4b02cbc038a359",
+      "0xcff3602871af972be59d7d53a36b18d9f9420f685ab6c7df1be50d78b397ca30",
+      "0xf4e069a1941c5ae9dbd988587545c62e13a7dec909c9a6b7bf5be5e87f593a20"
+    ],
+    "adminIdentityFull": [
+      "0xab76640f309bc16732edb45d225ff9599941a28a9de5e44aeb335cfe32771687",
+      "0x76e8b7d63884ae10fc150393ff71a6469dc0052669810a4afadce9ee3f2d648b",
+      "0x53ffe60f1b94e39c78692a5fa7de7f83693a7279da50f17858914c3d411a064e"
+    ]
+  },
+  "launcherIds": {
+    "pool": "0x231141ec06f9ec832ccfc82f9c17048f678d1a006edb0f7b3ce9711f9cff8eb3",
+    "did": "0x45fbc66619f43371222170d68c4d87b8f8586ce623c36ca7c59289199f901104",
+    "governance": "0x0e819572412d473ee2fc5b1a42516b9edcf9cf3263baee4417589643e3e69c6f",
+    "statutes": "0x5d2d1c6ad3b871da7370418808d44c74933be93497c0a25c9ed4ee285107e3d5",
+    "protocolConfig": "0x81b93d44c2f5ac95b63668f9f4f1565013e2dec1e498322fcc84873e9b18d1e5",
+    "adminAuthority": "0xbf6b93876c020a7ce9b3193614c17d3c4606fc3d9e83199bd1c23dccb4900d8b",
+    "adminIdentity0": "0xb68d5830ee374d2d49c886f1350f6e8da6d1f322682593a93e34736b733fad54",
+    "adminIdentity1": "0x1b0177ad225b8d871e4c03b1156608d235f074cb4bd749201734cb480b3e68f6",
+    "adminIdentity2": "0x41e03c403817d8433b91eee08c88761990edf59239a514912b17b0d1e612194a",
+    "vaultVersionRegistry": "0x7de495d111dc95b2a1454bde3065621576e28ebb1375497d01d24729c93a70b6",
+    "propertyRegistry": "0x461ce839f681cc35983b4fe184b7d78509a26c6988fab8a494cac6441e7fe030"
+  },
+  "sgtGenesisCoinId": "0xd3807f9f6124128615f50e8da3ade5d479534360d3cb4f35d079b845487445b7",
+  "sgtTailHash": "0x7952a54a92b75890925273c1584e3becf479fdcb34ea85532802ad9cbfb348e9",
+  "solsTailHash": "0xf79adfc9005049932c99fe90e6290e3591a895b2f5b934ba47781480999c3139",
+  "solsReserveSeed": {
+    "amount": 1,
+    "puzzleHash": "0x1f914c7543011475c41b9a5c9b8b17067475a0e543a48334399d584701210c3b",
+    "coinId": "0x29e7dd702acd85300df6bf6eb9b465369a1b3d1ab8ac9fc71db138cb53155fc0",
+    "circulating": false
+  },
+  "governanceStruct": {
+    "treeHash": "0x9427a7e018f09a6d546ae173c23d89fb9c218604ed78d2d97f2b7df1089a3676",
+    "launcherId": "0x0e819572412d473ee2fc5b1a42516b9edcf9cf3263baee4417589643e3e69c6f",
+    "serialized": "0xffa07faa3253bfddd1e0decb0906b2dc6247bbc4cf608f58345d173adb63e8b47c9fffa00e819572412d473ee2fc5b1a42516b9edcf9cf3263baee4417589643e3e69c6fa0eff07522495060c066f66f32acc2a77e3a3e737aca8baea4d1a64ea4cdc13da9",
+    "mintExecuteCosignerPubkey": "0xac5669419e8eb7d00814692207ddf331e45835ee441260f6309fd564e7e92a60555e5be793654a9b5f949c7f74de8174"
+  },
+  "protocolDid": {
+    "launcherId": "0x45fbc66619f43371222170d68c4d87b8f8586ce623c36ca7c59289199f901104",
+    "singletonStruct": "0xffa07faa3253bfddd1e0decb0906b2dc6247bbc4cf608f58345d173adb63e8b47c9fffa045fbc66619f43371222170d68c4d87b8f8586ce623c36ca7c59289199f901104a0eff07522495060c066f66f32acc2a77e3a3e737aca8baea4d1a64ea4cdc13da9",
+    "innerPuzzleHash": "0x97e1e8b16def79d291b6fb1b11fbcfdd07650269a56ac3d97bb7a03ffb6f6aed",
+    "fullPuzzleHash": "0xf6c7c7577c32ce59e44961981de94c743ae7ee60031b9af7e8197fb228d1d488"
+  },
+  "propertyRegistry": {
+    "launcherId": "0x461ce839f681cc35983b4fe184b7d78509a26c6988fab8a494cac6441e7fe030",
+    "governanceBlsPubkey": "0x515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151",
+    "currentPuzzleHash": "0xfcaaee69673da1540bb8eaa69c99d15d03861f805f9823d0b58ca254d9f23e4e"
+  },
+  "protocolParameters": {
+    "votingWindowSeconds": 300,
+    "quorumBps": 5000,
+    "minProposalStake": 10000,
+    "navValiditySeconds": 86400,
+    "oracleMaxAgeSeconds": 600,
+    "exchangeFeeBps": 100,
+    "protocolFeeBps": 30,
+    "sgtRewardsFeeBps": 70,
+    "rewardEpochSeconds": 86400,
+    "sgtTotalSupply": 1000000
+  },
+  "permanentRules": {
+    "sgtTailHash": "0x7952a54a92b75890925273c1584e3becf479fdcb34ea85532802ad9cbfb348e9",
+    "sgtTotalSupply": 1000000,
+    "solsTailHash": "0xf79adfc9005049932c99fe90e6290e3591a895b2f5b934ba47781480999c3139",
+    "zkPassportPolicyHash": "0x190fbd2cc96c4d2dffd2610f1f83def745b2750cc8477d9f7f72204244aff555",
+    "protocolTreasuryPuzzleHash": "0x6262626262626262626262626262626262626262626262626262626262626262",
+    "networkId": "0x37a90eb5185a9c4439a91ddc98bbadce7b4feba060d50116a067de66bf236615",
+    "maxExchangeFeeBps": 100,
+    "upgradeDelaySeconds": 86400,
+    "voteConservation": true,
+    "replayProtection": true,
+    "treasuryNonWithdrawal": true,
+    "protocolOnlySmartDeedSolsExchange": true,
+    "zkPassportRequired": true,
+    "solsSupplyNeverMelted": true,
+    "solsPrimaryPurchasesDisabled": true
+  },
+  "stateVersions": {
+    "statutes": 1,
+    "pool": 1,
+    "protocolConfig": 1,
+    "adminAuthority": 1,
+    "vault": 2,
+    "propertyRegistry": 0
+  },
+  "statutes": {
+    "contentHash": "0xd19434980a80d8322e5987ef40d133af2741a530a8a9e9ace1edd50d7e943289",
+    "roots": {
+      "parameters": "0x523b227efc98c025f2ec9ca3dbd3b9d64aa65345aab75f5c218623dcbab155aa",
+      "collections": "0x4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+      "oracles": "0x4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+      "bridgeRoutes": "0x4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+      "liquidityVenues": "0x4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+      "pauses": "0x4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a"
+    }
+  },
+  "adminAuthority": {
+    "version": 3,
+    "threshold": 2,
+    "policy": "owner-plus-one",
+    "ownerIndex": 0,
+    "coadminIndices": [
+      1,
+      2
+    ],
+    "coadminThreshold": 1,
+    "rosterHash": "0xbf3528a3ccf8d89cb4beff676ba45786b8f2cff91b3c6a821ed3a8ffffcd6f6c",
+    "sourceManifestHash": "0xf4bdb18ec5b525b343909c7a5023f796e544bdab40bb98b01e2c7f7eefd0c04e",
+    "operationalMipsRootHash": "0xf7e643b7da06ce318ff15eabcd3a28e80e307dcc47665517b69c13b5e21e2d91",
+    "lostRecoveryMipsRootHashes": [
+      "0x8bb7bba919f5b77434d6446ed3864a16c166407daa370736c943a4214b8015e5",
+      "0xe4600205138d4fd537f2aa18bfdb94ab25e52133aa25a7fb4d67e05fdb5724ca",
+      "0x0889f9c9e9267f53f5c54bca13826a281d6585023660e85494e9a1ff9d20dc87"
+    ],
+    "routineDelaySeconds": 86400,
+    "lostKeyDelaySeconds": 604800,
+    "identityVaults": [
+      {
+        "slot": 0,
+        "launcherAmount": 3,
+        "launcherId": "0xb68d5830ee374d2d49c886f1350f6e8da6d1f322682593a93e34736b733fad54",
+        "dailyCompressedPubkey": "0x021111111111111111111111111111111111111111111111111111111111111111",
+        "dailyMemberHash": "0x4739f3e2fd1eafd8579ad15204676f9e181d3cfa0c412b239f9989f095d0dfe9",
+        "recoveryMemberHash": "0x7650dcbbad551b7f56653ab2f846e83385470883f313ed364fd9b798e30e89e4",
+        "recoveryBlsPubkey": "0xaefe1789d6476f60439e1168f588ea16652dc321279f05a805fbc63933e88ae9c175d6c6ab182e54af562e1a0dce41bb",
+        "custodyHash": "0x1edb95a613dc90de86acf286577c82309572011fbfab409b0e4b02cbc038a359",
+        "fullPuzzleHash": "0xab76640f309bc16732edb45d225ff9599941a28a9de5e44aeb335cfe32771687"
+      },
+      {
+        "slot": 1,
+        "launcherAmount": 5,
+        "launcherId": "0x1b0177ad225b8d871e4c03b1156608d235f074cb4bd749201734cb480b3e68f6",
+        "dailyCompressedPubkey": "0x032222222222222222222222222222222222222222222222222222222222222222",
+        "dailyMemberHash": "0xb3d911b0f5d2588c06715a0c3ca7e8e64122943475006264b9daf40cbad35c4d",
+        "recoveryMemberHash": "0x0733dce7450335a2adc6d20cc556ccf67302572a52a94d3e4499d2b4f13ea457",
+        "recoveryBlsPubkey": "0xb6144137baa6440c17386d1a407fb3670d3b3627b4fa8bf4b56433f861eaba4e076cefac1d9365de56a0e5d976ad7354",
+        "custodyHash": "0xcff3602871af972be59d7d53a36b18d9f9420f685ab6c7df1be50d78b397ca30",
+        "fullPuzzleHash": "0x76e8b7d63884ae10fc150393ff71a6469dc0052669810a4afadce9ee3f2d648b"
+      },
+      {
+        "slot": 2,
+        "launcherAmount": 7,
+        "launcherId": "0x41e03c403817d8433b91eee08c88761990edf59239a514912b17b0d1e612194a",
+        "dailyCompressedPubkey": "0x023333333333333333333333333333333333333333333333333333333333333333",
+        "dailyMemberHash": "0x918e61024c6b1cc2755e4de331bdc56efedd5e6982b82c3f616e4f84c029cd97",
+        "recoveryMemberHash": "0x4d5619b22d0e86cb3945a003adc6abd33ed504732b9974c5ef743e37ed074043",
+        "recoveryBlsPubkey": "0x954a331766f0584949a2376fbd96ac5a1f0a9e90c916383a5a16762b11c29120f5a072ea43f64774d77ad1ac4ba98dac",
+        "custodyHash": "0xf4e069a1941c5ae9dbd988587545c62e13a7dec909c9a6b7bf5be5e87f593a20",
+        "fullPuzzleHash": "0x53ffe60f1b94e39c78692a5fa7de7f83693a7279da50f17858914c3d411a064e"
+      }
+    ],
+    "compressedPubkeys": [
+      "0x021111111111111111111111111111111111111111111111111111111111111111",
+      "0x032222222222222222222222222222222222222222222222222222222222222222",
+      "0x023333333333333333333333333333333333333333333333333333333333333333"
+    ],
+    "recoveryKits": [
+      {
+        "slot": 0,
+        "revision": 1,
+        "evmGuardian": "0x8181818181818181818181818181818181818181",
+        "recoveryBlsPubkey": "0xaefe1789d6476f60439e1168f588ea16652dc321279f05a805fbc63933e88ae9c175d6c6ab182e54af562e1a0dce41bb",
+        "recoveryBlsCommitment": "0x11354b840ab34f61ad7844760caa14e155a988a902a62409412f87e3b4b3964d",
+        "drillChallengeHash": "0x9191919191919191919191919191919191919191919191919191919191919191"
+      },
+      {
+        "slot": 1,
+        "revision": 1,
+        "evmGuardian": "0x8282828282828282828282828282828282828282",
+        "recoveryBlsPubkey": "0xb6144137baa6440c17386d1a407fb3670d3b3627b4fa8bf4b56433f861eaba4e076cefac1d9365de56a0e5d976ad7354",
+        "recoveryBlsCommitment": "0xe503f0f589242a8dae0489a55b2cc89f1250fd7af39d87066fa2acb9f090bcc3",
+        "drillChallengeHash": "0x9292929292929292929292929292929292929292929292929292929292929292"
+      },
+      {
+        "slot": 2,
+        "revision": 1,
+        "evmGuardian": "0x8383838383838383838383838383838383838383",
+        "recoveryBlsPubkey": "0x954a331766f0584949a2376fbd96ac5a1f0a9e90c916383a5a16762b11c29120f5a072ea43f64774d77ad1ac4ba98dac",
+        "recoveryBlsCommitment": "0xe878c4877b5393ba4a14508ceb6da23e5127001088878b3960bb898c6bac355b",
+        "drillChallengeHash": "0x9393939393939393939393939393939393939393939393939393939393939393"
+      }
+    ]
+  },
+  "validatorSet": {
+    "threshold": 2,
+    "pubkeys": [
+      "0x414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141",
+      "0x424242424242424242424242424242424242424242424242424242424242424242424242424242424242424242424242",
+      "0x434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343"
+    ]
+  },
+  "bridgePolicy": {
+    "policyVersion": 2,
+    "policyHash": "0x190fbd2cc96c4d2dffd2610f1f83def745b2750cc8477d9f7f72204244aff555",
+    "fundingAmount": 530,
+    "parentOutputAmount": 528,
+    "propertyRegistryLauncherAmount": 1,
+    "bufferFeeAmount": 1,
+    "networkFeeSource": "separate-fountain-fee-till",
+    "initialCoinCount": 32,
+    "lowWaterMark": 8,
+    "parentCoinIds": [
+      "0x16df08cf78c4494f504ba9eaa21cba6fdf902af55d4e96b0774d9e6b186f986d",
+      "0x5bafc696ebae20ecb165a59df0adadbb4f512b1ea525b26005f73f3b141df2f6",
+      "0x07660cac3a8a3c7866d0427e39beb948f18a3a6ef758caf5a70470c649cdb70e",
+      "0xbd7609a16cad03220604c985d467ed93f80ef372103269a36cce9390760af270",
+      "0xc0127eb052f244322f4ab0e79e6d26f13677c8523b4047ed4ccb6054d47445bf",
+      "0x5b1a18336676eca0229035c9625c49ec0d0aa6a5d65ffcb0e634267fa4eadf50",
+      "0x9f462041751cf356d0c51947dcc664ba115838aff101fdf6e01565ad281be3e4",
+      "0xaa5e28d0810d1ee49200075ac44eef35293cc2d539caa283b26889948af7f037",
+      "0x216d07c5b2dd0e86de0d63248cefb2083542ec14c9942f38998929f9edfba53b",
+      "0x1ad0a9ad0b17848af368ecc89704b87e5a95182da69fde4e99bda5395dbc4d96",
+      "0x98b47b435327248fdb736535889dfc90ef74ceb28125604d67018271d51a5397",
+      "0xf8983ea8a4226c64668d909b05e8e48eddc7fb29b47b42ab0e278ac3d3bda281",
+      "0x9f6c56d186a4b63f1fff5b50dbcb7789405036dcfb653c14edc76cb3c6da29eb",
+      "0xf9903749550f7de82429f12870aea0fb54acd10465c15d331f92fd02593b6483",
+      "0x487cb6aa8a7bf63e876f8e8f8cb81253143b47a40789ea50cd92e88a54fe8ed3",
+      "0x557210a3d527a57ae7dcad076fda91c51a5f1986fb67be1eee63568c70ae4ac4",
+      "0x035d1313f5aaeb31558c5748c6910c37d42e5fefaaffeede48869af5bb74b3df",
+      "0x9991b822969d8a230aaefcecaeab26aed0e294f865e9d92273480c8972c5cc3f",
+      "0xf4721500f6aaa2e5f7f0445cb07a61b3bede9be05a41dfaff90cac2cd4ecaf1e",
+      "0x09823dff0abe4d492e04df83484334d7655a147765eac99a5b4d80cb65b77211",
+      "0x783e04929c7d9b88aacda90f1ccd31f388a19474c8ec4707a146bbb652203cab",
+      "0xc773a99101b69dad0c060e45d4f7408440b3c2b2a2292a45d63be973f6ecb5c7",
+      "0x76336dda4103e0062dcb3a2179525e8c706c2f3ed878ff2db85789210e882848",
+      "0x01a54d7bf9d8f049c157b31bebee8e2a39431e8bc660c60ef90761f538c7701d",
+      "0x58206afd044198a874ce9ac31556c1b3dbace40ae6794017be843ed3d1b9e13e",
+      "0x35cd3f9122eb3cedd9dded1ac717c5a40d46d43d7de120a80093c10f094d2d17",
+      "0x5b9ae8a489510af6909b42fef1e24f9fbfde0672616a5fcf47a6a4a8ac90e24d",
+      "0xc64c225afc97657759fa6f43baddac1c0b2fc07cc5b2073f7f44aa95783d6195",
+      "0x27f06e2e4838ef06c24b44803984a5939a8d178811d87d5c04a45e773220fd20",
+      "0x288361a6aa572ba860f2356e2ba7bca0adbd1d3e16a072070e2dc1dcf515be7a",
+      "0xad7938d448cc86e4e8b8027158f1bc04d4a118534b4636e62e17ec5a9ca513e9",
+      "0xf1c5597d7d077d9f3b2adc55a1a1f151ccc755aa116e0f0205ed7240a606be3e"
+    ],
+    "bridgeCoinIds": [
+      "0xe6abe3260af0d6a74e3ba5fe3d3c698f669af2b98d7975137020ede2253b180b",
+      "0xec46929273800f3cdd6462afc44d5f9f9d6514a0b03746145487f773c305b53b",
+      "0x12d5d7a0ef526e2eac722ea12858999999491e66e9c8c145841e9ab175adbead",
+      "0xe8160ac18aca56e329c76fdf3b3844c2a3fb95806d78763636448a5991bf9bfe",
+      "0xe82fdab618bb59af725c9b402ed507d7f94ea93412587e3c2c5362c9ab2a5c93",
+      "0xe59498a6e8be543a964de2a07c48f622b929120935470f5ddd0b8c254da7ae8b",
+      "0xbb4c1b1a716c83a771e9b82a14b8c447c2e4956e9ea38ea844c9afce9fef6a58",
+      "0xb36d85ca7b2d9d87ac8d71cffb43c544e452463f87a5ddc8f521bcafc55c2290",
+      "0x6f996948701dea05b86e93333f1cd9cb17dd323eb00afd4485134c8a4784492b",
+      "0xdd7be3488dec510cab61ee7b0a154753537752d058e1fe0cadd4e8029b41ba32",
+      "0x244731df9e569b8b1c9199cd3f2a9521d3a7ffc39d7b922ffc508b2b8dc0d4be",
+      "0xaea42c82d8e2c0bde365df28829ecb06a63dac155941ec5a30a696eedff211c2",
+      "0x8157b5e1162b02ae7211d679ebd6959a9bae3b71e53eb40270209cb997777f8e",
+      "0x75231103d2b17251ba3be1ebbaa302512e0667944c809f0f11e05b74973f2e50",
+      "0xb37decd913b1845431f3df62beec15c00719772f507d81376bf53e1f39568cc9",
+      "0xce23ec016f2b54071b661c4fdb5f0f5a9cb6d7cb0bde1d960c6cdcf1db836265",
+      "0xd33f465cc99a550005a5b46ec85cb864d95580378d6142390e2fda9578d884e6",
+      "0x144f25efb146d2fe70e6056723e4883bfe221a8bba78fa6d6180d43f5d10cc41",
+      "0xfbce1b9a17d463b87a2b8197a6614c3db91d23873ac9904288bcdab351b7c035",
+      "0xc6ec90140d686e0f882cf7b8e1b826edf33212eb09317d9c421a7754cfefdc5b",
+      "0xb9e0c6c02c70a854b06f312de471b09c093f16f5425247fd06f54a68f4e11c31",
+      "0xd9bf59d9dce000351d3e52da9fa3ec3f23182d8731aac7f025349ab8619db4ab",
+      "0x15fa5361f97f8611ca497bf25c3df76ff1e3a6a1dd4bc5ad5efd1d28242f535b",
+      "0xa9562ceb02a62c1066f3243271c397cde60fea9881dc866e44560c84c437814c",
+      "0xa96442b5a47a3e8bcb2ab94491358022fd97849c4af192d21f89365f42d54577",
+      "0x80f787c572c3b42f1ef09a7279ea538f73ec08f26732bb01e602ad7dea4fb00a",
+      "0x956173e0022261797725faf20cc8a4ccc3df21affb25c97463eebb864e936585",
+      "0x071ad87d93cf5670eb94c76400edc92501f5ca90127b4bd21f0066236a8326cb",
+      "0x2ccbc85160355471b8c92c69bafa667e4c0a84e9d2cd9761e9af26e56a3b4c0c",
+      "0xdecdb017e5b7e179d7ab1956851130ecaaaefcddf9691e27b67185be21faefea",
+      "0xc9e2e89a3103f38bac5c6910212475255efaba2474cfa6efc77ee60127391f46",
+      "0x7fab8cd5d8f87dfbf282b530db5187287715a5a82a5f8e57f1439383d157c039"
+    ]
+  },
+  "canonicalVaultParamsHash": "0x0c331d9ea7e52d91e160f20fa44aec48bc64da860c2ec83213cdd41fa247b5b5",
+  "evmAddresses": {
+    "forwarder": "0x1111111111111111111111111111111111111111",
+    "verifierAdapter": "0x2222222222222222222222222222222222222222",
+    "attestationEmitter": "0x3333333333333333333333333333333333333333"
+  },
+  "retiredCoordinates": [
+    "0x7171717171717171717171717171717171717171717171717171717171717171"
+  ],
+  "adminRecoveryKits": [
+    {
+      "slot": 0,
+      "revision": 1,
+      "evmGuardian": "0x8181818181818181818181818181818181818181",
+      "recoveryBlsPubkey": "0xaefe1789d6476f60439e1168f588ea16652dc321279f05a805fbc63933e88ae9c175d6c6ab182e54af562e1a0dce41bb",
+      "recoveryBlsCommitment": "0x11354b840ab34f61ad7844760caa14e155a988a902a62409412f87e3b4b3964d",
+      "drillChallengeHash": "0x9191919191919191919191919191919191919191919191919191919191919191"
+    },
+    {
+      "slot": 1,
+      "revision": 1,
+      "evmGuardian": "0x8282828282828282828282828282828282828282",
+      "recoveryBlsPubkey": "0xb6144137baa6440c17386d1a407fb3670d3b3627b4fa8bf4b56433f861eaba4e076cefac1d9365de56a0e5d976ad7354",
+      "recoveryBlsCommitment": "0xe503f0f589242a8dae0489a55b2cc89f1250fd7af39d87066fa2acb9f090bcc3",
+      "drillChallengeHash": "0x9292929292929292929292929292929292929292929292929292929292929292"
+    },
+    {
+      "slot": 2,
+      "revision": 1,
+      "evmGuardian": "0x8383838383838383838383838383838383838383",
+      "recoveryBlsPubkey": "0x954a331766f0584949a2376fbd96ac5a1f0a9e90c916383a5a16762b11c29120f5a072ea43f64774d77ad1ac4ba98dac",
+      "recoveryBlsCommitment": "0xe878c4877b5393ba4a14508ceb6da23e5127001088878b3960bb898c6bac355b",
+      "drillChallengeHash": "0x9393939393939393939393939393939393939393939393939393939393939393"
+    }
+  ],
+  "signaturePolicy": {
+    "type": "SolslotGenesisArtifact",
+    "threshold": 2,
+    "policy": "owner-plus-one",
+    "ownerIndex": 0,
+    "coadminIndices": [
+      1,
+      2
+    ],
+    "coadminThreshold": 1,
+    "rosterHash": "0xbf3528a3ccf8d89cb4beff676ba45786b8f2cff91b3c6a821ed3a8ffffcd6f6c"
+  },
+  "signatures": [
+    {
+      "adminIndex": 0,
+      "compressedPubkey": "0x021111111111111111111111111111111111111111111111111111111111111111",
+      "signature": "0x0101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101"
+    },
+    {
+      "adminIndex": 2,
+      "compressedPubkey": "0x023333333333333333333333333333333333333333333333333333333333333333",
+      "signature": "0x0303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303"
+    }
+  ],
+  "artifactHash": "0x9fc4d6e233ed7da8872a92ce92428c1b955a70791aed45c3e769fbd5e1633cad"
+}

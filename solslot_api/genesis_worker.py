@@ -97,6 +97,8 @@ def _build_plan(
         ),
     )
     return build_rc23_genesis_ceremony_plan(
+        enrollment_activation=body.get("enrollmentActivation"),
+        evm_chain_id=ceremony['draft'].get('evmChainId',11155111),
         ceremony_id=bytes32(
             _hex_bytes(str(ceremony["ceremony_id"]), 32, "ceremonyId")
         ),

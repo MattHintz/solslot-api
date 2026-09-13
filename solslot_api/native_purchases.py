@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+import httpx
 from dataclasses import dataclass
 from typing import Annotated, Any, Mapping
 
@@ -12,7 +13,7 @@ from chia.consensus.condition_tools import (
     pkm_pairs_for_conditions_dict,
 )
 from chia.types.blockchain_format.coin import Coin
-from chia.types.blockchain_format.program import INFINITE_COST, Program
+from chia.types.blockchain_format.program import Program
 from chia.wallet.cat_wallet.cat_utils import CAT_MOD, match_cat_puzzle
 from chia.wallet.lineage_proof import LineageProof
 from chia.wallet.puzzles.singleton_top_layer_v1_1 import SINGLETON_MOD
@@ -48,6 +49,7 @@ from solslot_puzzles.stripe_settlement_v1_driver import (
     build_native_primary_batch_offer_v5,
     build_native_primary_offer_v5,
     inventory_reservation_message,
+    inventory_terms_for_puzzle_hash,
     make_inventory_available_inner,
     make_mint_offer_v5_inner,
     prepare_chia_buyer_batch_offer_v3,
@@ -69,7 +71,7 @@ from .governed_output_index import (
     GovernedOutputConflict,
     GovernedOutputExpectation,
     GovernedOutputNotFound,
-    find_exact_governed_descendant,
+    EvaluatedBundleOutputs,
     get_governed_output_index,
     reconcile_governed_delivery,
     serialize_governed_delivery,
@@ -81,6 +83,9 @@ from .payment_purchase_store import (
     StoredPaymentInventoryItem,
     get_payment_purchase_store,
 )
+from .inventory_recovery import (
+    decode_spend, record_coin, reconcile_timeout_release, timeout_successor_lineage,
+)
 from .protocol_artifacts import (
     _artifact_rejection_reasons,
     _require_server_to_server_token,
@@ -91,6 +96,8 @@ from .protocol_submission import (
     ProtocolSubmissionError,
 )
 from .state import get_registry
+from .wallet_offer_validation import decode_offer, validate_standard_payment
+from .wallet_offer_worker import run_offer_job
 from .validator_quorum import (
     InventoryReservationClaim,
     PrimaryPurchaseClaim,
@@ -234,6 +241,117 @@ class InventoryReservationResponse(NativePurchaseModel):
     items: list[InventoryReservationItemResponse] = Field(default_factory=list)
 
 
+@router.post("/inventory/reconcile-timeout")
+async def reconcile_inventory_timeout(
+    payload: InventoryReservationRequest,
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    """Observe an already executed timeout release; this endpoint never broadcasts."""
+    _require_server_to_server_token(settings, authorization)
+    require_minting_writes(settings)
+    require_operation_gate(settings, "purchases")
+    purchase_id = "0x" + _hex_bytes(payload.purchase_id, 32, "purchaseId").hex()
+    store = get_payment_purchase_store(settings.payment_purchase_db_path)
+    try:
+        result = await reconcile_timeout_release(store, request.app.state.coinset,
+                                                 purchase_id, settings.network)
+    except PaymentPurchaseNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PaymentPurchaseConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (httpx.HTTPError, OSError, TimeoutError) as exc:
+        raise HTTPException(status_code=503, detail="Chain confirmation is unavailable. The reservation remains held; retry later.") from exc
+    return {"purchaseId": result.purchase_id, "state": result.inventory_state,
+            "releaseEvidence": store.inventory_release_evidence(result.purchase_id)}
+
+
+@router.post("/inventory/reconcile-expiry")
+async def reconcile_inventory_expiry(
+    payload: InventoryReservationRequest, request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    """Retire a never-confirmed V2 authorization after independent chain proof."""
+    from .inventory_authorization_expiry import reconcile_inventory_authorization_expiry
+    from .chia_provider import ChiaProviderError
+    _require_server_to_server_token(settings, authorization)
+    require_minting_writes(settings)
+    require_operation_gate(settings, "purchases")
+    purchase_id = "0x" + _hex_bytes(payload.purchase_id, 32, "purchaseId").hex()
+    store = get_payment_purchase_store(settings.payment_purchase_db_path)
+    primary = getattr(request.app.state.coinset, "primary", None)
+    if primary is None or settings.network != "testnet11":
+        raise HTTPException(status_code=503, detail="Expiry recovery requires the configured Testnet primary node.")
+    try:
+        artifact = load_signed_public_artifact(settings)
+        def authorize():
+            _require_server_to_server_token(settings, authorization)
+            require_minting_writes(settings)
+            require_operation_gate(settings, "purchases")
+            current = load_signed_public_artifact(settings)
+            if current["artifactHash"] != artifact["artifactHash"] or current["sourceShas"] != artifact["sourceShas"]:
+                raise PaymentPurchaseConflict("signed release changed during authorization expiry")
+        result = await reconcile_inventory_authorization_expiry(store=store, node=primary,
+            purchase_id=purchase_id, artifact=artifact, environment=settings.runtime_environment+"-alpha", authorize=authorize)
+    except PaymentPurchaseNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PaymentPurchaseConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (PublicArtifactError, ChiaProviderError, httpx.HTTPError, OSError, TimeoutError) as exc:
+        raise HTTPException(status_code=503, detail="Expiry proof is unavailable. Inventory remains held; retry later.") from exc
+    return dict(purchaseId=purchase_id, state=result.inventory_state,
+                expiryEvidence=store.inventory_expiry_evidence(purchase_id))
+
+
+@router.post("/inventory/resume-timeout")
+async def resume_inventory_timeout(
+    payload: InventoryReservationRequest,
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    """Prepare once, submit, or resume exact fee-funded Testnet timeout releases."""
+    from .inventory_timeout_submission import advance_inventory_timeout
+    from .chia_provider import ChiaProviderError
+
+    _require_server_to_server_token(settings, authorization)
+    require_minting_writes(settings)
+    require_operation_gate(settings, "purchases")
+    purchase_id = "0x" + _hex_bytes(payload.purchase_id, 32, "purchaseId").hex()
+    store = get_payment_purchase_store(settings.payment_purchase_db_path)
+    submitter = getattr(request.app.state, "protocol_submitter", None)
+    provider = getattr(request.app.state, "coinset", None)
+    primary = getattr(provider, "primary", None)
+    if submitter is None or primary is None or submitter.provider is not provider:
+        raise HTTPException(status_code=503, detail="Timeout recovery requires the configured primary node and fee submitter.")
+    try:
+        artifact = load_signed_public_artifact(settings)
+        binding = dict(network=artifact["network"], artifactHash=artifact["artifactHash"],
+                       sourceShas=artifact["sourceShas"], adapterVersion=1,
+                       protocolTreasuryPuzzleHash=artifact["puzzleHashes"]["protocolTreasuryPuzzleHash"],
+                       validatorPubkeys=artifact["validatorSet"]["pubkeys"],
+                       environment=settings.runtime_environment + "-alpha")
+
+        def authorize() -> None:
+            _require_server_to_server_token(settings, authorization)
+            require_minting_writes(settings)
+            require_operation_gate(settings, "purchases")
+            current = load_signed_public_artifact(settings)
+            if current["artifactHash"] != binding["artifactHash"] or current["sourceShas"] != binding["sourceShas"]:
+                raise PaymentPurchaseConflict("signed release changed during timeout recovery")
+
+        return await advance_inventory_timeout(store=store, node=primary, submitter=submitter,
+            purchase_id=purchase_id, network=settings.network, release_binding=binding, authorize=authorize)
+    except PaymentPurchaseNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PaymentPurchaseConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (PublicArtifactError, ProtocolSubmissionError, ChiaProviderError, httpx.HTTPError, OSError, TimeoutError) as exc:
+        raise HTTPException(status_code=503, detail="Timeout recovery is pending. The exact transaction and inventory remain reserved; retry this same purchase.") from exc
+
+
 @dataclass(frozen=True)
 class NativePurchaseContext:
     stored: StoredPaymentPurchase
@@ -292,6 +410,8 @@ async def reserve_smartdeed_inventory(
     except PaymentPurchaseNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    if stored.inventory_state in {"RELEASED", "AUTHORIZATION_EXPIRED"}:
+        raise HTTPException(status_code=409, detail="This reservation has ended. Start a new purchase with a fresh quote.")
     if stored.inventory_state in {"SUBMITTED", "CONFIRMED"}:
         confirmed = await _confirm_inventory_reservation(
             request.app.state.coinset,
@@ -561,38 +681,10 @@ async def complete_native_purchase(
         )
     first = group.contexts[0]
     try:
-        unsigned = Offer.from_bech32(body.buyer_offer)
-        if unsigned.aggregated_signature() != G2Element():
-            raise PaymentArtifactError("prepared buyer offer must be unsigned")
-        signature = G2Element.from_bytes(
-            _hex_bytes(body.aggregated_signature, 96, "aggregatedSignature")
+        buyer_offer = await run_offer_job(
+            "native", group=group, encoded=body.buyer_offer,
+            signature_hex=body.aggregated_signature, network=settings.network,
         )
-        buyer_offer = Offer(
-            unsigned.requested_payments,
-            WalletSpendBundle(unsigned.coin_spends(), signature),
-            unsigned.driver_dict,
-        )
-        if group.batch is None:
-            validate_chia_buyer_offer_v3(
-                buyer_offer=buyer_offer,
-                artifact=first.purchase,
-                terms=first.terms,
-                deed_singleton_struct=first.deed_struct,
-            )
-        else:
-            validate_chia_buyer_batch_offer_v3(
-                buyer_offer=buyer_offer,
-                batch=group.batch,
-                terms=tuple(context.terms for context in group.contexts),
-                deed_singleton_structs=tuple(
-                    context.deed_struct for context in group.contexts
-                ),
-            )
-        _verify_buyer_signature(buyer_offer, settings.network)
-        if len(buyer_offer.coin_spends()) != 1 or buyer_offer.fees() != 0:
-            raise PaymentArtifactError(
-                "buyer offer must use one zero-fee payment coin"
-            )
     except (PaymentArtifactError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -669,56 +761,17 @@ async def complete_native_purchase(
             ),
         )
         quorum = await collect_primary_purchase_quorum(settings, claim)
-        if group.batch is None:
-            primary = build_native_primary_offer_v5(
-                buyer_offer=buyer_offer,
-                deed_coin=first.deed_coin,
-                deed_singleton_struct=first.deed_struct,
-                lineage_proof=first.deed_lineage,
-                artifact=first.purchase,
-                signer_indices=quorum.signer_indices,
-                terms=first.terms,
-                reservation=first.reservation,
-            )
-        else:
-            primary = build_native_primary_batch_offer_v5(
-                buyer_offer=buyer_offer,
-                batch=group.batch,
-                deed_coins=tuple(
-                    context.deed_coin for context in group.contexts
-                ),
-                deed_singleton_structs=tuple(
-                    context.deed_struct for context in group.contexts
-                ),
-                lineage_proofs=tuple(
-                    context.deed_lineage for context in group.contexts
-                ),
-                signer_indices_by_artifact=tuple(
-                    quorum.signer_indices for _context in group.contexts
-                ),
-                terms=tuple(context.terms for context in group.contexts),
-                reservations=reservations,
-            )
+        signed_spend, delivery_outputs = await run_offer_job(
+            "native_bundle", group=group, buyer_offer=buyer_offer,
+            signer_indices=quorum.signer_indices,
+            aggregated_signature=quorum.aggregated_signature,
+        )
     except (PaymentArtifactError, ValidatorQuorumError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    valid_spend = primary.aggregate_offer.to_valid_spend()
-    signed_spend = WalletSpendBundle(
-        valid_spend.coin_spends,
-        AugSchemeMPL.aggregate(
-            [
-                valid_spend.aggregated_signature,
-                quorum.aggregated_signature,
-            ]
-        ),
-    )
     output_index = get_governed_output_index(
         settings.payment_purchase_db_path
     )
     try:
-        delivery_outputs = _governed_smartdeed_outputs(
-            group,
-            signed_spend,
-        )
         output_index.prepare(
             purchase_id=group.stored.purchase_id,
             artifact_hash=(
@@ -795,18 +848,64 @@ async def complete_native_purchase(
     )
 
 
+def _build_native_purchase_spend(*, group, buyer_offer, signer_indices, aggregated_signature):
+    first = group.contexts[0]
+    reservations = tuple(context.reservation for context in group.contexts)
+    if group.batch is None:
+        primary = build_native_primary_offer_v5(
+            buyer_offer=buyer_offer,
+            deed_coin=first.deed_coin,
+            deed_singleton_struct=first.deed_struct,
+            lineage_proof=first.deed_lineage,
+            artifact=first.purchase,
+            signer_indices=signer_indices,
+            terms=first.terms,
+            reservation=first.reservation,
+        )
+    else:
+        primary = build_native_primary_batch_offer_v5(
+            buyer_offer=buyer_offer,
+            batch=group.batch,
+            deed_coins=tuple(
+                context.deed_coin for context in group.contexts
+            ),
+            deed_singleton_structs=tuple(
+                context.deed_struct for context in group.contexts
+            ),
+            lineage_proofs=tuple(
+                context.deed_lineage for context in group.contexts
+            ),
+            signer_indices_by_artifact=tuple(
+                signer_indices for _context in group.contexts
+            ),
+            terms=tuple(context.terms for context in group.contexts),
+            reservations=reservations,
+        )
+    valid_spend = primary.aggregate_offer.to_valid_spend()
+    signed_spend = WalletSpendBundle(
+        valid_spend.coin_spends,
+        AugSchemeMPL.aggregate(
+            [
+                valid_spend.aggregated_signature,
+                aggregated_signature,
+            ]
+        ),
+    )
+    return signed_spend, _governed_smartdeed_outputs(group, signed_spend)
+
+
 def _governed_smartdeed_outputs(
     group: NativePurchaseGroup,
     bundle: WalletSpendBundle,
 ) -> tuple[GovernedOutputExpectation, ...]:
     outputs: list[GovernedOutputExpectation] = []
+    evaluated = EvaluatedBundleOutputs(bundle)
     for ordinal, context in enumerate(group.contexts):
         vault = SINGLETON_MOD.curry(
             context.deed_struct,
             puzzle_for_p2_vault(context.purchase.vault_launcher_id),
         )
-        coin = find_exact_governed_descendant(
-            bundle,
+        coin = evaluated.find_exact_descendant(
             ancestor_coin_id=context.deed_coin.name(),
             puzzle_hash=bytes32(vault.get_tree_hash()),
             amount=1,
@@ -852,6 +951,9 @@ async def _submit_inventory_reservation(
     store: Any,
     stored: StoredPaymentPurchase,
 ) -> StoredPaymentPurchase:
+    if (stored.inventory_state in {"AUTHORIZATION_EXPIRED", "RELEASED"}
+            or (stored.inventory_expires_at is not None and stored.inventory_expires_at <= int(time.time()))):
+        raise HTTPException(status_code=409, detail="The reservation deadline has passed. Reconcile its chain status before starting a fresh purchase.")
     if stored.inventory_bundle is None:
         raise HTTPException(
             status_code=409,
@@ -1289,19 +1391,35 @@ async def _load_context(
             status_code=503,
             detail="The signed primary-purchase coordinates are unavailable.",
         ) from exc
+    released_cursor = (get_payment_purchase_store(settings.payment_purchase_db_path)
+                       .latest_released_inventory(_hex32(purchase.deed_launcher_id)))
     expected_coin_id = (
         str(inventory_item.reserved_coin_id)
         if require_inventory_reservation
         and inventory_item is not None
-        else str(deed["outputCoinId"]).lower()
+        else (str(released_cursor["availableCoinId"]) if released_cursor
+              else str(deed["outputCoinId"]).lower())
     )
     deed_record = await coinset.get_coin_record_by_name(expected_coin_id)
     deed_coin = _coin_from_record(deed_record)
+    if deed_coin is not None:
+        try:
+            terms = inventory_terms_for_puzzle_hash(
+                terms, deed_struct, deed_coin.puzzle_hash,
+                reservation=reservation if require_inventory_reservation else None,
+            )
+            expected_puzzle = SINGLETON_MOD.curry(
+                deed_struct, make_mint_offer_v5_inner(terms, reservation)
+                if require_inventory_reservation else make_inventory_available_inner(terms),
+            )
+        except PaymentArtifactError as exc:
+            raise HTTPException(status_code=409, detail="The governed SmartDeed inventory version is unavailable.") from exc
     if (
         deed_coin is None
         or not _record_is_unspent_coin(deed_record, deed_coin)
         or (
             not require_inventory_reservation
+            and released_cursor is None
             and deed_coin.parent_coin_info != purchase.deed_launcher_id
         )
         or deed_coin.puzzle_hash != expected_puzzle.get_tree_hash()
@@ -1331,26 +1449,52 @@ async def _load_context(
         or int(launcher_coin.amount) != 1
     ):
         raise HTTPException(status_code=409, detail="SmartDeed launcher lineage is unavailable.")
+    lineage = LineageProof(parent_name=launcher_coin.parent_coin_info, amount=launcher_coin.amount)
+    if require_inventory_reservation:
+        # The reservation may spend a released successor instead of the eve coin.
+        available_id = inventory_item.available_coin_id
+        if available_id != str(deed["outputCoinId"]).lower():
+            available_record = await coinset.get_coin_record_by_name(available_id)
+            available_coin = _coin_from_record(available_record)
+            try:
+                if available_coin is None or _hex32(available_coin.name()) != available_id:
+                    raise PaymentPurchaseConflict("reservation available parent is unavailable")
+                _, available_spent = record_coin(available_record, available_coin)
+                reserved_height, _ = record_coin(deed_record, deed_coin)
+                parent = decode_spend(await coinset.get_puzzle_and_solution(available_id, available_spent), available_coin)
+                expected_parent = SINGLETON_MOD.curry(deed_struct, make_inventory_available_inner(terms))
+                if (available_spent != reserved_height or deed_coin.parent_coin_info != available_coin.name()
+                        or available_coin.puzzle_hash != expected_parent.get_tree_hash()):
+                    raise PaymentPurchaseConflict("reservation available lineage is not atomic")
+                from chia.wallet.puzzles.singleton_top_layer_v1_1 import lineage_proof_for_coinsol
+                lineage = lineage_proof_for_coinsol(parent)
+            except PaymentPurchaseConflict as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        else:
+            lineage = LineageProof(parent_name=purchase.deed_launcher_id,
+                inner_puzzle_hash=bytes32(make_inventory_available_inner(terms).get_tree_hash()), amount=uint64(1))
+    elif released_cursor:
+        try:
+            parent_record = await coinset.get_coin_record_by_name(_hex32(deed_coin.parent_coin_info))
+            parent_coin = _coin_from_record(parent_record)
+            if parent_coin is None or parent_coin.name() != deed_coin.parent_coin_info:
+                raise PaymentPurchaseConflict("released inventory parent is unavailable")
+            _, spent_height = record_coin(parent_record, parent_coin)
+            child_height, _ = record_coin(deed_record, deed_coin)
+            if not spent_height or spent_height != child_height:
+                raise PaymentPurchaseConflict("released inventory lineage is not atomic")
+            parent = decode_spend(await coinset.get_puzzle_and_solution(_hex32(parent_coin.name()), spent_height), parent_coin)
+            lineage = timeout_successor_lineage(parent_spend=parent, successor=deed_coin,
+                                                deed_struct=deed_struct, terms=terms)
+        except PaymentPurchaseConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     return NativePurchaseContext(
         stored=stored,
         purchase=purchase,
         terms=terms,
         deed_coin=deed_coin,
         deed_struct=deed_struct,
-        deed_lineage=(
-            LineageProof(
-                parent_name=purchase.deed_launcher_id,
-                inner_puzzle_hash=bytes32(
-                    make_inventory_available_inner(terms).get_tree_hash()
-                ),
-                amount=uint64(1),
-            )
-            if require_inventory_reservation
-            else LineageProof(
-                parent_name=launcher_coin.parent_coin_info,
-                amount=launcher_coin.amount,
-            )
-        ),
+        deed_lineage=lineage,
         genesis_artifact=genesis,
         credential_receipt=receipt.model_dump(),
         credential_owner_auth_type=vault_record.auth_type,
@@ -1464,6 +1608,63 @@ async def _select_payment_coin(
     return None
 
 
+def _parse_prepared_payment_offer(
+    *, encoded: str, signature_hex: str, network: str,
+    dummy_spends: int, asset_id: bytes32 | None,
+    expected_assets: frozenset[bytes32 | None] | None = None,
+) -> Offer:
+    from chia.wallet.util.compute_hints import compute_spend_hints_and_additions
+    decoded = decode_offer(
+        encoded, real_spends=1, dummy_spends=dummy_spends,
+        expected_assets=expected_assets,
+    )
+    validate_standard_payment(decoded, asset_id=asset_id)
+    # Count both CLVM work and condition charges; a failed spend never gets a
+    # fresh allowance or reaches Offer's exception-swallowing constructor.
+    remaining = 100_000_000
+    for spend in decoded.real_spends:
+        _, used = compute_spend_hints_and_additions(spend, max_cost=remaining)
+        if not 0 <= used <= remaining:
+            raise PaymentArtifactError("wallet offer evaluation budget exceeded")
+        remaining -= used
+    unsigned = Offer.from_spend_bundle(decoded.bundle)
+    signature = G2Element.from_bytes(_hex_bytes(signature_hex, 96, "aggregatedSignature"))
+    buyer = Offer(
+        unsigned.requested_payments,
+        WalletSpendBundle(unsigned.coin_spends(), signature),
+        unsigned.driver_dict,
+    )
+    _verify_buyer_signature(buyer, network)
+    return buyer
+
+
+def _validate_native_payment_offer(
+    *, group: NativePurchaseGroup, encoded: str, signature_hex: str, network: str,
+) -> Offer:
+    first = group.contexts[0]
+    buyer = _parse_prepared_payment_offer(
+        encoded=encoded, signature_hex=signature_hex, network=network,
+        dummy_spends=group.quantity,
+        expected_assets=frozenset(context.purchase.deed_launcher_id for context in group.contexts),
+        asset_id=(None if first.purchase.rail == PaymentRail.CHIA_XCH
+                  else first.purchase.rail_asset_id),
+    )
+    if group.batch is None:
+        validate_chia_buyer_offer_v3(
+            buyer_offer=buyer, artifact=first.purchase, terms=first.terms,
+            deed_singleton_struct=first.deed_struct,
+        )
+    else:
+        validate_chia_buyer_batch_offer_v3(
+            buyer_offer=buyer, batch=group.batch,
+            terms=tuple(context.terms for context in group.contexts),
+            deed_singleton_structs=tuple(context.deed_struct for context in group.contexts),
+        )
+    if len(buyer.coin_spends()) != 1 or buyer.fees() != 0:
+        raise PaymentArtifactError("buyer offer must use one zero-fee payment coin")
+    return buyer
+
+
 def _verify_buyer_signature(offer: Offer, network: str) -> None:
     additional_data = AGG_SIG_ME_DATA.get(network)
     if additional_data is None:
@@ -1473,7 +1674,7 @@ def _verify_buyer_signature(offer: Offer, network: str) -> None:
         conditions = conditions_dict_for_solution(
             spend.puzzle_reveal,
             spend.solution,
-            INFINITE_COST,
+            100_000_000,
         )
         pairs.extend(
             pkm_pairs_for_conditions_dict(

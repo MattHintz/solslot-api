@@ -114,7 +114,6 @@ from .native_purchases import (
     _coin_spend_json,
     _record_is_unspent_coin,
     _select_payment_coin,
-    _verify_buyer_signature,
 )
 from .payment_purchase_store import (
     PaymentPurchaseNotFound,
@@ -830,6 +829,24 @@ class PresaleStore:
         violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
         if violations:
             raise RuntimeError("voucher payment-rail migration broke foreign keys")
+
+    def aggregate_counts(self) -> dict[str, Any]:
+        """Aggregate the current schema; active vouchers are escrowed vouchers."""
+        with self._lock:
+            # One statement keeps both aggregates on the same SQLite snapshot.
+            rows = self._conn.execute(
+                "SELECT 'series' AS kind, state, COUNT(*) AS cnt "
+                "FROM presale_series_v2 GROUP BY state UNION ALL "
+                "SELECT 'voucher' AS kind, state, COUNT(*) AS cnt "
+                "FROM voucher_records_v2 GROUP BY state"
+            ).fetchall()
+        series = {row["state"]: row["cnt"] for row in rows if row["kind"] == "series"}
+        vouchers = {row["state"]: row["cnt"] for row in rows if row["kind"] == "voucher"}
+        return {
+            "series_by_phase": series,
+            "vouchers_by_status": vouchers,
+            "active_voucher_count": vouchers.get("ESCROWED", 0),
+        }
 
     @contextmanager
     def txn(self) -> Iterator[sqlite3.Cursor]:
@@ -5278,20 +5295,12 @@ async def complete_native_voucher(
         authorization=authorization,
     )
     try:
-        unsigned = Offer.from_bech32(body.buyer_offer)
-        if unsigned.aggregated_signature() != G2Element():
-            raise PaymentArtifactError("prepared voucher offer must be unsigned")
-        signature = G2Element.from_bytes(
-            _hex_bytes(body.aggregated_signature, 96, "aggregatedSignature")
+        from .wallet_offer_worker import run_offer_job
+        buyer_offer = await run_offer_job(
+            "payment", encoded=body.buyer_offer,
+            signature_hex=body.aggregated_signature, network=settings.network,
+            dummy_spends=0, asset_id=None,
         )
-        buyer_offer = Offer(
-            unsigned.requested_payments,
-            WalletSpendBundle(unsigned.coin_spends(), signature),
-            unsigned.driver_dict,
-        )
-        if len(buyer_offer.coin_spends()) != 1:
-            raise PaymentArtifactError("voucher offer must use one XCH input")
-        _verify_buyer_signature(buyer_offer, settings.network)
     except (PaymentArtifactError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -5326,7 +5335,8 @@ async def complete_native_voucher(
         str(chain.get("currentCoinId") or ""),
     )
     try:
-        purchase_launcher = validate_xch_voucher_offer(
+        purchase_launcher = await run_offer_job(
+            "voucher",
             buyer_offer=buyer_offer,
             terms=terms,
             state=state,

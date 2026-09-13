@@ -51,6 +51,10 @@ class CoinsetClient:
         """Return the full node's configured network name and address prefix."""
         return await self._post("/get_network_info", {})
 
+    async def get_block_record(self, header_hash: str) -> dict[str, Any]:
+        """Fetch a specific ancestor for canonical transaction-time proofs."""
+        return await self._post("/get_block_record", {"header_hash": _hex0x(header_hash)})
+
     async def get_coin_record_by_name(self, coin_id: str) -> Optional[dict[str, Any]]:
         """Return a single CoinRecord or None when unconfirmed."""
         r = await self._post(

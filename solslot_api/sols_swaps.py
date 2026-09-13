@@ -33,7 +33,7 @@ from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
     SINGLETON_MOD_HASH,
     lineage_proof_for_coinsol,
 )
-from chia.wallet.trading.offer import Offer
+from chia.wallet.trading.offer import OFFER_MOD_HASH, Offer
 from chia.wallet.wallet_spend_bundle import WalletSpendBundle
 from chia_rs import AugSchemeMPL, G1Element, G2Element
 from chia_rs.sized_bytes import bytes32
@@ -89,6 +89,7 @@ from solslot_puzzles.vault_v2_driver import (
 
 from .chia_provider import ChiaProvider, ChiaProviderError
 from .config import Settings, get_settings
+from .wallet_offer_worker import run_offer_job
 from .credential_auth import (
     require_alpha_writes,
     require_vault_record,
@@ -620,8 +621,10 @@ async def complete_sols_swap(
                 raise SolsSwapOfferError(
                     "Prepared Sols payment offer is required."
                 )
-            unsigned = Offer.from_bech32(body.buyer_offer)
-            buyer_spends = tuple(unsigned.coin_spends())
+            decoded = await run_offer_job(
+                "decode", encoded=body.buyer_offer, real_spends=1, dummy_spends=0,
+            )
+            buyer_spends = decoded.real_spends
             if len(buyer_spends) != 1:
                 raise SolsSwapOfferError(
                     "Prepared buyer offer must spend one Sols coin."
@@ -638,8 +641,18 @@ async def complete_sols_swap(
                 raise SolsSwapOfferError(
                     "Swap operation no longer matches current chain state."
                 )
-            if unsigned.aggregated_signature() != G2Element():
-                raise SolsSwapOfferError("Prepared buyer offer must be unsigned.")
+            expected_buyer = prepare_vault_sols_buyer_offer(
+                payment_coin=context.payment_coin,
+                payment_lineage_proof=context.payment_lineage,
+                receipt=context.receipt,
+                config=context.config,
+                vault_launcher_id=context.vault_record.launcher_id,
+            )
+            if decoded.raw != bytes(expected_buyer.offer):
+                raise SolsSwapOfferError(
+                    "Prepared buyer offer does not match live chain state."
+                )
+            unsigned = expected_buyer.offer
             validate_sols_buyer_offer(
                 buyer_offer=unsigned,
                 receipt=context.receipt,
@@ -689,7 +702,9 @@ async def complete_sols_swap(
                 vault_launcher_id=context.vault_record.launcher_id,
             )
             valid_spend = atomic.aggregate_offer.to_valid_spend()
-            _verify_aggregate_signature(valid_spend, settings.network)
+            await run_offer_job(
+                "swap_signature", bundle=valid_spend, network=settings.network,
+            )
             inputs = (
                 context.pool_coin,
                 context.statutes_coin,
@@ -804,16 +819,21 @@ async def _complete_deed_to_sols_swap(
                     raise SolsSwapOfferError(
                         "Prepared protocol offer is required."
                     )
-                unsigned = Offer.from_bech32(body.buyer_offer)
-                if unsigned.aggregated_signature() != G2Element():
-                    raise SolsSwapOfferError(
-                        "Prepared protocol offer must be unsigned."
-                    )
                 expected_unsigned = _build_reverse_protocol_offer(
                     context,
                     signature_data=None,
                 )
-                if unsigned.name() != expected_unsigned.offer.name():
+                expected_spends = expected_unsigned.offer.to_spend_bundle().coin_spends
+                dummy_count = sum(
+                    spend.coin.parent_coin_info == bytes32.zeros
+                    for spend in expected_spends
+                )
+                decoded = await run_offer_job(
+                    "decode", encoded=body.buyer_offer,
+                    real_spends=len(expected_spends) - dummy_count,
+                    dummy_spends=dummy_count,
+                )
+                if decoded.raw != bytes(expected_unsigned.offer):
                     raise SolsSwapOfferError(
                         "Prepared protocol offer does not match live chain state."
                     )
@@ -864,7 +884,9 @@ async def _complete_deed_to_sols_swap(
                     [wallet_signature, reserve_signature]
                 ),
             )
-            _verify_aggregate_signature(valid_spend, settings.network)
+            await run_offer_job(
+                "swap_signature", bundle=valid_spend, network=settings.network,
+            )
             await _require_inputs_clear(
                 request.app.state.coinset,
                 tuple(

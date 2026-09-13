@@ -24,7 +24,9 @@ from solslot_api.state import VaultRecord, get_registry, reset_registry_for_test
 from solslot_puzzles.vault_driver import AUTH_TYPE_BLS, AUTH_TYPE_SECP256K1
 
 
-VAULT_A = "0x" + "11" * 32
+from chia.wallet.puzzles.singleton_top_layer_v1_1 import SINGLETON_LAUNCHER_HASH
+LAUNCHER_COIN_A = Coin(bytes32(b"\x0a" * 32), SINGLETON_LAUNCHER_HASH, uint64(1))
+VAULT_A = "0x" + LAUNCHER_COIN_A.name().hex()
 VAULT_B = "0x" + "22" * 32
 VAULT_C = "0x" + "33" * 32
 PARENT_A = "0x" + "aa" * 32
@@ -56,6 +58,8 @@ def _install_signed_artifact(
         "bridgePolicy": {
             "policyHash": bridge_policy_hash,
             "policyVersion": 2,
+            "parentCoinIds": [PARENT_A, PARENT_B],
+            "bridgeCoinIds": [_coin_id(parent, bridge_policy_hash) for parent in (PARENT_A, PARENT_B)],
         },
         "evmAddresses": {
             "attestationEmitter": "0x" + "ab" * 20,
@@ -89,6 +93,10 @@ def _install_validator_quorum(monkeypatch, tmp_path):
     monkeypatch.setenv("SOLSLOT_ZKPASSPORT_VALIDATOR_THRESHOLD", "2")
     monkeypatch.setenv("SOLSLOT_ZKPASSPORT_EMITTER_ADDRESS", "0x" + "ab" * 20)
     async def collect(_settings, claim):
+        attempt = get_credential_ledger(_settings).get_stamp_attempt(claim.vault_launcher_id)
+        assert attempt is not None and attempt["claim_hash"] == claim.canonical_hash()
+        assert json.loads(attempt["claim_json"]) == claim.model_dump(mode="json")
+        assert attempt["bundle_hex"] is None
         signatures = [
             zkpassport_enrollments.AugSchemeMPL.sign(key, claim.signature_message())
             for key in validator_keys[:2]
@@ -256,15 +264,12 @@ def test_malformed_vault_launcher_path_is_rejected_before_handler():
     assert response.status_code == 422
 
 
-def test_create_enrollment_discovers_unspent_bridge_coins(monkeypatch, tmp_path):
+def test_create_enrollment_rejects_noncanonical_bridge_amount(monkeypatch, tmp_path):
     with _client(monkeypatch, tmp_path, bridge_records=[_bridge_record(amount=2)]) as client:
         created = client.post("/zkpassport/enrollments", json={"vaultLauncherId": VAULT_A})
 
-    assert created.status_code == 200
-    body = created.json()
-    assert body["bridgeParentId"] == PARENT_A
-    assert body["bridgeAmount"] == 2
-    assert body["bridgeCoinId"] == _coin_id(PARENT_A, POLICY_HASH, 2)
+    assert created.status_code == 503
+    assert "signed-policy" in created.json()["detail"]
 
 
 def test_create_enrollment_reserves_bridge_coin_and_gets_same_record(monkeypatch, tmp_path):
@@ -440,6 +445,10 @@ def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_
     account = Account.from_key(private_key)
     owner_pubkey = eth_keys.PrivateKey(private_key).public_key.to_compressed_bytes()
     validator_keys, policy_hash = _install_validator_quorum(monkeypatch, tmp_path)
+    monkeypatch.setattr(zkpassport_enrollments, "_fetch_coin_record_by_name",
+        lambda _settings, coin_id: {"coin": LAUNCHER_COIN_A.to_json_dict(),
+            "confirmed_block_index": 100, "spent_block_index": 101}
+        if coin_id == VAULT_A else None)
     policy_hex = "0x" + policy_hash.hex()
     launcher = bytes32.fromhex(VAULT_A.removeprefix("0x"))
     pool_launcher = bytes32(b"\x70" * 32)
@@ -542,6 +551,12 @@ def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_
 
     class FakeChiaProvider:
         async def push_tx(self, spend_bundle_json):
+            ledger = get_credential_ledger(Settings())
+            attempt = ledger.get_stamp_attempt(VAULT_A)
+            stored = SpendBundle.from_bytes(bytes.fromhex(attempt["bundle_hex"]))
+            assert stored.to_json_dict() == spend_bundle_json
+            assert ledger.get_enrollment(VAULT_A)["status"] == "stamp_pending"
+            assert attempt["dispatch_status"] == "unknown"
             pushed.append(spend_bundle_json)
             return {"success": True, "status": "SUCCESS"}
 
@@ -679,6 +694,10 @@ def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
     owner_sk = zkpassport_enrollments.AugSchemeMPL.key_gen(bytes.fromhex("02" * 32))
     owner_pubkey = bytes(owner_sk.get_g1())
     validator_keys, policy_hash = _install_validator_quorum(monkeypatch, tmp_path)
+    monkeypatch.setattr(zkpassport_enrollments, "_fetch_coin_record_by_name",
+        lambda _settings, coin_id: {"coin": LAUNCHER_COIN_A.to_json_dict(),
+            "confirmed_block_index": 100, "spent_block_index": 101}
+        if coin_id == VAULT_A else None)
     policy_hex = "0x" + policy_hash.hex()
     launcher = bytes32.fromhex(VAULT_A.removeprefix("0x"))
     pool_launcher = bytes32(b"\x70" * 32)
@@ -781,6 +800,12 @@ def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
 
     class FakeChiaProvider:
         async def push_tx(self, spend_bundle_json):
+            ledger = get_credential_ledger(Settings())
+            attempt = ledger.get_stamp_attempt(VAULT_A)
+            stored = SpendBundle.from_bytes(bytes.fromhex(attempt["bundle_hex"]))
+            assert stored.to_json_dict() == spend_bundle_json
+            assert ledger.get_enrollment(VAULT_A)["status"] == "stamp_pending"
+            assert attempt["dispatch_status"] == "unknown"
             pushed.append(spend_bundle_json)
             return {"success": True, "status": "SUCCESS"}
 

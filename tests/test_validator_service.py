@@ -116,6 +116,7 @@ def _artifact(pool_launcher: bytes32, claim: ValidatorClaim) -> dict:
         "artifactHash": claim.artifact_hash,
         "launcherIds": {"pool": "0x" + bytes(pool_launcher).hex()},
         "bridgePolicy": {
+            "policyHash": claim.bridge_policy_hash,
             "parentCoinIds": [claim.bridge_parent_id],
             "bridgeCoinIds": [claim.bridge_coin_id],
         },

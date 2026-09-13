@@ -7,7 +7,7 @@ the first authenticated external payment message before fulfillment.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import json
 from pathlib import Path
 import sqlite3
@@ -115,6 +115,31 @@ class PaymentPurchaseStore:
                     UNIQUE (purchase_id, deed_launcher_id),
                     FOREIGN KEY (purchase_id) REFERENCES payment_purchases(purchase_id)
                         ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS payment_inventory_expiries (
+                    purchase_id TEXT PRIMARY KEY,
+                    evidence_json TEXT NOT NULL,
+                    FOREIGN KEY (purchase_id) REFERENCES payment_purchases(purchase_id)
+                );
+                CREATE TABLE IF NOT EXISTS payment_inventory_releases (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    purchase_id TEXT NOT NULL UNIQUE,
+                    evidence_json TEXT NOT NULL,
+                    FOREIGN KEY (purchase_id) REFERENCES payment_purchases(purchase_id)
+                );
+                CREATE TABLE IF NOT EXISTS payment_inventory_timeouts (
+                    purchase_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    binding_json TEXT NOT NULL,
+                    prepared_json TEXT,
+                    fee_coin_id TEXT UNIQUE,
+                    state TEXT NOT NULL DEFAULT 'PREPARING',
+                    receipt_json TEXT,
+                    lease_owner TEXT,
+                    lease_until INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (purchase_id, ordinal),
+                    FOREIGN KEY (purchase_id, ordinal)
+                        REFERENCES payment_purchase_inventory_items(purchase_id, ordinal)
                 );
                 """
             )
@@ -351,6 +376,88 @@ class PaymentPurchaseStore:
             ).fetchall()
         return tuple(_inventory_item(row) for row in rows)
 
+    def claim_inventory_timeout(self, purchase_id: str, ordinal: int, *,
+                                binding: Mapping[str, Any], owner: str,
+                                now: int, lease_seconds: int = 120) -> dict[str, Any]:
+        """Lease one exact input; wall time controls only coordination, never expiry."""
+        canonical = _canonical_json(binding)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            item = connection.execute(
+                "SELECT state FROM payment_purchase_inventory_items WHERE purchase_id=? AND ordinal=?",
+                (purchase_id, ordinal)).fetchone()
+            if item is None or item["state"] not in ("PREPARED", "SUBMITTED", "CONFIRMED"):
+                raise PaymentPurchaseConflict("timeout requires retained active inventory")
+            connection.execute(
+                "INSERT OR IGNORE INTO payment_inventory_timeouts(purchase_id,ordinal,binding_json) VALUES (?,?,?)",
+                (purchase_id, ordinal, canonical))
+            row = connection.execute(
+                "SELECT * FROM payment_inventory_timeouts WHERE purchase_id=? AND ordinal=?",
+                (purchase_id, ordinal)).fetchone()
+            if row["binding_json"] != canonical:
+                raise PaymentPurchaseConflict("timeout network, deployment, release or input binding changed")
+            if row["lease_owner"] is not None and row["lease_until"] > now:
+                raise PaymentPurchaseConflict("timeout recovery is already in progress; retry later")
+            connection.execute(
+                "UPDATE payment_inventory_timeouts SET lease_owner=?,lease_until=? WHERE purchase_id=? AND ordinal=?",
+                (owner, now + lease_seconds, purchase_id, ordinal))
+            connection.execute("COMMIT")
+        return json.loads(row["prepared_json"]) if row["prepared_json"] else {}
+
+    def preserve_inventory_timeout(self, purchase_id: str, ordinal: int, *, owner: str,
+                                    now: int, prepared: Mapping[str, Any]) -> None:
+        """Commit full fee-funded bytes before push. An existing bundle is immutable."""
+        canonical = _canonical_json(prepared)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM payment_inventory_timeouts WHERE purchase_id=? AND ordinal=?",
+                (purchase_id, ordinal)).fetchone()
+            if row is None or row["lease_owner"] != owner or row["lease_until"] <= now:
+                raise PaymentPurchaseConflict("timeout lease expired before dispatch")
+            if row["prepared_json"] is not None and row["prepared_json"] != canonical:
+                raise PaymentPurchaseConflict("the exact timeout bundle cannot be replaced")
+            try:
+                connection.execute(
+                    "UPDATE payment_inventory_timeouts SET prepared_json=?,fee_coin_id=?,state='PREPARED' "
+                    "WHERE purchase_id=? AND ordinal=?",
+                    (canonical, prepared["feeCoinId"], purchase_id, ordinal))
+            except sqlite3.IntegrityError as exc:
+                raise PaymentPurchaseConflict("timeout fee coin is already reserved") from exc
+            connection.execute("COMMIT")
+
+    def finish_inventory_timeout_attempt(self, purchase_id: str, ordinal: int, *, owner: str,
+                                         receipt: Mapping[str, Any] | None = None) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if receipt is not None:
+                connection.execute(
+                    "UPDATE payment_inventory_timeouts SET state='SUBMITTED',receipt_json=? "
+                    "WHERE purchase_id=? AND ordinal=? AND lease_owner=? AND prepared_json IS NOT NULL",
+                    (_canonical_json(receipt), purchase_id, ordinal, owner))
+            connection.execute(
+                "UPDATE payment_inventory_timeouts SET lease_owner=NULL,lease_until=0 "
+                "WHERE purchase_id=? AND ordinal=? AND lease_owner=?",
+                (purchase_id, ordinal, owner))
+            connection.execute("COMMIT")
+
+    def inventory_timeout_operations(self, purchase_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM payment_inventory_timeouts WHERE purchase_id=? ORDER BY ordinal",
+                (purchase_id,)).fetchall()
+        return [dict(ordinal=row["ordinal"], state=row["state"],
+                     binding=json.loads(row["binding_json"]),
+                     prepared=json.loads(row["prepared_json"]) if row["prepared_json"] else None,
+                     receipt=json.loads(row["receipt_json"]) if row["receipt_json"] else None) for row in rows]
+
+    def pending_timeout_fee_coin_ids(self) -> tuple[str, ...]:
+        # Conservatively retain all exact fee inputs, including after an external
+        # release. Neither local expiry nor a failed/unknown push authorizes reuse.
+        with self._connect() as connection:
+            return tuple(row[0] for row in connection.execute(
+                "SELECT fee_coin_id FROM payment_inventory_timeouts WHERE fee_coin_id IS NOT NULL"))
+
     def record_inventory_batch_prepared(
         self,
         purchase_id: str,
@@ -578,6 +685,128 @@ class PaymentPurchaseStore:
             values={"inventory_confirmation_height": confirmation_height},
         )
         return result
+
+    def inventory_expiry_evidence(self, purchase_id: str) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute('SELECT evidence_json FROM payment_inventory_expiries WHERE purchase_id=?',
+                                     (purchase_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def record_inventory_authorization_expired(self, purchase_id: str, *, evidence: Mapping[str, Any]) -> StoredPaymentPurchase:
+        """Internal atomic commit of the observer's exact preflight snapshot.
+
+        Keep bundle bytes, input identity, purchase uniqueness and fee records.
+        This is not a chain release and must never advance a release cursor.
+        """
+        encoded = _canonical_json(evidence)
+        with self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            try:
+                row = connection.execute('SELECT * FROM payment_purchases WHERE purchase_id=?', (purchase_id,)).fetchone()
+                if row is None:
+                    raise PaymentPurchaseNotFound('purchase artifact was not found')
+                stored = _record(row)
+                old = connection.execute('SELECT evidence_json FROM payment_inventory_expiries WHERE purchase_id=?', (purchase_id,)).fetchone()
+                if old is not None:
+                    if old[0] != encoded or stored.inventory_state != 'AUTHORIZATION_EXPIRED':
+                        raise PaymentPurchaseConflict('authorization expiry evidence cannot be changed')
+                    connection.execute('COMMIT')
+                    return stored
+                rows = connection.execute('SELECT * FROM payment_purchase_inventory_items WHERE purchase_id=? ORDER BY ordinal', (purchase_id,)).fetchall()
+                # Read through the same transaction: normal transitions cannot race this compare-and-set.
+                current_items = [asdict(_inventory_item(r)) for r in rows]
+                if (evidence.get('schema') != 'solslot.inventory-authorization-expiry.v1'
+                        or evidence.get('purchaseId') != purchase_id
+                        or stored.inventory_state not in {'PREPARED', 'SUBMITTED'}
+                        or stored.inventory_confirmation_height is not None or stored.external_message is not None
+                        or _canonical_json(evidence.get('snapshot')) != _canonical_json(asdict(stored))
+                        or _canonical_json({'items': evidence.get('items')}) != _canonical_json({'items': current_items})
+                        or not rows or len(evidence.get('chainProofs', [])) != len(rows)
+                        or any(r['state'] != stored.inventory_state for r in rows)
+                        or any(p.get('schema') != 'solslot.inventory-expiry-chain.v1'
+                            or p.get('network') != 'testnet11' or p.get('sourceCoinId') != r['available_coin_id']
+                            or p.get('expiresAt') != stored.inventory_expires_at
+                            or type(p.get('matureTimestamp')) is not int or p['matureTimestamp'] < stored.inventory_expires_at
+                            for r, p in zip(rows, evidence['chainProofs'], strict=True))):
+                    raise PaymentPurchaseConflict('authorization changed during expiry proof')
+                connection.execute('INSERT INTO payment_inventory_expiries VALUES (?,?)', (purchase_id, encoded))
+                connection.execute("UPDATE payment_purchases SET inventory_state='AUTHORIZATION_EXPIRED' WHERE purchase_id=?", (purchase_id,))
+                connection.execute("UPDATE payment_purchase_inventory_items SET state='AUTHORIZATION_EXPIRED' WHERE purchase_id=?", (purchase_id,))
+                result = connection.execute('SELECT * FROM payment_purchases WHERE purchase_id=?', (purchase_id,)).fetchone()
+                connection.execute('COMMIT')
+                return _record(result)
+            except Exception:
+                if connection.in_transaction:
+                    connection.execute('ROLLBACK')
+                raise
+
+    def inventory_release_evidence(self, purchase_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT evidence_json FROM payment_inventory_releases WHERE purchase_id=?",
+                (purchase_id,),
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def latest_released_inventory(self, deed_launcher_id: str) -> dict[str, Any] | None:
+        """A read cursor only; callers must revalidate its current chain lineage."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT r.evidence_json FROM payment_inventory_releases r "
+                "JOIN payment_purchase_inventory_items i ON i.purchase_id=r.purchase_id "
+                "WHERE i.deed_launcher_id=? AND i.state='RELEASED' "
+                "ORDER BY r.sequence DESC LIMIT 1", (deed_launcher_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return next(item for item in json.loads(row[0])["items"]
+                    if item["deedLauncherId"] == deed_launcher_id)
+
+    def record_inventory_released(self, purchase_id: str, *, evidence: Mapping[str, Any]) -> StoredPaymentPurchase:
+        """Commit a complete, independently reconciled timeout batch and its cursor.
+
+        This internal persistence method accepts only the reconciler's exact
+        evidence. Public requests cannot provide release evidence. Original
+        artifacts, signed bundles and validator tombstones remain unchanged.
+        """
+        encoded = _canonical_json(evidence)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                parent = connection.execute("SELECT * FROM payment_purchases WHERE purchase_id=?", (purchase_id,)).fetchone()
+                rows = connection.execute("SELECT * FROM payment_purchase_inventory_items WHERE purchase_id=? ORDER BY ordinal", (purchase_id,)).fetchall()
+                if parent is None:
+                    raise PaymentPurchaseNotFound("purchase artifact was not found")
+                old = connection.execute("SELECT evidence_json FROM payment_inventory_releases WHERE purchase_id=?", (purchase_id,)).fetchone()
+                if old is not None:
+                    if old[0] != encoded:
+                        raise PaymentPurchaseConflict("confirmed release evidence cannot be changed")
+                    connection.execute("COMMIT")
+                    return _record(parent)
+                items = evidence.get("items")
+                if (evidence.get("schema") != "solslot.inventory-timeout-release.v1"
+                        or not isinstance(items, list) or not rows or len(items) != len(rows)
+                        or parent["inventory_state"] not in {"PREPARED", "SUBMITTED", "CONFIRMED"}):
+                    raise PaymentPurchaseConflict("incomplete or invalid inventory release")
+                for row, item in zip(rows, items, strict=True):
+                    if (row["state"] != parent["inventory_state"]
+                            or item.get("ordinal") != row["ordinal"]
+                            or item.get("deedLauncherId") != row["deed_launcher_id"]
+                            or item.get("reservedCoinId") != row["reserved_coin_id"]
+                            or not item.get("availableCoinId") or not item.get("releaseSpend")
+                            or type(item.get("confirmationHeight")) is not int or item["confirmationHeight"] <= 0):
+                        raise PaymentPurchaseConflict("release evidence changes the reserved batch")
+                connection.execute("INSERT INTO payment_inventory_releases(purchase_id,evidence_json) VALUES (?,?)", (purchase_id, encoded))
+                connection.execute("UPDATE payment_purchases SET inventory_state='RELEASED' WHERE purchase_id=?", (purchase_id,))
+                connection.execute("UPDATE payment_purchase_inventory_items SET state='RELEASED' WHERE purchase_id=?", (purchase_id,))
+                connection.execute("UPDATE payment_inventory_timeouts SET state='CONFIRMED',lease_owner=NULL,lease_until=0 WHERE purchase_id=?", (purchase_id,))
+                result = connection.execute("SELECT * FROM payment_purchases WHERE purchase_id=?", (purchase_id,)).fetchone()
+                connection.execute("COMMIT")
+                return _record(result)
+            except Exception:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
 
     def _transition_inventory(
         self,

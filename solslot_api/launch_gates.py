@@ -30,7 +30,7 @@ def require_operation_gate(settings: Settings, gate_name: str) -> None:
             raise GenesisConflict("no signed alpha launch exists")
         if gate_name != "ceremonyBroadcast" and active["state"] != "locked":
             raise GenesisConflict("the signed alpha launch is not complete")
-        gate = store.gates(str(active["ceremony_id"])).get(gate_name)
+        gate = store.authorized_gate(settings, str(active["ceremony_id"]), gate_name)
         if not gate or gate["state"] != "open":
             raise GenesisConflict(f"the signed {gate_name} window is closed")
         if gate_name in {"presale", "purchases"}:

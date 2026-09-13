@@ -297,6 +297,20 @@ class GovernanceQueueStore:
             raise GovernanceQueueNotFound(proposal_id)
         return _record(row)
 
+    def find_executed_redemptions(self, settlement_id: str) -> list[GovernanceQueueRecord]:
+        """Find a permanent settlement independently of the queue's display page.
+
+        Return at most two matches so callers can reject ambiguous evidence.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM governance_proposal_queue "
+                "WHERE kind='FUNDED_REDEMPTION' AND state='EXECUTED' "
+                "AND lower(json_extract(bill_json, '$.settlementId'))=? LIMIT 2",
+                (settlement_id.lower(),),
+            ).fetchall()
+        return [_record(row) for row in rows]
+
     def list(
         self,
         *,

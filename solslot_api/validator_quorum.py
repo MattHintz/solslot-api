@@ -9,7 +9,7 @@ import logging
 import ssl
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from chia_rs import AugSchemeMPL, G1Element, G2Element
@@ -151,6 +151,28 @@ class ValidatorClaim(BaseModel):
             + bytes.fromhex(self.bridge_coin_id[2:])
             + additional_data
         )
+
+
+class PermitValidatorClaim(ValidatorClaim):
+    """Explicit selected-deployment claim; legacy claim hashes stay unchanged."""
+
+    claim_version: Literal["solslot.enrollment-permit-claim.v1"]
+    enrollment_permit: dict[str, Any]
+    permit_issuer_signature: str
+
+    @field_validator("enrollment_permit")
+    @classmethod
+    def _canonical_permit(cls, value: dict[str, Any]) -> dict[str, Any]:
+        from solslot_puzzles.enrollment_permit import EnrollmentPermit
+        return EnrollmentPermit.from_wire(value).to_wire()
+
+    @field_validator("permit_issuer_signature")
+    @classmethod
+    def _canonical_issuer_signature(cls, value: str) -> str:
+        import re
+        if re.fullmatch(r"0x[0-9a-f]{130}", value) is None:
+            raise ValueError("issuer signature must be canonical 65-byte hex")
+        return value
 
 
 class PrimaryPurchaseDeedItem(BaseModel):
@@ -1055,6 +1077,8 @@ class ValidatorHealthResponse(BaseModel):
     artifactHash: str | None = None
     artifactReady: bool
     ledgerReady: bool
+    evmChainId: int = 11155111
+    enrollmentActivation: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -1084,8 +1108,30 @@ def configured_validator_pubkeys(settings: Settings) -> tuple[bytes, ...]:
     return validator_set.pubkeys
 
 
-def configured_bridge_policy_hash(settings: Settings) -> str:
+def configured_bridge_policy_hash(settings: Settings, *, activation: dict[str, Any] | None = None) -> str:
     pubkeys = configured_validator_pubkeys(settings)
+    if activation is None and settings.enrollment_permit_release_identity:
+        from .public_artifact import load_signed_public_artifact
+        from solslot_puzzles.enrollment_activation import activation_from_artifact
+        try:
+            activation = activation_from_artifact(load_signed_public_artifact(settings), required=True,
+                environment=settings.runtime_environment + "-alpha")
+        except (OSError, ValueError) as exc:
+            raise ValidatorQuorumError("signed permit policy is unavailable") from exc
+    if activation is not None:
+        from solslot_puzzles.enrollment_activation import validate_enrollment_activation
+        try:
+            checked = validate_enrollment_activation(activation, source_shas=activation["sourceShas"],
+                ceremony_id=activation["deploymentId"], emitter=settings.zkpassport_emitter_address.lower(),
+                validator_pubkeys=pubkeys, environment=settings.runtime_environment + "-alpha")
+            if (settings.zkpassport_evm_chain_id != 84532
+                    or settings.enrollment_permit_release_identity != checked["releaseIdentity"]
+                    or settings.enrollment_permit_issuer_key_ref != checked["issuerKeyRef"]
+                    or settings.enrollment_permit_identity_client_id != checked["issuerIdentityClientId"]):
+                raise ValueError("permit policy differs from this API deployment")
+            return checked["bridgePolicyHash"]
+        except (AttributeError, KeyError, ValueError) as exc:
+            raise ValidatorQuorumError("permit policy evidence does not match the configured deployment") from exc
     validator_set = require_genesis_validator_set(
         pubkeys,
         settings.zkpassport_validator_threshold,
@@ -1133,11 +1179,12 @@ async def probe_validator_health(
     expected_evm_addresses: dict[str, str],
     expected_artifact_ready: bool | None = None,
     expected_artifact_hash: str | None = None,
+    expected_enrollment_activation: dict[str, Any] | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> tuple[ValidatorHealthResponse, ...]:
     """Contact every private signer and bind health to the ceremony plan."""
     pubkeys = configured_validator_pubkeys(settings)
-    if configured_bridge_policy_hash(settings) != expected_bridge_policy_hash.lower():
+    if configured_bridge_policy_hash(settings, activation=expected_enrollment_activation) != expected_bridge_policy_hash.lower():
         raise ValidatorQuorumError(
             "ceremony bridge policy does not match configured validator roster"
         )
@@ -1153,6 +1200,9 @@ async def probe_validator_health(
         response.raise_for_status()
         parsed = ValidatorHealthResponse.model_validate(response.json())
         expected_pubkey = "0x" + pubkeys[index].hex()
+        if (parsed.enrollmentActivation != expected_enrollment_activation
+                or parsed.evmChainId != (84532 if expected_enrollment_activation is not None else 11155111)):
+            raise ValidatorQuorumError(f"validator signer {index} enrollment deployment does not match ceremony")
         checks = (
             (parsed.status, "healthy", "status"),
             (parsed.signerIndex, index, "signer index"),

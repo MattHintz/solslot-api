@@ -41,7 +41,8 @@ def test_presign_is_scoped_and_signed() -> None:
         asset_id="hero-exterior",
         filename="Front View.PNG",
     )
-    assert upload["objectKey"] == "collections/HARBOR-17/hero-exterior.png"
+    assert upload["objectKey"].startswith("collections/v2/")
+    assert upload["objectKey"].endswith("/asset.png")
     assert upload["method"] == "PUT"
     assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in upload["uploadUrl"]
     assert "X-Amz-Signature=" in upload["uploadUrl"]
@@ -153,4 +154,5 @@ def test_private_presign_uses_segregated_prefix() -> None:
         filename="title.pdf",
         private=True,
     )
-    assert upload["objectKey"] == "private/collections/HARBOR-17/unredacted-title.pdf"
+    assert upload["objectKey"].startswith("private/collections/v2/")
+    assert upload["objectKey"].endswith("/asset.pdf")

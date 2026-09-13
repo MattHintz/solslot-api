@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Optional
 
 import httpx
-from eth_abi import decode as abi_decode
+from eth_abi import decode as abi_decode, encode as abi_encode
 from chia.types.blockchain_format.program import Program
 from chia.wallet.lineage_proof import LineageProof
 from chia_rs import AugSchemeMPL, Coin, G1Element, G2Element, SpendBundle
@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field, field_validator
 from web3 import Web3
 
 from .config import Settings
+from .bridge_coin_policy import BridgeCoinPolicy
 from .chia_provider import ChiaProvider
 from .credential_auth import (
     OwnerAuth,
@@ -41,12 +42,13 @@ from .credential_auth import (
     verify_vault_session,
     vault_session_payload,
 )
-from .credential_ledger import LedgerConflict, get_credential_ledger
+from .credential_ledger import LedgerConflict, LedgerRateLimited, get_credential_ledger
 from .evm_auth import recover_evm_signer
 from .faucet import AGG_SIG_ME_DATA
 from .state import VaultRecord, get_registry
 from .validator_quorum import (
     ValidatorClaim,
+    PermitValidatorClaim,
     ValidatorQuorumError,
     collect_validator_quorum,
     configured_bridge_policy_hash,
@@ -135,6 +137,18 @@ class VaultCredentialReceipt(BaseModel):
 
 
 class EnrollmentRecord(BaseModel):
+    enrollmentPermit: dict[str, Any] | None = None
+    permitIssuerSignature: str | None = None
+    permitIssuanceStatus: Literal['pending','issued'] | None = None
+
+    @field_validator('enrollmentPermit')
+    @classmethod
+    def _permit_is_canonical(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is not None:
+            from solslot_puzzles.enrollment_permit import EnrollmentPermit
+            EnrollmentPermit.from_wire(value)
+        return value
+
     vaultLauncherId: str
     network: str
     policyVersion: int
@@ -273,6 +287,47 @@ def _active_bridge_policy_hash(settings: Settings) -> str:
         ) from exc
 
 
+def _active_bridge_coin_policy(settings: Settings) -> BridgeCoinPolicy:
+    try:
+        return BridgeCoinPolicy.from_artifact(_active_genesis_artifact(settings))
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail="The signed bridge coin policy is invalid.") from exc
+
+
+def _require_enrollment_bridge_policy(
+    settings: Settings, record: dict[str, Any], *, policy: BridgeCoinPolicy | None = None,
+    execution: bool = False,
+) -> None:
+    policy = policy or _active_bridge_coin_policy(settings)
+    if execution and (policy.permit_version is not None or record.get('enrollmentPermit') is not None):
+        _record_permit(settings, record)
+    try:
+        policy.require_coin(
+            policy_hash=record.get("bridgePolicyHash"), parent_id=record.get("bridgeParentId"),
+            amount=record.get("bridgeAmount"), coin_id=record.get("bridgeCoinId"),
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=("This enrollment's bridge coin is outside the signed release policy. "
+                    "Contact support to reconcile any existing proof before restarting verification."),
+        ) from exc
+
+
+def _record_permit(settings: Settings, record: dict[str, Any], *,
+        owner_auth_type: int | None = None, owner_key: str | None = None,
+        current_vault_coin_id: str | None = None, now: int | None = None):
+    if not settings.enrollment_permit_release_identity and record.get("enrollmentPermit") is None:
+        return None
+    from .enrollment_permit_runtime import validate_record_permit
+    try:
+        return validate_record_permit(record, _active_genesis_artifact(settings),
+            owner_auth_type=owner_auth_type, owner_key=owner_key,
+            current_vault_coin_id=current_vault_coin_id, now=now)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=409, detail=f"The saved permit cannot authorize this action: {exc}") from exc
+
+
 def _active_emitter_address(settings: Settings) -> str:
     try:
         value = _active_genesis_artifact(settings)["evmAddresses"][
@@ -291,44 +346,53 @@ def _fetch_verified_evm_attestation(
     *,
     transaction_hash: str,
     expected_vault_launcher_id: str,
+    authenticated_artifact: dict[str, Any] | None = None,
+    permit_record: dict[str, Any] | None = None,
 ) -> IndexedEvmAttestation:
     """Read and fully validate the canonical emitter event from Sepolia."""
     tx_hash = _normalize_tx(transaction_hash, "evmTxHash")
-    emitter_address = _active_emitter_address(settings)
+    artifact = authenticated_artifact
+    if artifact is None and settings.enrollment_permit_release_identity:
+        artifact = _active_genesis_artifact(settings)
+    emitter_address = (Web3.to_checksum_address(artifact["evmAddresses"]["attestationEmitter"])
+        if artifact is not None else _active_emitter_address(settings))
     w3 = Web3(
         Web3.HTTPProvider(
             settings.zkpassport_evm_rpc_url,
             request_kwargs={"timeout": 20.0},
         )
     )
+    from .evm_relay_transaction import canonical_receipt
     try:
-        receipt = w3.eth.get_transaction_receipt(tx_hash)
-    except Exception as exc:  # noqa: BLE001 - provider-specific not-found errors vary
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"The zkPassport EVM transaction is not confirmed: {exc}",
-        ) from exc
-    if int(receipt.get("status", 0)) != 1:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The zkPassport EVM transaction reverted.",
-        )
-    block_number = int(receipt.get("blockNumber", 0))
-    try:
-        confirmations = int(w3.eth.block_number) - block_number + 1
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Could not verify zkPassport EVM confirmations: {exc}",
-        ) from exc
-    if confirmations < settings.zkpassport_evm_min_confirmations:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                "The zkPassport EVM event does not yet have the required "
-                f"{settings.zkpassport_evm_min_confirmations} confirmations."
-            ),
-        )
+        if int(w3.eth.chain_id) != settings.zkpassport_evm_chain_id:
+            raise ValueError("zkPassport RPC chain does not match the signed deployment")
+        receipt = canonical_receipt(w3, tx_hash, settings.zkpassport_evm_min_confirmations)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=f"The zkPassport receipt is not canonical: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Could not verify the canonical zkPassport receipt.") from exc
+    if receipt is None:
+        raise HTTPException(status_code=409, detail="The zkPassport EVM event is not yet confirmed with the required confirmations.")
+    if receipt['status'] != 1:
+        raise HTTPException(status_code=409, detail="The zkPassport EVM transaction reverted.")
+    block_number = receipt['blockNumber']
+
+    permit = None
+    if artifact is not None:
+        from solslot_puzzles.enrollment_activation import activation_from_artifact
+        from .enrollment_permit_runtime import validate_record_permit
+        try:
+            activation = activation_from_artifact(artifact)
+            if activation is not None:
+                record = permit_record
+                if record is None:
+                    record = get_credential_ledger(settings).get_enrollment(
+                        _normalize_hex32(expected_vault_launcher_id, "vaultLauncherId"))
+                if record is None:
+                    raise ValueError("permit reservation is unavailable")
+                permit = validate_record_permit(record, artifact)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=409, detail=f"Permit receipt evidence is invalid: {exc}") from exc
 
     matching: list[IndexedEvmAttestation] = []
     for log in receipt.get("logs", []):
@@ -378,6 +442,16 @@ def _fetch_verified_evm_attestation(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"The zkPassport emitter event is malformed: {exc}",
             ) from exc
+
+        if permit is not None:
+            types = ["uint16", "bytes32", "bytes32", "uint64", "bytes32", "bytes32", "bytes32",
+                "uint64", "bytes32", "bytes32", "bytes32", "uint16"]
+            values = (nullifier_type, service_scope_hash, service_subscope_hash, proof_timestamp,
+                attestation_leaf_hash, attestation_root, bridge_parent_id, bridge_amount, bridge_coin_id,
+                bridge_message, bridge_policy_hash, policy_version)
+            if (any(len(bytes(t)) != 32 for t in topics) or bytes(topics[1])[:12] != bytes(12)
+                    or abi_encode(types, values) != bytes(log.get("data") or b"")):
+                raise HTTPException(status_code=409, detail="The selected attestation encoding is not canonical.")
 
         matching.append(
             IndexedEvmAttestation(
@@ -466,7 +540,7 @@ def _fetch_verified_evm_attestation(
         "policyVersion": settings.zkpassport_policy_version,
         "attestationLeafHash": _hex32(leaf),
         "identityAttestRoot": _hex32(root),
-        "bridgePolicyHash": _active_bridge_policy_hash(settings),
+        "bridgePolicyHash": artifact["bridgePolicy"]["policyHash"] if artifact is not None else _active_bridge_policy_hash(settings),
         "bridgeCoinId": _hex32(bridge_coin_id),
         "bridgeMessage": _hex32(bridge_message),
     }
@@ -483,6 +557,24 @@ def _fetch_verified_evm_attestation(
             status_code=status.HTTP_409_CONFLICT,
             detail="The zkPassport EVM event commitments do not match the Chia policy.",
         )
+    if permit is not None:
+        from .enrollment_permit_runtime import verify_permit_event_pair, verify_selected_emitter
+        try:
+            block = w3.eth.get_block(block_number)
+            if bytes(block["hash"]) != bytes(receipt["blockHash"]):
+                raise ValueError("permit inclusion block changed during verification")
+            validator_message = verify_permit_event_pair(logs=list(receipt.get("logs", [])),
+                emitter=emitter_address, attestation_topic=_ATTESTATION_EVENT_TOPIC,
+                permit=permit, legacy_message=validator_message, block_timestamp=block["timestamp"])
+            direct = verify_selected_emitter(w3, artifact)
+            from solslot_puzzles.enrollment_permit import owner_key_hash
+            if ((permit.owner_auth_type == 1 and event.sender.lower() != direct)
+                    or (permit.owner_auth_type == 2 and owner_key_hash(2, bytes.fromhex(event.sender[2:])) != permit.owner_key_hash)):
+                raise ValueError("permit event sender differs from its authorized owner or relayer")
+        except (ValueError, TypeError, KeyError) as exc:
+            raise HTTPException(status_code=409, detail=f"Permit receipt does not match: {exc}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail="Could not inspect the permit deployment and inclusion block.") from exc
     return IndexedEvmAttestation(
         **{
             **event.__dict__,
@@ -583,9 +675,33 @@ def _find_initial_vault_coin(settings: Settings, vault_launcher_id: str) -> Coin
     return candidates[0]
 
 
+def _initial_vault_lineage(settings: Settings, vault_coin: Coin, launcher_id: bytes32) -> LineageProof:
+    """An eve singleton proves its launcher using the launcher's parent, not its ID."""
+    from chia.wallet.puzzles.singleton_top_layer_v1_1 import SINGLETON_LAUNCHER_HASH
+    record = _fetch_coin_record_by_name(settings, _hex32(launcher_id))
+    try:
+        launcher = _coin_from_record(record, "vaultLauncher")
+        if (launcher.name() != launcher_id or launcher.puzzle_hash != SINGLETON_LAUNCHER_HASH
+                or launcher.amount != 1 or vault_coin.parent_coin_info != launcher_id
+                or type(record.get("confirmed_block_index")) is not int
+                or record["confirmed_block_index"] <= 0
+                or type(record.get("spent_block_index")) is not int
+                or record["spent_block_index"] < record["confirmed_block_index"]):
+            raise ValueError("launcher record does not prove the initial vault lineage")
+        return LineageProof(parent_name=launcher.parent_coin_info, amount=uint64(1))
+    except (AttributeError, TypeError, ValueError, KeyError) as exc:
+        raise HTTPException(status_code=409,
+            detail="The confirmed launcher lineage is unavailable or does not match this vault.") from exc
+
+
 def _verify_reserved_bridge_coin(settings: Settings, record: EnrollmentRecord) -> Coin:
+    _require_enrollment_bridge_policy(settings, record.model_dump(), execution=True)
     coin_record = _fetch_coin_record_by_name(settings, record.bridgeCoinId)
-    if coin_record is None:
+    try:
+        confirmed = coin_record is not None and int(coin_record.get("confirmed_block_index") or 0) > 0
+    except (TypeError, ValueError):
+        confirmed = False
+    if not confirmed:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="The reserved zkPassport bridge coin is not confirmed on Chia.",
@@ -655,7 +771,13 @@ def _validator_claim(
         authorization_bytes = bytes.fromhex(owner_authorization.removeprefix("0x"))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Owner authorization is not hex.") from exc
-    return ValidatorClaim(
+    permit = _record_permit(settings, record.model_dump(), owner_auth_type=vault_record.auth_type,
+        owner_key=owner_key, current_vault_coin_id=_hex32(vault_coin.name()), now=int(time.time()))
+    claim_type = PermitValidatorClaim if permit is not None else ValidatorClaim
+    extra = dict(claim_version="solslot.enrollment-permit-claim.v1", enrollment_permit=permit.to_wire(),
+        permit_issuer_signature=record.permitIssuerSignature) if permit is not None else {}
+    return claim_type(
+        **extra,
         network=settings.network,
         artifact_hash=_active_artifact_hash(settings),
         vault_launcher_id=key,
@@ -920,26 +1042,36 @@ def _bridge_coin_candidates(
     settings: Settings,
     *,
     bridge_policy_hash: str,
+    policy: BridgeCoinPolicy | None = None,
 ) -> list[BridgeCoinCandidate]:
+    policy = policy or _active_bridge_coin_policy(settings)
+    if policy.policy_hash != bridge_policy_hash:
+        raise HTTPException(status_code=503, detail="The bridge discovery policy does not match the signed release.")
     candidates_by_id: dict[str, BridgeCoinCandidate] = {}
 
     for record in _fetch_bridge_coin_records(settings, bridge_policy_hash):
         if not isinstance(record, dict):
             continue
-        if record.get("spent_block_index") not in (0, None) or record.get("spent") is True:
+        if record.get("spent_block_index") not in (0, None) or bool(record.get("spent")):
             continue
         coin = record.get("coin")
         if not isinstance(coin, dict):
             continue
         try:
+            if int(record.get("confirmed_block_index") or 0) <= 0:
+                continue
             parent = _normalize_hex32(coin.get("parent_coin_info"), "bridge.parent_coin_info")
             puzzle_hash = _normalize_hex32(coin.get("puzzle_hash"), "bridge.puzzle_hash")
-            amount = int(coin.get("amount"))
+            raw_amount = coin.get("amount")
+            if isinstance(raw_amount, bool) or not isinstance(raw_amount, (str, int)):
+                continue
+            amount = int(raw_amount)
+            if amount != 1:
+                continue
+            coin_id = _coin_id(parent, puzzle_hash, amount)
+            policy.require_coin(policy_hash=puzzle_hash, parent_id=parent, amount=amount, coin_id=coin_id)
         except (TypeError, ValueError):
             continue
-        if puzzle_hash != bridge_policy_hash or amount <= 0:
-            continue
-        coin_id = _coin_id(parent, puzzle_hash, amount)
         candidates_by_id[coin_id] = BridgeCoinCandidate(
             parent_id=parent,
             amount=amount,
@@ -952,7 +1084,10 @@ def _bridge_coin_candidates(
     )
 
 def _public_record(record: dict[str, Any]) -> EnrollmentRecord:
-    return EnrollmentRecord.model_validate(record)
+    parsed = EnrollmentRecord.model_validate(record)
+    if parsed.permitIssuanceStatus == 'pending':
+        return parsed.model_copy(update={'enrollmentPermit':None,'permitIssuerSignature':None})
+    return parsed
 
 
 @router.post(
@@ -988,7 +1123,8 @@ def create_vault_session(
         payload=vault_session_payload(settings),
         owner_auth=req.ownerAuth,
     )
-    token, session = issue_vault_session(settings, verified_owner)
+    token, session = issue_vault_session(settings, verified_owner,
+        scope='vault' if settings.alpha_writes_enabled else 'relay_recovery')
     response.set_cookie(
         key=VAULT_SESSION_COOKIE,
         value=token,
@@ -1008,12 +1144,13 @@ def get_vault_session(
 ) -> VaultSessionResponse:
     settings = _settings()
     key = _normalize_hex32(vault_launcher_id, "vaultLauncherId")
-    session = verify_vault_session(settings, request, key)
+    session = verify_vault_session(settings, request, key, allow_recovery=True)
     return VaultSessionResponse(
         vaultLauncherId=key,
         authType=session.auth_type,
         network=session.network,
         expiresAt=session.expires_at,
+        scope=session.scope,
     )
 
 
@@ -1034,6 +1171,16 @@ def create_bls_relay_challenge(
             status_code=status.HTTP_409_CONFLICT,
             detail="EVM vaults authorize the proof with a ForwardRequest.",
         )
+    enrollment = get_credential_ledger(settings).get_enrollment(key)
+    if not enrollment:
+        raise HTTPException(status_code=404, detail="Create an enrollment before requesting relay authorization.")
+    _require_enrollment_bridge_policy(settings, enrollment, execution=True)
+    from .zkpassport_relay import _validate_relay_permit
+    try:
+        data = Web3.to_bytes(hexstr=req.data)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail="Relay calldata must be hex.") from exc
+    _validate_relay_permit(settings, enrollment, session, data, live=True)
     return issue_owner_challenge(
         settings,
         vault_launcher_id=key,
@@ -1082,23 +1229,27 @@ async def create_enrollment(
     settings = _settings()
     vault_launcher_id = _normalize_hex32(req.vaultLauncherId, "vaultLauncherId")
     verified_owner = verify_vault_session(settings, request, vault_launcher_id)
-    bridge_policy_hash = _active_bridge_policy_hash(settings)
-    if int(settings.zkpassport_bridge_amount) <= 0:
+    policy = _active_bridge_coin_policy(settings)
+    if policy.permit_version is not None:
+        artifact = _active_genesis_artifact(settings)
+        from .enrollment_permit_issuance import reserve_and_issue_permit
+        return _public_record(await reserve_and_issue_permit(settings,verified_owner,artifact,policy))
+    bridge_policy_hash = policy.policy_hash
+    if int(settings.zkpassport_bridge_amount) != 1:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="zkPassport bridge amount is not configured.",
+            detail="zkPassport bridge coins must be configured for exactly one mojo.",
         )
     while True:
-        bridge_candidates = _bridge_coin_candidates(
-            settings,
-            bridge_policy_hash=bridge_policy_hash,
-        )
-
         ledger = get_credential_ledger(settings)
         existing = ledger.get_enrollment(vault_launcher_id)
         if existing:
+            _require_enrollment_bridge_policy(settings, existing, policy=policy)
             return _public_record(existing)
 
+        bridge_candidates = _bridge_coin_candidates(
+            settings, bridge_policy_hash=bridge_policy_hash, policy=policy,
+        )
         used_coin_ids = ledger.enrollment_bridge_coin_ids()
         bridge_candidate = next(
             (
@@ -1126,15 +1277,19 @@ async def create_enrollment(
                 stored, _created = ledger.reserve_enrollment(
                     record=record.model_dump(),
                     owner_key=verified_owner.owner_key,
+                    max_pending_per_owner=settings.zkpassport_enrollment_max_pending_per_owner,
                 )
+            except LedgerRateLimited as exc:
+                raise HTTPException(status_code=429, detail=str(exc)) from exc
             except LedgerConflict:
                 continue
+            _require_enrollment_bridge_policy(settings, stored, policy=policy)
             return _public_record(stored)
 
         detail = (
-            "No unspent zkPassport bridge coins are available; top up the bridge pool."
+            "No confirmed signed-policy zkPassport bridge coins are available; contact support."
             if not bridge_candidates
-            else "No unreserved zkPassport bridge coins remain; top up the bridge pool."
+            else "No unreserved signed-policy zkPassport bridge coins remain; contact support."
         )
         raise HTTPException(
             status_code=(
@@ -1157,6 +1312,8 @@ def get_enrollment(vault_launcher_id: VaultLauncherPath) -> EnrollmentRecord:
             detail="No zkPassport enrollment receipt is indexed for this vault.",
         )
     parsed = _public_record(record)
+    if parsed.status in {"reserved", "evm_confirmed"}:
+        _require_enrollment_bridge_policy(settings, record)
     if parsed.status in {"stamp_pending", "receipt_syncing", "chia_confirmed"}:
         return _sync_chia_stamp(settings, key)
     return parsed
@@ -1264,6 +1421,7 @@ def record_evm_proof(
             status_code=status.HTTP_409_CONFLICT,
             detail="This enrollment is not awaiting a new EVM proof.",
         )
+    _require_enrollment_bridge_policy(settings, existing, execution=True)
     expected = {
         "bridgePolicyHash": record.bridgePolicyHash,
         "bridgeParentId": record.bridgeParentId,
@@ -1413,6 +1571,7 @@ def _build_bls_chia_stamp(
 
     try:
         built = build_bridge_and_vault_update_identity_bundle(
+            enrollment_permit=_record_permit(settings, record.model_dump(), now=int(time.time())),
             bridge_parent_id=bytes32.fromhex(record.bridgeParentId.removeprefix("0x")),
             bridge_amount=record.bridgeAmount,
             validator_pubkeys=validator_pubkeys,
@@ -1438,7 +1597,7 @@ def _build_bls_chia_stamp(
             ),
             proof_timestamp=event.proof_timestamp,
             current_timestamp=current_timestamp,
-            lineage_proof=LineageProof(parent_name=launcher, amount=uint64(1)),
+            lineage_proof=_initial_vault_lineage(settings, vault_coin, launcher),
         )
     except ValueError as exc:
         raise HTTPException(
@@ -1477,6 +1636,15 @@ def _build_bls_chia_stamp(
     return built, expected_vault_coin, owner_message
 
 
+def _freeze_stamp_attempt(settings: Settings, claim: ValidatorClaim, expected_vault_coin: Coin) -> None:
+    try:
+        get_credential_ledger(settings).reserve_stamp_attempt(
+            claim=claim.model_dump(mode="json"), expected_coin=expected_vault_coin.to_json_dict(),
+        )
+    except LedgerConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 async def _push_chia_stamp_and_mark_pending(
     settings: Settings,
     *,
@@ -1487,53 +1655,31 @@ async def _push_chia_stamp_and_mark_pending(
 ) -> SubmitChiaStampResponse:
     spend_bundle_id = _hex32(spend_bundle.name())
     expected_vault_coin_id = _hex32(expected_vault_coin.name())
+    ledger = get_credential_ledger(settings)
+    try:
+        # FULL synchronous SQLite commit precedes any provider call. Ambiguous
+        # sends retain exact bytes, claim, input locks and the expected output.
+        pending = EnrollmentRecord.model_validate(ledger.persist_stamp_bundle(
+            vault_launcher_id=key, bundle_hex=bytes(spend_bundle).hex(),
+        ))
+        if pending.receipt is None or pending.receipt.chiaVaultCoinId != expected_vault_coin_id:
+            raise LedgerConflict("Stamp successor differs from retained authorization.")
+        ledger.record_stamp_dispatch(key, spend_bundle_id, "unknown")
+    except (ValueError, LedgerConflict) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     try:
         push_result = await coinset.push_tx(spend_bundle.to_json_dict())
-    except Exception as exc:  # noqa: BLE001 - normalize provider failures for the portal
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"The Chia providers could not submit the vault stamp: {exc}",
-        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502,
+            detail="Stamp submission is uncertain. Its signed bundle and receipt IDs are retained; check status before retrying.") from exc
     push_status = str(push_result.get("status") or "").upper()
     if not push_result.get("success") and push_status not in {"SUCCESS", "PENDING"}:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"The Chia network rejected the vault stamp: {push_result.get('error') or push_result}",
-        )
-
-    ledger = get_credential_ledger(settings)
-    latest_raw = ledger.get_enrollment(key)
-    if not latest_raw:
-        raise HTTPException(status_code=404, detail="Enrollment not found.")
-    latest = EnrollmentRecord.model_validate(latest_raw)
-    if latest.receipt is None:
-        raise HTTPException(status_code=409, detail="No EVM proof receipt to stamp.")
-    receipt = latest.receipt.model_copy(
-        update={
-            "chiaVaultCoinId": expected_vault_coin_id,
-            "chiaSpendBundleId": spend_bundle_id,
-            "confirmedBlockIndex": None,
-        }
-    )
-    pending = latest.model_copy(
-        update={
-            "status": "stamp_pending",
-            "receipt": receipt,
-            "updatedAt": int(time.time()),
-        }
-    )
-    try:
-        ledger.update_enrollment(
-            pending.model_dump(),
-            expected_statuses={"evm_confirmed"},
-        )
-    except LedgerConflict as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return SubmitChiaStampResponse(
-        enrollment=pending,
-        spendBundleId=spend_bundle_id,
-        expectedVaultCoinId=expected_vault_coin_id,
-    )
+        ledger.record_stamp_dispatch(key, spend_bundle_id, "rejected")
+        raise HTTPException(status_code=502,
+            detail="The Chia provider rejected the retained stamp. Check status before retrying the same bundle.")
+    ledger.record_stamp_dispatch(key, spend_bundle_id, "submitted")
+    return SubmitChiaStampResponse(enrollment=pending, spendBundleId=spend_bundle_id,
+        expectedVaultCoinId=expected_vault_coin_id)
 
 
 @router.post("/{vault_launcher_id}/stamp/prepare", response_model=PrepareChiaStampResponse)
@@ -1543,11 +1689,12 @@ def prepare_chia_stamp(
 ) -> PrepareChiaStampResponse:
     settings = _settings()
     key = _normalize_hex32(vault_launcher_id, "vaultLauncherId")
-    verify_vault_session(settings, request, key)
+    session = verify_vault_session(settings, request, key)
     existing = get_credential_ledger(settings).get_enrollment(key)
     if not existing:
         raise HTTPException(status_code=404, detail="Enrollment not found.")
     record = EnrollmentRecord.model_validate(existing)
+    _require_enrollment_bridge_policy(settings, existing, execution=True)
     if record.status == "chia_confirmed":
         raise HTTPException(status_code=409, detail="This vault is already stamped on Chia.")
     if record.status == "stamp_pending":
@@ -1559,6 +1706,8 @@ def prepare_chia_stamp(
         )
 
     vault_coin = _find_initial_vault_coin(settings, key)
+    _record_permit(settings, existing, owner_auth_type=session.vault_record.auth_type,
+        owner_key=session.owner_key, current_vault_coin_id=_hex32(vault_coin.name()), now=int(time.time()))
     vault_record = get_registry().get(bytes32.fromhex(key.removeprefix("0x")))
     auth_type = "chia_bls" if vault_record and vault_record.auth_type == 1 else "evm"
     typed_data: Optional[dict[str, Any]] = None
@@ -1579,7 +1728,11 @@ def prepare_chia_stamp(
             expected_vault_launcher_id=key,
         )
         _verify_reserved_bridge_coin(settings, record)
-        current_timestamp = int(time.time())
+        attempt = get_credential_ledger(settings).get_stamp_attempt(key)
+        current_timestamp = json.loads(attempt["claim_json"])["current_timestamp"] if attempt else int(time.time())
+        if abs(int(time.time()) - current_timestamp) > 90:
+            raise HTTPException(status_code=409,
+                detail="The retained stamp submission window expired. Check the existing attempt before recovery.")
         built, _, _ = _build_bls_chia_stamp(
             settings,
             key=key,
@@ -1613,8 +1766,39 @@ async def submit_evm_chia_stamp(
     if not existing:
         raise HTTPException(status_code=404, detail="Enrollment not found.")
     record = EnrollmentRecord.model_validate(existing)
+    _require_enrollment_bridge_policy(settings, existing, execution=True)
+    attempt = get_credential_ledger(settings).get_stamp_attempt(key)
+    retained_claim = json.loads(attempt["claim_json"]) if attempt else None
+    if retained_claim:
+        req = SubmitChiaStampRequest(signature=retained_claim["owner_authorization"],
+            currentTimestamp=retained_claim["current_timestamp"])
     if record.status == "stamp_pending" and record.receipt:
         if record.receipt.chiaSpendBundleId and record.receipt.chiaVaultCoinId:
+            if attempt and attempt["bundle_hex"]:
+                if abs(int(time.time()) - retained_claim["current_timestamp"]) > 90:
+                    raise HTTPException(status_code=409,
+                        detail="The retained stamp submission window has passed. Check its existing receipt; authorization will not be renewed.")
+                # Exact bytes protect against replacement, not against a reorg
+                # or a changed release. Revalidate their original authorization
+                # without collecting another quorum or refreshing the clock.
+                event = _fetch_verified_evm_attestation(settings,
+                    transaction_hash=record.receipt.evmTxHash, expected_vault_launcher_id=key)
+                vault_coin = _find_initial_vault_coin(settings, key)
+                _verify_reserved_bridge_coin(settings, record)
+                fresh_claim = _validator_claim(settings, key=key, record=record, event=event,
+                    vault_coin=vault_coin, vault_record=verified_owner.vault_record,
+                    owner_key=verified_owner.owner_key, owner_authorization=retained_claim["owner_authorization"],
+                    current_timestamp=retained_claim["current_timestamp"])
+                if (fresh_claim.model_dump(mode="json") != retained_claim
+                        or fresh_claim.canonical_hash() != attempt["claim_hash"]
+                        or (verified_owner.vault_record.owner_evm_address
+                            and event.sender.lower() != verified_owner.vault_record.owner_evm_address.lower())):
+                    raise HTTPException(status_code=409,
+                        detail="The retained stamp no longer matches its original owner, EVM event or release. Reconcile the existing receipt.")
+                return await _push_chia_stamp_and_mark_pending(settings,
+                    coinset=request.app.state.coinset, key=key,
+                    spend_bundle=SpendBundle.from_bytes(bytes.fromhex(attempt["bundle_hex"])),
+                    expected_vault_coin=Coin.from_json_dict(json.loads(attempt["expected_coin_json"])))
             return SubmitChiaStampResponse(
                 enrollment=record,
                 spendBundleId=record.receipt.chiaSpendBundleId,
@@ -1656,7 +1840,7 @@ async def submit_evm_chia_stamp(
         if abs(int(time.time()) - req.currentTimestamp) > 90:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="The BLS vault stamp authorization expired. Prepare and sign it again.",
+                detail="The BLS stamp submission window expired. Check the existing attempt; retained authorization cannot be renewed.",
             )
         built, expected_vault_coin, owner_message = (
             _build_bls_chia_stamp(
@@ -1692,6 +1876,7 @@ async def submit_evm_chia_stamp(
             owner_authorization=req.signature,
             current_timestamp=req.currentTimestamp,
         )
+        _freeze_stamp_attempt(settings, claim, expected_vault_coin)
         try:
             quorum = await collect_validator_quorum(settings, claim)
         except ValidatorQuorumError as exc:
@@ -1790,9 +1975,13 @@ async def submit_evm_chia_stamp(
             detail="The configured validator quorum does not match the vault bridge policy.",
         )
 
-    current_timestamp = int(time.time())
+    current_timestamp = retained_claim["current_timestamp"] if retained_claim else int(time.time())
+    if abs(int(time.time()) - current_timestamp) > 90:
+        raise HTTPException(status_code=409,
+            detail="The retained stamp submission window expired. Check the existing attempt before recovery.")
     try:
         built = build_bridge_and_vault_update_identity_bundle(
+            enrollment_permit=_record_permit(settings, record.model_dump(), now=int(time.time())),
             bridge_parent_id=bytes32.fromhex(record.bridgeParentId.removeprefix("0x")),
             bridge_amount=record.bridgeAmount,
             validator_pubkeys=validator_pubkeys,
@@ -1816,7 +2005,7 @@ async def submit_evm_chia_stamp(
             ),
             proof_timestamp=event.proof_timestamp,
             current_timestamp=current_timestamp,
-            lineage_proof=LineageProof(parent_name=launcher, amount=uint64(1)),
+            lineage_proof=_initial_vault_lineage(settings, vault_coin, launcher),
             signature_data=compact_signature,
         )
     except ValueError as exc:
@@ -1830,6 +2019,20 @@ async def submit_evm_chia_stamp(
             detail="The Chia bridge validator message does not match the EVM event.",
         )
 
+    expected_puzzle = puzzle_for_vault_full(
+        launcher,
+        recovery.compressed_pubkey,
+        AUTH_TYPE_SECP256K1,
+        members_root,
+        pool_launcher_id,
+        identity_attest_root=identity_root,
+        zkpassport_bridge_policy_hash=bridge_policy_hash,
+    )
+    expected_vault_coin = Coin(
+        vault_coin.name(),
+        bytes32(expected_puzzle.get_tree_hash()),
+        uint64(1),
+    )
     claim = _validator_claim(
         settings,
         key=key,
@@ -1841,6 +2044,7 @@ async def submit_evm_chia_stamp(
         owner_authorization=req.signature,
         current_timestamp=current_timestamp,
     )
+    _freeze_stamp_attempt(settings, claim, expected_vault_coin)
     try:
         quorum = await collect_validator_quorum(settings, claim)
     except ValidatorQuorumError as exc:
@@ -1848,6 +2052,7 @@ async def submit_evm_chia_stamp(
     if quorum.signer_indices != (0, 1):
         try:
             built = build_bridge_and_vault_update_identity_bundle(
+                enrollment_permit=_record_permit(settings, record.model_dump(), now=int(time.time())),
                 bridge_parent_id=bytes32.fromhex(record.bridgeParentId.removeprefix("0x")),
                 bridge_amount=record.bridgeAmount,
                 validator_pubkeys=validator_pubkeys,
@@ -1871,7 +2076,7 @@ async def submit_evm_chia_stamp(
                 ),
                 proof_timestamp=event.proof_timestamp,
                 current_timestamp=current_timestamp,
-                lineage_proof=LineageProof(parent_name=launcher, amount=uint64(1)),
+                lineage_proof=_initial_vault_lineage(settings, vault_coin, launcher),
                 signature_data=compact_signature,
             )
         except ValueError as exc:
@@ -1882,20 +2087,6 @@ async def submit_evm_chia_stamp(
     spend_bundle = SpendBundle(
         list(built.spend_bundle.coin_spends),
         quorum.aggregated_signature,
-    )
-    expected_puzzle = puzzle_for_vault_full(
-        launcher,
-        recovery.compressed_pubkey,
-        AUTH_TYPE_SECP256K1,
-        members_root,
-        pool_launcher_id,
-        identity_attest_root=identity_root,
-        zkpassport_bridge_policy_hash=bridge_policy_hash,
-    )
-    expected_vault_coin = Coin(
-        vault_coin.name(),
-        bytes32(expected_puzzle.get_tree_hash()),
-        uint64(1),
     )
     return await _push_chia_stamp_and_mark_pending(
         settings,

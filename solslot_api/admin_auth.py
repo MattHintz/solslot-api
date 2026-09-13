@@ -37,7 +37,7 @@ from typing import Annotated, Any, Literal, Optional
 
 import jwt as pyjwt
 from eth_utils import to_checksum_address
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field, model_validator
 
 from .admin_roster import (
@@ -242,15 +242,14 @@ def validate_admin_config_at_startup(settings: Settings) -> None:
     only when an admin tries to sign in hours later.
 
     The retired environment-only allowlist is rejected explicitly. The
-    active authority source is a records file whose hash and launcher bind
-    to the current on-chain admin-authority singleton.
+    deployed authority source is the signed public release artifact, bound
+    to the current on-chain authority. Historical records are test-only.
     """
     retired_allowlist = os.environ.get("SOLSLOT_ADMIN_PUBKEY_ALLOWLIST", "").strip()
     if retired_allowlist:
         raise RuntimeError(
-            "SOLSLOT_ADMIN_PUBKEY_ALLOWLIST is retired. Configure "
-            "SOLSLOT_ADMIN_RECORDS_PATH with records bound to the current "
-            "admin-authority singleton."
+            "SOLSLOT_ADMIN_PUBKEY_ALLOWLIST is retired. Deployed administrator "
+            "identities must come from the signed public release artifact."
         )
 
     if settings.runtime_environment != "test" and settings.admin_records_path:
@@ -966,6 +965,28 @@ async def admin_eip712_compute_leaf_hash(
         prefix_and_domain_separator="0x" + prefix.hex(),
         network=network,
     )
+
+
+class AdminSessionResponse(BaseModel):
+    active: Literal[True] = True
+    owner: str
+    authority_slot: int = Field(ge=0, le=2)
+
+
+@router.get("/session", response_model=AdminSessionResponse)
+async def admin_session(
+    response: Response,
+    claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
+) -> AdminSessionResponse:
+    """Read-only session introspection for the configured legacy service.
+
+    The shared dependency verifies expiry and the current signed administrator
+    roster on each request. This endpoint neither creates nor extends a session.
+    """
+    if claims.auth_type != "evm" or claims.authority_slot not in range(3):
+        raise HTTPException(status_code=403, detail="A current EVM administrator session is required.")
+    response.headers["Cache-Control"] = "no-store"
+    return AdminSessionResponse(owner=claims.sub, authority_slot=claims.authority_slot)
 
 
 @router.post("/refresh", response_model=AdminRefreshResponse)

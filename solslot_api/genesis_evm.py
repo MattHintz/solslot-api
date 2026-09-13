@@ -66,6 +66,9 @@ def verify_genesis_evm_deployment(
 ) -> dict[str, Any]:
     """Verify the immutable deployment manifest against live Sepolia state."""
 
+    if 'enrollmentActivation' in plan or plan.get('evmChainId', 11155111) != 11155111:
+        from .genesis_permit_evm import verify_permit_deployment
+        return verify_permit_deployment(settings, record, plan)
     path = Path(settings.genesis_evm_deployment_path)
     if not path.is_file():
         raise GenesisEvmEvidenceError("genesis EVM deployment evidence is missing")

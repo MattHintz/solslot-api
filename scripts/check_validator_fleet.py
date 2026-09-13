@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from pathlib import Path
 
 from solslot_api.config import Settings
 from solslot_api.validator_quorum import probe_validator_health
@@ -19,6 +20,8 @@ async def main() -> int:
     parser.add_argument("--forwarder", required=True)
     parser.add_argument("--verifier-adapter", required=True)
     parser.add_argument("--attestation-emitter", required=True)
+    parser.add_argument("--enrollment-activation", type=Path,
+        help="Exact reviewed activation JSON for selected Base Sepolia signers; this does not approve activation.")
     artifact = parser.add_mutually_exclusive_group()
     artifact.add_argument(
         "--require-artifact-hash",
@@ -50,6 +53,8 @@ async def main() -> int:
             else None
         ),
         expected_artifact_hash=args.require_artifact_hash,
+        expected_enrollment_activation=(json.loads(args.enrollment_activation.read_text())
+            if args.enrollment_activation else None),
     )
     print(json.dumps([item.model_dump(mode="json") for item in health], indent=2))
     return 0

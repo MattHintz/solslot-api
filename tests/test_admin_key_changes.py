@@ -137,6 +137,9 @@ def test_direct_identity_safe_transaction_uses_the_standard_safe_tx_digest() -> 
 async def test_safe_transaction_reconstructs_the_approved_nonce_after_mining(
     monkeypatch,
 ) -> None:
+    from tests.test_safe_rpc_binding import safe_preimage, standard_transaction
+    expected_data = safe_preimage("0x" + "51" * 20, standard_transaction(nonce=7))
+    expected_hash = "0x" + keccak(expected_data).hex()
     calls: list[dict] = []
 
     async def reject_live_nonce(*_args, **_kwargs):
@@ -147,10 +150,10 @@ async def test_safe_transaction_reconstructs_the_approved_nonce_after_mining(
         call = params[0]
         calls.append(call)
         if len(calls) == 1:
-            return "0x" + "61" * 32
+            return expected_hash
         return "0x" + abi_encode(
             ["bytes"],
-            [bytes.fromhex("62" * 96)],
+            [expected_data],
         ).hex()
 
     monkeypatch.setattr(
@@ -170,8 +173,8 @@ async def test_safe_transaction_reconstructs_the_approved_nonce_after_mining(
 
     assert context["nonce"] == 7
     assert context["transaction"]["nonce"] == 7
-    assert context["transactionHash"] == "0x" + "61" * 32
-    assert context["transactionData"] == "0x" + "62" * 96
+    assert context["transactionHash"] == expected_hash
+    assert context["transactionData"] == "0x" + expected_data.hex()
     assert len(calls) == 2
     for call in calls:
         calldata = bytes.fromhex(call["data"][2:])

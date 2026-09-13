@@ -31,7 +31,12 @@ class PublishProposalMetadata(BaseModel):
     primary_purchase_usd_amount_minor: int | None = Field(
         None,
         gt=0,
-        description="Sealed per-deed USD price in minor units for the V2 primary offer",
+        description="Explicit inventory V2: sealed base USD minor units; fee added once. Historical V1 wire meaning is retained for reads.",
+    )
+
+    inventory_puzzle_version: int = Field(
+        1, ge=1, le=2, strict=True,
+        description="Governed inventory module version; omitted historical metadata remains V1",
     )
 
     @model_validator(mode="after")

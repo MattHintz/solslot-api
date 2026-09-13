@@ -60,7 +60,7 @@ from .external_settlement import (
 )
 from .faucet import Faucet
 from .launch_gates import require_operation_gate
-from .native_purchases import _load_context, _load_context_group
+from .native_purchases import _load_context_group
 from .omnichain_evidence import load_omnichain_evidence
 from .governance_queue import GovernanceQueueStore
 from .governance_sale_offer import (
@@ -71,7 +71,7 @@ from .governed_output_index import (
     CONFIRMED as GOVERNED_CONFIRMED,
     GovernedOutputConflict,
     GovernedOutputExpectation,
-    find_exact_governed_descendant,
+    EvaluatedBundleOutputs,
     get_governed_output_index,
     reconcile_governed_delivery,
 )
@@ -618,13 +618,22 @@ class StripeDeliveryWorker:
                 receipt_coin=receipt_coin,
                 expected_rail=expected_rail,
             )
-        context = await _load_context(
+        group = await _load_context_group(
             self.settings,
             self.provider,
             operation.purchase_id,
             require_live=False,
             allowed_rails=(expected_rail,),
         )
+        if (
+            group.batch is not None
+            or len(group.contexts) != 1
+            or group.contexts[0].purchase != purchase
+        ):
+            raise StripeDeliveryManualReview(
+                "Single SmartDeed differs from its canonical inventory"
+            )
+        context = group.contexts[0]
         if context.reservation is None:
             raise StripeDeliveryManualReview(
                 "SmartDeed reservation terms are unavailable"
@@ -695,7 +704,6 @@ class StripeDeliveryWorker:
             deed_coin=context.deed_coin,
             deed_singleton_struct=context.deed_struct,
             lineage_proof=context.deed_lineage,
-            artifact=purchase,
             terms=context.terms,
             reservation=context.reservation,
         )
@@ -706,14 +714,14 @@ class StripeDeliveryWorker:
                 [valid.aggregated_signature, quorum.aggregated_signature]
             ),
         )
-        additions = signed.additions()
+        evaluated = EvaluatedBundleOutputs(signed)
+        additions = evaluated.additions
         vault_full = SINGLETON_MOD.curry(
             context.deed_struct,
             puzzle_for_p2_vault(purchase.vault_launcher_id),
         )
         try:
-            deed_output = find_exact_governed_descendant(
-                signed,
+            deed_output = evaluated.find_exact_descendant(
                 ancestor_coin_id=context.deed_coin.name(),
                 puzzle_hash=bytes32(vault_full.get_tree_hash()),
                 amount=1,
@@ -889,7 +897,8 @@ class StripeDeliveryWorker:
                 [valid.aggregated_signature, quorum.aggregated_signature]
             ),
         )
-        additions = signed.additions()
+        evaluated = EvaluatedBundleOutputs(signed)
+        additions = evaluated.additions
         delivery_outputs: list[Coin] = []
         treasury_outputs: list[Coin] = []
         for context in group.contexts:
@@ -899,8 +908,7 @@ class StripeDeliveryWorker:
             )
             try:
                 delivery_outputs.append(
-                    find_exact_governed_descendant(
-                        signed,
+                    evaluated.find_exact_descendant(
                         ancestor_coin_id=context.deed_coin.name(),
                         puzzle_hash=bytes32(vault_full.get_tree_hash()),
                         amount=1,
@@ -1107,10 +1115,10 @@ class StripeDeliveryWorker:
             chain.sgt_tail_hash,
             recipient_inner,
         )
-        additions = signed.additions()
+        evaluated = EvaluatedBundleOutputs(signed)
+        additions = evaluated.additions
         try:
-            sgt_output = find_exact_governed_descendant(
-                signed,
+            sgt_output = evaluated.find_exact_descendant(
                 ancestor_coin_id=chain.sale_coin.name(),
                 puzzle_hash=bytes32(recipient_full.get_tree_hash()),
                 amount=terms.sgt_amount,

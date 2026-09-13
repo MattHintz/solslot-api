@@ -8,6 +8,7 @@ the underlying signed evidence remains downloadable for technical review.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import secrets
@@ -374,15 +375,21 @@ def require_launch_session(
         record = store.get(session.ceremony_id)
     except GenesisStoreError as exc:
         raise HTTPException(status_code=401, detail="Administrator launch no longer exists.") from exc
-    if session.wallet:
-        members = {int(item["slot"]): item for item in record["invitations"]}
-        member = members.get(session.slot)
-        if (
-            member is None
-            or not member.get("wallet_address")
-            or str(member["wallet_address"]).lower() != session.wallet
-        ):
-            raise HTTPException(status_code=403, detail="Wallet is not in the launch roster.")
+    from .admin_roster import current_launch_authority
+    try:
+        authority = current_launch_authority(settings, store, session.ceremony_id)
+        if authority.finalizing and (request.scope.get("method"), request.scope.get("path")) not in {
+            ("GET", "/admin/launch/workspace"), ("GET", "/admin/launch/audit"),
+            ("POST", "/admin/launch/progress"),
+        }:
+            raise ValueError("Finish the reserved genesis publication before other administrator actions.")
+        if session.setup:
+            if not authority.bootstrap or session.wallet or session.slot != OWNER_SLOT:
+                raise ValueError("Owner setup is no longer available.")
+        elif not session.wallet or authority.wallets.get(session.slot) != session.wallet:
+            raise ValueError("Wallet is not the current administrator for this launch slot.")
+    except (GenesisStoreError, ValueError) as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     return session
 
 
@@ -553,10 +560,86 @@ def _load_release_evidence(settings: Settings) -> dict[str, Any]:
     }
 
 
-def _plan_template_evidence(settings: Settings) -> dict[str, Any]:
+def _selected_template(settings: Settings, template: Mapping[str, Any], digest: str,
+        *, record: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
+    """Resolve selection from protected server evidence, never browser input."""
+    from solslot_puzzles.enrollment_activation import validate_enrollment_activation, exact_hex
+    from .genesis_permit_evm import _read, GenesisEvmEvidenceError
+    selected = (any(k in template for k in ("enrollmentActivation", "enrollment_activation"))
+        or settings.zkpassport_evm_chain_id != 11155111
+        or (record is not None and record["draft"].get("evmChainId", 11155111) != 11155111))
+    if not selected:
+        return None
+    try:
+        # This path requires independently pinned release bytes, unlike legacy
+        # setup where coordinates can still be installed after claiming a link.
+        _read(settings.launch_source_evidence_path, "release evidence",
+            (settings.launch_source_evidence_sha256 or "").removeprefix("0x"))
+        release = _load_release_evidence(settings)
+        body = PlanRequest.model_validate({**template, "fundingCoinIds": PLACEHOLDER_FUNDING_IDS})
+        active = body.enrollment_activation
+        if not isinstance(active, dict):
+            raise ValueError("selected launch requires a complete activation")
+        active = validate_enrollment_activation(active, source_shas=release["sourceShas"],
+            ceremony_id=active["deploymentId"], emitter=body.evm_addresses["attestationEmitter"],
+            validator_pubkeys=[exact_hex(k, 48, "validator") for k in body.validator_pubkeys],
+            environment=settings.runtime_environment + "-alpha")
+        if (settings.network != "testnet11" or settings.zkpassport_evm_chain_id != 84532
+                or settings.eip712_chain_id != 84532
+                or active["releaseIdentity"] != settings.enrollment_permit_release_identity
+                or active["issuerKeyRef"] != settings.enrollment_permit_issuer_key_ref
+                or active["issuerIdentityClientId"] != settings.enrollment_permit_identity_client_id
+                or active["reviewEvidenceSha256"] != settings.enrollment_deployment_review_sha256):
+            raise ValueError("selected launch differs from coordinator pins")
+        binding = {"evmChainId": 84532, "enrollmentActivation": active,
+            "launchPlanTemplateSha256": digest}
+        if record is not None and (record["ceremony_id"] != active["deploymentId"]
+                or any(record["draft"].get(k) != v for k,v in binding.items())
+                or record["draft"]["sourceShas"] != release["sourceShas"]
+                or record["draft"].get("releaseEvidenceHash") != release["fileSha256"]):
+            raise ValueError("protected launch selection changed after the original claim")
+        return binding
+    except (ValueError, KeyError, TypeError, GenesisEvmEvidenceError) as exc:
+        raise GenesisConflict(f"selected launch evidence is invalid: {exc}") from exc
+
+
+def _claim_selection(settings: Settings) -> dict[str, Any] | None:
+    path = Path(settings.launch_plan_template_path)
+    if not path.is_file() and settings.zkpassport_evm_chain_id == 11155111:
+        return None
+    from .genesis_permit_evm import _read, GenesisEvmEvidenceError
+    try:
+        template, digest = _read(str(path), "launch plan template")
+        return _selected_template(settings, template, digest)
+    except GenesisEvmEvidenceError as exc:
+        raise GenesisConflict(str(exc)) from exc
+
+
+def _ceremony_chain(record: Mapping[str, Any]) -> int:
+    chain = record["draft"].get("evmChainId", 11155111)
+    if type(chain) is not int or chain not in (11155111, 84532):
+        raise GenesisConflict("unsupported ceremony signing chain")
+    return chain
+
+
+def _ceremony_binding(record: Mapping[str, Any]) -> dict[str, Any]:
+    return {"ceremonyId": record["ceremony_id"], "evmChainId": _ceremony_chain(record)}
+
+
+def _selected_commitments(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    plan = record.get("plan") or {}
+    active = plan.get("enrollmentActivation") or record["draft"].get("enrollmentActivation")
+    if not isinstance(active, Mapping):
+        return None
+    return {k: active[k] for k in ("environment", "evmChainId", "deploymentId", "releaseIdentity",
+        "emitter", "issuer", "contextHash", "bridgePolicyHash", "reviewEvidenceSha256")}
+
+
+def _plan_template_evidence(settings: Settings, record: Mapping[str, Any] | None = None) -> dict[str, Any]:
     template, digest = _read_json_file(
         settings.launch_plan_template_path, "RC27 launch plan template"
     )
+    selection = _selected_template(settings, template, digest, record=record)
     template["fundingCoinIds"] = PLACEHOLDER_FUNDING_IDS
     plan = PlanRequest.model_validate(template)
 
@@ -583,6 +666,7 @@ def _plan_template_evidence(settings: Settings) -> dict[str, Any]:
         "fileSha256": "0x" + digest,
         "kosMintExecutePubkey": plan.kos_mint_execute_pubkey.lower(),
         "validatorCount": len(validator_pubkeys),
+        **({"enrollmentActivation": selection["enrollmentActivation"]} if selection else {}),
     }
 
 
@@ -593,6 +677,7 @@ def _resume_typed_data(
     wallet: str,
     nonce: str,
     expires_at: int,
+    chain_id: int = 11155111,
 ) -> dict[str, Any]:
     return {
         "types": {
@@ -610,7 +695,7 @@ def _resume_typed_data(
             ],
         },
         "primaryType": "SolslotLaunchResume",
-        "domain": {"name": "Solslot Alpha Launch", "version": "21", "chainId": 11155111},
+        "domain": {"name": "Solslot Alpha Launch", "version": "21", "chainId": chain_id},
         "message": {
             "ceremonyId": ceremony_id,
             "slot": slot,
@@ -628,6 +713,7 @@ def _action_typed_data(
     action_id: str,
     payload_hash: str,
     expires_at: int,
+    chain_id: int = 11155111,
 ) -> dict[str, Any]:
     return {
         "types": {
@@ -645,7 +731,7 @@ def _action_typed_data(
             ],
         },
         "primaryType": "SolslotLaunchAction",
-        "domain": {"name": "Solslot Alpha Launch", "version": "21", "chainId": 11155111},
+        "domain": {"name": "Solslot Alpha Launch", "version": "21", "chainId": chain_id},
         "message": {
             "ceremonyId": ceremony_id,
             "actionType": action_type,
@@ -707,7 +793,7 @@ def _gate_open(
         raise GenesisConflict("the server chain-write ceiling is closed")
     if gate_name == "ceremonyBroadcast" and not settings.ceremony_mode_enabled:
         raise GenesisConflict("the server ceremony ceiling is closed")
-    gate = store.gates(ceremony_id).get(gate_name)
+    gate = store.authorized_gate(settings, ceremony_id, gate_name)
     if (
         not gate
         or gate["configuredState"] != "open"
@@ -1154,7 +1240,7 @@ async def _readiness(
         )
 
     try:
-        plan_evidence = _plan_template_evidence(settings)
+        plan_evidence = _plan_template_evidence(settings, record)
         items.append(
             {
                 "id": "planInputs",
@@ -1191,10 +1277,11 @@ async def _readiness(
         {
             "id": "evmEvidence",
             "title": "Sepolia identity contracts",
-            "status": "Healthy" if evm_evidence_ready else "Blocked",
+            "status": "Waiting" if evm_evidence_ready else "Blocked",
+            "blocksCeremony": not evm_evidence_ready,
             "impact": (
-                "The Sepolia deployment evidence is installed. The wizard will "
-                "recheck receipts and contract code before launch."
+                "Deployment evidence is installed but not yet verified. Strict preflight "
+                "must confirm the selected chain, review, receipts and contract code."
                 if evm_evidence_ready
                 else (
                     "The Sepolia deployment evidence is not installed. "
@@ -1205,6 +1292,7 @@ async def _readiness(
             "action": None if evm_evidence_ready else "installEvmEvidence",
             "evidence": {
                 "deploymentEvidenceInstalled": deployment_path.is_file(),
+                "deploymentVerified": False,
                 "requiredConfirmations": settings.genesis_sepolia_confirmations,
             },
         }
@@ -1609,6 +1697,8 @@ def _public_ceremony(record: Mapping[str, Any], store: GenesisStore) -> dict[str
         "ceremonyId": record["ceremony_id"],
         "state": record["state"],
         "network": record["network"],
+        "evmChainId": _ceremony_chain(record),
+        "enrollmentCommitments": _selected_commitments(record),
         "createdAt": record["created_at"],
         "updatedAt": record["updated_at"],
         "administrators": administrators,
@@ -1652,20 +1742,28 @@ async def claim_owner_link(
         raise HTTPException(status_code=403, detail="Owner launch link is invalid.")
     try:
         release = _load_release_evidence(settings)
+        selection = _claim_selection(settings)
         active = store.claim_or_create_draft(
             token_hash=_token_hash(body.token),
-            ceremony_id="0x" + secrets.token_hex(32),
+            ceremony_id=selection["enrollmentActivation"]["deploymentId"] if selection else "0x" + secrets.token_hex(32),
             draft={
                 "schemaVersion": 2,
                 "sourceManifestVersion": SOURCE_MANIFEST_VERSION,
                 "network": "testnet11",
                 "evmChainId": 11155111,
+                **(selection or {}),
                 "reviewClass": settings.launch_genesis_review_class,
                 "releaseTag": release["releaseTag"],
                 "releaseEvidenceHash": release["fileSha256"],
                 "sourceShas": release["sourceShas"],
             },
         )
+        if selection and (active["ceremony_id"] != selection["enrollmentActivation"]["deploymentId"]
+                or any(active["draft"].get(k) != v for k,v in selection.items())
+                or active["draft"].get("releaseEvidenceHash") != release["fileSha256"]):
+            raise GenesisConflict("existing ceremony differs from protected selected launch")
+        if not selection and _ceremony_chain(active) != 11155111:
+            raise GenesisConflict("selected ceremony cannot resume as a legacy claim")
         ceremony_id = str(active["ceremony_id"])
         token = secrets.token_urlsafe(32)
         expires_at = int(time.time()) + settings.genesis_invitation_ttl_seconds
@@ -1717,6 +1815,7 @@ async def prepare_launch_invitation(
             "slot": invitation["slot"],
             "expiresAt": invitation["expires_at"],
             "typedData": typed,
+            "ceremonyBinding": _ceremony_binding(store.get(str(invitation["ceremony_id"]))),
         }
     except GenesisStoreError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1780,22 +1879,17 @@ async def resume_challenge(
             record = history[0] if history else None
         if record is None:
             raise GenesisNotFound("no active alpha launch")
-        member = next(
-            (
-                item
-                for item in record["invitations"]
-                if str(item.get("wallet_address") or "").lower() == wallet
-                and item.get("consumed_at")
-            ),
-            None,
-        )
-        if member is None:
+        from .admin_roster import current_launch_authority
+        authority = current_launch_authority(settings, store, str(record["ceremony_id"]))
+        slot = next((slot for slot, identity in authority.wallets.items() if identity == wallet), None)
+        if slot is None:
             raise GenesisNotFound("wallet is not enrolled for the active launch")
         nonce = "0x" + secrets.token_hex(32)
         expires_at = int(time.time()) + min(300, settings.challenge_ttl_seconds)
         store.create_auth_challenge(
             str(record["ceremony_id"]),
-            slot=int(member["slot"]),
+            settings=settings,
+            slot=slot,
             wallet_address=wallet,
             nonce_hash=_token_hash(nonce),
             expires_at=expires_at,
@@ -1803,9 +1897,11 @@ async def resume_challenge(
         return {
             "expiresAt": expires_at,
             "nonce": nonce,
+            "ceremonyBinding": _ceremony_binding(record),
             "typedData": _resume_typed_data(
                 ceremony_id=str(record["ceremony_id"]),
-                slot=int(member["slot"]),
+                chain_id=_ceremony_chain(record),
+                slot=slot,
                 wallet=wallet,
                 nonce=nonce,
                 expires_at=expires_at,
@@ -1831,6 +1927,7 @@ async def resume_login(
             raise GenesisExpired("administrator challenge expired or was already used")
         typed = _resume_typed_data(
             ceremony_id=str(challenge["ceremony_id"]),
+            chain_id=_ceremony_chain(store.get(str(challenge["ceremony_id"]))),
             slot=int(challenge["slot"]),
             wallet=wallet,
             nonce=body.nonce,
@@ -1840,6 +1937,7 @@ async def resume_login(
         if recovered.address.lower() != wallet:
             raise GenesisConflict("signature wallet changed")
         store.consume_auth_challenge(
+            settings=settings,
             nonce_hash=_token_hash(body.nonce), wallet_address=wallet
         )
         token, expires_at = _issue_session(
@@ -1883,18 +1981,26 @@ async def launch_workspace(
     if funding:
         funding_action_id, _ = _funding_payload(store, session.ceremony_id)
         action_approvals["funding"] = store.action_approvals(
-            session.ceremony_id, funding_action_id
+            session.ceremony_id, funding_action_id, settings=settings
         )
     for gate_name in store.gates(session.ceremony_id):
         gate_action_id, _ = _gate_payload(store, session.ceremony_id, gate_name)
         action_approvals[f"gate:{gate_name}"] = store.action_approvals(
-            session.ceremony_id, gate_action_id
+            session.ceremony_id, gate_action_id, settings=settings
         )
     abandon_intent = store.latest_action_intent(session.ceremony_id, "abandon")
     if abandon_intent and abandon_intent["state"] == "prepared":
         action_approvals["abandon"] = store.action_approvals(
-            session.ceremony_id, str(abandon_intent["actionId"])
+            session.ceremony_id, str(abandon_intent["actionId"]), settings=settings
         )
+    gate_states = store.gates(session.ceremony_id)
+    for gate_name, gate in gate_states.items():
+        if gate["state"] == "open":
+            try:
+                store.authorized_gate(settings, session.ceremony_id, gate_name)
+            except GenesisStoreError as exc:
+                gate["state"] = "closed"
+                gate["unavailableReason"] = str(exc)
     return {
         "session": {
             "slot": session.slot,
@@ -1906,7 +2012,7 @@ async def launch_workspace(
         "launch": _public_ceremony(record, store),
         "readiness": readiness,
         "nextTask": _task_for(record, readiness),
-        "gates": store.gates(session.ceremony_id),
+        "gates": gate_states,
         "actionApprovals": action_approvals,
         "notice": "TESTNET, NO REAL INVESTMENT OR LEGAL RIGHT.",
     }
@@ -2253,6 +2359,7 @@ async def prepare_launch_action(
         expires_at = int(time.time()) + 600
         typed = _action_typed_data(
             ceremony_id=session.ceremony_id,
+            chain_id=_ceremony_chain(store.get(session.ceremony_id)),
             action_type=body.action_type,
             action_id=action_id,
             payload_hash=payload_hash,
@@ -2273,6 +2380,7 @@ async def prepare_launch_action(
 @router.post("/actions/approve")
 async def approve_launch_action(
     body: ActionApproveRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[GenesisStore, Depends(get_genesis_store)],
     session: Annotated[LaunchSession, Depends(require_launch_session)],
 ) -> dict[str, Any]:
@@ -2288,6 +2396,7 @@ async def approve_launch_action(
             raise GenesisExpired("launch action signature expired")
         typed = _action_typed_data(
             ceremony_id=session.ceremony_id,
+            chain_id=_ceremony_chain(store.get(session.ceremony_id)),
             action_type=body.action_type,
             action_id=body.action_id,
             payload_hash=body.payload_hash.lower(),
@@ -2305,6 +2414,7 @@ async def approve_launch_action(
             signer_address=session.wallet or "",
             signature=body.signature,
             expires_at=body.expires_at,
+            settings=settings,
         )
     except (GenesisStoreError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -2337,6 +2447,7 @@ async def prepare_launch_abandonment(
         expires_at = int(time.time()) + 600
         typed = _action_typed_data(
             ceremony_id=session.ceremony_id,
+            chain_id=_ceremony_chain(store.get(session.ceremony_id)),
             action_type="abandon",
             action_id=action_id,
             payload_hash=payload_hash,
@@ -2356,6 +2467,7 @@ async def prepare_launch_abandonment(
 
 @router.post("/abandon/execute")
 async def execute_launch_abandonment(
+    settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[GenesisStore, Depends(get_genesis_store)],
     session: Annotated[LaunchSession, Depends(require_launch_session)],
 ) -> dict[str, Any]:
@@ -2365,7 +2477,7 @@ async def execute_launch_abandonment(
         if not intent or intent["state"] != "prepared":
             raise GenesisConflict("approved abandonment is unavailable")
         approval = store.action_approvals(
-            session.ceremony_id, str(intent["actionId"])
+            session.ceremony_id, str(intent["actionId"]), settings=settings
         )
         if not approval["approved"]:
             raise GenesisConflict("owner-plus-one abandonment approval is required")
@@ -2402,7 +2514,7 @@ async def activate_gate(
             detail="Complete and archive genesis before opening operational windows.",
         )
     action_id, _ = _gate_payload(store, session.ceremony_id, gate_name)
-    approval = store.action_approvals(session.ceremony_id, action_id)
+    approval = store.action_approvals(session.ceremony_id, action_id, settings=settings)
     if not approval["approved"]:
         raise HTTPException(status_code=409, detail="Owner-plus-one approval is required.")
     gate = store.gates(session.ceremony_id).get(gate_name)
@@ -2445,6 +2557,7 @@ async def activate_gate(
         closes_at=gate["closesAt"],
         payload_hash=gate["payloadHash"],
         state="open",
+        settings=settings,
     )
 
 
@@ -2459,7 +2572,7 @@ async def execute_fixed_funding(
     try:
         _funding_ceiling_open(settings)
         action_id, _ = _funding_payload(store, session.ceremony_id)
-        if not store.action_approvals(session.ceremony_id, action_id)["approved"]:
+        if not store.action_approvals(session.ceremony_id, action_id, settings=settings)["approved"]:
             raise GenesisConflict("owner-plus-one funding approval is required")
         receipt = store.funding_receipt(session.ceremony_id)
         assert receipt is not None
@@ -2606,13 +2719,23 @@ async def build_guided_plan(
         funding = store.funding_receipt(session.ceremony_id)
         if not funding or funding["state"] != "confirmed":
             raise GenesisConflict("confirm the fixed ceremony funding first")
-        template, _ = _read_json_file(
+        template, digest = _read_json_file(
             settings.launch_plan_template_path, "RC27 launch plan template"
         )
+        selection = _selected_template(settings, template, digest, record=record)
+        if selection:
+            from .genesis_permit_evm import verify_permit_deployment
+            active = selection["enrollmentActivation"]
+            projection = {"network": "testnet11", "evmChainId": 84532, "sourceShas": record["draft"]["sourceShas"],
+                "ceremonyId": record["ceremony_id"], "enrollmentActivation": active,
+                "validatorSet": {"threshold": 2, "pubkeys": template["validatorPubkeys"]},
+                "evmAddresses": template["evmAddresses"], "puzzleHashes": {"bridgePolicy": active["bridgePolicyHash"]}}
+            await asyncio.to_thread(verify_permit_deployment, settings,
+                {**record, "plan_input": {"enrollmentActivation": active}}, projection)
         template["fundingCoinIds"] = dict(funding["plan"]["fundingCoinIds"])
         body = PlanRequest.model_validate(template)
         return await create_plan(session.ceremony_id, body, settings, store)
-    except GenesisStoreError as exc:
+    except (GenesisStoreError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
@@ -2626,7 +2749,9 @@ async def guided_prepare_plan_signature(
         session.ceremony_id, SignaturePrepareRequest(slot=session.slot), store
     )
     record = store.get(session.ceremony_id)
+    prepared["ceremonyBinding"] = _ceremony_binding(record)
     prepared["decisionReceipt"] = {
+        "enrollmentCommitments": _selected_commitments(record),
         "title": "Approve the fixed Testnet11 launch plan",
         "network": "Testnet11",
         "financialEffect": "No payment is made by this signature.",
@@ -2784,7 +2909,10 @@ async def guided_prepare_artifact_signature(
     prepared = await prepare_artifact_signature(
         session.ceremony_id, SignaturePrepareRequest(slot=session.slot), store
     )
+    record = store.get(session.ceremony_id)
+    prepared["ceremonyBinding"] = _ceremony_binding(record)
     prepared["decisionReceipt"] = {
+        "enrollmentCommitments": _selected_commitments(record),
         "title": "Sign the permanent launch archive",
         "network": "Testnet11",
         "financialEffect": "No payment is made.",

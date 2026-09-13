@@ -28,7 +28,7 @@ def test_metrics_route_declares_admin_authentication() -> None:
 
 
 def test_metrics_returns_aggregate_snapshot() -> None:
-    body = alpha_metrics(Settings(runtime_environment="test"), _claims())
+    body = alpha_metrics(Settings(runtime_environment="test", admin_db_path=":memory:"), _claims())
     assert "timestamp" in body
     assert "flags" in body
     assert "presale" in body
@@ -39,6 +39,6 @@ def test_metrics_returns_aggregate_snapshot() -> None:
 
 
 def test_metrics_contains_no_secrets() -> None:
-    body_str = str(alpha_metrics(Settings(runtime_environment="test"), _claims()))
+    body_str = str(alpha_metrics(Settings(runtime_environment="test", admin_db_path=":memory:"), _claims()))
     for sensitive in ["token", "secret", "password", "key", "jwt", "private"]:
         assert sensitive not in body_str.lower() or sensitive in ("telemetry_event_count",)

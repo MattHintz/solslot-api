@@ -47,9 +47,13 @@ created until every gate in this document is green.
 
 ### Administrator authority
 
-- Interactive admin authority comes only from `SOLSLOT_ADMIN_RECORDS_PATH`.
-- The records launcher and computed `admins_hash` must match the current
-  admin-authority singleton or startup fails.
+- Deployed interactive admin authority comes only from the signed public
+  release artifact, revalidated against the current authority singleton and
+  genesis roster. Missing or invalid evidence fails closed.
+- `SOLSLOT_ADMIN_RECORDS_PATH` is retired in deployed environments and causes
+  startup rejection. Its parser is retained only in the explicit `test`
+  environment for historical unit tests; it cannot authorize staging or
+  production access.
 - A removed member loses access on the next request even if its JWT has not
   expired.
 - Ceremony bearer credentials cannot authorize post-genesis mutations.
@@ -86,7 +90,24 @@ created until every gate in this document is green.
 - Relay limits persist across processes and restarts and are keyed by source
   IP, owner, vault, nullifier, and bridge coin.
 - One relay is allowed per enrollment; request digests and forwarder nonces are
-  locked before submission.
+  locked before submission. The outer nonce is allocated across both owner
+  modes and all coordinator workers. Exact signed EVM bytes, their locally
+  derived transaction hash, owner, network, deployment and release context
+  commit to SQLite before any provider submission.
+- A provider timeout or mismatched response hash leaves the original relay
+  outcome unknown. Authenticated recovery checks its canonical receipt first
+  and may resend only the retained bytes within the original retry window.
+  Receipt lookup remains available after the window ends or writes are gated.
+  Historical reservations without signed bytes require explicit reconciliation;
+  they are never backfilled, renewed or recycled. Any unresolved historical
+  relay blocks new outer-nonce allocation across owners until reconciliation.
+- When writes are paused, an existing relay owner can reauthenticate into a
+  receipt-only session. That scope is rejected by ordinary vault mutation
+  routes and by exact-transaction dispatch, even after writes are reenabled.
+- EVM confirmation binds the transaction hash, chain, canonical block and every
+  event coordinate. Pending, removed or reverted events cannot mark a vault
+  verified. Browser refresh checks the server's retained relay before requesting
+  a new proof or wallet authorization.
 - Global gas budgets and the relay circuit breaker fail closed.
 - Public enrollment requests cannot spend the faucet or create bridge coins.
 - Bridge-pool replenishment requires current chain-bound admin authority.

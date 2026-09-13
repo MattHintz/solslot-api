@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 
 import pytest
+from eth_account import Account
+from tests.launch_authority_fixtures import install_signed_authority, open_signed_gate
 from fastapi import HTTPException
 
 from solslot_api.config import Settings
@@ -16,7 +18,7 @@ CONFIG_HASH = "0x" + "72" * 32
 
 
 def _settings(tmp_path) -> Settings:
-    return Settings(
+    settings = Settings(
         runtime_environment="test",
         network="testnet11",
         launch_control_enabled=True,
@@ -24,6 +26,9 @@ def _settings(tmp_path) -> Settings:
         launch_settlement_rehearsal_path=str(tmp_path / "settlement.json"),
         launch_rehearsal_config_hash=CONFIG_HASH,
     )
+
+    install_signed_authority(settings, CEREMONY_ID, [Account.from_key(index.to_bytes(32, "big")) for index in (501, 502, 503)])
+    return settings
 
 
 def _evidence(settings: Settings) -> dict:
@@ -134,15 +139,13 @@ def _evidence(settings: Settings) -> dict:
     }
 
 
-def _open_gate(store: GenesisStore, gate_name: str) -> None:
+def _open_gate(store: GenesisStore, gate_name: str, settings) -> None:
     now = int(time.time())
-    store.upsert_gate(
-        CEREMONY_ID,
-        gate_name=gate_name,
+    open_signed_gate(
+        store, settings, CEREMONY_ID, gate_name,
         opens_at=now - 1,
         closes_at=now + 600,
         payload_hash="0x" + "73" * 32,
-        state="open",
         now=now,
     )
 
@@ -159,7 +162,7 @@ def test_operational_windows_require_completed_genesis(tmp_path) -> None:
     settings = _settings(tmp_path)
     store = GenesisStore(settings.genesis_db_path)
     store.create_draft(CEREMONY_ID, {}, now=100)
-    _open_gate(store, "minting")
+    _open_gate(store, "minting", settings)
 
     with pytest.raises(HTTPException, match="signed alpha launch is not complete"):
         require_operation_gate(settings, "minting")
@@ -173,7 +176,7 @@ def test_purchase_windows_require_write_once_settlement_proof(tmp_path) -> None:
     store = GenesisStore(settings.genesis_db_path)
     store.create_draft(CEREMONY_ID, {}, now=100)
     _lock(store)
-    _open_gate(store, "purchases")
+    _open_gate(store, "purchases", settings)
 
     with pytest.raises(HTTPException, match="settlement rehearsal is not started"):
         require_operation_gate(settings, "purchases")

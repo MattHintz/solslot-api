@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 import pytest
+from tests.launch_authority_fixtures import install_signed_authority
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 from fastapi import FastAPI, HTTPException, Response
@@ -114,6 +115,8 @@ def _client(tmp_path) -> tuple[TestClient, GenesisStore, Settings]:
         admin_token=LEGACY_ADMIN_TOKEN,
         genesis_db_path=str(tmp_path / "genesis.db"),
         genesis_output_dir=str(tmp_path / "ceremonies"),
+        public_artifact_path=str(tmp_path / "not-published.json"),
+        bootstrap_manifest_path=str(tmp_path / "not-locked.json"),
     )
     store = GenesisStore(settings.genesis_db_path)
     app = FastAPI()
@@ -308,7 +311,8 @@ def _login(client: TestClient, account) -> None:
     assert login.status_code == 200, login.text
 
 
-def _mark_launch_locked(store: GenesisStore, ceremony_id: str) -> None:
+def _mark_launch_locked(store: GenesisStore, ceremony_id: str, settings, accounts) -> None:
+    install_signed_authority(settings, ceremony_id, accounts)
     with store._transaction() as connection:
         connection.execute(
             "UPDATE ceremonies SET state='locked' WHERE ceremony_id=?",
@@ -605,8 +609,8 @@ def test_owner_setup_cookie_can_replace_a_lost_enrollment_secret(tmp_path) -> No
 def test_settlement_rehearsal_is_coadmin_only_and_observes_stripe_vouchers(
     tmp_path, monkeypatch
 ) -> None:
-    client, store, _ = _client(tmp_path)
-    _, ceremony_id = _claim_and_enroll_owner(client)
+    client, store, settings = _client(tmp_path)
+    owner, ceremony_id = _claim_and_enroll_owner(client)
     rejected = client.post("/admin/launch/settlement-rehearsal/start")
     assert rejected.status_code == 403
     assert "coadministrator" in rejected.json()["detail"]
@@ -615,7 +619,7 @@ def test_settlement_rehearsal_is_coadmin_only_and_observes_stripe_vouchers(
     before_genesis = client.post("/admin/launch/settlement-rehearsal/start")
     assert before_genesis.status_code == 409
     assert "Complete genesis first" in before_genesis.json()["detail"]
-    _mark_launch_locked(store, ceremony_id)
+    _mark_launch_locked(store, ceremony_id, settings, [owner, coadmin])
 
     async def fake_start(
         _settings,
@@ -653,10 +657,10 @@ def test_settlement_rehearsal_is_coadmin_only_and_observes_stripe_vouchers(
 def test_purchase_gate_stays_locked_until_delivery_and_refund_are_proven(
     tmp_path,
 ) -> None:
-    client, store, _ = _client(tmp_path)
+    client, store, settings = _client(tmp_path)
     owner, ceremony_id = _claim_and_enroll_owner(client)
     coadmin = _enroll_coadmin(client)
-    _mark_launch_locked(store, ceremony_id)
+    _mark_launch_locked(store, ceremony_id, settings, [owner, coadmin])
     now = 2_000_000_000
     payload_hash = "0x" + "ab" * 32
     store.upsert_gate(
@@ -674,6 +678,7 @@ def test_purchase_gate_stays_locked_until_delivery_and_refund_are_proven(
     for slot, account in ((1, owner), (2, coadmin)):
         store.add_action_approval(
             ceremony_id,
+            settings=settings,
             action_id=action_id,
             action_type="gate:purchases",
             payload_hash=payload_hash,
@@ -723,7 +728,7 @@ async def test_approved_future_gate_is_configured_open_but_not_yet_effective(
             assert actual_ceremony_id == ceremony_id
             return {"ceremonyBroadcast": gate}
 
-        def action_approvals(self, actual_ceremony_id, action_id):
+        def action_approvals(self, actual_ceremony_id, action_id, *, settings):
             assert actual_ceremony_id == ceremony_id
             assert action_id.startswith("0x")
             return {"approved": True}
@@ -763,10 +768,10 @@ async def test_approved_future_gate_is_configured_open_but_not_yet_effective(
 
 
 def test_settlement_rehearsal_rejects_legacy_admin_wallet_transactions(tmp_path) -> None:
-    client, store, _ = _client(tmp_path)
-    _, ceremony_id = _claim_and_enroll_owner(client)
-    _enroll_coadmin(client)
-    _mark_launch_locked(store, ceremony_id)
+    client, store, settings = _client(tmp_path)
+    owner, ceremony_id = _claim_and_enroll_owner(client)
+    coadmin = _enroll_coadmin(client)
+    _mark_launch_locked(store, ceremony_id, settings, [owner, coadmin])
     store.set_settlement_rehearsal(
         ceremony_id,
         job_id="rehearsal_job_0001",
@@ -956,7 +961,7 @@ async def test_payment_activation_requires_completed_base_sepolia_ownership(
             return {"purchases": gate}
 
         @staticmethod
-        def action_approvals(actual_ceremony_id, _action_id):
+        def action_approvals(actual_ceremony_id, _action_id, *, settings):
             assert actual_ceremony_id == ceremony_id
             return {"approved": True}
 
@@ -1024,9 +1029,10 @@ def test_gate_open_returns_exact_signed_broadcast_authorization(tmp_path) -> Non
     }
 
     class GateStore:
-        def gates(self, actual_ceremony_id):
+        def authorized_gate(self, settings, actual_ceremony_id, gate_name):
             assert actual_ceremony_id == ceremony_id
-            return {"ceremonyBroadcast": gate}
+            assert gate_name == "ceremonyBroadcast"
+            return gate
 
     settings = Settings(
         runtime_environment="test",

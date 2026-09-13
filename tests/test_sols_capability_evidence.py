@@ -198,3 +198,75 @@ def test_capability_evidence_rejects_missing_runtime_code_hash(
             governed_root=ROOT,
             governed_records=[ROUTE],
         )
+
+
+def _v3_evidence(path: Path):
+    _write_evidence(path)
+    payload = json.loads(path.read_text())
+    payload.update(schemaVersion=3, network="testnet11", testOnly=True, environment="test", deploymentId="alpha-isolated", evidenceScope="warp-cat-bridge")
+    descriptor = payload["runtimeEvidence"]["adapters"][0]
+    descriptor.update({key: payload[key] for key in ("network", "environment", "deploymentId", "releaseTag", "sourceSha")})
+    descriptor.update(adapterVersion=1, evmChainId=84532)
+    descriptor["confirmation"] = {"observerVersion": 1, "chiaLockerPuzzleHash": "0x" + "21"*32, "chiaUnlockerPuzzleHash": "0x" + "22"*32, "chiaBridgePuzzleHash": "0x" + "23"*32, "chiaLockedAssetPuzzleHash": "0x" + "24"*32, "chiaSourceChain": "0x786368", "evmSourceChain": "0x627365", "requiredChiaConfirmations": 3, "requiredEvmConfirmations": 3, "mojoToTokenRatio": 10**15, "tipBps": 30}
+    payload["records"][0]["destinationChainId"] = "0x" + (84532).to_bytes(32,"big").hex()
+    payload["implementation"].update(chainTrialsPassed=True, chainTrialEvidenceRoot="0x" + "25"*32)
+    binding = dict(expected_network="testnet11", expected_environment="test", expected_deployment_id="alpha-isolated", expected_release_tag=payload["releaseTag"], expected_source_sha=payload["sourceSha"], require_runtime_binding=True)
+    return payload, binding
+
+
+def _rewrite(path, payload):
+    raw = json.dumps(payload, sort_keys=True).encode()
+    path.write_bytes(raw)
+    return hashlib.sha256(raw).hexdigest()
+
+
+def test_reviewed_isolated_testnet_evidence_is_supported(tmp_path):
+    path = tmp_path / "testnet.json"
+    payload, binding = _v3_evidence(path)
+    evidence = load_sols_capability_evidence(path_value=str(path), expected_sha256=_rewrite(path,payload), capability="warp-cat-bridge", **binding)
+    assert evidence.network == "testnet11"
+    assert evidence.deployment_id == "alpha-isolated"
+
+
+@pytest.mark.parametrize("field,value", [("environment","production"), ("network","mainnet"), ("deploymentId","beta"), ("releaseTag","unreviewed"), ("sourceSha","cd"*20), ("testOnly",False), ("evidenceScope","samuel-purchase-rail")])
+def test_runtime_evidence_rejects_cross_environment_and_purchase_scope(tmp_path, field, value):
+    path = tmp_path / "testnet.json"
+    payload, binding = _v3_evidence(path)
+    payload[field] = value
+    with pytest.raises(SolsCapabilityEvidenceError):
+        load_sols_capability_evidence(path_value=str(path), expected_sha256=_rewrite(path,payload), capability="warp-cat-bridge", **binding)
+
+
+@pytest.mark.parametrize("field,value", [("environment","production"), ("network","mainnet"), ("deploymentId","beta"), ("releaseTag","wrong"), ("sourceSha","cd"*20), ("evmChainId",8453), ("adapterVersion",2)])
+def test_adapter_cannot_cross_reviewed_release_or_network(tmp_path, field, value):
+    path = tmp_path / "testnet.json"
+    payload, binding = _v3_evidence(path)
+    payload["runtimeEvidence"]["adapters"][0][field] = value
+    with pytest.raises(SolsCapabilityEvidenceError):
+        load_sols_capability_evidence(path_value=str(path), expected_sha256=_rewrite(path,payload), capability="warp-cat-bridge", **binding)
+
+
+def test_historical_schema2_cannot_enable_runtime_execution(tmp_path):
+    path = tmp_path / "old.json"
+    digest = _write_evidence(path)
+    with pytest.raises(SolsCapabilityEvidenceError, match="schema 3"):
+        load_sols_capability_evidence(path_value=str(path), expected_sha256=digest, capability="warp-cat-bridge", require_runtime_binding=True)
+
+
+def test_fixtures_alone_cannot_enable_testnet_capability(tmp_path):
+    path = tmp_path / "testnet.json"
+    payload, binding = _v3_evidence(path)
+    payload["implementation"].pop("chainTrialsPassed")
+    with pytest.raises(SolsCapabilityEvidenceError, match="fixtures are insufficient"):
+        load_sols_capability_evidence(path_value=str(path), expected_sha256=_rewrite(path,payload), capability="warp-cat-bridge", **binding)
+
+
+def test_duplicate_adapter_record_is_rejected_before_advertising_execution(tmp_path):
+    path = tmp_path / "testnet.json"
+    payload, binding = _v3_evidence(path)
+    copy = dict(payload["runtimeEvidence"]["adapters"][0])
+    copy["adapterId"] = "second-adapter-same-route"
+    payload["runtimeEvidence"]["adapters"].append(copy)
+    payload["adapterIds"].append(copy["adapterId"])
+    with pytest.raises(SolsCapabilityEvidenceError, match="same governed record"):
+        load_sols_capability_evidence(path_value=str(path), expected_sha256=_rewrite(path,payload), capability="warp-cat-bridge", **binding)

@@ -96,3 +96,14 @@ def test_metadata_bytes_rejects_non_bytes32_field() -> None:
     metadata = _metadata(property_id_canon="0x01")
     with pytest.raises(ValueError, match="property_id_canon must be 32 bytes"):
         metadata_bytes(metadata)
+
+
+def test_inventory_version_metadata_is_explicit_and_historical_default_is_preserved():
+    assert metadata_bytes(_metadata())["inventory_puzzle_version"] == 1
+    assert metadata_bytes(_metadata(inventory_puzzle_version=2))["inventory_puzzle_version"] == 2
+
+
+@pytest.mark.parametrize("value", [0, 3, True, "2", 2.0, None])
+def test_inventory_version_metadata_rejects_unknown_or_coerced_values(value):
+    with pytest.raises(ValueError):
+        _metadata(inventory_puzzle_version=value)

@@ -565,7 +565,7 @@ class _Reader:
 
 
 @pytest.mark.asyncio
-async def test_bridge_and_liquidity_views_stay_preview_only_on_testnet() -> None:
+async def test_bridge_and_liquidity_views_require_isolated_evidence_on_testnet() -> None:
     chain_snapshot = {
         "statutes": {
             "registryVersion": 4,
@@ -594,6 +594,7 @@ async def test_bridge_and_liquidity_views_stay_preview_only_on_testnet() -> None
     }
     settings = Settings(
         network="testnet11",
+        alpha_writes_enabled=False,
         sols_bridge_enabled=True,
         sols_liquidity_enabled=True,
     )
@@ -604,7 +605,7 @@ async def test_bridge_and_liquidity_views_stay_preview_only_on_testnet() -> None
     governance = await governance_summary(settings, reader)
 
     assert bridge["mode"] == "PREVIEW"
-    assert bridge["activationState"] == "MAINNET_ONLY"
+    assert bridge["activationState"] == "AWAITING_RELEASE_EVIDENCE"
     assert bridge["routes"][0]["governedActive"] is True
     assert bridge["routes"][0]["executable"] is False
     assert {
@@ -615,10 +616,10 @@ async def test_bridge_and_liquidity_views_stay_preview_only_on_testnet() -> None
         "releaseEvidence": "WAITING",
         "adapter": "READY",
         "confirmationObserver": "WAITING",
-        "operatorGate": "READY",
+        "operatorGate": "WAITING",
     }
     assert liquidity["mode"] == "PREVIEW"
-    assert liquidity["activationState"] == "MAINNET_ONLY"
+    assert liquidity["activationState"] == "AWAITING_RELEASE_EVIDENCE"
     assert liquidity["venues"][0]["executable"] is False
     assert governance["statutesVersion"] == 4
     assert governance["minimumProposalStake"] == "10000"
@@ -658,12 +659,12 @@ async def test_feature_flags_cannot_bypass_missing_beta_adapter_evidence() -> No
     assert bridge["executable"] is False
     assert bridge["routes"][0]["executable"] is False
     assert bridge["activationState"] == "AWAITING_RELEASE_EVIDENCE"
-    assert "release evidence" in bridge["reason"]
+    assert "deployment" in bridge["reason"]
     assert liquidity["mode"] == "PREVIEW"
     assert liquidity["executable"] is False
     assert liquidity["venues"][0]["executable"] is False
     assert liquidity["activationState"] == "AWAITING_RELEASE_EVIDENCE"
-    assert "release evidence" in liquidity["reason"]
+    assert "deployment" in liquidity["reason"]
 
 
 def test_active_adapter_coverage_rejects_uninstalled_tibet_wallet_execution() -> None:

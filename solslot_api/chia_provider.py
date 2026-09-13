@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import ipaddress
 import logging
 import ssl
@@ -12,6 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Optional, TypeVar
 from urllib.parse import urlsplit
+from chia_rs import Coin
+from chia_rs.sized_bytes import bytes32
+from chia_rs.sized_ints import uint64
 
 from .coinset_client import CoinsetClient
 
@@ -563,13 +565,15 @@ def _input_coin_ids(spend_bundle_json: dict[str, Any]) -> list[str]:
         try:
             parent = bytes.fromhex(str(parent_value).removeprefix("0x"))
             puzzle_hash = bytes.fromhex(str(puzzle_value).removeprefix("0x"))
-            amount = int(coin["amount"])
-            amount_bytes = amount.to_bytes(8, "big")
+            raw_amount = coin["amount"]
+            if type(raw_amount) not in (str, int):
+                continue
+            amount = uint64(int(raw_amount))
         except (KeyError, OverflowError, TypeError, ValueError):
             continue
         if len(parent) != 32 or len(puzzle_hash) != 32:
             continue
-        result.append("0x" + hashlib.sha256(parent + puzzle_hash + amount_bytes).hexdigest())
+        result.append("0x" + Coin(bytes32(parent), bytes32(puzzle_hash), amount).name().hex())
     return result
 
 

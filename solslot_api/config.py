@@ -327,8 +327,6 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
     ):
         if not enabled:
             continue
-        if settings.network != "mainnet":
-            raise RuntimeError(f"{capability} execution is mainnet-only.")
         if not path_value or not digest or len(digest.removeprefix("0x")) != 64:
             raise RuntimeError(
                 f"{capability} execution requires checksum-pinned release evidence."
@@ -343,6 +341,7 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
                 path_value=path_value,
                 expected_sha256=digest,
                 capability=capability_id,
+                **settings.capability_evidence_binding(),
             )
         except SolsCapabilityEvidenceError as exc:
             raise RuntimeError(
@@ -668,6 +667,14 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
     # source and a circular trust dependency.
 
     expected_evm_chain_id = 1 if settings.network == "mainnet" else 11155111
+    permit_metadata = (settings.enrollment_permit_release_identity,
+        settings.enrollment_permit_issuer_key_ref, settings.enrollment_permit_identity_client_id)
+    if any(permit_metadata):
+        if settings.network != "testnet11" or not all(permit_metadata):
+            raise RuntimeError("Enrollment permit issuer metadata requires complete isolated Testnet configuration.")
+        expected_evm_chain_id = 84532
+    # This is a posture precheck, not activation authority. Every trust-critical
+    # call still verifies the full signed artifact and exact issuer/release pins.
     if settings.eip712_chain_id != expected_evm_chain_id:
         raise RuntimeError(
             "SOLSLOT_EIP712_CHAIN_ID does not match SOLSLOT_NETWORK: "
@@ -871,7 +878,24 @@ class Settings(BaseSettings):
     # necessary but never sufficient to make either customer action live.
     sols_bridge_enabled: bool = False
     sols_liquidity_enabled: bool = False
-    # Mainnet capability evidence is a reviewed JSON package whose exact
+    # Independent deployment pins; leaving any unset keeps execution closed.
+    sols_capability_deployment_id: Optional[str] = None
+    sols_capability_release_tag: Optional[str] = None
+    sols_capability_source_sha: Optional[str] = None
+    sols_capability_evm_rpc_url: Optional[str] = None
+    sols_capability_operations_path: str = "./state/sols_capability_operations.db"
+
+    def capability_evidence_binding(self) -> dict[str, object]:
+        return {
+            "expected_network": self.network,
+            "expected_environment": self.runtime_environment,
+            "expected_deployment_id": self.sols_capability_deployment_id,
+            "expected_release_tag": self.sols_capability_release_tag,
+            "expected_source_sha": self.sols_capability_source_sha,
+            "require_runtime_binding": True,
+        }
+
+    # Capability evidence is a reviewed JSON package whose exact
     # checksum is pinned by deployment. The API also binds its governed root
     # and records to reconstructed statutes before advertising execution.
     sols_bridge_release_evidence_path: Optional[str] = None
@@ -951,11 +975,17 @@ class Settings(BaseSettings):
     # coordinates come exclusively from the signed RC23 V4 public artifact.
     deployment_manifest_path: str = "./state/deployment_manifest_v2.json"
     public_artifact_path: str = "./state/public_artifact_v4.json"
+    # Public, version-pinned issuer coordinates only; private keys remain in Key Vault.
+    enrollment_permit_release_identity: str = ""
+    enrollment_permit_issuer_key_ref: str = ""
+    enrollment_permit_identity_client_id: str = ""
     bootstrap_manifest_path: str = "./state/bootstrap_manifest_v2.json"
     genesis_db_path: str = "./state/genesis_ceremony_v2.db"
     genesis_output_dir: str = "./state/genesis_ceremonies"
     genesis_audit_approval_path: str = "./state/genesis_audit_approval_v2.json"
     genesis_evm_deployment_path: str = "./state/genesis_evm_deployment_v2.json"
+    enrollment_deployment_review_path: str = ""
+    enrollment_deployment_review_sha256: str = ""
     genesis_invitation_ttl_seconds: int = Field(172800, ge=1800, le=172800)
     genesis_plan_ttl_seconds: int = Field(3600, ge=900, le=7200)
     genesis_sepolia_confirmations: int = Field(12, ge=12, le=12)
@@ -1213,6 +1243,9 @@ class Settings(BaseSettings):
     zkpassport_verifier_adapter_address: Optional[str] = None
     zkpassport_emitter_address: Optional[str] = None
     zkpassport_evm_min_confirmations: int = Field(12, ge=1)
+    # Admission bound only. Existing external authorizations have no lease;
+    # pending coins are never freed solely because local time has elapsed.
+    zkpassport_enrollment_max_pending_per_owner: int = Field(3, ge=1, le=20)
 
     # Persistent relay limits. Each axis is enforced independently so one
     # account, vault, source, or bridge coin cannot drain the sponsored key.

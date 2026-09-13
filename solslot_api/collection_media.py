@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -66,16 +67,19 @@ class CollectionMediaPipeline:
             candidate = filename.rsplit(".", 1)[1].lower()
             if candidate.isalnum() and len(candidate) <= 12:
                 extension = "." + candidate
+        identity = hashlib.sha256(json.dumps([collection_id, asset_id]).encode("utf-8")).hexdigest()
+        # A new namespace and per-attempt version preserve historical URLs and
+        # never collapse distinct IDs or filename extensions into the same key.
         object_key = (
-            f"{'private/' if private else ''}collections/{_safe_segment(collection_id)}/"
-            f"{_safe_segment(asset_id)}{extension}"
+            f"{'private/' if private else ''}collections/v2/{identity}/"
+            f"{uuid.uuid4().hex}/asset{extension}"
         )
         expires = self.settings.collection_s3_presign_ttl_seconds
         return {
             "objectKey": object_key,
             "uploadUrl": self._s3_signed_url("PUT", object_key, expires),
             "method": "PUT",
-            "headers": {},
+            "headers": {"If-None-Match": "*"},
             "expiresIn": expires,
         }
 
@@ -96,17 +100,8 @@ class CollectionMediaPipeline:
             follow_redirects=False,
             transport=self.transport,
         ) as client:
-            response = await client.get(download_url)
-            response.raise_for_status()
-            payload = response.content
-            if len(payload) > self.settings.collection_asset_max_bytes:
-                raise MediaVerificationError("uploaded object exceeds the configured size cap")
-            actual_sha256 = hashlib.sha256(payload).hexdigest()
+            payload, actual_sha256 = await self._read_bounded(client, download_url, expected_byte_size)
             actual_mime = _detect_mime(payload)
-            if len(payload) != expected_byte_size:
-                raise MediaVerificationError(
-                    f"byte-size mismatch: expected {expected_byte_size}, got {len(payload)}"
-                )
             if actual_sha256 != expected_sha256.lower():
                 raise MediaVerificationError("SHA-256 mismatch")
             if actual_mime != expected_mime_type.lower():
@@ -119,9 +114,9 @@ class CollectionMediaPipeline:
             await self._pin_cid(client, cid, asset_name, actual_sha256)
 
             https_url = self._public_s3_url(object_key)
-            await self._verify_remote_bytes(client, https_url, actual_sha256)
+            await self._verify_remote_bytes(client, https_url, actual_sha256, len(payload))
             gateway_url = self._gateway_url(cid)
-            await self._verify_remote_bytes(client, gateway_url, actual_sha256)
+            await self._verify_remote_bytes(client, gateway_url, actual_sha256, len(payload))
 
         return VerifiedMedia(
             sha256=actual_sha256,
@@ -152,17 +147,8 @@ class CollectionMediaPipeline:
             follow_redirects=False,
             transport=self.transport,
         ) as client:
-            response = await client.get(download_url)
-            response.raise_for_status()
-            payload = response.content
-            if len(payload) > self.settings.collection_asset_max_bytes:
-                raise MediaVerificationError("uploaded object exceeds the configured size cap")
-            actual_sha256 = hashlib.sha256(payload).hexdigest()
+            payload, actual_sha256 = await self._read_bounded(client, download_url, expected_byte_size)
             actual_mime = _detect_mime(payload)
-            if len(payload) != expected_byte_size:
-                raise MediaVerificationError(
-                    f"byte-size mismatch: expected {expected_byte_size}, got {len(payload)}"
-                )
             if actual_sha256 != expected_sha256.lower():
                 raise MediaVerificationError("SHA-256 mismatch")
             if actual_mime != expected_mime_type.lower():
@@ -258,15 +244,56 @@ class CollectionMediaPipeline:
         if returned_cid != cid:
             raise MediaVerificationError("pinning service acknowledged a different CID")
 
+    async def _read_bounded(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        expected_byte_size: int,
+        *,
+        retain: bool = True,
+    ) -> tuple[bytes, str]:
+        if not 0 < expected_byte_size <= self.settings.collection_asset_max_bytes:
+            raise MediaVerificationError("declared byte size exceeds the configured size cap")
+        payload = bytearray()
+        digest = hashlib.sha256()
+        size = 0
+        async with client.stream("GET", url, headers={"Accept-Encoding": "identity"}) as response:
+            response.raise_for_status()
+            # Reject compressed transfers before HTTPX can allocate decoded
+            # output. Object origins must honor the identity representation.
+            encoding = response.headers.get("content-encoding", "").strip().lower()
+            if encoding not in ("", "identity"):
+                raise MediaVerificationError("unsupported content encoding for media verification")
+            length = response.headers.get("content-length")
+            if length is not None:
+                try:
+                    declared_length = int(length)
+                except ValueError as exc:
+                    raise MediaVerificationError("invalid content length") from exc
+                if declared_length != expected_byte_size:
+                    raise MediaVerificationError("byte-size mismatch in content length")
+            async for chunk in response.aiter_bytes():
+                size += len(chunk)
+                if size > expected_byte_size:
+                    raise MediaVerificationError("download exceeds the declared size cap")
+                digest.update(chunk)
+                if retain:
+                    payload.extend(chunk)
+            if size != expected_byte_size:
+                raise MediaVerificationError(
+                    f"byte-size mismatch: expected {expected_byte_size}, got {size}"
+                )
+        return bytes(payload), digest.hexdigest()
+
     async def _verify_remote_bytes(
         self,
         client: httpx.AsyncClient,
         url: str,
         expected_sha256: str,
+        expected_byte_size: int,
     ) -> None:
-        response = await client.get(url)
-        response.raise_for_status()
-        if hashlib.sha256(response.content).hexdigest() != expected_sha256:
+        _, digest = await self._read_bounded(client, url, expected_byte_size, retain=False)
+        if digest != expected_sha256:
             raise MediaVerificationError(f"availability endpoint served altered bytes: {url}")
 
     def _public_s3_url(self, object_key: str) -> str:
@@ -299,20 +326,26 @@ class CollectionMediaPipeline:
         canonical_uri = path_prefix + "/" + "/".join(
             quote(part, safe="-_.~") for part in path_parts
         )
+        # The storage service must enforce create-only PUTs, including replay of
+        # the same URL after verification. Signing the condition prevents its
+        # removal or alteration by the uploader. GETs retain their old contract.
+        signed_headers = "host;if-none-match" if method.upper() == "PUT" else "host"
         params = {
             "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
             "X-Amz-Credential": credential,
             "X-Amz-Date": amz_date,
             "X-Amz-Expires": str(expires),
-            "X-Amz-SignedHeaders": "host",
+            "X-Amz-SignedHeaders": signed_headers,
         }
         canonical_query = "&".join(
             f"{quote(key, safe='-_.~')}={quote(value, safe='-_.~')}"
             for key, value in sorted(params.items())
         )
         canonical_headers = f"host:{endpoint.netloc.lower()}\n"
+        if method.upper() == "PUT":
+            canonical_headers += "if-none-match:*\n"
         canonical_request = "\n".join(
-            [method.upper(), canonical_uri, canonical_query, canonical_headers, "host", "UNSIGNED-PAYLOAD"]
+            [method.upper(), canonical_uri, canonical_query, canonical_headers, signed_headers, "UNSIGNED-PAYLOAD"]
         )
         string_to_sign = "\n".join(
             [
@@ -383,13 +416,6 @@ def _signature_key(secret: str, date: str, region: str, service: str) -> bytes:
     region_key = hmac.new(date_key, region.encode(), hashlib.sha256).digest()
     service_key = hmac.new(region_key, service.encode(), hashlib.sha256).digest()
     return hmac.new(service_key, b"aws4_request", hashlib.sha256).digest()
-
-
-def _safe_segment(value: str) -> str:
-    cleaned = "".join(char for char in value if char.isalnum() or char in "-_.")
-    if not cleaned or cleaned in {".", ".."}:
-        raise ValueError("collection and asset ids must contain URL-safe characters")
-    return cleaned[:160]
 
 
 def _detect_mime(payload: bytes) -> str:
