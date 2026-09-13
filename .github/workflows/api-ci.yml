@@ -16,7 +16,7 @@ env:
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
   # Coordinated candidate protocol source; publication of this exact commit
   # precedes API CI. Deployment environment pins remain separately governed.
-  PROTOCOL_REF: 453fa78e94bcb39ad9c510f588f98b4494d78a93
+  PROTOCOL_REF: 8258bfd7bed5f9cf2187a4b34be4993216c601d9
 
 jobs:
   verify:
