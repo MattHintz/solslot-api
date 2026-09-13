@@ -74,7 +74,8 @@ def coin_record(coin, *, confirmed=120, spent=0):
     }
 
 
-def delivery_case(tmp_path, monkeypatch, rail=PAYMENT_RAIL_STRIPE, inventory_version=1):
+def delivery_case(tmp_path, monkeypatch, rail=PAYMENT_RAIL_STRIPE, inventory_version=1,
+                  *, purchase_transform=None, reservation_expires_at=None, smart_deed_inner_hash=None):
     keys = tuple(AugSchemeMPL.key_gen(bytes([n]) * 32) for n in (1, 2, 3))
     pubkeys = tuple(bytes(k.get_g1()) for k in keys)
     base, _ = _context(keys[0], keys, now=1_900_000_000)
@@ -92,9 +93,12 @@ def delivery_case(tmp_path, monkeypatch, rail=PAYMENT_RAIL_STRIPE, inventory_ver
         oracle_price_usd_minor_per_asset=0,
         source_evidence_root=_b32(0),
     )
+    if purchase_transform is not None:
+        purchase = purchase_transform(purchase)
     terms = PrimaryMintTermsV3.for_artifact(
         artifact=purchase,
-        smart_deed_inner_hash=base.terms.smart_deed_inner_hash,
+        smart_deed_inner_hash=(base.terms.smart_deed_inner_hash
+            if smart_deed_inner_hash is None else smart_deed_inner_hash),
         inventory_version=inventory_version,
         deed_launcher_puzzle_hash=base.terms.deed_launcher_puzzle_hash,
         protocol_puzhash=purchase.protocol_treasury_puzzle_hash,
@@ -102,7 +106,8 @@ def delivery_case(tmp_path, monkeypatch, rail=PAYMENT_RAIL_STRIPE, inventory_ver
         provider_id=PRIMARY_PURCHASE_PROVIDER_ID,
     )
     reservation = InventoryReservationV1(
-        artifact=purchase, expires_at=purchase.quote_expires_at
+        artifact=purchase, expires_at=(purchase.quote_expires_at
+            if reservation_expires_at is None else reservation_expires_at)
     )
     available_puzzle = SINGLETON_MOD.curry(
         base.deed_struct, make_inventory_available_inner(terms)
@@ -325,6 +330,10 @@ def delivery_case(tmp_path, monkeypatch, rail=PAYMENT_RAIL_STRIPE, inventory_ver
         deed_struct=base.deed_struct,
         store=store,
         rail=rail,
+        keys=keys,
+        terms=terms,
+        genesis=genesis,
+        available=available,
     )
 
 
