@@ -63,8 +63,13 @@ signatures and expiry conditions, and reject a raw long initial reservation.
 The extension must occur before the current reservation expires. Its successor
 has a different parent, coin ID and lineage. Current API orchestration,
 independent authorization and durable successor reconciliation remain missing.
-Payment eligibility for extension must be settled before implementing a new
-signing path; the inspected documents do not authorize unpaid holds to renew.
+Extension orchestration must preserve the existing payment-hold policy: once
+card confirmation or ACH processing begins, the exact deed remains unavailable
+until an authoritative terminal state. Unresolved ACH moves to review after ten
+days without releasing inventory; automatic ACH retries remain disabled for
+alpha. Final payment success is required for fulfillment, not for retaining a
+processing payment's hold. A timeout is not payment-failure evidence. Renewal
+must still use the separately authorized V5 transition before current expiry.
 The long-lived snapshot tests are not evidence that this upstream path works.
 Presale alpha readiness remains blocked until that lifecycle is completed.
 
