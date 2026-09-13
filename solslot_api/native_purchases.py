@@ -1381,25 +1381,27 @@ async def _load_context(
                 raise PaymentArtifactError(
                     "presale reservation differs from its governed series"
                 )
-            presale_reservation_expiry = int(
+            presale_delivery_deadline = int(
                 series_terms.get("launchDeadline") or 0
             ) + DELIVERY_WINDOW_SECONDS
-            if presale_reservation_expiry <= int(time.time()):
+            if presale_delivery_deadline <= int(time.time()):
                 raise PaymentArtifactError(
                     "presale reservation delivery window has expired"
                 )
-        else:
-            presale_reservation_expiry = min(
-                purchase.quote_expires_at,
-                purchase.authorization_expires_at,
-            )
+        # PRESALE uses the same initial authorization bound as every other
+        # purchase. A longer hold needs a separate, timely V5 extension; the
+        # series delivery deadline does not authorize the initial reservation.
+        initial_reservation_expiry = min(
+            purchase.quote_expires_at,
+            purchase.authorization_expires_at,
+        )
         reservation = InventoryReservationV1(
             artifact=purchase,
             expires_at=(
                 stored.inventory_expires_at
                 if require_inventory_reservation
                 and stored.inventory_expires_at is not None
-                else presale_reservation_expiry
+                else initial_reservation_expiry
             ),
         )
         expected_puzzle = SINGLETON_MOD.curry(

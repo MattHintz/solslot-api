@@ -57,7 +57,7 @@ def assert_signed(bundle):
     assert AugSchemeMPL.aggregate_verify([pk for pk, _ in pairs], [msg for _, msg in pairs], bundle.aggregated_signature)
 
 
-async def handoff_case(tmp_path, monkeypatch, recovery):
+async def handoff_case(tmp_path, monkeypatch, recovery, *, purchase_transform=None):
     c = delivery_case(tmp_path, monkeypatch, inventory_version=2)
     c.settings = c.worker.settings
     old = (await native._load_context_group(c.settings, c.worker.provider, c.operation.purchase_id,
@@ -146,6 +146,8 @@ async def handoff_case(tmp_path, monkeypatch, recovery):
     c.fresh = replace(old.purchase, vault_launcher_id=_b32(62),
         vault_p2_puzzle_hash=puzzle_for_p2_vault(_b32(62)).get_tree_hash(), zkpassport_root=_b32(63),
         authorization_nonce=_b32(64), quote_expires_at=NOW+300, authorization_expires_at=NOW+600)
+    if purchase_transform is not None:
+        c.fresh = purchase_transform(c.fresh)
     receipt = credential(c.fresh, c.buyer)
     monkeypatch.setattr('solslot_api.zkpassport_enrollments._sync_chia_stamp',
         lambda *_: SimpleNamespace(status='chia_confirmed', receipt=SimpleNamespace(**receipt, model_dump=lambda: dict(receipt))))
