@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field, field_validator
 from solslot_puzzles.vault_driver import AUTH_TYPE_BLS, AUTH_TYPE_SECP256K1
 
 from .config import Settings
-from .credential_ledger import LedgerConflict, OwnerChallenge, get_credential_ledger
+from .credential_ledger import LedgerConflict, LedgerRateLimited, OwnerChallenge, get_credential_ledger, get_existing_credential_ledger
 from .evm_auth import recover_evm_signer
 from .state import VaultRecord, get_registry
 
@@ -67,6 +67,7 @@ class OwnerChallengeResponse(BaseModel):
 
 
 class VaultSessionResponse(BaseModel):
+    scope: Literal['vault', 'relay_recovery'] = 'vault'
     vaultLauncherId: str
     authType: Literal["evm", "chia_bls"]
     network: str
@@ -89,6 +90,7 @@ class VerifiedVaultSession:
     network: str
     expires_at: int
     vault_record: VaultRecord
+    scope: Literal['vault', 'relay_recovery'] = 'vault'
 
 
 VAULT_SESSION_COOKIE = "solslot_vault_session_v2"
@@ -106,6 +108,7 @@ def vault_session_payload(settings: Settings) -> dict[str, Any]:
 def issue_vault_session(
     settings: Settings,
     verified_owner: VerifiedOwner,
+    *, scope: Literal['vault', 'relay_recovery'] = 'vault',
 ) -> tuple[str, VaultSessionResponse]:
     secret = _vault_session_secret(settings)
     now = int(time.time())
@@ -116,6 +119,7 @@ def issue_vault_session(
         "aud": VAULT_SESSION_AUDIENCE,
         "sub": verified_owner.owner_key,
         "jti": secrets.token_hex(16),
+        "scope": scope,
         "iat": now,
         "exp": expires_at,
         "vaultLauncherId": vault,
@@ -125,6 +129,7 @@ def issue_vault_session(
     }
     token = pyjwt.encode(claims, secret, algorithm="HS256")
     return token, VaultSessionResponse(
+        scope=scope,
         vaultLauncherId=vault,
         authType=verified_owner.auth_type,
         network=settings.network,
@@ -136,6 +141,7 @@ def verify_vault_session(
     settings: Settings,
     request: Request,
     vault_launcher_id: str,
+    *, allow_recovery: bool = False,
 ) -> VerifiedVaultSession:
     vault = normalize_hex32(vault_launcher_id, "vaultLauncherId")
     token = request.cookies.get(VAULT_SESSION_COOKIE)
@@ -176,6 +182,9 @@ def verify_vault_session(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="The vault-owner session does not match this vault and network.",
         )
+    scope = claims.get('scope', 'vault')
+    if scope not in ('vault', 'relay_recovery') or (scope == 'relay_recovery' and not allow_recovery):
+        raise HTTPException(status_code=403, detail='This session can only check retained relay receipts. Reconnect when writes are available.')
     record = require_vault_record(vault)
     expected_owner = (
         record.owner_evm_address.lower()
@@ -198,6 +207,7 @@ def verify_vault_session(
         network=settings.network,
         expires_at=int(claims["exp"]),
         vault_record=record,
+        scope=scope,
     )
 
 
@@ -335,14 +345,24 @@ def require_vault_record(vault_launcher_id: str) -> VaultRecord:
     return record
 
 
+def _require_credential_action(settings: Settings, action: str, vault: str) -> None:
+    if action == 'session_login' and not settings.alpha_writes_enabled:
+        # A write freeze must not lock an owner out of an existing receipt.
+        # The login route issues a restricted recovery session in this state.
+        ledger = get_existing_credential_ledger(settings)
+        if ledger is not None and ledger.get_relay_attempt(vault) is not None:
+            return
+    require_alpha_writes(settings)
+
+
 def issue_owner_challenge(
     settings: Settings,
     *,
     vault_launcher_id: str,
     request: OwnerChallengeRequest,
 ) -> OwnerChallengeResponse:
-    require_alpha_writes(settings)
     vault = normalize_hex32(vault_launcher_id, "vaultLauncherId")
+    _require_credential_action(settings, request.action, vault)
     record = require_vault_record(vault)
     if record.auth_type == AUTH_TYPE_SECP256K1 and record.owner_evm_address:
         auth_type: Literal["evm", "chia_bls"] = "evm"
@@ -354,13 +374,17 @@ def issue_owner_challenge(
             detail="This vault authorization type cannot stamp V2 credentials.",
         )
     payload_hash = credential_payload_hash(request.action, vault, request.payload)
-    challenge = get_credential_ledger(settings).issue_owner_challenge(
-        vault_launcher_id=vault,
-        action=request.action,
-        payload_hash=payload_hash,
-        auth_type=auth_type,
-        ttl_seconds=settings.zkpassport_owner_challenge_ttl_seconds,
-    )
+    try:
+        challenge = get_credential_ledger(settings).issue_owner_challenge(
+            vault_launcher_id=vault,
+            action=request.action,
+            payload_hash=payload_hash,
+            auth_type=auth_type,
+            ttl_seconds=settings.zkpassport_owner_challenge_ttl_seconds,
+            max_pending=settings.challenge_store_max_pending,
+        )
+    except LedgerRateLimited as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
     return OwnerChallengeResponse(
         challengeId=challenge.challenge_id,
         vaultLauncherId=vault,
@@ -385,8 +409,8 @@ def verify_owner_auth(
     payload: dict[str, Any],
     owner_auth: OwnerAuth,
 ) -> VerifiedOwner:
-    require_alpha_writes(settings)
     vault = normalize_hex32(vault_launcher_id, "vaultLauncherId")
+    _require_credential_action(settings, action, vault)
     record = require_vault_record(vault)
     payload_hash = credential_payload_hash(action, vault, payload)
     ledger = get_credential_ledger(settings)

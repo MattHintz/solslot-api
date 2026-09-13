@@ -182,11 +182,11 @@ def test_guided_launch_requires_a_separate_owner_claim_token() -> None:
 
 
 def test_customer_bridge_and_liquidity_cannot_execute_on_testnet() -> None:
-    with pytest.raises(RuntimeError, match="bridge execution is mainnet-only"):
+    with pytest.raises(RuntimeError, match="bridge execution requires checksum-pinned release evidence"):
         validate_server_hardening_at_startup(
             _staging(sols_bridge_enabled=True)
         )
-    with pytest.raises(RuntimeError, match="liquidity execution is mainnet-only"):
+    with pytest.raises(RuntimeError, match="liquidity execution requires checksum-pinned release evidence"):
         validate_server_hardening_at_startup(
             _staging(sols_liquidity_enabled=True)
         )

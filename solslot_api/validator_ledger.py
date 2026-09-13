@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 class ValidatorLedgerConflict(RuntimeError):
@@ -203,6 +204,39 @@ class ValidatorLedger:
                     COMMIT;
                     """
                 )
+
+                version = 9
+            if version < 10:
+                # Preserve the entire v9 table as immutable historical evidence.
+                # A separate active pointer permits expiry without deleting a
+                # signed claim or weakening permanent purchase uniqueness.
+                self._conn.executescript("""
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE inventory_reservation_history (
+                        claim_hash TEXT PRIMARY KEY,
+                        canonical_claim TEXT NOT NULL,
+                        purchase_id TEXT NOT NULL UNIQUE,
+                        available_coin_id TEXT NOT NULL,
+                        signature TEXT NOT NULL,
+                        signed_at INTEGER NOT NULL
+                    );
+                    INSERT INTO inventory_reservation_history
+                        SELECT * FROM inventory_reservation_signatures;
+                    CREATE TABLE inventory_reservation_active (
+                        available_coin_id TEXT PRIMARY KEY,
+                        claim_hash TEXT NOT NULL UNIQUE
+                    );
+                    INSERT INTO inventory_reservation_active
+                        SELECT available_coin_id,claim_hash FROM inventory_reservation_signatures;
+                    CREATE TABLE inventory_reservation_retirements (
+                        claim_hash TEXT PRIMARY KEY,
+                        replacement_claim_hash TEXT NOT NULL UNIQUE,
+                        evidence_json TEXT NOT NULL,
+                        retired_at INTEGER NOT NULL
+                    );
+                    PRAGMA user_version = 10;
+                    COMMIT;
+                """)
 
     def record_or_recover(
         self,
@@ -485,60 +519,77 @@ class ValidatorLedger:
                 self._conn.execute("ROLLBACK")
                 raise
 
-    def record_inventory_reservation_or_recover(
-        self,
-        *,
-        claim_hash: str,
-        canonical_claim: str,
-        purchase_id: str,
-        available_coin_id: str,
-        signature: str,
-    ) -> str:
-        """Record one exact inventory reservation or recover an exact retry."""
-
+    def active_inventory_authorization(self, available_coin_id: str) -> dict | None:
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                "SELECT h.* FROM inventory_reservation_active a "
+                "JOIN inventory_reservation_history h ON h.claim_hash=a.claim_hash "
+                "WHERE a.available_coin_id=?", (available_coin_id,)).fetchone()
+            return dict(row) if row is not None else None
+
+    def inventory_retirement(self, claim_hash: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM inventory_reservation_retirements WHERE claim_hash=?",
+                                     (claim_hash,)).fetchone()
+            return dict(row) if row is not None else None
+
+    def record_inventory_reservation_or_recover(
+        self, *, claim_hash: str, canonical_claim: str, purchase_id: str,
+        available_coin_id: str, signature: str,
+        retire_claim_hash: str | None = None, retirement_evidence: dict | None = None,
+    ) -> str:
+        """Atomically retire an independently verified claim and record its successor.
+
+        Retirement evidence is produced by the private signer, never accepted
+        from a public request. Every old claim/purchase and signature survives.
+        """
+        if (retire_claim_hash is None) != (retirement_evidence is None):
+            raise ValidatorLedgerConflict('Inventory retirement evidence is incomplete.')
+        if retirement_evidence is not None:
+            if (retirement_evidence.get('schema') != 'solslot.validator-inventory-retirement.v1'
+                    or retirement_evidence.get('claimHash') != retire_claim_hash
+                    or retirement_evidence.get('replacementClaimHash') != claim_hash
+                    or retirement_evidence.get('sourceCoinId') != available_coin_id):
+                raise ValidatorLedgerConflict('Inventory retirement evidence differs from its claim.')
+            encoded = json.dumps(retirement_evidence, sort_keys=True, separators=(',', ':'))
+        with self._lock:
+            self._conn.execute('BEGIN IMMEDIATE')
             try:
-                existing = self._conn.execute(
-                    """
-                    SELECT canonical_claim, signature
-                    FROM inventory_reservation_signatures
-                    WHERE claim_hash = ?
-                    """,
-                    (claim_hash,),
-                ).fetchone()
+                active = self._conn.execute('SELECT claim_hash FROM inventory_reservation_active WHERE available_coin_id=?',
+                                            (available_coin_id,)).fetchone()
+                existing = self._conn.execute('SELECT * FROM inventory_reservation_history WHERE claim_hash=?',
+                                              (claim_hash,)).fetchone()
                 if existing is not None:
-                    if existing["canonical_claim"] != canonical_claim:
-                        raise ValidatorLedgerConflict(
-                            "Reservation claim hash collides with different evidence."
-                        )
-                    self._conn.execute("COMMIT")
-                    return str(existing["signature"])
-                self._conn.execute(
-                    """
-                    INSERT INTO inventory_reservation_signatures(
-                        claim_hash, canonical_claim, purchase_id,
-                        available_coin_id, signature, signed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        claim_hash,
-                        canonical_claim,
-                        purchase_id,
-                        available_coin_id,
-                        signature,
-                        int(time.time()),
-                    ),
-                )
-                self._conn.execute("COMMIT")
+                    if (existing['canonical_claim'] != canonical_claim or existing['purchase_id'] != purchase_id
+                            or existing['available_coin_id'] != available_coin_id):
+                        raise ValidatorLedgerConflict('Reservation claim hash collides with different evidence.')
+                    if active is None or active['claim_hash'] != claim_hash:
+                        raise ValidatorLedgerConflict('This inventory authorization was retired and cannot be replayed.')
+                    self._conn.execute('COMMIT')
+                    return str(existing['signature'])
+                if active is not None and active['claim_hash'] != retire_claim_hash:
+                    raise ValidatorLedgerConflict('Purchase or available SmartDeed coin was already reserved.')
+                if active is None and retire_claim_hash is not None:
+                    raise ValidatorLedgerConflict('Inventory authorization changed during retirement proof.')
+                self._conn.execute('INSERT INTO inventory_reservation_history VALUES (?,?,?,?,?,?)',
+                    (claim_hash, canonical_claim, purchase_id, available_coin_id, signature, int(time.time())))
+                if active is None:
+                    self._conn.execute('INSERT INTO inventory_reservation_active VALUES (?,?)', (available_coin_id,claim_hash))
+                else:
+                    self._conn.execute('INSERT INTO inventory_reservation_retirements VALUES (?,?,?,?)',
+                        (retire_claim_hash, claim_hash, encoded, int(time.time())))
+                    changed = self._conn.execute('UPDATE inventory_reservation_active SET claim_hash=? '
+                        'WHERE available_coin_id=? AND claim_hash=?', (claim_hash,available_coin_id,retire_claim_hash))
+                    if changed.rowcount != 1:
+                        raise ValidatorLedgerConflict('Inventory authorization changed during retirement proof.')
+                self._conn.execute('COMMIT')
                 return signature
             except sqlite3.IntegrityError as exc:
-                self._conn.execute("ROLLBACK")
-                raise ValidatorLedgerConflict(
-                    "Purchase or available SmartDeed coin was already reserved."
-                ) from exc
+                self._conn.execute('ROLLBACK')
+                raise ValidatorLedgerConflict('Purchase or available SmartDeed coin was already reserved.') from exc
             except Exception:
-                self._conn.execute("ROLLBACK")
+                if self._conn.in_transaction:
+                    self._conn.execute('ROLLBACK')
                 raise
 
     def record_voucher_issuance_or_recover(

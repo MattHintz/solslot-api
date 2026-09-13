@@ -10,7 +10,7 @@ enumerable during the alpha.
 from __future__ import annotations
 
 import time
-from typing import Annotated, Optional
+from typing import Annotated
 
 from fastapi import APIRouter, Depends
 
@@ -21,50 +21,23 @@ router = APIRouter(prefix="/alpha", tags=["alpha-ops"])
 
 
 def _presale_metrics(settings: Settings) -> dict:
-    """Aggregate presale/voucher metrics from the in-process store."""
+    """Read current persisted presale/voucher totals, or report unavailable."""
     try:
-        from .presale_endpoints import _store
+        from .presale_endpoints import get_presale_store
 
-        if _store is None:
-            return {"available": False}
-        rows = _store._conn.execute(
-            "SELECT phase, COUNT(*) as cnt FROM presale_series GROUP BY phase"
-        ).fetchall()
-        series_by_phase = {r["phase"]: r["cnt"] for r in rows}
-
-        voucher_rows = _store._conn.execute(
-            "SELECT status, COUNT(*) as cnt FROM voucher_records GROUP BY status"
-        ).fetchall()
-        vouchers_by_status = {r["status"]: r["cnt"] for r in voucher_rows}
-
-        stale_rows = _store._conn.execute(
-            "SELECT COUNT(*) as cnt FROM voucher_records "
-            "WHERE status = 'ACTIVE' AND rowid IN ("
-            "  SELECT rowid FROM voucher_records WHERE status = 'ACTIVE'"
-            ")"
-        ).fetchone()
-
-        return {
-            "available": True,
-            "series_by_phase": series_by_phase,
-            "vouchers_by_status": vouchers_by_status,
-            "active_voucher_count": stale_rows["cnt"] if stale_rows else 0,
-        }
+        return {"available": True, **get_presale_store(settings).aggregate_counts()}
     except Exception:
         return {"available": False}
 
 
-def _telemetry_metrics() -> dict:
-    """Aggregate telemetry/bug-report counts."""
+def _telemetry_metrics(settings: Settings) -> dict:
+    """Distinguish a successful zero count from unavailable storage."""
     try:
-        from .alpha_observability import _telemetry_store, _bug_report_store
+        from .alpha_observability import get_alpha_observability_store
 
-        return {
-            "telemetry_event_count": len(_telemetry_store),
-            "bug_report_count": len(_bug_report_store),
-        }
+        return {"available": True, **get_alpha_observability_store(settings).aggregate_counts()}
     except Exception:
-        return {"telemetry_event_count": 0, "bug_report_count": 0}
+        return {"available": False}
 
 
 @router.get("/metrics")
@@ -85,5 +58,5 @@ def alpha_metrics(
             "payment_omnichain_enabled": settings.payment_omnichain_enabled,
         },
         "presale": _presale_metrics(settings),
-        "telemetry": _telemetry_metrics(),
+        "telemetry": _telemetry_metrics(settings),
     }

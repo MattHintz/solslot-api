@@ -574,3 +574,27 @@ class TestRefresh:
             headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 403
+
+
+def test_session_introspection_requires_bearer(client):
+    assert client.get("/admin/auth/session").status_code == 401
+    assert client.get("/admin/auth/session", headers={"X-Solslot-Admin-Subject": _TEST_ADDRESS}).status_code == 401
+
+
+def test_session_introspection_returns_only_current_authority(client, settings_with_admin):
+    token, _ = issue_jwt(sub=_TEST_ADDRESS_LOWER, auth_type="evm", settings=settings_with_admin, authority_slot=0)
+    response = client.get("/admin/auth/session", headers={"Authorization": "Bearer " + token})
+    assert response.status_code == 200
+    assert response.json() == {"active": True, "owner": _TEST_ADDRESS_LOWER, "authority_slot": 0}
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_session_introspection_rechecks_revocation(client, settings_with_admin, monkeypatch):
+    token, _ = issue_jwt(sub=_TEST_ADDRESS_LOWER, auth_type="evm", settings=settings_with_admin, authority_slot=0)
+    monkeypatch.setattr(admin_auth, "_effective_admin_allowlist", lambda settings: {_OTHER_ACCT.address.lower()})
+    assert client.get("/admin/auth/session", headers={"Authorization": "Bearer " + token}).status_code == 403
+
+
+def test_session_introspection_rejects_legacy_unbound_slot(client, settings_with_admin):
+    token, _ = issue_jwt(sub=_TEST_ADDRESS_LOWER, auth_type="evm", settings=settings_with_admin)
+    assert client.get("/admin/auth/session", headers={"Authorization": "Bearer " + token}).status_code == 403

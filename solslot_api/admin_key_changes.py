@@ -2446,14 +2446,16 @@ def _case_actions(
     return actions
 
 
-def _safe_typed_data_digest(typed_data: Mapping[str, Any]) -> str:
+def _safe_typed_data_preimage(typed_data: Mapping[str, Any]) -> bytes:
     try:
         signable = encode_typed_data(full_message=dict(typed_data))
     except (TypeError, ValueError) as exc:
         raise ValueError("Authority V3 Safe signing data is invalid") from exc
-    return "0x" + keccak(
-        b"\x19" + bytes(signable.version) + signable.header + signable.body
-    ).hex()
+    return b"\x19" + bytes(signable.version) + signable.header + signable.body
+
+
+def _safe_typed_data_digest(typed_data: Mapping[str, Any]) -> str:
+    return "0x" + keccak(_safe_typed_data_preimage(typed_data)).hex()
 
 
 def _normalize_safe_eoa_signature(signature: str) -> bytes:
@@ -2607,6 +2609,10 @@ async def _safe_transaction_context(
         "refundReceiver": ZERO_EVM_ADDRESS,
         "nonce": nonce,
     }
+    local_data = _safe_typed_data_preimage(
+        _safe_transaction_typed_data(safe, transaction)
+    )
+    local_hash = "0x" + keccak(local_data).hex()
     argument_types = [
         "address",
         "uint256",
@@ -2652,7 +2658,7 @@ async def _safe_transaction_context(
             )
         )
 
-    transaction_hash = _hex_value(
+    rpc_hash = _hex_value(
         await call(
             "getTransactionHash("
             "address,uint256,bytes,uint8,uint256,uint256,uint256,"
@@ -2661,29 +2667,24 @@ async def _safe_transaction_context(
         64,
         "Safe transaction hash",
     )
+    if rpc_hash != local_hash:
+        raise ValueError("Safe transaction hash differs from the local EIP-712 action")
     encoded_result = await call(
         "encodeTransactionData("
         "address,uint256,bytes,uint8,uint256,uint256,uint256,"
         "address,address,uint256)"
     )
-    try:
-        transaction_data = (
-            "0x"
-            + bytes(
-                abi_decode(
-                    ["bytes"],
-                    bytes.fromhex(encoded_result[2:]),
-                )[0]
-            ).hex()
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Safe transaction data response is malformed") from exc
+    # Compare the complete canonical ABI result. This also rejects malformed,
+    # truncated and trailing data without parsing provider-controlled offsets.
+    expected_result = "0x" + abi_encode(["bytes"], [local_data]).hex()
+    if encoded_result.lower() != expected_result:
+        raise ValueError("Safe transaction data differs from the local EIP-712 action")
     return {
         "safe": safe,
         "nonce": nonce,
         "transaction": transaction,
-        "transactionHash": transaction_hash,
-        "transactionData": transaction_data,
+        "transactionHash": local_hash,
+        "transactionData": "0x" + local_data.hex(),
     }
 
 

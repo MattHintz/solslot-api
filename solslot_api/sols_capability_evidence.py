@@ -40,6 +40,9 @@ class SolsCapabilityEvidence:
     records: tuple[dict[str, Any], ...]
     runtime_evidence_root: str
     sha256: str
+    environment: str | None = None
+    network: str = "mainnet"
+    deployment_id: str | None = None
 
 
 def load_sols_capability_evidence(
@@ -49,8 +52,18 @@ def load_sols_capability_evidence(
     capability: CapabilityName,
     governed_root: str | None = None,
     governed_records: Sequence[Mapping[str, Any]] | None = None,
+    expected_network: str = "mainnet",
+    expected_environment: str | None = None,
+    expected_deployment_id: str | None = None,
+    expected_release_tag: str | None = None,
+    expected_source_sha: str | None = None,
+    require_runtime_binding: bool = False,
 ) -> SolsCapabilityEvidence:
-    """Load exact, mainnet-only release evidence and bind it to statutes.
+    """Load exact release evidence and bind it to statutes and deployment.
+
+    Schema 2 is retained for offline historical review only. Runtime callers
+    require schema 3 and explicit deployment coordinates; fixtures never enable
+    a different environment or substitute purchase-rail evidence for a bridge.
 
     The expected SHA-256 is a deployment input recorded by the signed release
     manifest. The evidence then binds the reviewed adapter/runtime package to
@@ -83,16 +96,34 @@ def load_sols_capability_evidence(
     if not isinstance(payload, Mapping):
         raise SolsCapabilityEvidenceError("release evidence must be an object")
     if (
-        payload.get("schemaVersion") != 2
+        payload.get("schemaVersion") not in {2, 3}
         or payload.get("kind") != "solslot-sols-capability-release"
         or payload.get("capability") != capability
-        or payload.get("network") != "mainnet"
+        or payload.get("network") != expected_network
         or payload.get("auditStatus") != "reviewed"
-        or payload.get("testOnly") is not False
+        or payload.get("testOnly") is not (expected_network == "testnet11")
     ):
         raise SolsCapabilityEvidenceError(
-            "release evidence is not an approved mainnet capability package"
+            "release evidence is not an approved network-bound capability package"
         )
+
+    if expected_network not in {"mainnet", "testnet11"}:
+        raise SolsCapabilityEvidenceError("unsupported capability network")
+    if require_runtime_binding or payload.get("schemaVersion") == 3:
+        if payload.get("schemaVersion") != 3:
+            raise SolsCapabilityEvidenceError("runtime execution requires schema 3 deployment binding")
+        for key, expected in (
+            ("environment", expected_environment),
+            ("deploymentId", expected_deployment_id),
+            ("releaseTag", expected_release_tag),
+            ("sourceSha", expected_source_sha),
+        ):
+            if not expected or payload.get(key) != expected:
+                raise SolsCapabilityEvidenceError(f"release evidence {key} does not match runtime")
+        if payload.get("environment") not in {"development", "test", "staging", "production"}:
+            raise SolsCapabilityEvidenceError("unsupported capability environment")
+        if payload.get("evidenceScope") != capability:
+            raise SolsCapabilityEvidenceError("evidence scope is not the customer capability")
 
     release_tag = _nonempty(payload.get("releaseTag"), "releaseTag")
     source_sha = _hex(payload.get("sourceSha"), 20, "sourceSha")
@@ -122,6 +153,11 @@ def load_sols_capability_evidence(
         raise SolsCapabilityEvidenceError(
             "capability adapter implementation is incomplete"
         )
+
+    if payload.get("schemaVersion") == 3:
+        if implementation.get("chainTrialsPassed") is not True:
+            raise SolsCapabilityEvidenceError("reviewed chain trials are not complete; fixtures are insufficient")
+        _hex(implementation.get("chainTrialEvidenceRoot"), 32, "chainTrialEvidenceRoot")
 
     adapter_values = payload.get("adapterIds")
     if not isinstance(adapter_values, list) or not adapter_values:
@@ -164,7 +200,26 @@ def load_sols_capability_evidence(
         raise SolsCapabilityEvidenceError(
             "records must have unique routeId or venueId values"
         )
+    descriptor_record_ids = [str(item.get("recordId", "")).lower() for item in adapter_descriptors]
+    if len(set(descriptor_record_ids)) != len(descriptor_record_ids):
+        raise SolsCapabilityEvidenceError("multiple runtime adapters target the same governed record")
     for index, descriptor in enumerate(adapter_descriptors):
+        if payload.get("schemaVersion") == 3:
+            for key in ("environment", "network", "deploymentId", "releaseTag", "sourceSha"):
+                if descriptor.get(key) != payload.get(key):
+                    raise SolsCapabilityEvidenceError(f"runtime adapter {key} is not release-bound")
+            if descriptor.get("kind") == "WARP_CAT":
+                from .sols_bridge_observer import validate_observer_descriptor
+                try:
+                    validate_observer_descriptor(descriptor)
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise SolsCapabilityEvidenceError(f"invalid Warp observer evidence: {exc}") from exc
+            if descriptor.get("adapterVersion") != 1:
+                raise SolsCapabilityEvidenceError("runtime adapter version is not installed")
+            chain_id = descriptor.get("evmChainId")
+            allowed_chains = {1, 8453} if expected_network == "mainnet" else {11155111, 84532}
+            if descriptor.get("kind") != "TIBETSWAP_V2" and (type(chain_id) is not int or chain_id not in allowed_chains):
+                raise SolsCapabilityEvidenceError("runtime adapter EVM chain crosses the network boundary")
         descriptor_record_id = _nonempty(
             descriptor.get("recordId"),
             f"runtimeEvidence.adapters[{index}].recordId",
@@ -210,6 +265,9 @@ def load_sols_capability_evidence(
         records=records,
         runtime_evidence_root=runtime_root,
         sha256=digest,
+        environment=payload.get("environment"),
+        network=expected_network,
+        deployment_id=payload.get("deploymentId"),
     )
 
 

@@ -13,6 +13,7 @@ from pathlib import Path
 import sqlite3
 import time
 from typing import Any, Iterator, Mapping, Sequence
+from types import MappingProxyType
 
 from chia.types.blockchain_format.coin import Coin
 from chia_rs.sized_bytes import bytes32
@@ -36,6 +37,70 @@ class GovernedOutputConflict(RuntimeError):
     pass
 
 
+@dataclass(frozen=True, init=False)
+class EvaluatedBundleOutputs:
+    """One immutable evaluation of one exact local transaction bundle.
+
+    Construct this only after the complete bundle is built. It is request-local:
+    no caller-supplied additions and no cache shared with a later or fee-funded
+    bundle. Each lookup retains the original exact ancestry checks.
+    """
+
+    additions: tuple[Coin, ...]
+    _additions_by_id: Mapping[bytes32, Coin]
+    _removals_by_id: Mapping[bytes32, Coin]
+    _destinations: Mapping[tuple[bytes32, int], tuple[Coin, ...]]
+
+    def __init__(self, bundle: Any) -> None:
+        additions = tuple(bundle.additions())
+        removals = tuple(bundle.removals())
+        object.__setattr__(self, "additions", additions)
+        object.__setattr__(self, "_additions_by_id", MappingProxyType(
+            {coin.name(): coin for coin in additions}))
+        object.__setattr__(self, "_removals_by_id", MappingProxyType(
+            {coin.name(): coin for coin in removals}))
+        destinations: dict[tuple[bytes32, int], list[Coin]] = {}
+        for coin in additions:
+            destinations.setdefault((coin.puzzle_hash, int(coin.amount)), []).append(coin)
+        object.__setattr__(self, "_destinations", MappingProxyType(
+            {key: tuple(coins) for key, coins in destinations.items()}))
+
+    def find_exact_descendant(
+        self, *, ancestor_coin_id: bytes32, puzzle_hash: bytes32, amount: int, label: str,
+    ) -> Coin:
+        """Require one destination reached through created-and-spent parents."""
+        matches = self._destinations.get((puzzle_hash, amount), ())
+        if len(matches) != 1:
+            raise GovernedOutputConflict(
+                f"bundle must create exactly one {label} output"
+            )
+        output = matches[0]
+        current = output
+        visited: set[bytes32] = set()
+        while current.parent_coin_info != ancestor_coin_id:
+            parent_id = current.parent_coin_info
+            if parent_id in visited:
+                raise GovernedOutputConflict(
+                    f"{label} output ancestry contains a cycle"
+                )
+            visited.add(parent_id)
+            parent = self._removals_by_id.get(parent_id)
+            if (
+                parent is None
+                or self._additions_by_id.get(parent_id) != parent
+                or int(parent.amount) != amount
+            ):
+                raise GovernedOutputConflict(
+                    f"{label} output does not descend from its governed input"
+                )
+            current = parent
+        if ancestor_coin_id not in self._removals_by_id:
+            raise GovernedOutputConflict(
+                f"{label} governed input is absent from the atomic bundle"
+            )
+        return output
+
+
 def find_exact_governed_descendant(
     bundle: Any,
     *,
@@ -44,52 +109,11 @@ def find_exact_governed_descendant(
     amount: int,
     label: str,
 ) -> Coin:
-    """Find one final output and prove its in-bundle ancestry.
-
-    Chia offers may move a singleton through an ephemeral offer coin before
-    creating the requested destination.  The final output therefore need not
-    have the original singleton as its direct parent, but every intermediate
-    parent must be both created and spent in this exact atomic bundle.
-    """
-
-    additions = tuple(bundle.additions())
-    removals = tuple(bundle.removals())
-    matches = tuple(
-        coin
-        for coin in additions
-        if coin.puzzle_hash == puzzle_hash and int(coin.amount) == amount
+    """Compatibility entry point for a single lookup on one exact bundle."""
+    return EvaluatedBundleOutputs(bundle).find_exact_descendant(
+        ancestor_coin_id=ancestor_coin_id, puzzle_hash=puzzle_hash,
+        amount=amount, label=label,
     )
-    if len(matches) != 1:
-        raise GovernedOutputConflict(
-            f"bundle must create exactly one {label} output"
-        )
-    output = matches[0]
-    removals_by_id = {coin.name(): coin for coin in removals}
-    additions_by_id = {coin.name(): coin for coin in additions}
-    current = output
-    visited: set[bytes32] = set()
-    while current.parent_coin_info != ancestor_coin_id:
-        parent_id = current.parent_coin_info
-        if parent_id in visited:
-            raise GovernedOutputConflict(
-                f"{label} output ancestry contains a cycle"
-            )
-        visited.add(parent_id)
-        parent = removals_by_id.get(parent_id)
-        if (
-            parent is None
-            or additions_by_id.get(parent_id) != parent
-            or int(parent.amount) != amount
-        ):
-            raise GovernedOutputConflict(
-                f"{label} output does not descend from its governed input"
-            )
-        current = parent
-    if ancestor_coin_id not in removals_by_id:
-        raise GovernedOutputConflict(
-            f"{label} governed input is absent from the atomic bundle"
-        )
-    return output
 
 
 @dataclass(frozen=True)

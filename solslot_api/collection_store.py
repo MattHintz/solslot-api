@@ -318,7 +318,11 @@ class CollectionStore:
             title=title,
         )
         chosen_slug = slug or _slugify(title)
+        if draft.collection_id != collection_id:
+            raise ValueError("collection ID must match its metadata representation exactly")
         with self._lock, self._txn() as cur:
+            if cur.execute("SELECT 1 FROM property_collections WHERE slug=?", (collection_id,)).fetchone():
+                raise CollectionConflict("collection ID conflicts with an existing public slug")
             chosen_slug = self._unique_slug(cur, chosen_slug)
             try:
                 cur.execute(
@@ -373,7 +377,7 @@ class CollectionStore:
 
     def get(self, identifier: str, *, include_related: bool = True) -> dict[str, Any]:
         with self._lock:
-            row = self._collection_row(identifier)
+            row = self._collection_row(identifier, allow_slug=True)
             return self._render_collection(row, include_related=include_related)
 
     def update_draft(
@@ -495,7 +499,8 @@ class CollectionStore:
                 cur, collection_id, actor_subject, "ASSET_DECLARED",
                 {"assetId": asset_id, "revision": revision, "visibility": visibility},
             )
-        return self.get_asset(collection_id, asset_id)
+            result = self._render_asset(self._asset_row(collection_id, asset_id, cur=cur))
+        return result
 
     def mark_asset_uploaded(
         self,
@@ -504,12 +509,14 @@ class CollectionStore:
         *,
         object_key: str,
         actor_subject: str,
+        expected_revision: Optional[int] = None,
     ) -> dict[str, Any]:
         return self._update_asset(
             collection_id,
             asset_id,
             actor_subject=actor_subject,
             action="ASSET_UPLOADED",
+            expected_revision=expected_revision,
             updates={"object_key": object_key, "state": "UPLOADED", "failure_reason": None},
         )
 
@@ -520,6 +527,7 @@ class CollectionStore:
         *,
         object_key: str,
         actor_subject: str,
+        expected_revision: Optional[int] = None,
     ) -> dict[str, Any]:
         """Remember the presigned destination without claiming upload success."""
         return self._update_asset(
@@ -527,6 +535,7 @@ class CollectionStore:
             asset_id,
             actor_subject=actor_subject,
             action="ASSET_UPLOAD_AUTHORIZED",
+            expected_revision=expected_revision,
             updates={"object_key": object_key, "state": "PENDING_UPLOAD"},
         )
 
@@ -543,9 +552,12 @@ class CollectionStore:
         ipfs_cid: Optional[str],
         availability_status: str,
         actor_subject: str,
+        expected_revision: Optional[int] = None,
     ) -> dict[str, Any]:
         with self._lock:
             asset = self._asset_row(collection_id, asset_id)
+            if expected_revision is not None:
+                self._require_revision(asset, expected_revision)
         mismatches: list[str] = []
         if actual_sha256.lower() != asset["expected_sha256"]:
             mismatches.append("SHA-256")
@@ -559,6 +571,7 @@ class CollectionStore:
                 asset_id,
                 reason="verified bytes do not match declared " + ", ".join(mismatches),
                 actor_subject=actor_subject,
+                expected_revision=int(asset["revision"]),
             )
             raise CollectionConflict("asset verification mismatch: " + ", ".join(mismatches))
         if asset["visibility"] == "PRIVATE":
@@ -576,6 +589,7 @@ class CollectionStore:
             asset_id,
             actor_subject=actor_subject,
             action="ASSET_VERIFIED",
+            expected_revision=int(asset["revision"]),
             updates={
                 "actual_sha256": actual_sha256.lower(),
                 "actual_mime_type": actual_mime_type.lower(),
@@ -596,12 +610,14 @@ class CollectionStore:
         *,
         reason: str,
         actor_subject: str,
+        expected_revision: Optional[int] = None,
     ) -> dict[str, Any]:
         return self._update_asset(
             collection_id,
             asset_id,
             actor_subject=actor_subject,
             action="ASSET_FAILED",
+            expected_revision=expected_revision,
             updates={"state": "FAILED", "failure_reason": reason},
         )
 
@@ -727,7 +743,7 @@ class CollectionStore:
 
     def readiness(self, collection_id: str) -> dict[str, Any]:
         with self._lock:
-            row = self._collection_row(collection_id)
+            row = self._collection_row(collection_id, allow_slug=True)
             draft = PropertyDossierDraftV1.model_validate_json(row["dossier_json"])
             assets = {
                 asset["asset_id"]: asset
@@ -1161,19 +1177,19 @@ class CollectionStore:
 
     def versions(self, collection_id: str) -> list[dict[str, Any]]:
         with self._lock:
-            self._collection_row(collection_id)
+            collection = self._collection_row(collection_id, allow_slug=True)
             rows = self._conn.execute(
                 "SELECT * FROM property_metadata_versions WHERE collection_id=? ORDER BY sequence",
-                (collection_id,),
+                (collection["id"],),
             ).fetchall()
         return [self._render_version(row) for row in rows]
 
     def audit_events(self, collection_id: str) -> list[dict[str, Any]]:
         with self._lock:
-            self._collection_row(collection_id)
+            collection = self._collection_row(collection_id, allow_slug=True)
             rows = self._conn.execute(
                 "SELECT * FROM property_collection_audit_events WHERE collection_id=? ORDER BY id",
-                (collection_id,),
+                (collection["id"],),
             ).fetchall()
         return [
             {
@@ -1189,7 +1205,7 @@ class CollectionStore:
         if result["state"] != "PUBLISHED":
             raise CollectionNotFound(identifier)
         with self._lock:
-            row = self._collection_row(identifier)
+            row = self._collection_row(identifier, allow_slug=True)
             canonical_json = row["canonical_json"]
         if canonical_json is None:
             raise CollectionInvalidState(
@@ -1310,6 +1326,7 @@ class CollectionStore:
         actor_subject: str,
         action: str,
         updates: dict[str, Any],
+        expected_revision: Optional[int] = None,
     ) -> dict[str, Any]:
         allowed = {
             "object_key", "verified_https_url", "ipfs_cid", "actual_sha256",
@@ -1321,8 +1338,23 @@ class CollectionStore:
         if "state" in updates and updates["state"] not in ASSET_STATES:
             raise ValueError("invalid asset state")
         with self._lock, self._txn() as cur:
-            self._collection_row(collection_id, cur=cur)
+            collection = self._collection_row(collection_id, cur=cur)
             current = self._asset_row(collection_id, asset_id, cur=cur)
+            if expected_revision is not None:
+                self._require_revision(current, expected_revision)
+            if "object_key" in updates:
+                if collection["state"] == "SEALED":
+                    raise CollectionInvalidState("sealed asset storage is immutable")
+                if current["object_key"] and current["object_key"] != updates["object_key"]:
+                    raise CollectionConflict("asset object key is immutable for this upload attempt")
+                if current["state"] in ("PINNED", "VERIFIED"):
+                    raise CollectionConflict("verified assets cannot be authorized for another upload")
+                if cur.execute(
+                    "SELECT 1 FROM property_collection_assets WHERE object_key=? "
+                    "AND NOT (collection_id=? AND asset_id=?)",
+                    (updates["object_key"], collection_id, asset_id),
+                ).fetchone():
+                    raise CollectionConflict("object key is already assigned to another asset")
             assignments = [f"{name}=?" for name in updates]
             values = list(updates.values())
             assignments.extend(["revision=?", "updated_at=?"])
@@ -1333,7 +1365,8 @@ class CollectionStore:
                 values,
             )
             self._audit(cur, collection_id, actor_subject, action, {"assetId": asset_id})
-        return self.get_asset(collection_id, asset_id)
+            result = self._render_asset(self._asset_row(collection_id, asset_id, cur=cur))
+        return result
 
     def _sync_deeds(
         self,
@@ -1533,12 +1566,16 @@ class CollectionStore:
             "checkedAt": row["checked_at"],
         }
 
-    def _collection_row(self, identifier: str, *, cur: Optional[sqlite3.Cursor] = None) -> sqlite3.Row:
+    def _collection_row(
+        self, identifier: str, *, cur: Optional[sqlite3.Cursor] = None, allow_slug: bool = False
+    ) -> sqlite3.Row:
         db = cur or self._conn
         row = db.execute(
-            "SELECT * FROM property_collections WHERE id=? OR slug=?",
-            (identifier, identifier),
+            "SELECT * FROM property_collections WHERE id=?",
+            (identifier,),
         ).fetchone()
+        if row is None and allow_slug:
+            row = db.execute("SELECT * FROM property_collections WHERE slug=?", (identifier,)).fetchone()
         if row is None:
             raise CollectionNotFound(identifier)
         return row
@@ -1581,7 +1618,7 @@ class CollectionStore:
         base = _slugify(candidate)
         slug = base
         counter = 2
-        while cur.execute("SELECT 1 FROM property_collections WHERE slug=?", (slug,)).fetchone():
+        while cur.execute("SELECT 1 FROM property_collections WHERE slug=? OR id=?", (slug, slug)).fetchone():
             slug = f"{base}-{counter}"
             counter += 1
         return slug

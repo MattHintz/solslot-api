@@ -490,10 +490,16 @@ def _validate_collection_publish_context(
     fee_bps = int(offering.get("royaltyBps") or 0)
     technology_fee = (base_usd_amount * fee_bps + 9_999) // 10_000
     expected_usd_amount = base_usd_amount + technology_fee
+    if metadata.inventory_puzzle_version == 2:
+        # Explicit V2 carries the base price. Protocol CLVM adds the agreed fee
+        # exactly once. Historical version-1 wire semantics remain unchanged.
+        expected_usd_amount = base_usd_amount
+        if fee_bps != 100:
+            raise HTTPException(status_code=409, detail="inventory V2 alpha technology fee must be 100 basis points")
     if metadata.primary_purchase_usd_amount_minor != expected_usd_amount:
         raise HTTPException(
             status_code=409,
-            detail="primary purchase USD amount does not match the sealed base price plus technology fee",
+            detail="primary purchase USD amount does not match the sealed allocation and inventory version",
         )
     if deed["proposalId"] not in (None, proposal_id):
         raise HTTPException(status_code=409, detail="deed allocation row already has a proposal")
@@ -688,6 +694,7 @@ async def _publish_mint_bundle(
         "owner_member_hash": body.proposal_metadata.owner_member_hash.lower(),
         "gov_member_hash": body.proposal_metadata.gov_member_hash.lower(),
         "proposal_data_hash": "0x" + canonical.proposal_data_hash.hex(),
+        "inventory_puzzle_version": body.proposal_metadata.inventory_puzzle_version,
         **(
             {
                 "metadata_root": str(body.proposal_metadata.metadata_root).lower(),

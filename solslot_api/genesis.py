@@ -71,6 +71,7 @@ class ApiModel(BaseModel):
 
 
 class DraftRequest(ApiModel):
+    evm_chain_id: Literal[11155111,84532] = Field(11155111,alias="evmChainId")
     source_shas: dict[str, str] = Field(alias="sourceShas")
     review_class: Literal[
         "independent-release-review", "internal-engineering-testnet"
@@ -139,6 +140,7 @@ class ProtocolParameters(ApiModel):
 class PlanRequest(ApiModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
+    enrollment_activation: dict[str, Any] | None = Field(default=None, alias="enrollmentActivation")
     evm_addresses: dict[str, str] = Field(alias="evmAddresses")
     funding_coin_ids: FundingCoinIds = Field(alias="fundingCoinIds")
     faucet_puzzle_hash: str = Field(alias="faucetPuzzleHash")
@@ -350,6 +352,7 @@ def _plan_typed_data(record: Mapping[str, Any]) -> dict[str, Any]:
         roster_hash=str(record["roster_hash"]),
         plan_hash=str(record["plan_hash"]),
         expires_at=int(record["plan_expires_at"]),
+        chain_id=record.get('draft',{}).get('evmChainId',11155111),
     )
 
 
@@ -626,7 +629,7 @@ def _ceremony_broadcast_gate_authorization(
         raise GenesisConflict("the server chain-write ceiling is closed")
     if not settings.ceremony_mode_enabled:
         raise GenesisConflict("the server ceremony ceiling is closed")
-    gate = store.gates(ceremony_id).get("ceremonyBroadcast")
+    gate = store.authorized_gate(settings, ceremony_id, "ceremonyBroadcast")
     if (
         not gate
         or gate["configuredState"] != "open"
@@ -843,7 +846,7 @@ async def create_draft(
         "schemaVersion": 2,
         "sourceManifestVersion": SOURCE_MANIFEST_VERSION,
         "network": "testnet11",
-        "evmChainId": 11155111,
+        "evmChainId": body.evm_chain_id,
         "reviewClass": body.review_class,
         "sourceShas": body.source_shas,
     }
@@ -914,6 +917,7 @@ def _invitation_typed_data(
             wallet=normalized_wallet,
             nonce=str(invitation["nonce"]),
             expires_at=int(invitation["expires_at"]),
+            chain_id=store.get(str(invitation['ceremony_id']))['draft'].get('evmChainId',11155111),
         )
         return invitation, typed
     except GenesisStoreError as exc:
@@ -996,6 +1000,10 @@ async def create_plan(
         current = store.get(ceremony_id.lower())
         expires_at = int(time.time()) + settings.genesis_plan_ttl_seconds
         input_payload = body.model_dump(by_alias=True)
+        if input_payload.get("enrollmentActivation") is None:
+            input_payload.pop("enrollmentActivation", None)
+        elif input_payload["enrollmentActivation"].get("environment") != settings.runtime_environment + "-alpha":
+            raise ValueError("enrollment activation must match the ceremony host environment")
         input_payload["adminRecoveryKits"] = _recovery_kits_for_plan(
             store,
             ceremony_id.lower(),
@@ -1331,14 +1339,14 @@ def _internal_review_approval(
     }
 
 
-async def _prepare_bundle(
-    settings: Settings, record: Mapping[str, Any]
-) -> tuple[
-    dict[str, Any],
-    dict[str, Any],
-    dict[str, Any],
-    tuple[ValidatorHealthResponse, ...],
-]:
+def _selected_genesis(record: Mapping[str, Any]) -> bool:
+    # Explicit null and mixed projections must reach strict validation, never legacy.
+    return (any("enrollmentActivation" in record.get(key, {}) for key in ("plan", "plan_input"))
+        or record.get("draft", {}).get("evmChainId", 11155111) != 11155111
+        or record.get("plan", {}).get("evmChainId", 11155111) != 11155111)
+
+
+async def _authority_preflight(settings: Settings, record: Mapping[str, Any]) -> dict[str, Any]:
     from .authority_v3_evidence import (
         load_governance_evidence,
         validate_governance_roster,
@@ -1382,6 +1390,55 @@ async def _prepare_bundle(
         raise GenesisConflict(
             f"Authority V3 launch approval failed: {exc}"
         ) from exc
+    return authority_review
+
+
+async def _deployment_preflight(settings: Settings, record: Mapping[str, Any], plan: Mapping[str, Any]):
+    try:
+        validator_health = await probe_validator_health(
+            settings,
+            expected_api_commit=str(record["draft"]["sourceShas"]["api"]),
+            expected_protocol_commit=str(record["draft"]["sourceShas"]["protocol"]),
+            expected_network=str(plan["network"]),
+            expected_bridge_policy_hash=str(plan["puzzleHashes"]["bridgePolicy"]),
+            expected_evm_addresses={
+                key: str(plan["evmAddresses"][key]) for key in REQUIRED_EVM_ADDRESSES
+            },
+            expected_artifact_ready=False,
+            **({"expected_enrollment_activation": plan["enrollmentActivation"]}
+               if _selected_genesis(record) else {}),
+        )
+    except (KeyError, TypeError, ValidatorQuorumError) as exc:
+        raise GenesisConflict(f"live validator preflight failed: {exc}") from exc
+    try:
+        evm_evidence = await asyncio.to_thread(
+            verify_genesis_evm_deployment, settings, record, plan
+        )
+    except GenesisEvmEvidenceError as exc:
+        raise GenesisConflict(f"live EVM preflight failed: {exc}") from exc
+
+    return evm_evidence, validator_health
+
+
+async def _selected_push_preflight(settings: Settings, record: Mapping[str, Any], approval: Mapping[str, Any]) -> None:
+    """Recheck a selected push without rebuilding or replacing reserved inputs."""
+    authority = await _authority_preflight(settings, record)
+    evidence, _health = await _deployment_preflight(settings, record, record["plan"])
+    if (authority != approval.get("authorityV3Review")
+            or evidence["enrollmentDeploymentReview"] != approval.get("enrollmentDeploymentReview")
+            or evidence["manifestArtifactHash"] != approval.get("evmManifestArtifactHash")):
+        raise GenesisConflict("selected genesis review changed before push; preserve the original reservation")
+
+
+async def _prepare_bundle(
+    settings: Settings, record: Mapping[str, Any]
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    tuple[ValidatorHealthResponse, ...],
+]:
+    authority_review = await _authority_preflight(settings, record)
     faucet = _faucet()
     if _hex(faucet.address_puzzle_hash).lower() != str(
         record["plan_input"]["faucetPuzzleHash"]
@@ -1402,26 +1459,7 @@ async def _prepare_bundle(
     plan = result["plan"]
     if plan != record["plan"] or result["planHash"] != record["plan_hash"]:
         raise GenesisConflict("stored ceremony plan does not reproduce exactly")
-    try:
-        validator_health = await probe_validator_health(
-            settings,
-            expected_api_commit=str(record["draft"]["sourceShas"]["api"]),
-            expected_protocol_commit=str(record["draft"]["sourceShas"]["protocol"]),
-            expected_network=str(plan["network"]),
-            expected_bridge_policy_hash=str(plan["puzzleHashes"]["bridgePolicy"]),
-            expected_evm_addresses={
-                key: str(plan["evmAddresses"][key]) for key in REQUIRED_EVM_ADDRESSES
-            },
-            expected_artifact_ready=False,
-        )
-    except (KeyError, TypeError, ValidatorQuorumError) as exc:
-        raise GenesisConflict(f"live validator preflight failed: {exc}") from exc
-    try:
-        evm_evidence = await asyncio.to_thread(
-            verify_genesis_evm_deployment, settings, record, plan
-        )
-    except GenesisEvmEvidenceError as exc:
-        raise GenesisConflict(f"live Sepolia preflight failed: {exc}") from exc
+    evm_evidence, validator_health = await _deployment_preflight(settings, record, plan)
 
     review_class = str(
         record.get("draft", {}).get("reviewClass", INDEPENDENT_REVIEW_CLASS)
@@ -1449,6 +1487,9 @@ async def _prepare_bundle(
     else:
         raise GenesisConflict("unsupported genesis review class")
     approval["authorityV3Review"] = authority_review
+    if _selected_genesis(record):
+        approval["enrollmentDeploymentReview"] = evm_evidence["enrollmentDeploymentReview"]
+        approval["evmManifestArtifactHash"] = evm_evidence["manifestArtifactHash"]
     return plan, result, approval, validator_health
 
 
@@ -1541,10 +1582,15 @@ async def _broadcast_ceremony(
                 gate_authorization=dict(gate_authorization),
             )
 
+        async def authorize_selected_replay() -> None:
+            original = reservation.get("ceremonyEvidence", {}).get("auditApproval", {})
+            await _selected_push_preflight(settings, record, original)
+            authorize_exact_replay()
+
         try:
             receipt = await submitter.reconcile_reserved(
                 reservation,
-                before_push=authorize_exact_replay,
+                before_push=(authorize_selected_replay if _selected_genesis(record) else authorize_exact_replay),
             )
         except ProtocolSubmissionError as exc:
             raise GenesisConflict(
@@ -1619,10 +1665,16 @@ async def _broadcast_ceremony(
         )
         reserved_spend_bundle_id = prepared.spend_bundle_id
 
+    async def reserve_selected(prepared: PreparedProtocolBundle) -> None:
+        current = store.get(ceremony_id.lower())
+        _require_live_plan(current, expected_plan_hash=expected_plan_hash)
+        await _selected_push_preflight(settings, current, approval)
+        reserve_prepared(prepared)
+
     try:
         receipt = await submitter.submit(
             bundle["spendBundle"],
-            before_push=reserve_prepared,
+            before_push=(reserve_selected if _selected_genesis(record) else reserve_prepared),
             selection_purpose="genesis",
         )
     except ProtocolSubmissionError as exc:

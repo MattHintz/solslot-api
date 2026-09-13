@@ -507,7 +507,7 @@ async def presign_collection_asset(
 ) -> dict[str, Any]:
     if body.byte_size > settings.collection_asset_max_bytes:
         raise HTTPException(status_code=413, detail="asset exceeds configured upload limit")
-    _store_call(
+    declared = _store_call(
         lambda: store.declare_asset(
             collection_id,
             asset_id=body.asset_id,
@@ -539,6 +539,7 @@ async def presign_collection_asset(
             body.asset_id,
             object_key=upload["objectKey"],
             actor_subject=claims.sub,
+            expected_revision=declared["revision"],
         )
     )
     return {**upload, "asset": asset}
@@ -558,9 +559,12 @@ async def complete_collection_asset(
     asset = _store_call(lambda: store.get_asset(collection_id, asset_id))
     if not asset["objectKey"]:
         raise HTTPException(status_code=409, detail="asset has no authorized upload destination")
-    _store_call(
+    if asset["state"] in ("PINNED", "VERIFIED"):
+        return asset
+    asset = _store_call(
         lambda: store.mark_asset_uploaded(
-            collection_id, asset_id, object_key=asset["objectKey"], actor_subject=claims.sub
+            collection_id, asset_id, object_key=asset["objectKey"], actor_subject=claims.sub,
+            expected_revision=asset["revision"],
         )
     )
     try:
@@ -583,7 +587,8 @@ async def complete_collection_asset(
     except (MediaPipelineUnavailable, MediaVerificationError, httpx.HTTPError) as exc:
         _store_call(
             lambda: store.mark_asset_failed(
-                collection_id, asset_id, reason=str(exc), actor_subject=claims.sub
+                collection_id, asset_id, reason=str(exc), actor_subject=claims.sub,
+                expected_revision=asset["revision"],
             )
         )
         code = 503 if isinstance(exc, MediaPipelineUnavailable) else 422
@@ -600,6 +605,7 @@ async def complete_collection_asset(
             ipfs_cid=getattr(verified, "cid", None),
             availability_status=verified.availability_status,
             actor_subject=claims.sub,
+            expected_revision=asset["revision"],
         )
     )
 

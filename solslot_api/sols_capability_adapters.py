@@ -76,6 +76,23 @@ def build_warp_bridge_intent(
         required_token="{operationId}",
     )
 
+    transfer_preview: dict[str, Any] = {}
+    confirmation = descriptor.get("confirmation")
+    if isinstance(confirmation, Mapping):
+        tip_bps = _positive_int(confirmation.get("tipBps"), "tipBps")
+        ratio = _positive_int(confirmation.get("mojoToTokenRatio"), "mojoToTokenRatio")
+        destination_amount = amount if direction == "EVM_TO_CHIA" else amount * ratio
+        tip = destination_amount * tip_bps // 10_000
+        if direction == "EVM_TO_CHIA":
+            tip = max(1, tip)
+        if tip <= 0 or destination_amount <= tip:
+            raise SolsCapabilityAdapterError("bridge amount is below the transfer-tip minimum")
+        transfer_preview = {
+            "expectedReceivedMinor": str(destination_amount - tip),
+            "transferTipMinor": str(tip),
+            "destinationDecimals": 3 if direction == "EVM_TO_CHIA" else 18,
+        }
+
     if direction == "EVM_TO_CHIA":
         receiver = _bytes32(destination, "destination puzzle hash")
         chain_id = _positive_int(descriptor.get("evmChainId"), "evmChainId")
@@ -93,6 +110,7 @@ def build_warp_bridge_intent(
             "schemaVersion": 1,
             "adapterId": adapter_id,
             "direction": direction,
+            **transfer_preview,
             "executionMode": "EVM_TRANSACTION",
             "amountMojos": str(amount),
             "destination": receiver,
@@ -130,6 +148,7 @@ def build_warp_bridge_intent(
         "schemaVersion": 1,
         "adapterId": adapter_id,
         "direction": direction,
+        **transfer_preview,
         "executionMode": "OFFICIAL_WARP_OFFER",
         "amountMojos": str(amount),
         "destination": destination_address,
@@ -485,13 +504,13 @@ def validate_adapter_descriptor(descriptor: Mapping[str, Any]) -> None:
         build_warp_bridge_intent(
             descriptor=descriptor,
             direction="CHIA_TO_EVM",
-            amount_mojos="1",
+            amount_mojos="10000",
             destination="0x1111111111111111111111111111111111111111",
         )
         build_warp_bridge_intent(
             descriptor=descriptor,
             direction="EVM_TO_CHIA",
-            amount_mojos="1",
+            amount_mojos="10000",
             destination="0x" + "11" * 32,
         )
     elif kind == "AERODROME_V1":

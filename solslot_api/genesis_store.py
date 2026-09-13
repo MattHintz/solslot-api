@@ -7,10 +7,13 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .config import Settings
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 ADMIN_SLOTS = (1, 2, 3)
 TERMINAL_STATES = frozenset({"locked", "abandoned"})
 ABANDONABLE_STATES = frozenset(
@@ -23,6 +26,13 @@ COADMIN_SLOTS = frozenset({2, 3})
 def owner_plus_one_approved(slots: set[int]) -> bool:
     """Ceremony slots are one-based: slot 1 is the permanent owner."""
     return OWNER_SLOT in slots and bool(slots & COADMIN_SLOTS)
+
+
+def launch_gate_action_id(ceremony_id: str, gate_name: str, payload_hash: str) -> str:
+    import hashlib
+    return "0x" + hashlib.sha256(
+        f"{ceremony_id}:gate:{gate_name}:{payload_hash.lower()}".encode("ascii")
+    ).hexdigest()
 
 
 class GenesisStoreError(RuntimeError):
@@ -776,6 +786,11 @@ class GenesisStore:
                         "ADD COLUMN publication_json TEXT"
                     )
                 connection.execute("PRAGMA user_version = 12")
+            if version < 13:
+                columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(launch_gates)")}
+                if "approval_snapshot_json" not in columns:
+                    connection.execute("ALTER TABLE launch_gates ADD COLUMN approval_snapshot_json TEXT")
+                connection.execute("PRAGMA user_version = 13")
 
     def _event(
         self,
@@ -2227,10 +2242,18 @@ class GenesisStore:
             for row in rows
         }
 
+    def _launch_authority(self, settings: Settings, ceremony_id: str):
+        from .admin_roster import current_launch_authority
+        try:
+            return current_launch_authority(settings, self, ceremony_id)
+        except ValueError as exc:
+            raise GenesisConflict(str(exc)) from exc
+
     def create_auth_challenge(
         self,
         ceremony_id: str,
         *,
+        settings: Settings,
         slot: int,
         wallet_address: str,
         nonce_hash: str,
@@ -2242,13 +2265,9 @@ class GenesisStore:
             raise GenesisExpired("authentication challenge must expire in the future")
         with self._transaction() as connection:
             self._require_ceremony(connection, ceremony_id)
-            member = connection.execute(
-                "SELECT wallet_address FROM invitations WHERE ceremony_id=? AND slot=? "
-                "AND consumed_at IS NOT NULL",
-                (ceremony_id, slot),
-            ).fetchone()
-            if member is None or str(member["wallet_address"]).lower() != wallet_address.lower():
-                raise GenesisConflict("wallet is not enrolled in this administrator slot")
+            authority = self._launch_authority(settings, ceremony_id)
+            if authority.wallets.get(slot) != wallet_address.lower():
+                raise GenesisConflict("wallet is not the current administrator for this launch slot")
             connection.execute(
                 "DELETE FROM launch_auth_challenges WHERE expires_at<? OR consumed_at IS NOT NULL",
                 (timestamp,),
@@ -2270,6 +2289,7 @@ class GenesisStore:
     def consume_auth_challenge(
         self,
         *,
+        settings: Settings,
         nonce_hash: str,
         wallet_address: str,
         now: int | None = None,
@@ -2288,6 +2308,9 @@ class GenesisStore:
                 raise GenesisExpired("administrator challenge expired")
             if str(row["wallet_address"]).lower() != wallet_address.lower():
                 raise GenesisConflict("administrator challenge wallet changed")
+            authority = self._launch_authority(settings, str(row["ceremony_id"]))
+            if authority.wallets.get(int(row["slot"])) != wallet_address.lower():
+                raise GenesisConflict("wallet is not the current administrator for this launch slot")
             connection.execute(
                 "UPDATE launch_auth_challenges SET consumed_at=? WHERE nonce_hash=?",
                 (timestamp, nonce_hash),
@@ -2315,6 +2338,7 @@ class GenesisStore:
         self,
         ceremony_id: str,
         *,
+        settings: Settings,
         action_id: str,
         action_type: str,
         payload_hash: str,
@@ -2329,19 +2353,18 @@ class GenesisStore:
             raise GenesisExpired("launch action signature expired")
         with self._transaction() as connection:
             self._require_ceremony(connection, ceremony_id)
-            member = connection.execute(
-                "SELECT wallet_address FROM invitations WHERE ceremony_id=? AND slot=? "
-                "AND consumed_at IS NOT NULL",
-                (ceremony_id, slot),
-            ).fetchone()
-            if member is None or str(member["wallet_address"]).lower() != signer_address.lower():
-                raise GenesisConflict("action signer is not the enrolled administrator")
+            authority = self._launch_authority(settings, ceremony_id)
+            if authority.finalizing or authority.wallets.get(slot) != signer_address.lower():
+                raise GenesisConflict("wallet is not the current administrator for this launch slot")
             existing = connection.execute(
-                "SELECT payload_hash,signature,expires_at FROM launch_action_approvals "
+                "SELECT * FROM launch_action_approvals "
                 "WHERE ceremony_id=? AND action_id=? AND slot=?",
                 (ceremony_id, action_id, slot),
             ).fetchone()
-            if existing and int(existing["expires_at"]) < timestamp:
+            if existing and (int(existing["expires_at"]) < timestamp
+                             or str(existing["signer_address"]).lower() != authority.wallets.get(slot)):
+                self._event(connection, ceremony_id, "launch_action_approval_superseded",
+                            dict(existing), timestamp)
                 connection.execute(
                     "DELETE FROM launch_action_approvals "
                     "WHERE ceremony_id=? AND action_id=? AND slot=?",
@@ -2355,7 +2378,7 @@ class GenesisStore:
                     and int(existing["expires_at"]) == expires_at
                 ):
                     return self.action_approvals(
-                        ceremony_id, action_id, now=timestamp
+                        ceremony_id, action_id, settings=settings, now=timestamp
                     )
                 raise GenesisConflict("administrator slot already approved this action")
             connection.execute(
@@ -2387,10 +2410,10 @@ class GenesisStore:
                 },
                 timestamp,
             )
-        return self.action_approvals(ceremony_id, action_id, now=timestamp)
+        return self.action_approvals(ceremony_id, action_id, settings=settings, now=timestamp)
 
     def action_approvals(
-        self, ceremony_id: str, action_id: str, *, now: int | None = None
+        self, ceremony_id: str, action_id: str, *, settings: Settings, now: int | None = None
     ) -> dict[str, Any]:
         timestamp = int(time.time()) if now is None else now
         with self._connect() as connection:
@@ -2399,7 +2422,9 @@ class GenesisStore:
                 "WHERE ceremony_id=? AND action_id=? ORDER BY slot",
                 (ceremony_id, action_id),
             ).fetchall()
-        active_rows = [row for row in rows if int(row["expires_at"]) >= timestamp]
+        authority = self._launch_authority(settings, ceremony_id)
+        active_rows = [row for row in rows if not authority.finalizing and int(row["expires_at"]) >= timestamp
+                       and authority.wallets.get(int(row["slot"])) == str(row["signer_address"]).lower()]
         slots = {int(row["slot"]) for row in active_rows}
         return {
             "actionId": action_id,
@@ -2412,6 +2437,7 @@ class GenesisStore:
                     "submittedAt": int(row["submitted_at"]),
                     "expiresAt": int(row["expires_at"]),
                     "expired": int(row["expires_at"]) < timestamp,
+                    "currentSigner": authority.wallets.get(int(row["slot"])) == str(row["signer_address"]).lower(),
                 }
                 for row in rows
             ],
@@ -2427,6 +2453,7 @@ class GenesisStore:
         payload_hash: str,
         state: str,
         now: int | None = None,
+        settings: Settings | None = None,
     ) -> dict[str, Any]:
         if state not in {"pending", "open", "closed", "cancelled"}:
             raise ValueError("invalid launch gate state")
@@ -2435,18 +2462,50 @@ class GenesisStore:
         timestamp = int(time.time()) if now is None else now
         with self._transaction() as connection:
             self._require_ceremony(connection, ceremony_id)
+            snapshot = None
+            if state == "open" and settings is not None:
+                proposal = connection.execute(
+                    "SELECT * FROM launch_gates WHERE ceremony_id=? AND gate_name=?",
+                    (ceremony_id, gate_name),
+                ).fetchone()
+                if (proposal is None or str(proposal["payload_hash"]) != payload_hash.lower()
+                    or int(proposal["opens_at"]) != opens_at or int(proposal["closes_at"]) != closes_at
+                    or proposal["state"] not in {"pending", "open"}):
+                    raise GenesisConflict("gate proposal changed before activation")
+                action_id = launch_gate_action_id(ceremony_id, gate_name, payload_hash)
+                approval = self.action_approvals(ceremony_id, action_id, settings=settings, now=timestamp)
+                if not approval["approved"]:
+                    raise GenesisConflict("current owner-plus-one gate approval is required")
+                rows = connection.execute(
+                    "SELECT * FROM launch_action_approvals WHERE ceremony_id=? AND action_id=?",
+                    (ceremony_id, action_id),
+                ).fetchall()
+                snapshot = canonical_json({
+                    "schemaVersion": 1, "activatedAt": timestamp,
+                    "actionId": action_id, "payloadHash": payload_hash.lower(),
+                    "opensAt": opens_at, "closesAt": closes_at,
+                    "approvals": [dict(row) for row in rows if int(row["slot"]) in approval["slots"]],
+                })
+            prior = connection.execute(
+                "SELECT approval_snapshot_json FROM launch_gates WHERE ceremony_id=? AND gate_name=?",
+                (ceremony_id, gate_name),
+            ).fetchone()
+            if prior and prior["approval_snapshot_json"] and prior["approval_snapshot_json"] != snapshot:
+                self._event(connection, ceremony_id, "launch_gate_activation_superseded",
+                            {"gate": gate_name, "approvalSnapshot": json.loads(prior["approval_snapshot_json"])}, timestamp)
             connection.execute(
                 """
                 INSERT INTO launch_gates(
                     ceremony_id,gate_name,network,opens_at,closes_at,
-                    payload_hash,state,updated_at
-                ) VALUES(?,?,'testnet11',?,?,?,?,?)
+                    payload_hash,state,updated_at,approval_snapshot_json
+                ) VALUES(?,?,'testnet11',?,?,?,?,?,?)
                 ON CONFLICT(ceremony_id,gate_name) DO UPDATE SET
                     opens_at=excluded.opens_at,
                     closes_at=excluded.closes_at,
                     payload_hash=excluded.payload_hash,
                     state=excluded.state,
-                    updated_at=excluded.updated_at
+                    updated_at=excluded.updated_at,
+                    approval_snapshot_json=excluded.approval_snapshot_json
                 """,
                 (
                     ceremony_id,
@@ -2456,6 +2515,7 @@ class GenesisStore:
                     payload_hash.lower(),
                     state,
                     timestamp,
+                    snapshot,
                 ),
             )
             self._event(
@@ -2501,6 +2561,53 @@ class GenesisStore:
                 "updatedAt": int(row["updated_at"]),
             }
         return result
+
+    def authorized_gate(
+        self, settings: Settings, ceremony_id: str, gate_name: str, *, now: int | None = None,
+    ) -> dict[str, Any]:
+        """Revalidate activation-time approvals against today's exact slots.
+
+        Signature expiry limits activation, not the separately approved gate
+        duration. Old unsigned rows have no activation proof and fail closed.
+        """
+        timestamp = int(time.time()) if now is None else now
+        with self._transaction() as connection:
+            gate = self.gates(ceremony_id, now=timestamp).get(gate_name)
+            if not gate or gate["state"] != "open":
+                raise GenesisConflict(f"the signed {gate_name} window is closed")
+            row = connection.execute(
+                "SELECT approval_snapshot_json FROM launch_gates WHERE ceremony_id=? AND gate_name=?",
+                (ceremony_id, gate_name),
+            ).fetchone()
+            try:
+                snapshot = json.loads(row["approval_snapshot_json"] or "null")
+                action_id = launch_gate_action_id(ceremony_id, gate_name, gate["payloadHash"])
+                if (not isinstance(snapshot, dict) or snapshot.get("schemaVersion") != 1
+                    or snapshot.get("actionId") != action_id
+                    or snapshot.get("payloadHash") != gate["payloadHash"]
+                    or snapshot.get("opensAt") != gate["opensAt"]
+                    or snapshot.get("closesAt") != gate["closesAt"]
+                    or snapshot.get("activatedAt") != gate["updatedAt"]):
+                    raise ValueError("gate activation proof is missing or changed")
+                authority = self._launch_authority(settings, ceremony_id)
+                if authority.finalizing:
+                    raise GenesisConflict("reserved genesis publication must finish before gate use")
+                activated = snapshot["activatedAt"]
+                slots = set()
+                for approval in snapshot["approvals"]:
+                    slot = int(approval["slot"])
+                    if (approval["ceremony_id"] == ceremony_id
+                        and approval["action_id"] == action_id
+                        and approval["action_type"] == f"gate:{gate_name}"
+                        and approval["payload_hash"] == gate["payloadHash"]
+                        and approval["submitted_at"] <= activated <= approval["expires_at"]
+                        and authority.wallets.get(slot) == approval["signer_address"].lower()):
+                        slots.add(slot)
+                if not owner_plus_one_approved(slots):
+                    raise ValueError("current owner-plus-one gate approval is required")
+            except (KeyError, TypeError, ValueError, AttributeError) as exc:
+                raise GenesisConflict(str(exc)) from exc
+        return gate
 
     def set_funding_receipt(
         self,
@@ -2804,9 +2911,16 @@ class GenesisStore:
             raise GenesisExpired("recovery drill challenge must expire in the future")
         with self._transaction() as connection:
             self._require_ceremony(connection, ceremony_id)
+            # Completed drills are recovery evidence, including initial kits
+            # that retain only the challenge hash. Candidates also retain a
+            # foreign key to their drill in every lifecycle state.
             connection.execute(
                 "DELETE FROM admin_recovery_drills "
-                "WHERE expires_at < ? OR consumed_at IS NOT NULL",
+                "WHERE expires_at < ? AND consumed_at IS NULL "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM admin_recovery_kit_candidates AS candidate "
+                "WHERE candidate.challenge_id = admin_recovery_drills.challenge_id"
+                ")",
                 (timestamp,),
             )
             try:

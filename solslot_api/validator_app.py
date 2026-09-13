@@ -16,6 +16,7 @@ from .validator_quorum import (
     PrimaryPurchaseClaim,
     StripeSettlementClaim,
     ValidatorClaim,
+    PermitValidatorClaim,
     ValidatorSignatureResponse,
     VoucherIssuanceClaim,
     VoucherSeriesPhaseClaim,
@@ -40,7 +41,7 @@ from .validator_settings import ValidatorSettings, get_validator_settings
 class ValidatorSignRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    claim: ValidatorClaim
+    claim: PermitValidatorClaim | ValidatorClaim
     claimHash: str
 
 
@@ -98,6 +99,8 @@ class ValidatorHealthResponse(BaseModel):
     artifactHash: str | None
     artifactReady: bool
     ledgerReady: bool
+    evmChainId: int = 11155111
+    enrollmentActivation: dict[str, Any] | None = None
 
 
 def create_validator_app(
@@ -145,6 +148,10 @@ def create_validator_app(
         release = load_release_metadata(signer_settings.release_metadata_path)
         if release is None:
             raise HTTPException(status_code=503, detail="release metadata is missing")
+        if signer_settings.enrollment_activation is not None:
+            sources = signer_settings.enrollment_activation["sourceShas"]
+            if sources["api"] != release.apiCommit or sources["protocol"] != release.protocolCommit:
+                raise HTTPException(status_code=503, detail="permit health release does not match the reviewed activation")
         artifact_hash: str | None = None
         artifact_ready = False
         if Path(signer_settings.public_artifact_path).is_file():
@@ -171,6 +178,8 @@ def create_validator_app(
             artifactHash=artifact_hash,
             artifactReady=artifact_ready,
             ledgerReady=active_ledger.healthcheck(),
+            evmChainId=signer_settings.evm_chain_id,
+            enrollmentActivation=signer_settings.enrollment_activation,
         )
 
     @application.post(

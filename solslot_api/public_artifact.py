@@ -36,11 +36,17 @@ def _verify_artifact_in_worker(
     del modified_ns, size
     try:
         raw = Path(path_text).read_text(encoding="utf-8")
-        payload = json.loads(raw)
+        json.loads(raw)
     except (OSError, json.JSONDecodeError) as exc:
         raise PublicArtifactError(
             "signed RC23 public artifact is unreadable"
         ) from exc
+    return _verify_artifact_json(raw)
+
+
+@lru_cache(maxsize=8)
+def _verify_artifact_json(raw: str) -> str:
+    payload = json.loads(raw)
     try:
         process = subprocess.run(
             [sys.executable, "-m", "solslot_api.genesis_worker"],
@@ -71,6 +77,21 @@ def _verify_artifact_in_worker(
     return raw
 
 
+def verify_signed_public_artifact_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Verify a bounded reserved artifact without publishing a file.
+
+    As with verify_signed_public_artifact_file, callers must bind the returned
+    artifact to their ceremony, network and permitted operation.
+    """
+    try:
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise PublicArtifactError("reserved signed artifact is invalid") from exc
+    if len(raw.encode("utf-8")) > MAX_PUBLIC_ARTIFACT_BYTES:
+        raise PublicArtifactError("reserved signed artifact exceeds the size limit")
+    return json.loads(_verify_artifact_json(raw))
+
+
 def _same_hex(left: object, right: object) -> bool:
     return isinstance(left, str) and isinstance(right, str) and left.lower() == right.lower()
 
@@ -89,6 +110,23 @@ def _require_configured_evm_binding(
 
 
 def _verify_runtime_bindings(settings: Settings, payload: Mapping[str, Any]) -> None:
+    from solslot_puzzles.inventory_activation import validate_inventory_activation
+    try:
+        validate_inventory_activation(payload, environment=settings.runtime_environment + "-alpha")
+    except ValueError as exc:
+        raise PublicArtifactError(str(exc)) from exc
+    from solslot_puzzles.enrollment_activation import activation_from_artifact
+    try:
+        selected = activation_from_artifact(payload, environment=settings.runtime_environment + "-alpha")
+    except ValueError as exc:
+        raise PublicArtifactError(str(exc)) from exc
+    if selected is None and any((settings.enrollment_permit_release_identity,
+            settings.enrollment_permit_issuer_key_ref,settings.enrollment_permit_identity_client_id)):
+        raise PublicArtifactError('permit issuer configuration requires signed enrollment activation')
+    if selected is not None and (settings.enrollment_permit_release_identity != selected['releaseIdentity']
+            or settings.enrollment_permit_issuer_key_ref != selected['issuerKeyRef']
+            or settings.enrollment_permit_identity_client_id != selected['issuerIdentityClientId']):
+        raise PublicArtifactError('enrollment permit runtime does not match the reviewed release and issuer metadata')
     if payload.get("network") != settings.network:
         raise PublicArtifactError("public artifact network does not match this API")
     if payload.get("evmChainId") != settings.zkpassport_evm_chain_id:
@@ -242,4 +280,5 @@ __all__ = [
     "load_signed_public_artifact",
     "signed_admin_allowlist",
     "verify_signed_public_artifact_file",
+    "verify_signed_public_artifact_payload",
 ]

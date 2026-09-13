@@ -16,6 +16,21 @@ from solslot_api.chia_provider import (
 from solslot_api.chia_proxy import router as chia_proxy_router
 
 
+@pytest.mark.parametrize("amount", [0, 1, 127, 128, 255, 256, 10_000_000, 2**63, 2**64-1])
+def test_input_ids_match_consensus_coin_names(amount):
+    from chia_rs import Coin
+    from chia_rs.sized_bytes import bytes32
+    from chia_rs.sized_ints import uint64
+    coin = Coin(bytes32(b"\x11"*32), bytes32(b"\x22"*32), uint64(amount))
+    assert _input_coin_ids({"coin_spends": [{"coin": coin.to_json_dict()}]}) == ["0x"+coin.name().hex()]
+
+
+@pytest.mark.parametrize("amount", [True, 1.5, -1, 2**64, "1.5"])
+def test_input_ids_reject_non_uint64_amounts(amount):
+    assert _input_coin_ids({"coin_spends": [{"coin": {
+        "parent_coin_info": "11"*32, "puzzle_hash": "22"*32, "amount": amount}}]}) == []
+
+
 class FakeRpc:
     def __init__(
         self,

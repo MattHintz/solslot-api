@@ -39,21 +39,14 @@ PY
 [ -d "$(dirname "$target")" ] || { echo "validator artifact directory is missing" >&2; exit 1; }
 
 artifact_hash="$(
-  "$release_dir/.venv/bin/python" - "$artifact" "$release_dir/release.json" <<'PY'
-import json
+  "$release_dir/.venv/bin/python" - "$environment_file" "$artifact" "$release_dir/release.json" <<'PY'
 import sys
-
-from solslot_api.public_artifact import verify_signed_public_artifact_file
-
-artifact = verify_signed_public_artifact_file(sys.argv[1])
-with open(sys.argv[2], encoding="utf-8") as stream:
-    release = json.load(stream)
-sources = artifact.get("sourceShas", {})
-if sources.get("api") != release.get("api_commit"):
-    raise SystemExit("artifact API commit does not match the installed validator release")
-if sources.get("protocol") != release.get("protocol_commit"):
-    raise SystemExit("artifact protocol commit does not match the installed validator release")
-print(artifact["artifactHash"])
+from solslot_api.validator_installation import validate_install_candidate, validator_unit_environment
+try:
+    artifact_hash = validate_install_candidate(*sys.argv[1:], unit_environment=validator_unit_environment())
+except Exception:
+    raise SystemExit("candidate artifact does not match the complete installed signer configuration") from None
+print(artifact_hash)
 PY
 )"
 
@@ -83,4 +76,5 @@ PY
   echo "running validator reads a different public artifact path" >&2
   exit 1
 }
+echo "Artifact installed; authenticated fleet health must still pass from the coordinator." >&2
 printf '%s\n' "$artifact_hash"

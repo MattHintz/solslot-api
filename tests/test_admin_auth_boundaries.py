@@ -101,6 +101,7 @@ def test_admin_auth_private_reads_and_refresh_are_jwt_gated() -> None:
         ("GET", "/admin/auth/authority_v2"),
         ("POST", "/admin/auth/eip712/compute_leaf_hash"),
         ("POST", "/admin/auth/refresh"),
+        ("GET", "/admin/auth/session"),
     }
 
     jwt_routes = {
@@ -112,6 +113,7 @@ def test_admin_auth_private_reads_and_refresh_are_jwt_gated() -> None:
     assert jwt_routes == {
         ("GET", "/admin/auth/authority_v2"),
         ("POST", "/admin/auth/refresh"),
+        ("GET", "/admin/auth/session"),
     }
 
 

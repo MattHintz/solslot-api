@@ -5,6 +5,7 @@ import pytest
 from solslot_api.genesis_store import (
     SCHEMA_VERSION,
     GenesisConflict,
+    GenesisNotFound,
     GenesisStore,
 )
 
@@ -20,13 +21,15 @@ def _store() -> GenesisStore:
     return store
 
 
-def _public_kit(revision: int = 1) -> dict:
+def _public_kit(revision: int = 1, *, ceremony_slot: int = 1) -> dict:
     return {
         "schemaVersion": 1,
+        # Storage uses ceremony slots 1..3; signed/public payloads use 0..2.
+        "slot": ceremony_slot - 1,
         "revision": revision,
-        "evmGuardian": "0x" + "44" * 20,
-        "recoveryBlsPubkey": "0x" + "55" * 48,
-        "recoveryBlsCommitment": "0x" + "66" * 32,
+        "evmGuardian": "0x" + f"{0x43 + ceremony_slot:02x}" * 20,
+        "recoveryBlsPubkey": "0x" + f"{0x54 + ceremony_slot:02x}" * 48,
+        "recoveryBlsCommitment": "0x" + f"{0x65 + ceremony_slot:02x}" * 32,
     }
 
 
@@ -34,6 +37,7 @@ def _complete_kit(
     store: GenesisStore,
     *,
     challenge_id: str = "drill-1",
+    challenge_hash: str = CHALLENGE_HASH,
     revision: int = 1,
     now: int = 101,
 ) -> dict:
@@ -41,14 +45,14 @@ def _complete_kit(
         CEREMONY_ID,
         challenge_id=challenge_id,
         slot=1,
-        challenge_hash=CHALLENGE_HASH,
+        challenge_hash=challenge_hash,
         public_payload=_public_kit(revision),
         expires_at=now + 900,
         now=now,
     )
     return store.complete_recovery_drill(
         challenge_id,
-        expected_challenge_hash=CHALLENGE_HASH,
+        expected_challenge_hash=challenge_hash,
         backup_status="VERIFIED",
         backup_revision=revision,
         backup_ciphertext_hash="0x" + "77" * 32,
@@ -174,6 +178,129 @@ def test_cancelled_recovery_kit_candidate_never_changes_active_kit() -> None:
     assert store.recovery_kit(CEREMONY_ID, 1) == original
     with pytest.raises(GenesisConflict, match="not pending"):
         store.activate_recovery_kit_candidate("drill-cancel", now=203)
+
+
+@pytest.mark.parametrize("candidate_state", ["PENDING", "ACTIVATED", "CANCELLED"])
+def test_recovery_drill_cleanup_preserves_replacement_evidence(
+    tmp_path,
+    candidate_state: str,
+) -> None:
+    path = tmp_path / "recovery.db"
+    store = GenesisStore(path)
+    store.create_draft(CEREMONY_ID, {"network": "testnet11"}, now=100)
+    _complete_kit(store)
+    initial_drill = store.recovery_drill("drill-1")
+    _complete_kit(
+        store,
+        challenge_id="replacement",
+        challenge_hash="0x" + "81" * 32,
+        revision=2,
+        now=200,
+    )
+    if candidate_state == "ACTIVATED":
+        store.activate_recovery_kit_candidate("replacement", now=202)
+    elif candidate_state == "CANCELLED":
+        store.cancel_recovery_kit_candidate("replacement", now=202)
+    candidate = store.recovery_kit_candidate("replacement")
+    replacement_drill = store.recovery_drill("replacement")
+    active_kit = store.recovery_kit(CEREMONY_ID, 1)
+    assert candidate["state"] == candidate_state
+
+    # Reopening exercises the persistent foreign keys, after proof expiry.
+    store = GenesisStore(path)
+    other_public = _public_kit(ceremony_slot=2)
+    other_drill = store.create_recovery_drill(
+        CEREMONY_ID,
+        challenge_id="other-slot",
+        slot=2,
+        challenge_hash="0x" + "82" * 32,
+        public_payload=other_public,
+        expires_at=3_000,
+        now=2_000,
+    )
+    other_kit = store.complete_recovery_drill(
+        "other-slot",
+        expected_challenge_hash="0x" + "82" * 32,
+        backup_status="NOT_CONFIGURED",
+        backup_revision=None,
+        backup_ciphertext_hash=None,
+        now=2_001,
+    )
+    assert other_drill["slot"] == 2
+    assert other_drill["public"]["slot"] == other_kit["slot"] == 1
+    assert other_kit["evmGuardian"] == other_public["evmGuardian"]
+    assert other_kit["evmGuardian"] != active_kit["evmGuardian"]
+    assert other_kit["recoveryBlsPubkey"] != active_kit["recoveryBlsPubkey"]
+    other_ceremony = "0x" + "12" * 32
+    store.create_draft(other_ceremony, {"network": "testnet11"}, now=2_002)
+    store.create_recovery_drill(
+        other_ceremony,
+        challenge_id="other-ceremony",
+        slot=1,
+        challenge_hash="0x" + "83" * 32,
+        public_payload=_public_kit(),
+        expires_at=3_000,
+        now=2_003,
+    )
+    if candidate_state != "PENDING":
+        store.create_recovery_drill(
+            CEREMONY_ID,
+            challenge_id="next-replacement",
+            slot=1,
+            challenge_hash="0x" + "84" * 32,
+            public_payload=_public_kit(int(active_kit["revision"]) + 1),
+            expires_at=3_000,
+            now=2_004,
+        )
+
+    assert store.recovery_drill("drill-1") == initial_drill
+    assert store.recovery_drill("replacement") == replacement_drill
+    assert store.recovery_kit_candidate("replacement") == candidate
+    assert store.recovery_kit(CEREMONY_ID, 1) == active_kit
+    for drill in (initial_drill, replacement_drill):
+        with pytest.raises(GenesisConflict, match="already used"):
+            store.complete_recovery_drill(
+                drill["challengeId"],
+                expected_challenge_hash=drill["challengeHash"],
+                backup_status="NOT_CONFIGURED",
+                backup_revision=None,
+                backup_ciphertext_hash=None,
+                now=2_005,
+            )
+
+
+def test_recovery_drill_cleanup_removes_only_expired_unused_challenges() -> None:
+    store = _store()
+    _complete_kit(store)
+    completed = store.recovery_drill("drill-1")
+    for challenge_id, expires_at in (("expired", 299), ("still-valid", 300)):
+        store.create_recovery_drill(
+            CEREMONY_ID,
+            challenge_id=challenge_id,
+            slot=2,
+            challenge_hash="0x" + f"{expires_at:064x}",
+            public_payload=_public_kit(ceremony_slot=2),
+            expires_at=expires_at,
+            now=200,
+        )
+    still_valid = store.recovery_drill("still-valid")
+    created = store.create_recovery_drill(
+        CEREMONY_ID,
+        challenge_id="new-drill",
+        slot=3,
+        challenge_hash="0x" + "85" * 32,
+        public_payload=_public_kit(ceremony_slot=3),
+        expires_at=1_000,
+        now=300,
+    )
+
+    with pytest.raises(GenesisNotFound, match="challenge not found"):
+        store.recovery_drill("expired")
+    assert store.recovery_drill("still-valid") == still_valid
+    assert store.recovery_drill("drill-1") == completed
+    assert created["challengeId"] == "new-drill"
+    assert created["slot"] == 3
+    assert created["public"]["slot"] == 2
 
 
 def test_only_one_key_change_can_be_active_and_receipts_are_append_only() -> None:
@@ -481,5 +608,5 @@ def test_schema_eight_adds_resumable_evm_submissions_on_restart(
             "WHERE type='table' AND name='admin_recovery_evm_submissions'"
         ).fetchone()
 
-    assert version == SCHEMA_VERSION == 12
+    assert version == SCHEMA_VERSION == 13
     assert table is not None

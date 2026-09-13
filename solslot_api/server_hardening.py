@@ -268,10 +268,17 @@ class ServerHardeningMiddleware:
 
     @staticmethod
     def _is_public_challenge_request(scope: dict[str, Any]) -> bool:
-        return (
-            str(scope.get("method", "")).upper() == "POST"
-            and scope.get("path") == "/auth/challenge"
-        )
+        if str(scope.get("method", "")).upper() != "POST":
+            return False
+        path = str(scope.get("path", "")).rstrip("/")
+        if path == "/auth/challenge":
+            return True
+        parts = path.split("/")
+        # Count before route/path/body validation. Canonical ASGI paths are
+        # already URL-decoded; a changed vault ID or trailing-slash redirect
+        # must not create a new per-IP challenge budget.
+        return (len(parts) == 6 and parts[1:3] == ["zkpassport", "enrollments"]
+                and parts[4] in {"session", "relay"} and parts[5] == "challenge")
 
     @staticmethod
     def _is_chia_push_request(scope: dict[str, Any]) -> bool:

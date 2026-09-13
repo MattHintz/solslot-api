@@ -387,6 +387,9 @@ async def lifespan(app: FastAPI):
         app.state.protocol_submitter.add_fee_coin_reservation_source(
             presale_store.pending_stripe_terminal_fee_coin_ids
         )
+        app.state.protocol_submitter.add_fee_coin_reservation_source(
+            get_payment_purchase_store(settings.payment_purchase_db_path).pending_timeout_fee_coin_ids
+        )
 
     app.state.voucher_issuance_worker = None
     app.state.stripe_delivery_worker = None

@@ -83,6 +83,7 @@ from .sols_capability_adapters import (
     public_adapter_profile,
 )
 from .vault_eligibility import require_current_approved_vault
+from .sols_capability_operations import CapabilityOperationStore, CapabilityOperationConflict
 
 
 router = APIRouter(prefix="/sols", tags=["sols-secondary-market"])
@@ -2043,6 +2044,7 @@ async def bridge_routes(
         )
         executable = all(item["status"] == "READY" for item in checks)
         profiles = _capability_profiles(
+            settings=settings,
             evidence_ready=evidence_ready,
             capability="warp-cat-bridge",
             governed_root=str(statutes["routesRoot"]),
@@ -2054,6 +2056,11 @@ async def bridge_routes(
         return {
             "schemaVersion": 2,
             "network": settings.network,
+            "environment": settings.runtime_environment,
+            "deploymentId": settings.sols_capability_deployment_id,
+            "releaseEvidenceSha256": (
+                (settings.sols_bridge_release_evidence_sha256 or "").removeprefix("0x").lower() if evidence_ready else None
+            ),
             "mode": "LIVE" if executable else "PREVIEW",
             "executable": executable,
             "activationState": _activation_state(
@@ -2129,6 +2136,7 @@ async def liquidity_venues(
         )
         executable = all(item["status"] == "READY" for item in checks)
         profiles = _capability_profiles(
+            settings=settings,
             evidence_ready=evidence_ready,
             capability="governed-liquidity",
             governed_root=str(statutes["liquidityRoot"]),
@@ -2140,6 +2148,11 @@ async def liquidity_venues(
         return {
             "schemaVersion": 2,
             "network": settings.network,
+            "environment": settings.runtime_environment,
+            "deploymentId": settings.sols_capability_deployment_id,
+            "releaseEvidenceSha256": (
+                (settings.sols_liquidity_release_evidence_sha256 or "").removeprefix("0x").lower() if evidence_ready else None
+            ),
             "mode": "LIVE" if executable else "PREVIEW",
             "executable": executable,
             "activationState": _activation_state(
@@ -2189,6 +2202,7 @@ async def create_bridge_intent(
     reader: Annotated[SolsMarketReader, Depends(_reader)],
 ) -> dict[str, Any]:
     session = verify_vault_session(settings, request, body.vaultLauncherId)
+    require_current_approved_vault(settings, session.vault_launcher_id)
     try:
         statutes, records, evidence = await _execution_context(
             settings=settings,
@@ -2210,13 +2224,16 @@ async def create_bridge_intent(
             evidence.adapter_descriptors,
             record_id=body.routeId,
         )
+        if body.direction == "EVM_TO_CHIA" and session.auth_type != "evm":
+            raise SolsCapabilityAdapterError("connect the EVM source wallet to prepare a return transfer")
         intent = build_warp_bridge_intent(
             descriptor=descriptor,
             direction=body.direction,
             amount_mojos=body.amountMojos,
             destination=body.destination,
         )
-        return _capability_intent_response(
+        response = _capability_intent_response(
+            deployment_binding={"environment": evidence.environment, "deploymentId": evidence.deployment_id, "releaseTag": evidence.release_tag, "sourceSha": evidence.source_sha, "sourceAccount": session.owner_key},
             network=settings.network,
             vault_launcher_id=session.vault_launcher_id,
             capability="warp-cat-bridge",
@@ -2236,10 +2253,16 @@ async def create_bridge_intent(
                 "reversible": False,
                 "customerImpact": (
                     "The selected amount leaves this chain and becomes the "
-                    "corresponding asset on the destination chain."
+                    "corresponding asset after the disclosed bridge tip on the destination chain."
                 ),
             },
         )
+        store = CapabilityOperationStore(settings.sols_capability_operations_path)
+        try:
+            store.prepare(response)
+        finally:
+            store.close()
+        return response
     except HTTPException:
         raise
     except (
@@ -2263,6 +2286,7 @@ async def create_liquidity_intent(
     reader: Annotated[SolsMarketReader, Depends(_reader)],
 ) -> dict[str, Any]:
     session = verify_vault_session(settings, request, body.vaultLauncherId)
+    require_current_approved_vault(settings, session.vault_launcher_id)
     try:
         statutes, records, evidence = await _execution_context(
             settings=settings,
@@ -2329,7 +2353,8 @@ async def create_liquidity_intent(
             raise SolsCapabilityAdapterError(
                 "the governed venue has no reviewed native adapter"
             )
-        return _capability_intent_response(
+        response = _capability_intent_response(
+            deployment_binding={"environment": evidence.environment, "deploymentId": evidence.deployment_id, "releaseTag": evidence.release_tag, "sourceSha": evidence.source_sha, "sourceAccount": session.owner_key},
             network=settings.network,
             vault_launcher_id=session.vault_launcher_id,
             capability="governed-liquidity",
@@ -2352,6 +2377,12 @@ async def create_liquidity_intent(
                 ),
             },
         )
+        store = CapabilityOperationStore(settings.sols_capability_operations_path)
+        try:
+            store.prepare(response)
+        finally:
+            store.close()
+        return response
     except HTTPException:
         raise
     except (
@@ -2414,6 +2445,7 @@ async def _execution_context(
         path_value=evidence_path,
         expected_sha256=evidence_sha256,
         capability=capability,
+        **settings.capability_evidence_binding(),
         governed_root=str(statutes[root_key]),
         governed_records=records,
     )
@@ -2448,8 +2480,10 @@ def _capability_intent_response(
     governed_record: Mapping[str, Any],
     intent: Mapping[str, Any],
     decision_receipt: Mapping[str, Any],
+    deployment_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     binding = {
+        **dict(deployment_binding or {}),
         "network": network,
         "vaultLauncherId": vault_launcher_id,
         "capability": capability,
@@ -2533,12 +2567,12 @@ def _capability_checks(
         ),
         _readiness(
             "network",
-            "Mainnet beta boundary",
-            "READY" if settings.network == "mainnet" else "WAITING",
+            "Deployment network boundary",
+            "READY" if settings.sols_capability_deployment_id else "WAITING",
             (
-                "The API is running on Chia mainnet."
-                if settings.network == "mainnet"
-                else "Customer bridge and liquidity execution stay disabled on Testnet11."
+                "The configured deployment requires matching network-specific evidence."
+                if settings.sols_capability_deployment_id
+                else "A separate network-specific capability deployment must be pinned."
             ),
         ),
     ]
@@ -2552,6 +2586,7 @@ def _capability_checks(
                 path_value=evidence_path,
                 expected_sha256=evidence_sha256,
                 capability=capability,
+                **settings.capability_evidence_binding(),
                 governed_root=governed_root,
                 governed_records=governed_records,
             )
@@ -2615,10 +2650,10 @@ def _capability_checks(
         _readiness(
             "operatorGate",
             "Runtime activation",
-            "READY" if feature_enabled else "WAITING",
+            "READY" if feature_enabled and settings.alpha_writes_enabled else "WAITING",
             (
-                "The mainnet runtime gate is enabled."
-                if feature_enabled
+                "The network-specific runtime gate is enabled."
+                if feature_enabled and settings.alpha_writes_enabled
                 else "The operator gate remains safely disabled."
             ),
         )
@@ -2671,6 +2706,7 @@ def _active_adapter_coverage(
 
 def _capability_profiles(
     *,
+    settings: Settings,
     evidence_ready: bool,
     capability: Literal["warp-cat-bridge", "governed-liquidity"],
     governed_root: str,
@@ -2685,6 +2721,7 @@ def _capability_profiles(
         path_value=evidence_path,
         expected_sha256=evidence_sha256,
         capability=capability,
+        **settings.capability_evidence_binding(),
         governed_root=governed_root,
         governed_records=governed_records,
     )
@@ -2727,8 +2764,6 @@ def _activation_state(
 ) -> str:
     if executable:
         return "LIVE"
-    if network != "mainnet":
-        return "MAINNET_ONLY"
     readiness = {item["id"]: item["status"] for item in checks}
     if readiness.get("governance") != "READY":
         return "AWAITING_GOVERNANCE"
@@ -2798,3 +2833,146 @@ __all__ = [
     "SolsMarketReader",
     "router",
 ]
+
+
+class CapabilityOperationHints(BaseModel):
+    sourceTransactionId: str | None = Field(None, pattern=r"^0x[0-9a-fA-F]{64}$")
+    destinationTransactionId: str | None = Field(None, pattern=r"^0x[0-9a-fA-F]{64}$")
+
+
+@router.get("/vaults/{vault_launcher_id}/capability-operations")
+async def list_capability_operations(vault_launcher_id: str, request: Request,
+                                    settings: Annotated[Settings, Depends(get_settings)]) -> dict[str, Any]:
+    session = verify_vault_session(settings, request, vault_launcher_id)
+    store = CapabilityOperationStore(settings.sols_capability_operations_path)
+    try:
+        operations = store.list_for_vault(session.vault_launcher_id)
+        # Never mix deployment histories when a host is repointed.
+        return {"operations": [op for op in operations if op["receipt"].get("network") == settings.network
+                and op["receipt"].get("environment") == settings.runtime_environment
+                and op["receipt"].get("deploymentId") == settings.sols_capability_deployment_id]}
+    finally:
+        store.close()
+
+
+@router.post("/vaults/{vault_launcher_id}/capability-operations/{operation_hash}/observe")
+async def observe_capability_operation(vault_launcher_id: str, operation_hash: str,
+                                      body: CapabilityOperationHints, request: Request,
+                                      settings: Annotated[Settings, Depends(get_settings)],
+                                      reader: Annotated[SolsMarketReader, Depends(_reader)]) -> dict[str, Any]:
+    """Persist discovery references; only re-fetched chain proof can complete.
+
+    Recovery remains available with transaction flags disabled. This route has
+    no signing/submission call and cannot spend customer or operator assets.
+    """
+    from web3 import AsyncWeb3, AsyncHTTPProvider
+    from .sols_bridge_observer import WarpCatObserver
+    session = verify_vault_session(settings, request, vault_launcher_id)
+    store = CapabilityOperationStore(settings.sols_capability_operations_path)
+    try:
+        operation = store.get(operation_hash, session.vault_launcher_id)
+        receipt = operation["receipt"]
+        if receipt["capability"] != "warp-cat-bridge":
+            raise ValueError("liquidity confirmation observer is not installed")
+        evidence = load_sols_capability_evidence(
+            path_value=settings.sols_bridge_release_evidence_path,
+            expected_sha256=settings.sols_bridge_release_evidence_sha256,
+            capability="warp-cat-bridge", **settings.capability_evidence_binding())
+        if receipt["releaseEvidenceSha256"] != evidence.sha256 or receipt.get("deploymentId") != evidence.deployment_id or receipt.get("environment") != evidence.environment or receipt["network"] != evidence.network:
+            raise ValueError("recovery requires the original deployment-bound release evidence")
+        descriptor = descriptor_for_record(evidence.adapter_descriptors, record_id=receipt["governedRecord"]["routeId"])
+        if not settings.sols_capability_evm_rpc_url or not settings.sols_capability_evm_rpc_url.startswith("https://"):
+            raise ValueError("the dedicated customer bridge RPC is not configured")
+        hints = body.model_dump(exclude_none=True)
+        if hints:
+            operation = store.record_hints(operation_hash, session.vault_launcher_id, hints)
+        provider = AsyncHTTPProvider(settings.sols_capability_evm_rpc_url, request_kwargs={"timeout": 15})
+        try:
+            try:
+                observation = await WarpCatObserver(AsyncWeb3(provider), reader.provider).observe(receipt, descriptor, operation["hints"])
+            except Exception:
+                # Provider outages and conflicting chain evidence invalidate
+                # fresh completion. Never retry a spend to resolve uncertainty.
+                observation = {"operationHash": operation_hash, "status": "RECOVERY_REQUIRED", "detail": "Both-chain confirmation is unavailable or inconsistent; inspect the saved transaction references before retrying observation."}
+        finally:
+            await provider.disconnect()
+        return store.record_observation(operation_hash, session.vault_launcher_id, observation)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Capability operation or reviewed proof is unavailable.") from exc
+    except (ValueError, CapabilityOperationConflict) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        store.close()
+
+
+@router.post("/vaults/{vault_launcher_id}/capability-operations/{operation_hash}/references")
+async def record_capability_references(vault_launcher_id: str, operation_hash: str,
+                                      body: CapabilityOperationHints, request: Request,
+                                      settings: Annotated[Settings, Depends(get_settings)]) -> dict[str, Any]:
+    session = verify_vault_session(settings, request, vault_launcher_id)
+    store = CapabilityOperationStore(settings.sols_capability_operations_path)
+    try:
+        operation = store.get(operation_hash, session.vault_launcher_id)
+        receipt = operation["receipt"]
+        if receipt.get("environment") != settings.runtime_environment or receipt["network"] != settings.network or receipt.get("deploymentId") != settings.sols_capability_deployment_id:
+            raise ValueError("operation belongs to another deployment")
+        return store.record_hints(operation_hash, session.vault_launcher_id, body.model_dump(exclude_none=True))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Capability operation not found.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        store.close()
+
+
+@router.post("/vaults/{vault_launcher_id}/capability-operations/{operation_hash}/authorize")
+async def authorize_capability_operation(vault_launcher_id: str, operation_hash: str,
+                                         request: Request,
+                                         settings: Annotated[Settings, Depends(get_settings)],
+                                         reader: Annotated[SolsMarketReader, Depends(_reader)]) -> dict[str, Any]:
+    """Revalidate a freshly prepared action; saved receipts grant no authority.
+
+    Observation endpoints deliberately remain usable with writes disabled.
+    Execution authorization must pass the current vault, deployment, evidence,
+    governance and runtime gates each time it is requested.
+    """
+    session = verify_vault_session(settings, request, vault_launcher_id)
+    require_current_approved_vault(settings, session.vault_launcher_id)
+    store = CapabilityOperationStore(settings.sols_capability_operations_path)
+    try:
+        operation = store.get(operation_hash, session.vault_launcher_id)
+        receipt = operation["receipt"]
+        if operation["status"] != "PREPARED" or operation["hints"]:
+            raise ValueError("saved or submitted operation is observation-only; prepare a new action")
+        bridge = receipt["capability"] == "warp-cat-bridge"
+        if not bridge and receipt["capability"] != "governed-liquidity":
+            raise ValueError("unsupported capability")
+        statutes, records, evidence = await _execution_context(
+            settings=settings, reader=reader, capability=receipt["capability"],
+            records_key="bridgeRoutes" if bridge else "liquidityVenues",
+            root_key="routesRoot" if bridge else "liquidityRoot",
+            feature_enabled=settings.sols_bridge_enabled if bridge else settings.sols_liquidity_enabled,
+            evidence_path=settings.sols_bridge_release_evidence_path if bridge else settings.sols_liquidity_release_evidence_path,
+            evidence_sha256=settings.sols_bridge_release_evidence_sha256 if bridge else settings.sols_liquidity_release_evidence_sha256,
+            execution_surface_installed=WARP_CAT_EXECUTION_SURFACE_INSTALLED if bridge else LIQUIDITY_EXECUTION_SURFACE_INSTALLED,
+            installed_adapter_kinds=WARP_CAT_INSTALLED_ADAPTERS if bridge else LIQUIDITY_INSTALLED_ADAPTERS,
+            confirmation_observer_installed=WARP_CAT_CONFIRMATION_OBSERVER_INSTALLED if bridge else None,
+        )
+        record_key = "routeId" if bridge else "venueId"
+        record = _active_record(records, record_key, receipt["governedRecord"][record_key])
+        if dict(record) != receipt["governedRecord"] or str(statutes["routesRoot" if bridge else "liquidityRoot"]) != receipt["governedRoot"]:
+            raise ValueError("governed record or root changed after preparation")
+        if receipt.get("environment") != settings.runtime_environment or receipt["network"] != settings.network or receipt.get("deploymentId") != evidence.deployment_id or receipt["releaseEvidenceSha256"] != evidence.sha256 or receipt.get("sourceSha") != evidence.source_sha or receipt.get("releaseTag") != evidence.release_tag:
+            raise ValueError("deployment or reviewed release changed after preparation")
+        if receipt.get("sourceAccount", "").lower() != session.owner_key.lower():
+            raise ValueError("prepared source account no longer matches the vault owner")
+        return {"executable": True, "operationHash": operation_hash,
+                "releaseEvidenceSha256": evidence.sha256, "governedRoot": receipt["governedRoot"],
+                "recordId": record[record_key], "network": settings.network,
+                "environment": settings.runtime_environment, "deploymentId": evidence.deployment_id}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Capability operation or current governed record is unavailable.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        store.close()

@@ -44,8 +44,8 @@ SOURCE_SHAS = {
 }
 
 
-def _signed_artifact(*, signed_slots: tuple[int, ...] = (0, 2)) -> dict:
-    accounts = [Account.create(f"public-artifact-admin-{slot}") for slot in range(3)]
+def _signed_artifact(*, signed_slots: tuple[int, ...] = (0, 2), accounts=None, ceremony_id=None) -> dict:
+    accounts = accounts or [Account.create(f"public-artifact-admin-{slot}") for slot in range(3)]
     recovery_accounts = [
         Account.create(f"public-artifact-recovery-{slot}")
         for slot in range(3)
@@ -59,7 +59,7 @@ def _signed_artifact(*, signed_slots: tuple[int, ...] = (0, 2)) -> dict:
         for slot in range(3)
     ]
     ceremony = {
-        "ceremony_id": "0x" + "91" * 32,
+        "ceremony_id": ceremony_id or "0x" + "91" * 32,
         "draft": {"sourceManifestVersion": 4, "sourceShas": SOURCE_SHAS},
         "invitations": [
             {

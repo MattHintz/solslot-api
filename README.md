@@ -130,7 +130,8 @@ Create an isolated environment and pin the exact protocol checkout:
 
 ```bash
 python3.12 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip wheel
+.venv/bin/python -m pip install pip==26.2.1 wheel==0.47.0
+export PIP_BUILD_CONSTRAINT="$(realpath ../solslot-protocol/build-constraints.lock)"
 .venv/bin/python -m pip install -c constraints.lock zstd==1.5.7.3
 .venv/bin/python -m pip install -c constraints.lock -e ../solslot-protocol -e '.[dev]'
 PYTHON=.venv/bin/python bash scripts/check_dependency_audit.sh
@@ -139,9 +140,10 @@ PYTHON=.venv/bin/python bash scripts/check_dependency_audit.sh
 .venv/bin/python scripts/check_namespace.py --paths .
 ```
 
-`PYSEC-2026-1845` is ignored only while Chia's current
-`chia-puzzles-py` release requires `pytest<9`; remove the waiver as soon as the
-Chia dependency stack allows `pytest>=9.0.3`.
+The audit has no advisory ignores. Pytest 9.0.3 fixes the temporary-directory advisory.
+The exact upstream Chia archive makes pytest optional while preserving the
+published 0.20.3 Python/puzzle bytes; its source and build-backend pins are
+verified by the protocol dependency provenance checks.
 `zstd==1.5.7.3` is installed explicitly because Chia 2.7.x requires that
 yanked wheel; remove the preinstall once Chia accepts a non-yanked `zstd`
 release.

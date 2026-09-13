@@ -88,15 +88,14 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
-def _open_broadcast_gate(store: GenesisStore, ceremony_id: str) -> None:
+def _open_broadcast_gate(store: GenesisStore, ceremony_id: str, settings) -> None:
+    from tests.launch_authority_fixtures import open_signed_gate
     now = int(time.time())
-    store.upsert_gate(
-        ceremony_id,
-        gate_name="ceremonyBroadcast",
+    open_signed_gate(
+        store, settings, ceremony_id, "ceremonyBroadcast",
         opens_at=now - 60,
         closes_at=now + 3600,
         payload_hash="0x" + "ef" * 32,
-        state="open",
         now=now,
     )
 
@@ -399,7 +398,7 @@ def _direct_broadcast_fixture(tmp_path, monkeypatch, label: str):
             "UPDATE ceremonies SET plan_expires_at=? WHERE ceremony_id=?",
             (int(time.time()) + 3600, ceremony_id),
         )
-    _open_broadcast_gate(store, ceremony_id)
+    _open_broadcast_gate(store, ceremony_id, settings)
     review_receipt = b'{"review":"authority-v3"}\n'
     review_path = tmp_path / f"{label}-authority-v3-review.json"
     review_path.write_bytes(review_receipt)
@@ -942,13 +941,12 @@ async def test_reserved_replay_rechecks_gate_inside_submitter_boundary(
     prepared = PreparedBundle()
     now = int(time.time())
     closes_at = now + 60
-    store.upsert_gate(
-        ceremony_id,
-        gate_name="ceremonyBroadcast",
+    from tests.launch_authority_fixtures import open_signed_gate
+    open_signed_gate(
+        store, settings, ceremony_id, "ceremonyBroadcast",
         opens_at=now - 60,
         closes_at=closes_at,
         payload_hash="0x" + "ef" * 32,
-        state="open",
         now=now,
     )
     gate_authorization = genesis_module._ceremony_broadcast_gate_authorization(
@@ -1547,7 +1545,7 @@ async def test_broadcast_boundary_blocks_plan_expiry_and_renewal_races(
             "UPDATE ceremonies SET plan_expires_at=? WHERE ceremony_id=?",
             (int(time.time()) + 3600, ceremony_id),
         )
-    _open_broadcast_gate(store, ceremony_id)
+    _open_broadcast_gate(store, ceremony_id, settings)
     review_receipt = b'{"review":"authority-v3"}\n'
     review_path = tmp_path / f"{race}-authority-v3-review.json"
     review_path.write_bytes(review_receipt)
@@ -1764,7 +1762,7 @@ def test_broadcast_requires_fee_funded_local_mempool_submission(
     client, store, settings = _client(tmp_path)
     ceremony_id, accounts = _create_and_enroll(client, store)
     _approve_plan(client, ceremony_id, accounts)
-    _open_broadcast_gate(store, ceremony_id)
+    _open_broadcast_gate(store, ceremony_id, settings)
     review_receipt = b'{"review":"authority-v3"}\n'
     review_path = tmp_path / "authority-v3-review.json"
     review_path.write_bytes(review_receipt)

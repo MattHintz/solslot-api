@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 
 import pytest
+from tests.launch_authority_fixtures import bootstrap_settings
 
 from solslot_api.genesis_store import (
     GenesisConflict,
@@ -853,13 +854,13 @@ def test_guided_launch_owner_claim_profiles_and_wallet_resume_are_persistent(
         nonce_hash=nonce_hash,
         expires_at=1000,
         now=120,
-    )
+     settings=bootstrap_settings(store))
     reopened = GenesisStore(path)
     challenge = reopened.consume_auth_challenge(
         nonce_hash=nonce_hash,
         wallet_address="0x" + "01" * 20,
         now=121,
-    )
+     settings=bootstrap_settings(reopened))
     assert challenge["slot"] == 1
     assert reopened.profiles(CEREMONY)[1]["displayName"] == "Owner"
     with pytest.raises(GenesisConflict, match="already used"):
@@ -867,7 +868,7 @@ def test_guided_launch_owner_claim_profiles_and_wallet_resume_are_persistent(
             nonce_hash=nonce_hash,
             wallet_address="0x" + "01" * 20,
             now=122,
-        )
+         settings=bootstrap_settings(reopened))
 
 
 def test_guided_action_requires_owner_plus_one_and_rejects_changed_payload(
@@ -889,7 +890,7 @@ def test_guided_action_requires_owner_plus_one_and_rejects_changed_payload(
         signature="0x" + "01" * 65,
         expires_at=200,
         now=130,
-    )
+     settings=bootstrap_settings(store))
     assert one["approved"] is False
     assert owner_plus_one_approved(set(one["slots"])) is False
     two = store.add_action_approval(
@@ -902,7 +903,7 @@ def test_guided_action_requires_owner_plus_one_and_rejects_changed_payload(
         signature="0x" + "03" * 65,
         expires_at=200,
         now=131,
-    )
+     settings=bootstrap_settings(store))
     assert two["approved"] is True
     with pytest.raises(GenesisConflict, match="already approved"):
         store.add_action_approval(
@@ -915,10 +916,10 @@ def test_guided_action_requires_owner_plus_one_and_rejects_changed_payload(
             signature="0x" + "04" * 65,
             expires_at=200,
             now=132,
-        )
+         settings=bootstrap_settings(store))
 
-    assert store.action_approvals(CEREMONY, action_id, now=200)["approved"] is True
-    expired = store.action_approvals(CEREMONY, action_id, now=201)
+    assert store.action_approvals(CEREMONY, action_id, now=200, settings=bootstrap_settings(store))["approved"] is True
+    expired = store.action_approvals(CEREMONY, action_id, now=201, settings=bootstrap_settings(store))
     assert expired["approved"] is False
     assert expired["slots"] == []
     for slot in (1, 3):
@@ -932,7 +933,7 @@ def test_guided_action_requires_owner_plus_one_and_rejects_changed_payload(
             signature="0x" + f"{slot + 10:02x}" * 65,
             expires_at=300,
             now=210 + slot,
-        )
+         settings=bootstrap_settings(store))
     assert renewed["approved"] is True
 
 

@@ -8,6 +8,8 @@ two authoritative sources into an authentication allowlist.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 
 from eth_keys import keys as eth_keys
@@ -15,7 +17,7 @@ from eth_keys import keys as eth_keys
 from .config import Settings
 from .evm_auth import normalize_evm_address
 from .genesis_store import GenesisNotFound, GenesisStore
-from .public_artifact import PublicArtifactError, load_signed_public_artifact
+from .public_artifact import PublicArtifactError, PublicArtifactMissing, load_signed_public_artifact, verify_signed_public_artifact_payload
 
 
 HEX32_LENGTH = 64
@@ -157,11 +159,75 @@ def current_signed_admin_allowlist(
     }
 
 
+@dataclass(frozen=True)
+class LaunchAuthority:
+    wallets: Mapping[int, str]
+    bootstrap: bool
+    finalizing: bool = False
+
+
+def current_launch_authority(
+    settings: Settings, store: GenesisStore, ceremony_id: str,
+) -> LaunchAuthority:
+    """Resolve one-based launch slots from current signed authority.
+
+    Invitations are enrollment history after finalization. They authorize only
+    the pre-genesis ceremony, before any publication or bootstrap lock exists.
+    """
+    record = store.get(ceremony_id)
+    publication = store.finalization_publication(ceremony_id)
+    finalizing = record["state"] == "artifact_signed" and publication is not None
+    if finalizing:
+        # Only resume publication of the already reserved, signed artifact.
+        # This authority is restricted to guided recovery by the callers below.
+        if publication.get("schemaVersion") != 1 or not isinstance(publication.get("artifact"), Mapping):
+            raise PublicArtifactError("reserved launch publication is invalid")
+        artifact = verify_signed_public_artifact_payload(publication["artifact"])
+        if (artifact.get("artifactHash") != record.get("artifact_hash")
+            or artifact.get("network") != settings.network
+            or artifact.get("evmChainId") != settings.zkpassport_evm_chain_id):
+            raise PublicArtifactError("reserved launch artifact binding changed")
+        from .genesis import _expected_bootstrap_lock, _validate_bootstrap_lock
+        lock = publication.get("bootstrapLock")
+        if not isinstance(lock, Mapping):
+            raise PublicArtifactError("reserved launch lock is unavailable")
+        _validate_bootstrap_lock(lock, _expected_bootstrap_lock(
+            ceremony_id=ceremony_id, record=record, artifact=artifact,
+        ))
+    else:
+        try:
+            artifact = load_signed_public_artifact(settings)
+        except PublicArtifactMissing as exc:
+            paths = (Path(settings.public_artifact_path), Path(settings.bootstrap_manifest_path))
+            if (
+                record["state"] == "locked"
+                or any(path.exists() or path.is_symlink() for path in paths)
+                or store.finalization_publication(ceremony_id) is not None
+                or any(case.get("state") == "COMPLETED" and case.get("kind") != "RECOVERY_KIT"
+                       for case in store.recovery_cases(ceremony_id))
+            ):
+                raise PublicArtifactError("current launch authority evidence is unavailable") from exc
+            return LaunchAuthority({
+                int(item["slot"]): str(item["wallet_address"]).lower()
+                for item in record["invitations"]
+                if item.get("wallet_address") and item.get("consumed_at") is not None
+            }, bootstrap=True)
+    if artifact_ceremony_id(artifact) != ceremony_id.lower():
+        raise PublicArtifactError("signed authority belongs to a different launch")
+    admins = current_artifact_admins(artifact, store)
+    wallets = {slot + 1: identity[0] for slot, identity in enumerate(admins)}
+    if len(set(wallets.values())) != 3:
+        raise PublicArtifactError("current launch administrator identities are not distinct")
+    return LaunchAuthority(wallets, bootstrap=False, finalizing=finalizing)
+
+
 __all__ = [
+    "LaunchAuthority",
     "address_from_compressed_pubkey",
     "artifact_admins",
     "artifact_ceremony_id",
     "current_artifact_admins",
+    "current_launch_authority",
     "current_signed_admin_allowlist",
     "current_signed_admins",
 ]
