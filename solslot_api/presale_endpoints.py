@@ -1555,6 +1555,15 @@ class PresaleStore:
             )
         return self.voucher(series["termsHash"], serial)
 
+    def voucher_for_purchase(self, purchase_id: str) -> dict[str, Any]:
+        """Use the unique current-protocol purchase binding, never a list scan."""
+        row = self._conn.execute(
+            "SELECT * FROM voucher_records_v2 WHERE purchase_id=?", (purchase_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(purchase_id)
+        return self._render_voucher(row, self._get_series(row["terms_hash"]))
+
     def voucher(self, terms_hash: str, serial: int) -> dict[str, Any]:
         series = self._get_series(terms_hash)
         row = self._conn.execute(

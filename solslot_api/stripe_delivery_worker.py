@@ -5,6 +5,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
+import math
 from typing import Any, Mapping
 
 from fastapi import HTTPException
@@ -125,6 +126,13 @@ class StripeDeliveryWorkerConfig:
     enabled: bool = False
     interval_seconds: float = 15.0
     lease_seconds: int = 60
+    advance_timeout_seconds: float = 20.0
+
+    def __post_init__(self):
+        if (isinstance(self.advance_timeout_seconds, bool)
+                or not math.isfinite(self.advance_timeout_seconds)
+                or not 0 < self.advance_timeout_seconds < self.lease_seconds):
+            raise ValueError('delivery advancement deadline must be finite and shorter than its lease')
 
 
 class StripeDeliveryWorker:
@@ -191,6 +199,10 @@ class StripeDeliveryWorker:
     ) -> StripeDeliveryOperation | None:
         if not self._writes_are_open():
             return None
+        # Do not queue caller tasks behind slow provider work. Keep serialized
+        # funding selection; each current advance has a deadline inside its lease.
+        if self._advance_lock.locked():
+            return None
         async with self._advance_lock:
             operation = (
                 self.store.claim(
@@ -209,7 +221,11 @@ class StripeDeliveryWorker:
             if not self._rail_is_enabled(operation):
                 return self.store.release_lease(operation.purchase_id)
             try:
-                return await self._advance(operation)
+                async with asyncio.timeout(self.config.advance_timeout_seconds):
+                    return await self._advance(operation)
+            except asyncio.CancelledError:
+                self.store.record_error(operation.purchase_id, 'Delivery observation interrupted; retain exact execution for recovery')
+                raise
             except StripeDeliveryManualReview as exc:
                 logger.error(
                     "Stripe purchase %s requires manual review: %s",

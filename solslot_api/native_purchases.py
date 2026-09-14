@@ -253,15 +253,20 @@ async def inventory_purchase_status(
     normalized = "0x" + _hex_bytes(purchase_id, 32, "purchaseId").hex()
     store = get_payment_purchase_store(settings.payment_purchase_db_path)
     try:
-        result = retained_inventory_status(store.inventory_status_snapshot(normalized),
-            environment=settings.runtime_environment + "-alpha", network=settings.network)
-        from .inventory_payment_holds import checkout_status
         checkout=store.checkout_hold(normalized)
+        terminal_artifact=load_signed_public_artifact(settings) if checkout is not None else None
+        result = retained_inventory_status(store.inventory_status_snapshot(normalized),
+            environment=settings.runtime_environment + "-alpha", network=settings.network, artifact=terminal_artifact)
+        from .inventory_payment_holds import checkout_status
         if checkout is not None:
-            result['checkoutHold']=checkout_status(checkout,load_signed_public_artifact(settings),now=int(time.time()))
+            if checkout['state'] in {'RETURNED','DELIVERED'}:
+                from .checkout_terminals import terminal_status
+                result['checkoutHold']=terminal_status(store,normalized,terminal_artifact)
+            else:
+                result['checkoutHold']=checkout_status(checkout,terminal_artifact,now=int(time.time()))
         from .inventory_extensions import hold_status
         hold = hold_status(store.get(normalized), store.inventory_extension_operations(normalized), now=int(time.time()))
-        if hold is not None:
+        if hold is not None and (checkout is None or checkout['state'] not in {'RETURNED','DELIVERED'}):
             from .inventory_extension_chain import current_position, validate_execution
             from .inventory_extension_claims import InventoryExtensionClaim
             stored = store.get(normalized)
@@ -275,6 +280,39 @@ async def inventory_purchase_status(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (PaymentPurchaseConflict, ValueError, TypeError, KeyError) as exc:
         raise HTTPException(status_code=409, detail="Inventory evidence is incomplete. The purchase remains held for review.") from exc
+
+
+@router.post('/inventory/payment-hold/reconcile-return')
+async def reconcile_payment_return(payload: InventoryReservationRequest, request: Request,
+        settings: Annotated[Settings, Depends(get_settings)], authorization: Annotated[str | None, Header()] = None):
+    return await _reconcile_checkout_terminal(payload,request,settings,authorization,paid=False)
+
+
+@router.post('/inventory/payment-hold/reconcile-paid')
+async def reconcile_payment_delivery(payload: InventoryReservationRequest, request: Request,
+        settings: Annotated[Settings, Depends(get_settings)], authorization: Annotated[str | None, Header()] = None):
+    return await _reconcile_checkout_terminal(payload,request,settings,authorization,paid=True)
+
+
+async def _reconcile_checkout_terminal(payload,request,settings,authorization,*,paid):
+    from .checkout_terminals import reconcile_checkout_return, reconcile_paid_checkout
+    from .presale_endpoints import get_presale_store
+    # These service-only observers remain available while new purchases are paused.
+    _require_server_to_server_token(settings,authorization)
+    args=dict(store=get_payment_purchase_store(settings.payment_purchase_db_path),node=request.app.state.coinset,
+        settings=settings,purchase_id=payload.purchase_id,load_artifact=lambda:load_signed_public_artifact(settings))
+    try:
+        if paid:
+            result=await reconcile_paid_checkout(**args,presales=get_presale_store(settings))
+        else:
+            result=await reconcile_checkout_return(**args)
+        return dict(purchaseId=payload.purchase_id,checkoutHold=result)
+    except PaymentPurchaseNotFound as exc:
+        raise HTTPException(status_code=404,detail='Retained checkout evidence was not found.') from exc
+    except (PaymentPurchaseConflict,ValueError,TypeError,KeyError,ValidatorQuorumError) as exc:
+        raise HTTPException(status_code=409,detail='Terminal proof is incomplete. Keep this purchase for recovery.') from exc
+    except (httpx.HTTPError,OSError,TimeoutError) as exc:
+        raise HTTPException(status_code=503,detail='Terminal observation is unavailable. Retry the same purchase.') from exc
 
 
 class InventoryExtensionRequest(BaseModel):

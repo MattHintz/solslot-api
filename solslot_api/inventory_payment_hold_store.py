@@ -45,13 +45,16 @@ class InventoryPaymentHoldStoreMixin:
     def claim_checkout_quorum(self,purchase_id,*,kind,owner,now):
         # One in-flight proof per purchase across processes, with a separate
         # recovery budget so new checkout traffic cannot consume every slot.
-        if kind not in ('arm','abort'):raise ValueError('unknown checkout quorum lane')
+        if kind not in ('arm','abort','return'):raise ValueError('unknown checkout quorum lane')
         with self._connect() as db:
             db.execute('BEGIN IMMEDIATE')
             row=db.execute('SELECT * FROM payment_checkout_quorum_leases WHERE purchase_id=?',(purchase_id,)).fetchone()
             if row and (row['lease_until']>now or (row['kind']==kind and row['retry_after']>now)):
                 raise conflict('checkout proof is already running or cooling down; recover the same purchase shortly')
-            count=db.execute('SELECT count(*) FROM payment_checkout_quorum_leases WHERE kind=? AND lease_until>?',(kind,now)).fetchone()[0]
+            # Abort and full return share the separately reserved recovery capacity.
+            lanes=('arm',) if kind=='arm' else ('abort','return')
+            placeholders=','.join('?' for _ in lanes)
+            count=db.execute(f'SELECT count(*) FROM payment_checkout_quorum_leases WHERE kind IN ({placeholders}) AND lease_until>?',(*lanes,now)).fetchone()[0]
             if count>=(8 if kind=='arm' else 4):raise conflict('checkout proof capacity is busy; retry the same purchase shortly')
             db.execute('INSERT INTO payment_checkout_quorum_leases(purchase_id,kind,owner,lease_until,retry_after) VALUES (?,?,?,?,?) '
                 'ON CONFLICT(purchase_id) DO UPDATE SET kind=excluded.kind,owner=excluded.owner,lease_until=excluded.lease_until,retry_after=excluded.retry_after',
@@ -121,6 +124,7 @@ class InventoryPaymentHoldStoreMixin:
             row=db.execute('SELECT * FROM payment_checkout_holds WHERE purchase_id=?',(purchase_id,)).fetchone()
             encoded=canonical(claim.model_dump(mode='json'))
             if (row is None or row['claim_json']!=canonical(claim.hold.model_dump(mode='json'))
+                    or row['state'] not in ('ARMING','ARMED','ABORTING','ABORTED')
                     or (row['abort_claim_json'] is not None and row['abort_claim_json']!=encoded)
                     or db.execute('SELECT 1 FROM payment_inventory_extensions WHERE purchase_id=?',(purchase_id,)).fetchone()):
                 raise conflict('partial cancellation must preserve its original unextended hold')
