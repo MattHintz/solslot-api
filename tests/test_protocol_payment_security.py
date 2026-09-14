@@ -9,7 +9,6 @@ from chia_rs.sized_bytes import bytes32
 from solslot_api import protocol_artifacts
 from solslot_api.config import Settings
 from solslot_api.protocol_artifacts import (
-    PAYMENT_SETTLED_TOPIC,
     VerifyPurchaseFinalizationRequest,
     _require_server_to_server_token,
     _verify_external_escrow_chain_evidence,
@@ -247,91 +246,13 @@ def _evm_normalized():
 def test_evm_callback_is_reconstructed_from_rpc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from tests.test_escrow_deposit import Chain
     normalized = _evm_normalized()
+    # Relayer provenance is PaymentDeposited, not the later PaymentSettled.
+    normalized["quoteExpiresAt"] = normalized["source"]["blockTimestamp"] + 300
+    chain = Chain(normalized)
+    monkeypatch.setattr(protocol_artifacts, "Web3", chain.web3)
     source = normalized["source"]
-    chain_block_hash = source["blockHash"]
-    deposit = (
-        normalized["depositor"],
-        normalized["settlementToken"],
-        bytes.fromhex(normalized["localPaymentId"][2:]),
-        bytes.fromhex(normalized["purchaseId"][2:]),
-        bytes.fromhex(normalized["artifactHash"][2:]),
-        bytes.fromhex(normalized["collectionId"][2:]),
-        bytes.fromhex(normalized["deedLauncherId"][2:]),
-        bytes.fromhex(normalized["vaultLauncherId"][2:]),
-        bytes.fromhex(normalized["destinationPuzzle"][2:]),
-        _b32(23),
-        _b32(24),
-        _b32(25),
-        normalized["amount"],
-        normalized["quantity"],
-        1,
-        "0x" + "26" * 20,
-        1_700_000_000,
-        normalized["quoteExpiresAt"],
-        3,
-        True,
-    )
-
-    class Call:
-        def call(self, **_kwargs):
-            return deposit
-
-    class Functions:
-        @staticmethod
-        def getDeposit(_payment_id):
-            return Call()
-
-    class Eth:
-        block_number = 111
-
-        @staticmethod
-        def get_transaction_receipt(_tx):
-            return {
-                "status": 1,
-                "to": source["spoke"],
-                "transactionHash": source["transactionHash"],
-                "blockNumber": source["blockNumber"],
-                "blockHash": chain_block_hash,
-                "logs": [
-                    {
-                        "logIndex": source["logIndex"],
-                        "address": source["spoke"],
-                        "topics": [
-                            PAYMENT_SETTLED_TOPIC,
-                            normalized["globalPaymentId"],
-                        ],
-                    }
-                ],
-            }
-
-        @staticmethod
-        def get_block(_height):
-            return {
-                "hash": chain_block_hash,
-                "timestamp": source["blockTimestamp"],
-            }
-
-        @staticmethod
-        def contract(**_kwargs):
-            return SimpleNamespace(functions=Functions())
-
-    class FakeWeb3:
-        eth = Eth()
-
-        def __init__(self, _provider):
-            pass
-
-        @staticmethod
-        def HTTPProvider(_url, request_kwargs):
-            assert request_kwargs == {"timeout": 20.0}
-            return object()
-
-        @staticmethod
-        def to_checksum_address(value):
-            return value
-
-    monkeypatch.setattr(protocol_artifacts, "Web3", FakeWeb3)
     settings = Settings(
         runtime_environment="test",
         payment_omnichain_rpc_url="https://base-sepolia.example.invalid",

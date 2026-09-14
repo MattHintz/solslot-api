@@ -124,3 +124,29 @@ async def test_base_validator_rejects_invalid_evidence_before_key_access(tmp_pat
         assert c.key_reads == []
     finally:
         c.ledger.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('inventory_version',[1,2])
+async def test_base_private_signer_uses_real_deposit_verifier_and_recovers_signature(tmp_path,monkeypatch,inventory_version):
+    from tests.test_escrow_deposit import Chain
+    real_provider=service._verify_base_voucher_payment
+    c=await signer_case(tmp_path,monkeypatch,inventory_version)
+    chain=Chain(c.claim.payment_evidence)
+    monkeypatch.setattr(service,'Web3',chain.web3)
+    monkeypatch.setattr(service,'_verify_base_voucher_payment',real_provider)
+    c.signer_settings.base_sepolia_rpc_url='https://offline.invalid'
+    c.signer_settings.base_sepolia_spoke_address=chain.evidence['source']['spoke']
+    c.signer_settings.base_sepolia_usdc_address=chain.evidence['settlementToken']
+    c.signer_settings.base_sepolia_min_confirmations=12
+    try:
+        signature=sign(c)
+        expected=AugSchemeMPL.aggregate([AugSchemeMPL.sign(c.keys[0],m) for m in c.claim.signature_messages()])
+        assert signature==hx(expected)
+        assert [call for call in chain.calls if call[0]=='deposit']
+        c.ledger.close();c.ledger=ValidatorLedger(tmp_path/'validator.db')
+        assert sign(c)==signature
+        c.key_reads.clear();chain.latest[18:]=[5,False]
+        with pytest.raises(service.ValidatorEvidenceError,match='eligible'):sign(c)
+        assert c.key_reads==[]
+    finally:c.ledger.close()

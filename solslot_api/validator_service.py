@@ -2096,124 +2096,20 @@ def _verify_base_voucher_payment(
     ):
         raise ValidatorEvidenceError("Base voucher source route is invalid")
 
-    w3 = Web3(
-        Web3.HTTPProvider(
-            settings.base_sepolia_rpc_url,
-            request_kwargs={"timeout": 20.0},
-        )
-    )
-    tx_hash = str(source.get("transactionHash") or "")
+    # Quote and vault authorization must have been valid when funds were
+    # deposited. Current reservation/series/owner checks remain in each signer.
+    from .escrow_deposit import EscrowDepositError, verify_escrow_deposit
     try:
-        receipt = w3.eth.get_transaction_receipt(tx_hash)
-        block = w3.eth.get_block(int(source["blockNumber"]))
-        latest = int(w3.eth.block_number)
-    except Exception as exc:  # noqa: BLE001
-        raise ValidatorEvidenceError(
-            "Base Sepolia could not independently verify the payment"
-        ) from exc
-    block_number = int(receipt.get("blockNumber") or 0)
-    if (
-        int(receipt.get("status") or 0) != 1
-        or block_number != int(source.get("blockNumber") or 0)
-        or "0x" + bytes(receipt.get("blockHash") or b"").hex()
-        != str(source.get("blockHash") or "").lower()
-        or int(block.get("timestamp") or 0) != int(source.get("blockTimestamp") or 0)
-        or latest - block_number + 1 < settings.base_sepolia_min_confirmations
-    ):
-        raise ValidatorEvidenceError("Base voucher receipt provenance changed")
-
-    log_index = int(source.get("logIndex") or 0)
-    event_topic = Web3.keccak(
-        text=(
-            "PaymentDeposited(bytes32,bytes32,address,address,uint256,uint64,"
-            "address,bytes32,uint256)"
+        purchase.assert_live(int(source["blockTimestamp"]))
+        if int(evidence["quoteExpiresAt"]) != int(purchase.quote_expires_at):
+            raise ValidatorEvidenceError("Base voucher quote expiry differs from purchase")
+        verify_escrow_deposit(
+            rpc_url=settings.base_sepolia_rpc_url, evidence=evidence,
+            chain_id=84532, spoke=spoke, token=usdc,
+            confirmations=settings.base_sepolia_min_confirmations, web3_factory=Web3,
         )
-    )
-    matching = []
-    for log in receipt.get("logs", []):
-        topics = list(log.get("topics") or [])
-        if (
-            str(log.get("address") or "").lower() == spoke
-            and int(log.get("logIndex") or 0) == log_index
-            and len(topics) == 4
-            and bytes(topics[0]) == bytes(event_topic)
-            and "0x" + bytes(topics[1]).hex() == expected["globalPaymentId"]
-            and "0x" + bytes(topics[2]).hex()
-            == str(evidence.get("localPaymentId") or "").lower()
-            and "0x" + bytes(topics[3])[-20:].hex() == expected_payer
-        ):
-            matching.append(log)
-    if len(matching) != 1:
-        raise ValidatorEvidenceError("Base voucher deposit event is missing or ambiguous")
-
-    deposit_abi = [
-        {
-            "inputs": [{"name": "globalPaymentId", "type": "bytes32"}],
-            "name": "getDeposit",
-            "outputs": [
-                {
-                    "components": [
-                        {"name": "depositor", "type": "address"},
-                        {"name": "settlementToken", "type": "address"},
-                        {"name": "localPaymentId", "type": "bytes32"},
-                        {"name": "purchaseId", "type": "bytes32"},
-                        {"name": "artifactHash", "type": "bytes32"},
-                        {"name": "collectionId", "type": "bytes32"},
-                        {"name": "deedLauncherId", "type": "bytes32"},
-                        {"name": "vaultLauncherId", "type": "bytes32"},
-                        {"name": "destinationPuzzle", "type": "bytes32"},
-                        {"name": "requestMessageId", "type": "bytes32"},
-                        {"name": "resultMessageId", "type": "bytes32"},
-                        {"name": "warpNonce", "type": "bytes32"},
-                        {"name": "amount", "type": "uint256"},
-                        {"name": "quantity", "type": "uint256"},
-                        {"name": "hubChainSelector", "type": "uint64"},
-                        {"name": "hubGateway", "type": "address"},
-                        {"name": "createdAt", "type": "uint64"},
-                        {"name": "quoteExpiresAt", "type": "uint64"},
-                        {"name": "status", "type": "uint8"},
-                        {"name": "succeeded", "type": "bool"},
-                    ],
-                    "name": "",
-                    "type": "tuple",
-                }
-            ],
-            "stateMutability": "view",
-            "type": "function",
-        }
-    ]
-    try:
-        deposit = w3.eth.contract(
-            address=Web3.to_checksum_address(spoke), abi=deposit_abi
-        ).functions.getDeposit(expected["globalPaymentId"]).call()
-    except Exception as exc:  # noqa: BLE001
-        raise ValidatorEvidenceError("Base voucher deposit storage is unavailable") from exc
-    observed_deposit = {
-        "depositor": str(deposit[0]).lower(),
-        "settlementToken": str(deposit[1]).lower(),
-        "localPaymentId": "0x" + bytes(deposit[2]).hex(),
-        "purchaseId": "0x" + bytes(deposit[3]).hex(),
-        "artifactHash": "0x" + bytes(deposit[4]).hex(),
-        "collectionId": "0x" + bytes(deposit[5]).hex(),
-        "deedLauncherId": "0x" + bytes(deposit[6]).hex(),
-        "vaultLauncherId": "0x" + bytes(deposit[7]).hex(),
-        "destinationPuzzle": "0x" + bytes(deposit[8]).hex(),
-        "amount": int(deposit[12]),
-        "quantity": int(deposit[13]),
-    }
-    for field, expected_value in {
-        **expected,
-        "localPaymentId": str(evidence.get("localPaymentId") or "").lower(),
-    }.items():
-        if observed_deposit.get(field) != expected_value:
-            raise ValidatorEvidenceError(
-                f"Base voucher stored deposit {field} does not match"
-            )
-    status_value = int(deposit[18])
-    if status_value not in (1, 2, 3) or (
-        status_value >= 2 and bool(deposit[19]) is not True
-    ):
-        raise ValidatorEvidenceError("Base voucher deposit is not eligible")
+    except (EscrowDepositError, PaymentArtifactError, KeyError, TypeError, ValueError) as exc:
+        raise ValidatorEvidenceError(str(exc)) from exc
 
 
 def verify_voucher_issuance_claim(
