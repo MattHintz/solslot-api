@@ -64,6 +64,8 @@ from solslot_puzzles.payment_artifacts_v3 import (
 from solslot_puzzles.property_registry_driver import canonicalise_property_id
 from solslot_puzzles.vault_driver import puzzle_hash_for_p2_vault
 
+from .escrow_deposit import EscrowDepositError, EscrowProviderUnavailable, same_deposit_message, verify_escrow_deposit
+from .escrow_verification_work import run_deposit_verification
 from .bootstrap_manifest import _assert_public_artifact, content_hash
 from .config import Settings, get_settings
 from .credential_auth import require_minting_writes
@@ -122,42 +124,6 @@ ALPHA_TECHNOLOGY_FEE_BPS = 100
 PAYMENT_SETTLED_TOPIC = Web3.keccak(
     text="PaymentSettled(bytes32,address,address,uint256,bool,bool)"
 ).hex()
-ESCROW_DEPOSIT_ABI = [
-    {
-        "inputs": [{"name": "globalPaymentId", "type": "bytes32"}],
-        "name": "getDeposit",
-        "outputs": [
-            {
-                "components": [
-                    {"name": "depositor", "type": "address"},
-                    {"name": "settlementToken", "type": "address"},
-                    {"name": "localPaymentId", "type": "bytes32"},
-                    {"name": "purchaseId", "type": "bytes32"},
-                    {"name": "artifactHash", "type": "bytes32"},
-                    {"name": "collectionId", "type": "bytes32"},
-                    {"name": "deedLauncherId", "type": "bytes32"},
-                    {"name": "vaultLauncherId", "type": "bytes32"},
-                    {"name": "destinationPuzzle", "type": "bytes32"},
-                    {"name": "requestMessageId", "type": "bytes32"},
-                    {"name": "resultMessageId", "type": "bytes32"},
-                    {"name": "warpNonce", "type": "bytes32"},
-                    {"name": "amount", "type": "uint256"},
-                    {"name": "quantity", "type": "uint256"},
-                    {"name": "hubChainSelector", "type": "uint64"},
-                    {"name": "hubGateway", "type": "address"},
-                    {"name": "createdAt", "type": "uint64"},
-                    {"name": "quoteExpiresAt", "type": "uint64"},
-                    {"name": "status", "type": "uint8"},
-                    {"name": "succeeded", "type": "bool"},
-                ],
-                "name": "",
-                "type": "tuple",
-            }
-        ],
-        "stateMutability": "view",
-        "type": "function",
-    }
-]
 
 
 @router.get("/artifact", response_model=dict[str, Any])
@@ -1045,7 +1011,10 @@ async def verify_external_escrow(
             if batch is not None
             else _purchase_artifact_from_json(record.purchase_artifact)
         )
-        canonical_document.assert_live(int(time.time()))
+        # A delayed first callback is evaluated at the deposit's authenticated
+        # chain time, not the callback wall clock. RPC verification below proves
+        # that time before any durable payment binding or fulfillment.
+        canonical_document.assert_live(source.block_timestamp)
         canonical = (
             batch.artifacts[0] if batch is not None else canonical_document
         )
@@ -1084,17 +1053,6 @@ async def verify_external_escrow(
             status_code=status.HTTP_409_CONFLICT,
             detail="external payment provenance does not match the reviewed escrow rail",
         )
-    try:
-        _verify_external_escrow_chain_evidence(
-            settings,
-            normalized=normalized,
-            deployment=deployment,
-        )
-    except PaymentArtifactError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=str(exc),
-        ) from exc
     delivery_amount = batch.quantity if batch is not None else 1
     delivery_context = canonical.collection_id
     delivery_asset = canonical.deed_launcher_id
@@ -1133,6 +1091,21 @@ async def verify_external_escrow(
                 + ", ".join(mismatches)
             ),
         )
+    # Reject a different payment and malformed commitments before spending RPC
+    # capacity. An identical replay is still independently checked for refunds.
+    if record.external_message is not None and not same_deposit_message(record.external_message, normalized):
+        raise HTTPException(status_code=409, detail="purchase is already bound to another external payment")
+    try:
+        await run_deposit_verification(
+            settings.payment_purchase_db_path, normalized["purchaseId"],
+            lambda: _verify_external_escrow_chain_evidence(
+                settings, normalized=normalized, deployment=deployment,
+            ),
+        )
+    except EscrowProviderUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "5"}) from exc
+    except PaymentArtifactError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     try:
         record = store.bind_external_message(
             normalized["purchaseId"],
@@ -1143,6 +1116,10 @@ async def verify_external_escrow(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
         ) from exc
+    # A relayer retry may observe more confirmations, but never rewrites the
+    # first authenticated event or changes the evidence used by fulfillment.
+    normalized = record.external_message
+    assert normalized is not None
     return VerifyExternalEscrowResponse(
         verified=True,
         purchase_intent_id=record.purchase_intent_id,
@@ -2635,112 +2612,24 @@ def _verify_stripe_provider_evidence(
         )
 
 
-def _rpc_hex(value: object) -> str:
-    if hasattr(value, "hex"):
-        rendered = value.hex()  # type: ignore[union-attr]
-        return rendered if str(rendered).startswith("0x") else "0x" + str(rendered)
-    return str(value)
-
-
 def _verify_external_escrow_chain_evidence(
     settings: Settings,
     *,
     normalized: Mapping[str, Any],
     deployment: Any,
 ) -> None:
-    """Re-read the canonical receipt, settlement log, and deposit storage."""
-
-    if not settings.payment_omnichain_rpc_url:
-        raise PaymentArtifactError("EVM escrow RPC is not configured")
-    source = normalized["source"]
-    w3 = Web3(
-        Web3.HTTPProvider(
-            settings.payment_omnichain_rpc_url,
-            request_kwargs={"timeout": 20.0},
-        )
-    )
+    """Authenticate a deposit; final settlement has its own authorized path."""
     try:
-        receipt = w3.eth.get_transaction_receipt(source["transactionHash"])
-        block = w3.eth.get_block(source["blockNumber"])
-        latest = int(w3.eth.block_number)
-    except Exception as exc:  # noqa: BLE001
-        raise PaymentArtifactError(
-            "EVM escrow transaction could not be independently verified"
-        ) from exc
-    block_number = int(receipt.get("blockNumber") or 0)
-    confirmations = latest - block_number + 1
-    if (
-        int(receipt.get("status") or 0) != 1
-        or str(receipt.get("to") or "").lower() != deployment.spoke_address
-        or _rpc_hex(receipt.get("transactionHash")).lower()
-        != source["transactionHash"]
-        or block_number != source["blockNumber"]
-        or _rpc_hex(receipt.get("blockHash")).lower() != source["blockHash"]
-        or _rpc_hex(block.get("hash")).lower() != source["blockHash"]
-        or int(block.get("timestamp") or 0) != source["blockTimestamp"]
-        or confirmations < deployment.confirmations
-        or confirmations < source["confirmations"]
-    ):
-        raise PaymentArtifactError("EVM escrow receipt provenance changed")
-    matching_logs = [
-        log
-        for log in receipt.get("logs", [])
-        if int(log.get("logIndex", -1)) == source["logIndex"]
-        and str(log.get("address") or "").lower() == deployment.spoke_address
-        and len(log.get("topics") or []) >= 2
-        and _rpc_hex(log["topics"][0]).lower() == PAYMENT_SETTLED_TOPIC.lower()
-        and _rpc_hex(log["topics"][1]).lower()
-        == normalized["globalPaymentId"]
-    ]
-    if len(matching_logs) != 1:
-        raise PaymentArtifactError("EVM settlement log is missing or ambiguous")
-    contract = w3.eth.contract(
-        address=Web3.to_checksum_address(deployment.spoke_address),
-        abi=ESCROW_DEPOSIT_ABI,
-    )
-    try:
-        deposit = contract.functions.getDeposit(
-            normalized["globalPaymentId"]
-        ).call(block_identifier=source["blockNumber"])
-    except Exception as exc:  # noqa: BLE001
-        raise PaymentArtifactError("EVM escrow deposit storage is unavailable") from exc
-    observed = {
-        "depositor": str(deposit[0]).lower(),
-        "settlementToken": str(deposit[1]).lower(),
-        "localPaymentId": _rpc_hex(deposit[2]).lower(),
-        "purchaseId": _rpc_hex(deposit[3]).lower(),
-        "artifactHash": _rpc_hex(deposit[4]).lower(),
-        "collectionId": _rpc_hex(deposit[5]).lower(),
-        "deedLauncherId": _rpc_hex(deposit[6]).lower(),
-        "vaultLauncherId": _rpc_hex(deposit[7]).lower(),
-        "destinationPuzzle": _rpc_hex(deposit[8]).lower(),
-        "amount": int(deposit[12]),
-        "quantity": int(deposit[13]),
-        "quoteExpiresAt": int(deposit[17]),
-        "status": int(deposit[18]),
-        "succeeded": bool(deposit[19]),
-    }
-    expected = {
-        field: normalized[field]
-        for field in (
-            "depositor",
-            "settlementToken",
-            "localPaymentId",
-            "purchaseId",
-            "artifactHash",
-            "collectionId",
-            "deedLauncherId",
-            "vaultLauncherId",
-            "destinationPuzzle",
-            "amount",
-            "quantity",
-            "quoteExpiresAt",
+        verify_escrow_deposit(
+            rpc_url=settings.payment_omnichain_rpc_url,
+            evidence=normalized, chain_id=normalized["source"]["chainId"],
+            spoke=deployment.spoke_address, token=normalized["settlementToken"],
+            confirmations=deployment.confirmations, web3_factory=Web3,
         )
-    }
-    expected["status"] = 3
-    expected["succeeded"] = True
-    if observed != expected:
-        raise PaymentArtifactError("EVM escrow deposit differs from callback evidence")
+    except EscrowProviderUnavailable:
+        raise
+    except EscrowDepositError as exc:
+        raise PaymentArtifactError(str(exc)) from exc
 
 
 def _require_omnichain_ingest_token(

@@ -89,6 +89,14 @@ def base_case(tmp_path, monkeypatch, inventory_version=2, *, after_authorization
     deposit = dict(case.operation.evidence)
     deposit["source"] = dict(deposit["source"], transactionHash=hx(_b32(43)), confirmations=12, blockTimestamp=NOW+50, blockNumber=123, logIndex=2)
     deposit["gatewayProfile"] = "ccip"
+    # Include the actual callback's complete deposit commitments so private
+    # signer integration can exercise the provider verifier, not only a stub.
+    deposit.update(localPaymentId=hx(_b32(46)), purchaseId=hx(case.purchase.purchase_id),
+        artifactHash=hx(case.purchase.artifact_hash), amount=case.purchase.rail_amount,
+        quantity=case.purchase.delivery_amount, collectionId=hx(case.purchase.collection_id),
+        deedLauncherId=hx(case.purchase.deed_launcher_id), vaultLauncherId=hx(case.purchase.vault_launcher_id),
+        destinationPuzzle=hx(case.purchase.vault_p2_puzzle_hash), quoteExpiresAt=case.purchase.quote_expires_at)
+    deposit["source"]["blockHash"] = deposit["blockHash"]
     stored = case.purchases.bind_external_message(hx(case.purchase.purchase_id), deposit)
     payer = hx(bytes32(b"\x00"*12 + bytes.fromhex(deposit["depositor"][2:])))
     evidence = VoucherIssuanceEvidenceRequest(purchaseArtifact=stored.purchase_artifact,

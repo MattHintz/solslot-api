@@ -17,6 +17,8 @@ from .inventory_payment_hold_store import InventoryPaymentHoldStoreMixin, migrat
 from .purchase_admission import PurchaseAdmissionStoreMixin, migrate_purchase_admission, close_inventory_admission
 from .checkout_terminal_store import CheckoutTerminalStoreMixin, migrate_checkout_terminals
 from .checkout_lifecycle_store import CheckoutLifecycleStoreMixin, migrate_lifecycle
+from .escrow_verification_work import migrate_escrow_verifications
+from .escrow_deposit import same_deposit_message
 
 
 class PaymentPurchaseNotFound(LookupError):
@@ -186,6 +188,7 @@ class PaymentPurchaseStore(InventoryExtensionStoreMixin, InventoryPaymentHoldSto
             migrate_checkout_terminals(connection)
             migrate_purchase_admission(connection)
             migrate_lifecycle(connection)
+            migrate_escrow_verifications(connection)
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS "
                 "payment_purchases_external_transaction "
@@ -950,7 +953,7 @@ class PaymentPurchaseStore(InventoryExtensionStoreMixin, InventoryPaymentHoldSto
                 )
             existing_json = row["external_message_json"]
             if existing_json is not None:
-                if existing_json != message_json:
+                if existing_json != message_json and not same_deposit_message(json.loads(existing_json), message):
                     connection.execute("ROLLBACK")
                     raise PaymentPurchaseConflict(
                         "purchase is already bound to another external payment"
