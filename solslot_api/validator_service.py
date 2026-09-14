@@ -31,6 +31,10 @@ from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 from web3 import Web3
 
+from solslot_puzzles.voucher_purchase import voucher_purchase_from_json, validate_base_voucher_purchase
+from solslot_puzzles.base_voucher_v5 import (
+    prepare_base_voucher_redemption_offer_v5, build_base_voucher_primary_offer_v5,
+)
 from solslot_puzzles import load_puzzle
 from solslot_puzzles.vault_driver import (
     AUTH_TYPE_BLS,
@@ -53,6 +57,7 @@ from solslot_puzzles.payment_artifacts_v2 import (
     purchase_artifact_from_json,
 )
 from solslot_puzzles.payment_artifacts_v3 import (
+    PurchaseArtifactV3,
     PurchaseDeliveryKind,
     PurchaseKind,
     STRIPE_PAYMENT_PROVIDER_ID,
@@ -2274,8 +2279,9 @@ def verify_voucher_issuance_claim(
             voucher = voucher_commitment_from_json(
                 claim.voucher_commitment
             )
-            purchase = purchase_artifact_from_json(claim.purchase_artifact)
+            purchase = voucher_purchase_from_json(claim.purchase_artifact)
             if voucher.payment_rail == VoucherPaymentRail.BASE_SEPOLIA_USDC:
+                validate_base_voucher_purchase(voucher, purchase, terms)
                 payment_source = claim.payment_evidence.get("source")
                 if not isinstance(payment_source, Mapping):
                     raise ValueError("voucher payment source is missing")
@@ -2832,9 +2838,11 @@ def verify_voucher_transition_claim(
             voucher = voucher_commitment_from_json(
                 claim.voucher_commitment
             )
-            purchase = purchase_artifact_from_json(
+            purchase = voucher_purchase_from_json(
                 claim.purchase_artifact
             )
+        if not is_stripe and voucher.payment_rail == VoucherPaymentRail.BASE_SEPOLIA_USDC:
+            validate_base_voucher_purchase(voucher, purchase, terms)
         state = VoucherSeriesStateV2(
             sold_count=claim.series_sold_count,
             redeemed_count=claim.series_redeemed_count,
@@ -2857,6 +2865,13 @@ def verify_voucher_transition_claim(
         voucher.payment_rail == VoucherPaymentRail.BASE_SEPOLIA_USDC
         and purchase.rail == PaymentRail.EVM_TEST_USD
     )
+    is_current_base = is_base and isinstance(purchase, PurchaseArtifactV3)
+    if is_current_base and action == VoucherAction.REDEEM:
+        if claim.reservation_expires_at is None or int(time.time()) >= claim.reservation_expires_at:
+            raise ValidatorEvidenceError("Base voucher inventory reservation has expired or is missing")
+        if (claim.smart_deed_inner_hash != "0x" + bytes(voucher.smart_deed_inner_hash).hex()
+            or claim.vault_identity_attest_root != "0x" + bytes(purchase.zkpassport_root).hex()):
+            raise ValidatorEvidenceError("Base voucher deed or credential differs from paid commitments")
     is_native = (
         not is_stripe
         and
@@ -3279,7 +3294,7 @@ def verify_voucher_transition_claim(
                 deed_launcher_id=purchase.deed_launcher_id,
                 protocol_did_singleton_struct=did_struct,
             )
-            if is_stripe:
+            if is_stripe or is_current_base:
                 assert claim.reservation_expires_at is not None
                 mint_terms = PrimaryMintTermsV3.for_artifact(
                     artifact=purchase,
@@ -3348,7 +3363,7 @@ def verify_voucher_transition_claim(
             "voucher redemption SmartDeed coin",
         )
         if (
-            (not is_stripe and deed_coin.parent_coin_info != purchase.deed_launcher_id)
+            (not (is_stripe or is_current_base) and deed_coin.parent_coin_info != purchase.deed_launcher_id)
             or deed_coin.puzzle_hash != expected_deed_puzzle.get_tree_hash()
             or int(deed_coin.amount) != 1
         ):
@@ -3365,6 +3380,11 @@ def verify_voucher_transition_claim(
                     deed_singleton_struct=deed_struct,
                 )
                 if is_stripe
+                else prepare_base_voucher_redemption_offer_v5(
+                    terminal=transition, receipt_coin=payment_coin, artifact=purchase,
+                    terms=mint_terms, deed_singleton_struct=deed_struct,
+                )
+                if is_current_base
                 else prepare_base_voucher_redemption_offer(
                     terminal_coin_spends=transition.coin_spends,
                     receipt_coin=payment_coin,
@@ -3402,8 +3422,14 @@ def verify_voucher_transition_claim(
                     reservation=reservation,
                 )
                 if is_stripe
-                else
-                build_universal_primary_offer_v4(
+                else build_base_voucher_primary_offer_v5(
+                    voucher_offer=claimed_buyer_offer, terminal=transition,
+                    receipt_coin=payment_coin, artifact=purchase, deed_coin=deed_coin,
+                    deed_singleton_struct=deed_struct, lineage_proof=deed_lineage,
+                    signer_indices=(0, 1), terms=mint_terms, reservation=reservation,
+                )
+                if is_current_base
+                else build_universal_primary_offer_v4(
                     buyer_offer=claimed_buyer_offer,
                     deed_coin=deed_coin,
                     deed_singleton_struct=deed_struct,

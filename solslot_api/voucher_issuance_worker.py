@@ -26,6 +26,10 @@ from chia_rs import AugSchemeMPL, G2Element, SpendBundle
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 
+from solslot_puzzles.voucher_purchase import voucher_purchase_from_json, validate_base_voucher_purchase
+from solslot_puzzles.base_voucher_v5 import (
+    prepare_base_voucher_redemption_offer_v5, build_base_voucher_primary_offer_v5,
+)
 from solslot_puzzles import load_puzzle
 from solslot_puzzles.payment_artifacts_v2 import (
     PaymentRail,
@@ -1824,12 +1828,21 @@ class VoucherIssuanceWorker:
         deadline = int(series.get("deliveryDeadline") or 0)
         if series.get("state") != "LIVE" or int(time.time()) >= deadline:
             return False
-        context = await _load_context(
+        group = await _load_context_group(
             self.settings,
             self.coinset,
             str(voucher_json["purchaseId"]),
             require_live=False,
+            allowed_rails=(PaymentRail.EVM_TEST_USD,),
         )
+        if (group.batch is not None or len(group.contexts) != 1
+            or group.contexts[0].purchase.purchase_kind != PurchaseKind.PRESALE):
+            raise RuntimeError("Base voucher differs from its single canonical reservation")
+        context = group.contexts[0]
+        if context.reservation is None:
+            raise RuntimeError("Base voucher inventory reservation is missing")
+        if int(time.time()) >= context.reservation.expires_at:
+            raise RuntimeError("Base voucher inventory reservation has expired")
         stored, payment_evidence, evidence_hash = self._base_payment_evidence(
             voucher_json
         )
@@ -1890,11 +1903,12 @@ class VoucherIssuanceWorker:
                 range(self.settings.zkpassport_validator_threshold)
             ),
         )
-        provisional_buyer = prepare_base_voucher_redemption_offer(
-            terminal_coin_spends=provisional.coin_spends,
+        provisional_buyer = prepare_base_voucher_redemption_offer_v5(
+            terminal=provisional,
             receipt_coin=receipt_coin,
             artifact=context.purchase,
             terms=context.terms,
+            deed_singleton_struct=context.deed_struct,
         )
         genesis = load_signed_public_artifact(self.settings)
         receipt = context.credential_receipt
@@ -1926,6 +1940,7 @@ class VoucherIssuanceWorker:
             smart_deed_inner_hash=_hex32(context.terms.smart_deed_inner_hash),
             protocol_puzzle_hash=_hex32(context.terms.protocol_puzhash),
             buyer_offer=provisional_buyer.to_bech32(),
+            reservation_expires_at=context.reservation.expires_at,
             payment_evidence=payment_evidence,
             external_settlement_evidence_hash=_hex32(evidence_hash),
             external_validator_message=_hex32(
@@ -1962,25 +1977,19 @@ class VoucherIssuanceWorker:
             raise RuntimeError(
                 "Base voucher redemption changed after quorum selection"
             )
-        buyer_offer = prepare_base_voucher_redemption_offer(
-            terminal_coin_spends=terminal.coin_spends,
+        buyer_offer = prepare_base_voucher_redemption_offer_v5(
+            terminal=terminal,
             receipt_coin=receipt_coin,
             artifact=context.purchase,
             terms=context.terms,
-        )
-        primary = build_universal_primary_offer_v4(
-            buyer_offer=buyer_offer,
-            deed_coin=context.deed_coin,
             deed_singleton_struct=context.deed_struct,
-            lineage_proof=context.deed_lineage,
-            artifact=context.purchase,
-            signer_indices=quorum.signer_indices,
-            terms=context.terms,
-            purchase_mode=PrimaryPurchaseMode.VOUCHER,
-            voucher_coin_id=voucher_coin.name(),
-            voucher_transition_message=terminal.validator_message,
-            external_receipt_coin=receipt_coin,
-            external_settlement_evidence_hash=evidence_hash,
+        )
+        primary = build_base_voucher_primary_offer_v5(
+            voucher_offer=buyer_offer, terminal=terminal, receipt_coin=receipt_coin,
+            artifact=context.purchase, deed_coin=context.deed_coin,
+            deed_singleton_struct=context.deed_struct, lineage_proof=context.deed_lineage,
+            signer_indices=quorum.signer_indices, terms=context.terms,
+            reservation=context.reservation,
         )
         valid = primary.aggregate_offer.to_valid_spend()
         bundle = SpendBundle(
@@ -1989,25 +1998,17 @@ class VoucherIssuanceWorker:
                 [valid.aggregated_signature, quorum.aggregated_signature]
             ),
         )
-        additions = [
-            addition
-            for spend in bundle.coin_spends
-            for addition in compute_additions(spend)
-        ]
+        evaluated = EvaluatedBundleOutputs(bundle)
         treasury_output = _one_output(
-            additions,
-            context.terms.protocol_puzhash,
-            1,
+            evaluated.additions, context.terms.protocol_puzhash, 1,
             "Base receipt coordination output",
         )
-        deed_output = _one_output(
-            additions,
-            _deed_vault_full_puzzle_hash(
-                context.purchase.deed_launcher_id,
-                context.purchase.vault_launcher_id,
-            ),
-            1,
-            "vault SmartDeed delivery",
+        deed_output = evaluated.find_exact_descendant(
+            ancestor_coin_id=context.deed_coin.name(),
+            puzzle_hash=SINGLETON_MOD.curry(
+                context.deed_struct, puzzle_for_p2_vault(context.purchase.vault_launcher_id),
+            ).get_tree_hash(),
+            amount=1, label="vault SmartDeed delivery",
         )
         await self._dispatch_retained_execution(series, voucher_json, bundle,
             kind="base_redemption", bindings=dict(
@@ -2189,7 +2190,7 @@ class VoucherIssuanceWorker:
         stored, payment_evidence, evidence_hash = self._base_payment_evidence(
             voucher_json
         )
-        purchase = purchase_artifact_from_json(stored.purchase_artifact)
+        purchase = voucher_purchase_from_json(stored.purchase_artifact)
         terms = series_terms_from_json(series["terms"])
         voucher = voucher_commitment_from_json(voucher_json["commitment"])
         if (
@@ -2436,6 +2437,8 @@ class VoucherIssuanceWorker:
         expected_deed_puzzle_hash = (
             self._stripe_redemption_destination(voucher, coins)
             if stripe
+            else self._base_redemption_destination(series, voucher, coins)
+            if base and self.purchases.get(str(voucher["purchaseId"])).purchase_artifact.get("schema") == "solslot.purchase-artifact.v3"
             else _deed_vault_full_puzzle_hash(
                 voucher_commitment.deed_launcher_id,
                 voucher_commitment.approved_vault_launcher_id,
@@ -2589,6 +2592,45 @@ class VoucherIssuanceWorker:
         )
         if output != coins["deed_output"]:
             raise RuntimeError("Stripe voucher confirmation changed SmartDeed destination")
+        return bytes32(destination)
+
+    def _base_redemption_destination(self, series, voucher, coins) -> bytes32:
+        stored, _, evidence_hash = self._base_payment_evidence(voucher)
+        purchase = voucher_purchase_from_json(stored.purchase_artifact)
+        commitment = voucher_commitment_from_json(voucher["commitment"])
+        validate_base_voucher_purchase(commitment, purchase, series_terms_from_json(series["terms"]))
+        if purchase.network != self.settings.network or _hex32(evidence_hash) != voucher["externalSettlementEvidenceHash"]:
+            raise RuntimeError("Base voucher confirmation changed paid commitments")
+        execution = self.presales.pending_voucher_execution(series["termsHash"], voucher["serial"])
+        if not isinstance(execution, Mapping) or execution.get("kind") != "base_redemption":
+            raise RuntimeError("Base voucher exact redemption evidence is missing")
+        bundle = SpendBundle.from_json_dict(execution["spendBundle"])
+        expected = dict(
+            spend_bundle_id=voucher["redemptionBundleId"],
+            treasury_output_coin_id=voucher["redemptionTreasuryOutputCoinId"],
+            deed_output_coin_id=voucher["redemptionDeedOutputCoinId"],
+            terminal_voucher_coin_id=voucher["redemptionTerminalVoucherCoinId"],
+            series_input_coin_id=voucher["redemptionSeriesInputCoinId"],
+            series_output_coin_id=voucher["redemptionSeriesOutputCoinId"],
+            deed_input_coin_id=voucher["redemptionDeedInputCoinId"],
+            external_settlement_evidence_hash=_hex32(evidence_hash),
+        )
+        if execution["bindings"] != expected or _hex32(bundle.name()) != expected["spend_bundle_id"]:
+            raise RuntimeError("Base voucher confirmation differs from exact execution")
+        removals = {coin.name(): coin for coin in bundle.removals()}
+        for name in ("series_input", "voucher_input", "payment_input", "deed_input"):
+            coin = coins[name]
+            if coin is None or removals.get(coin.name()) != coin:
+                raise RuntimeError("Base voucher confirmation changed an exact input")
+        genesis = load_signed_public_artifact(self.settings)
+        struct = deed_singleton_struct(deed_launcher_id=purchase.deed_launcher_id,
+            protocol_did_singleton_struct=singleton_struct(_b32(genesis["launcherIds"]["did"])))
+        destination = SINGLETON_MOD.curry(struct, puzzle_for_p2_vault(purchase.vault_launcher_id)).get_tree_hash()
+        output = EvaluatedBundleOutputs(bundle).find_exact_descendant(
+            ancestor_coin_id=_b32(voucher["redemptionDeedInputCoinId"]), puzzle_hash=destination,
+            amount=1, label="vault SmartDeed delivery")
+        if output != coins["deed_output"]:
+            raise RuntimeError("Base voucher confirmation changed SmartDeed destination")
         return bytes32(destination)
 
     async def _confirm_base_redemption_if_ready(

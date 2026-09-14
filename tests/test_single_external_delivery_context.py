@@ -158,6 +158,7 @@ def delivery_case(tmp_path, monkeypatch, rail=PAYMENT_RAIL_STRIPE, inventory_ver
     receipt_data = dict(
         base.credential_receipt,
         vaultLauncherId=hx(purchase.vault_launcher_id),
+        identityAttestRoot=hx(purchase.zkpassport_root),
         network="testnet11",
         confirmedBlockIndex=110,
         policyVersion=settings.zkpassport_policy_version,
@@ -269,6 +270,7 @@ def delivery_case(tmp_path, monkeypatch, rail=PAYMENT_RAIL_STRIPE, inventory_ver
     )
     receipt_coin = Coin(_b32(45), receipt_puzzle.get_tree_hash(), uint64(1))
     records = {hx(c.name()): coin_record(c) for c in (launcher, reserved, receipt_coin)}
+    records[hx(reserved.name())] = coin_record(reserved, confirmed=124)
     queried = []
 
     async def get_coin(coin_id):

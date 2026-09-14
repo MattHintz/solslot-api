@@ -905,6 +905,11 @@ async def verify_purchase_finalization(
                         issued_purchase=stored,
                     )
                     delivery_state = str(voucher_event["voucherState"])
+                elif isinstance(canonical, PurchaseArtifactV3) and canonical.purchase_kind == PurchaseKind.PRESALE:
+                    voucher_event = _ingest_base_presale_purchase(settings, stored)
+                    if voucher_event is None:
+                        raise PaymentArtifactError("Base presale did not produce a voucher")
+                    delivery_state = str(voucher_event.get("voucher", {}).get("state") or voucher_event["outcome"])
                 else:
                     from .stripe_delivery_store import get_stripe_delivery_store
 
@@ -1185,62 +1190,46 @@ def _ingest_verified_presale_payment(
     settings: Settings,
 ) -> dict[str, Any] | None:
     """Route one confirmed Base payment into its active voucher campaign."""
-    from .presale_endpoints import (
-        VoucherIssuanceEvidenceRequest,
-        _external_escrow_contract,
-        get_presale_store,
-    )
-    from .vault_eligibility import require_current_approved_vault
+    record = get_payment_purchase_store(settings.payment_purchase_db_path).get(payload.escrow_message.purchase_id)
+    if record.purchase_artifact != verified.purchase_artifact:
+        raise PaymentArtifactError("verified Base purchase differs from issued artifact")
+    return _ingest_base_presale_purchase(settings, record)
 
+
+def _ingest_base_presale_purchase(settings: Settings, record: Any) -> dict[str, Any] | None:
+    from .presale_endpoints import VoucherIssuanceEvidenceRequest, _external_escrow_contract, get_presale_store
+    from .vault_eligibility import require_current_approved_vault
+    from solslot_puzzles.voucher_purchase import voucher_purchase_from_json
+
+    raw = record.purchase_artifact
+    if raw.get("schema") == "solslot.purchase-batch.v1":
+        return None
+    artifact = _purchase_artifact_from_json(raw)
+    if isinstance(artifact, PurchaseArtifactV3) and artifact.purchase_kind != PurchaseKind.PRESALE:
+        return None
+    artifact = voucher_purchase_from_json(raw)
     store = get_presale_store(settings)
+    series_key = artifact.presale_terms_hash if isinstance(artifact, PurchaseArtifactV3) else artifact.collection_id
     try:
-        series = store.get(payload.escrow_message.collection_id)
+        series = store.get(_hex32(series_key))
     except KeyError:
+        if isinstance(artifact, PurchaseArtifactV3):
+            raise PaymentArtifactError("paid Base presale series is missing")
         return None
-    if series["state"] != "PRESALE":
-        return None
-    # A closed customer sales window prevents new purchase artifacts. It must
-    # not strand a payment that was already confirmed by the configured escrow
-    # while its artifact was valid. The callback remains authenticated and all
-    # artifact, vault, price, deed, and chain evidence checks still apply.
-    body = payload.escrow_message
-    source = payload.source
-    record = get_payment_purchase_store(settings.payment_purchase_db_path).get(
-        body.purchase_id
-    )
-    if record.purchase_artifact.get("schema") == "solslot.purchase-batch.v1":
-        return None
-    artifact = purchase_artifact_from_json(record.purchase_artifact)
-    payer = bytes32(
-        b"\x00" * 12 + bytes.fromhex(body.depositor.removeprefix("0x"))
-    )
+    message = record.external_message
+    if not isinstance(message, Mapping) or not isinstance(message.get("source"), Mapping):
+        raise PaymentArtifactError("Base presale is missing authenticated escrow evidence")
+    source = message["source"]
+    payer = bytes32(b"\x00" * 12 + bytes.fromhex(str(message["depositor"]).removeprefix("0x")))
     evidence = VoucherIssuanceEvidenceRequest(
-        purchaseArtifact=verified.purchase_artifact,
-        globalPaymentId=body.global_payment_id,
-        originalPayer=_hex32(payer),
-        evidenceId=(
-            f"base:{source.transaction_hash.lower()}:{source.log_index}"
-        ),
-        confirmedHeight=source.block_number,
-        transactionIndex=0,
-        outputIndex=source.log_index,
-        confirmedAt=source.block_timestamp,
+        purchaseArtifact=raw, globalPaymentId=message["globalPaymentId"], originalPayer=_hex32(payer),
+        evidenceId=f"base:{str(source['transactionHash']).lower()}:{source['logIndex']}",
+        confirmedHeight=source["blockNumber"], transactionIndex=0, outputIndex=source["logIndex"],
+        confirmedAt=source["blockTimestamp"],
     )
-    approved = require_current_approved_vault(
-        settings,
-        _hex32(artifact.vault_launcher_id),
-    )
-    return store.ingest_payment(
-        series["termsHash"],
-        evidence,
-        approved_vault=approved,
-        issued_purchase=record,
-        external_escrow_contract=_external_escrow_contract(
-            settings,
-            artifact,
-            record,
-        ),
-    )
+    return store.ingest_payment(series["termsHash"], evidence,
+        approved_vault=require_current_approved_vault(settings, _hex32(artifact.vault_launcher_id)),
+        issued_purchase=record, external_escrow_contract=_external_escrow_contract(settings, artifact, record))
 
 
 def _build_canonical_payment_artifact(
@@ -1529,7 +1518,7 @@ def _build_canonical_payment_artifact(
         ),
         "quote_expires_at": quote_expires_at,
     }
-    if is_voucher:
+    if is_voucher and body.rail == "chia_xch":
         common["usd_amount_minor"] = gross_usd_amount_minor
     else:
         common.update(
@@ -1550,33 +1539,9 @@ def _build_canonical_payment_artifact(
             raise PaymentArtifactError(
                 "Stripe purchases must use USD minor units"
             )
-        stripe_common = common
         if is_voucher:
-            stripe_common = {
-                "network": settings.network,
-                "collection_id": collection_id,
-                "deed_launcher_id": deed_launcher_id,
-                "metadata_root": expected_metadata_root,
-                "metadata_anchor_id": expected_metadata_anchor,
-                "share_ppm": share_ppm,
-                "base_usd_amount_minor": base_usd_amount_minor,
-                "technology_fee_bps": fee_bps,
-                "protocol_treasury_puzzle_hash": protocol_treasury,
-                "zkpassport_root": zkpassport_root,
-                "vault_launcher_id": vault_id,
-                "vault_p2_puzzle_hash": vault_p2,
-                "authorization_nonce": _bytes32_field(
-                    str(body.authorization_nonce), "authorization_nonce"
-                ),
-                "authorization_expires_at": int(
-                    body.authorization_expires_at or 0
-                ),
-                "quote_expires_at": quote_expires_at,
-                "presale_terms_hash": _bytes32_field(
-                    str(voucher_terms_hash), "presale_terms_hash"
-                ),
-            }
-        purchase = build_stripe_purchase_artifact_v3(**stripe_common)
+            common["presale_terms_hash"] = _bytes32_field(str(voucher_terms_hash), "presale_terms_hash")
+        purchase = build_stripe_purchase_artifact_v3(**common)
         purchase.assert_live(now)
         return purchase_artifact_v3_to_json(purchase), None
 
@@ -1601,22 +1566,16 @@ def _build_canonical_payment_artifact(
             raise PaymentArtifactError(
                 "EVM chain is not enabled for protocol purchases"
             )
-        builder = (
-            build_evm_test_usd_purchase_artifact
-            if is_voucher
-            else build_evm_test_usd_purchase_artifact_v3
+        if is_voucher:
+            common["presale_terms_hash"] = _bytes32_field(str(voucher_terms_hash), "presale_terms_hash")
+        purchase = build_evm_test_usd_purchase_artifact_v3(
+            **common, chain_id=chain_id, token_asset_id=_evm_token_asset_id(token_address),
         )
-        purchase = builder(
-            **common,
-            chain_id=chain_id,
-            token_asset_id=_evm_token_asset_id(token_address),
-        )
+        if is_voucher:
+            from solslot_puzzles.voucher_purchase import require_current_base_presale
+            require_current_base_presale(purchase)
         purchase.assert_live(now)
-        return (
-            purchase_artifact_to_json(purchase)
-            if is_voucher
-            else purchase_artifact_v3_to_json(purchase)
-        ), None
+        return purchase_artifact_v3_to_json(purchase), None
 
     asset_id = bytes32.zeros
     if body.rail == "chia_cat":

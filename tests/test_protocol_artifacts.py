@@ -1312,11 +1312,12 @@ def test_quote_price_uses_target_raise_share_not_chia_par_value(
     assert purchase["baseAmountMinor"] != "250000000000"
 
 
-def test_stripe_quote_for_active_presale_is_v3_and_window_bound(
-    monkeypatch,
-    tmp_path,
+@pytest.mark.parametrize("rail,currency", [("stripe", "USD"), ("base_usdc", "USDC")])
+def test_quote_for_active_presale_is_v3_and_window_bound(
+    monkeypatch, tmp_path, rail, currency,
 ):
     _configure_external_quote(monkeypatch, tmp_path)
+    get_settings().payment_evm_usdc_tokens["84532"] = "0x036cbd53842c5426634e7929541ec2318f3dcf7e"
     now = int(time.time())
     terms_hash = "0x" + "91" * 32
     monkeypatch.setattr(
@@ -1336,12 +1337,12 @@ def test_stripe_quote_for_active_presale_is_v3_and_window_bound(
     )
     body = BuildProtocolOfferArtifactRequest.model_validate(
         _request(
-            rail="stripe",
+            rail=rail,
             purchase_intent_id="pi_stripe_presale_v3",
             expires_at=now + 900,
             authorization_nonce="0x" + "17" * 32,
             authorization_expires_at=now + 1200,
-            payment_terms={"currency": "USD", "quantity": 1},
+            payment_terms={"currency": currency, "quantity": 1},
         )
     )
     purchase, _oracle = _build_canonical_payment_artifact(
