@@ -72,6 +72,12 @@ class InventoryExtensionStoreMixin:
             row = db.execute('SELECT * FROM payment_purchases WHERE purchase_id=?', (purchase_id,)).fetchone()
             if row is None or _record(row) != expected_snapshot or row['inventory_state'] != 'CONFIRMED':
                 raise conflict('inventory changed before extension preparation')
+            held=db.execute('SELECT * FROM payment_checkout_holds WHERE purchase_id=?',(purchase_id,)).fetchone()
+            if held:
+                hold=json.loads(held['claim_json'])
+                if (held['state']!='ARMED' or hold['payment_intent_id']!=claim['payment_intent_id']
+                        or hold['payment_method']!=claim['payment_method']):
+                    raise conflict('extension cannot replace a partial, canceled or different checkout payment')
             if len(expected_snapshot.inventory_extension_receipts) >= 128:
                 raise conflict('extension history requires review; inventory remains held')
             if db.execute('SELECT 1 FROM payment_inventory_timeouts WHERE purchase_id=?', (purchase_id,)).fetchone():

@@ -218,6 +218,8 @@ class BuildProtocolOfferArtifactRequest(BaseModel):
         None, min_length=66, max_length=66
     )
     authorization_expires_at: Optional[int] = Field(None, gt=0)
+    checkout_owner_auth_type: Optional[int] = Field(None,strict=True,ge=1,le=3)
+    checkout_owner_key: Optional[str] = Field(None,pattern=r'^0x[0-9a-f]{66,130}$')
     native_asset_id: Optional[str] = Field(
         None, min_length=66, max_length=66
     )
@@ -455,6 +457,22 @@ async def build_protocol_offer_artifact(
             status_code=status.HTTP_409_CONFLICT,
             detail="The requested genesis artifact is not the active signed artifact.",
         )
+    from .inventory_payment_hold_claims import payment_hold_activation
+    try:
+        hold_capability=payment_hold_activation(genesis_artifact,settings.runtime_environment+'-alpha',required=False)
+        if hold_capability is not None and hold_capability['adapterVersion']==2:
+            from .purchase_admission import require_admission_owner
+            require_admission_owner(vault_launcher_id,body.checkout_owner_auth_type,body.checkout_owner_key)
+            if body.payment_terms.quantity>hold_capability['maxReservedDeedsPerIdentity']:
+                raise ValueError('reviewed alpha admission permits one reserved deed per identity')
+            if not int(time.time())<body.expires_at<=int(time.time())+hold_capability['maxSoftQuoteSeconds']:
+                raise ValueError('reviewed alpha checkout requires a live fifteen-minute soft quote')
+            get_payment_purchase_store(settings.payment_purchase_db_path).admit_purchase(
+                purchase_intent_id=body.purchase_intent_id,receipt=receipt.model_dump(),
+                activation=hold_capability,now=int(time.time()),owner_auth_type=body.checkout_owner_auth_type,owner_key=body.checkout_owner_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=429,detail='New checkout admission is unavailable. Recover the existing purchase or retry later.',
+                            headers={'Retry-After':'60'}) from exc
     try:
         if body.rail in {"base_usdc", "evm_usdc"}:
             chain_id = body.payment_terms.chain_id

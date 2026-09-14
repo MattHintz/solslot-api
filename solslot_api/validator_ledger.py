@@ -10,9 +10,9 @@ from collections.abc import Sequence
 from pathlib import Path
 
 
-from .inventory_payment_hold_ledger import InventoryPaymentHoldLedgerMixin, migrate_payment_holds
+from .inventory_payment_hold_ledger import InventoryPaymentHoldLedgerMixin, migrate_payment_holds, migrate_payment_hold_aborts
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 class ValidatorLedgerConflict(RuntimeError):
@@ -258,6 +258,9 @@ class ValidatorLedger(InventoryPaymentHoldLedgerMixin):
             if version < 12:
                 migrate_payment_holds(self._conn)
 
+            if version < 13:
+                migrate_payment_hold_aborts(self._conn)
+
     def _assert_no_extension_signature(self, coin_id: str | None) -> None:
         # Called under the same BEGIN IMMEDIATE transaction as terminal writes.
         if coin_id is not None and self._conn.execute(
@@ -276,7 +279,7 @@ class ValidatorLedger(InventoryPaymentHoldLedgerMixin):
         with self._lock:
             self._conn.execute('BEGIN IMMEDIATE')
             try:
-                if self._conn.execute('SELECT 1 FROM inventory_payment_holds WHERE purchase_id=?', (purchase_id,)).fetchone():
+                if self.inventory_payment_hold(purchase_id) is not None:
                     self._assert_payment_hold_identity(purchase_id, json.loads(canonical_claim).get('payment_intent_id'))
                 old = self._conn.execute('SELECT * FROM inventory_extension_signatures WHERE reserved_coin_id=?', (reserved_coin_id,)).fetchone()
                 if old is not None:
