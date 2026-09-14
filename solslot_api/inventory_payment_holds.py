@@ -8,7 +8,7 @@ from chia.wallet.puzzles.singleton_top_layer_v1_1 import lineage_proof_for_coins
 from solslot_puzzles.stripe_settlement_v1_driver import build_inventory_release_spend
 from .inventory_extension_chain import current_position
 from .inventory_payment_hold_claims import (
-    InventoryPaymentHoldClaim, InventoryPaymentHoldAbortClaim, payment_hold_activation,
+    InventoryPaymentHoldClaim, InventoryPaymentHoldAbortClaim, InventoryPaymentHoldReleaseClaim, payment_hold_activation,
 )
 from .inventory_recovery import hx
 from .payment_purchase_store import PaymentPurchaseConflict
@@ -16,7 +16,7 @@ from .validator_quorum import collect_inventory_payment_hold_quorum, configured_
 
 
 def verify_hold_receipt(claim,receipt,artifact):
-    hold=claim.hold if isinstance(claim,InventoryPaymentHoldAbortClaim) else claim
+    hold=claim.hold if isinstance(claim,InventoryPaymentHoldReleaseClaim) else claim
     try:
         if (hold.genesis_artifact_hash!=artifact['artifactHash']
                 or hold.activation!=payment_hold_activation(artifact,hold.activation['environment'])
@@ -45,6 +45,8 @@ def receipt_for(claim,quorum,artifact):
 
 def checkout_status(operation,artifact,*,now):
     if operation is None:return None
+    if operation['state'] not in {'ARMING','ARMED','ABORTING','ABORTED','RETURNING','RETURNED','DELIVERED'}:
+        raise PaymentPurchaseConflict('unknown checkout state requires review')
     claim=InventoryPaymentHoldClaim.model_validate(operation['claim'])
     # Even an ARMING record must retain its exact current reviewed deployment.
     if (claim.genesis_artifact_hash!=artifact['artifactHash']

@@ -26,6 +26,7 @@ def migrate_purchase_admission(db):
         CREATE INDEX IF NOT EXISTS purchase_admission_subject ON payment_purchase_admission(subject_hash,created_at);
         CREATE INDEX IF NOT EXISTS purchase_admission_vault ON payment_purchase_admission(vault_launcher_id,state);
         CREATE INDEX IF NOT EXISTS purchase_admission_created ON payment_purchase_admission(created_at);
+        CREATE INDEX IF NOT EXISTS purchase_admission_active ON payment_purchase_admission(state,expires_at);
     ''')
 
 
@@ -63,7 +64,10 @@ class PurchaseAdmissionStoreMixin:
                     >=activation['maxNewQuotesPerIdentityHour']
                 or db.execute('SELECT count(*) FROM payment_purchase_admission WHERE created_at>?',(now-60,)).fetchone()[0]
                     >=activation['maxNewQuotesPerMinute']
-                or db.execute(f'SELECT count(*) FROM payment_purchase_admission WHERE {active}',(now,)).fetchone()[0]
+                or db.execute("SELECT count(*) FROM (SELECT purchase_intent_id FROM payment_purchase_admission "
+                    "WHERE state='SIGNING' UNION ALL SELECT purchase_intent_id FROM payment_purchase_admission "
+                    "WHERE state='QUOTING' AND expires_at>? LIMIT ?)",
+                    (now,activation['maxPendingPurchases'])).fetchone()[0]
                     >=activation['maxPendingPurchases']):
                 raise conflict('new checkout capacity is limited; existing purchase recovery remains available')
             db.execute('INSERT INTO payment_purchase_admission(purchase_intent_id,subject_hash,vault_launcher_id,binding_json,owner_auth_type,owner_key,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?)',

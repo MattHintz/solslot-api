@@ -89,7 +89,7 @@ def _expiry_clock(proof, coin, expires_at, network):
     raise ValueError("expiry clock lacks a mature timestamp")
 
 
-def retained_inventory_status(snapshot, *, environment, network):
+def retained_inventory_status(snapshot, *, environment, network, artifact=None):
     """Validate one consistent snapshot without live quote/credential checks.
 
     Environment describes the observing service. The retained genesis hash
@@ -169,7 +169,7 @@ def retained_inventory_status(snapshot, *, environment, network):
             raise ValueError("unexpected confirmation")
         if (expired is not None) != (state == "AUTHORIZATION_EXPIRED") or (released is not None) != (state == "RELEASED"):
             raise ValueError("contradictory recovery receipts")
-        receipt = validated_recovery_receipt(snapshot, network=network)
+        receipt = validated_recovery_receipt(snapshot, network=network, artifact=artifact)
         return dict(purchaseId=stored.purchase_id, purchaseIntentId=stored.purchase_intent_id,
             purchaseArtifactHash=stored.artifact_hash, offerArtifactHash=stored.offer_artifact_hash,
             rail=stored.rail, quantity=len(rows), deedLauncherIds=list(stored.deed_launcher_ids),
@@ -184,7 +184,7 @@ def retained_inventory_status(snapshot, *, environment, network):
         raise PaymentPurchaseConflict("Inventory evidence is incomplete or inconsistent. Keep this purchase for review.") from exc
 
 
-def validated_recovery_receipt(snapshot, *, network):
+def validated_recovery_receipt(snapshot, *, network, artifact=None):
     """Validate terminal retained evidence for both reads and idempotent observers."""
     try:
         stored, rows, expired, released = snapshot
@@ -194,6 +194,12 @@ def validated_recovery_receipt(snapshot, *, network):
                 or (released is not None) != (state == "RELEASED")):
             raise ValueError("contradictory recovery receipts")
         receipt = None
+        if released is not None and released.get('schema') == 'solslot.checkout-terminal.v1':
+            from .checkout_terminals import validate_terminal_evidence
+            if released.get('kind') != 'RETURNED' or network != 'testnet11':
+                raise ValueError('invalid checkout inventory return')
+            validate_terminal_evidence(snapshot, released, artifact)
+            return dict(kind='payment-return', confirmationHeight=released['items'][0]['confirmationHeight'])
         if released is not None:
             # Rebuild retained timeout commitments; do not demand that the
             # successor is still unspent after a later legitimate purchase.
