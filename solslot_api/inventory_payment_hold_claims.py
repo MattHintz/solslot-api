@@ -18,6 +18,10 @@ def payment_hold_activation(artifact, environment, *, required=True):
         validatorLedgerVersion=12,extensionReleaseIdentity=extension['releaseIdentity'],
         stripeAccountId=extension['stripeAccountId'],stripeMode='test',minConfirmations=3,
         paymentHoldPolicy=extension['paymentHoldPolicy'])
+    if isinstance(value,dict) and value.get('adapterVersion')==2:
+        from .purchase_admission import ADMISSION_POLICY
+        expected.update(adapterVersion=2,validatorLedgerVersion=13,partialCancelPolicy='canceled-unfunded-original-timeout-v1')
+        expected.update(ADMISSION_POLICY)
     expected['releaseIdentity']=hashlib.sha256(canonical(expected).encode()).hexdigest()
     if (not isinstance(value,dict) or set(value)!=set(expected)|{'reviewEvidenceSha256'}
             or any(value.get(k)!=v or type(value.get(k)) is not type(v) for k,v in expected.items())
@@ -73,3 +77,10 @@ class InventoryPaymentHoldReleaseClaim(BaseModel):
 
     def signature_message(self):
         return b'solslot.inventory-payment-hold.release.v1:'+bytes.fromhex(self.canonical_hash()[2:])
+
+
+class InventoryPaymentHoldAbortClaim(InventoryPaymentHoldReleaseClaim):
+    schema_version: Literal['solslot.inventory-payment-hold-abort.v1']='solslot.inventory-payment-hold-abort.v1'
+
+    def signature_message(self):
+        return b'solslot.inventory-payment-hold.abort.v1:'+bytes.fromhex(self.canonical_hash()[2:])

@@ -1446,6 +1446,7 @@ async def collect_inventory_payment_hold_quorum(settings, claim, *, client=None)
         raise ValidatorQuorumError("payment holds require the reviewed two-of-three quorum")
     release = claim.schema_version == 'solslot.inventory-payment-hold-release.v1'
     path = '/v1/inventory-payment-hold/release' if release else '/v1/inventory-payment-hold/sign'
+    if claim.schema_version=='solslot.inventory-payment-hold-abort.v1':path='/v1/inventory-payment-hold/abort'
     return await _collect_inventory_quorum(settings, claim, path, client=client)
 
 

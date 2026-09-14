@@ -142,21 +142,39 @@ async def sign_inventory_payment_hold(settings,ledger,claim,claim_hash):
 
 
 async def sign_inventory_payment_hold_release(settings,ledger,claim,claim_hash):
+    return await _sign_inventory_payment_return(settings,ledger,claim,claim_hash)
+
+
+async def sign_inventory_payment_hold_abort(settings,ledger,claim,claim_hash):
+    return await _sign_inventory_payment_return(settings,ledger,claim,claim_hash,aborting=True)
+
+
+async def _sign_inventory_payment_return(settings,ledger,claim,claim_hash,*,aborting=False):
     from .validator_service import load_validator_private_key,ValidatorEvidenceError
     try:
         hold=claim.hold
         if claim.canonical_hash()!=claim_hash:raise ValueError('payment release hash changed')
         artifact=active_hold(settings,hold);purchase,struct,terms=extension_coordinates(hold,artifact)
         old=ledger.inventory_payment_hold(hx(purchase.purchase_id))
-        if old is None or old['claim_hash']!=hold.canonical_hash():raise ValueError('release lacks its private hold')
+        if old is not None and old['claim_hash']!=hold.canonical_hash():raise ValueError('release differs from its private hold')
+        if old is None and not aborting:raise ValueError('release lacks its private hold')
+        if aborting:
+            if (hold.activation.get('adapterVersion')!=2 or hold.activation.get('validatorLedgerVersion')!=13
+                    or claim.schema_version!='solslot.inventory-payment-hold-abort.v1'
+                    or claim.reserved_coin_id!=hold.reserved_coin_id
+                    or claim.reservation_expires_at!=hold.reservation_expires_at
+                    or hold.reservation_expires_at!=min(purchase.quote_expires_at,purchase.authorization_expires_at)):
+                raise ValueError('partial cancellation requires reviewed original-inventory abort authority')
         if claim.reservation_expires_at<hold.reservation_expires_at:raise ValueError('release shortens reservation')
         provider=await payment_provider(settings,hold)
+        if aborting and provider['terminal']!='CANCELED_UNPAID':raise ValueError('partial cancellation requires canceled and unfunded payment')
         if provider['terminal'] is None:raise ValueError('payment is not terminally canceled or fully refunded')
         reservation=InventoryReservationV1(purchase,claim.reservation_expires_at)
         async with httpx.AsyncClient(base_url=settings.coinset_base_url.rstrip('/'),timeout=20) as client:
             node=IndependentNode(client);peak=await node.peak()
             expected=SINGLETON_MOD.curry(struct,make_mint_offer_v5_inner(terms,reservation)).get_tree_hash()
             coin,lineage=await node.current(claim.reserved_coin_id,expected,struct,peak,require_unspent=False)
+            if aborting and hx(coin.puzzle_hash)!=hold.reserved_puzzle_hash:raise ValueError('partial cancellation changed the original puzzle')
             raw,_=await node.record(claim.reserved_coin_id);_,spent=record_coin(raw,coin)
             if not spent or peak[0]-spent+1<3:raise ValueError('inventory timeout is not confirmed')
             release=build_inventory_release_spend(reserved_coin=coin,deed_singleton_struct=struct,lineage_proof=lineage,
@@ -165,12 +183,14 @@ async def sign_inventory_payment_hold_release(settings,ledger,claim,claim_hash):
             if not equivalent_timeout_spend(actual,release.spend) or hx(release.next_coin.name())!=claim.available_coin_id:
                 raise ValueError('inventory did not return through the exact timeout')
             out,_=await node.record(claim.available_coin_id);created,out_spent=record_coin(out,release.next_coin)
-            if created!=spent or (out_spent and old['state']!='RELEASED'):
+            if created!=spent or (out_spent and (old is None or old['state']!='RELEASED')):
                 raise ValueError('returned inventory is not the exact unspent successor')
             if await node.peak()!=peak:raise ValueError('chain tip changed during refund recovery')
         if active_hold(settings,hold)['artifactHash']!=artifact['artifactHash']:raise ValueError('release changed during recovery')
         if claim.canonical_hash()!=claim_hash:raise ValueError('payment claim changed during independent verification')
         signature=hx(AugSchemeMPL.sign(load_validator_private_key(settings),claim.signature_message()))
+        if aborting:
+            return ledger.record_inventory_payment_hold_abort(claim=claim,signature=signature,purchase_id=hx(purchase.purchase_id),deed_launcher_id=hx(purchase.deed_launcher_id))
         return ledger.record_inventory_payment_hold_release(claim=claim,signature=signature,purchase_id=hx(purchase.purchase_id))
     except Exception as exc:
         if isinstance(exc,ValidatorEvidenceError):raise

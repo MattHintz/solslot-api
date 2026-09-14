@@ -255,6 +255,10 @@ async def inventory_purchase_status(
     try:
         result = retained_inventory_status(store.inventory_status_snapshot(normalized),
             environment=settings.runtime_environment + "-alpha", network=settings.network)
+        from .inventory_payment_holds import checkout_status
+        checkout=store.checkout_hold(normalized)
+        if checkout is not None:
+            result['checkoutHold']=checkout_status(checkout,load_signed_public_artifact(settings),now=int(time.time()))
         from .inventory_extensions import hold_status
         hold = hold_status(store.get(normalized), store.inventory_extension_operations(normalized), now=int(time.time()))
         if hold is not None:
@@ -281,6 +285,52 @@ class InventoryExtensionRequest(BaseModel):
     payment_started_at: int = Field(alias="paymentStartedAt", gt=0)
     payment_method: Literal["card", "us_bank_account"] = Field(alias="paymentMethod")
     observe_only: bool = Field(default=False, alias="observeOnly")
+
+
+class InventoryPaymentHoldRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid',populate_by_name=True,strict=True)
+    purchase_id: str = Field(alias='purchaseId',pattern=r'^0x[0-9a-f]{64}$')
+    payment_intent_id: str = Field(alias='paymentIntentId',pattern=r'^pi_[A-Za-z0-9]{1,200}$')
+    payment_method: Literal['card','us_bank_account'] = Field(alias='paymentMethod')
+
+
+@router.post('/inventory/payment-hold/arm')
+async def arm_inventory_payment_hold(payload:InventoryPaymentHoldRequest,
+        settings:Annotated[Settings,Depends(get_settings)],authorization:Annotated[str|None,Header()]=None):
+    from .inventory_payment_holds import arm_checkout
+    _require_server_to_server_token(settings,authorization)
+    def authorize():
+        _require_server_to_server_token(settings,authorization)
+        require_minting_writes(settings);require_operation_gate(settings,'purchases')
+    try:
+        result=await arm_checkout(store=get_payment_purchase_store(settings.payment_purchase_db_path),settings=settings,
+            purchase_id=payload.purchase_id,payment_intent_id=payload.payment_intent_id,payment_method=payload.payment_method,
+            load_artifact=lambda:load_signed_public_artifact(settings),authorize=authorize)
+        return dict(purchaseId=payload.purchase_id,checkoutHold=result)
+    except PaymentPurchaseNotFound as exc:
+        raise HTTPException(status_code=404,detail=str(exc)) from exc
+    except (PaymentPurchaseConflict,ValueError,TypeError,KeyError,ValidatorQuorumError) as exc:
+        raise HTTPException(status_code=409,detail='Checkout hold incomplete. Retain this payment and recover the same purchase.') from exc
+    except (httpx.HTTPError,OSError,TimeoutError) as exc:
+        raise HTTPException(status_code=503,detail='Checkout hold unavailable. Payment must remain unconfirmed.') from exc
+
+
+@router.post('/inventory/payment-hold/abort')
+async def abort_inventory_payment_hold(payload:InventoryReservationRequest,
+        settings:Annotated[Settings,Depends(get_settings)],authorization:Annotated[str|None,Header()]=None):
+    from .inventory_payment_holds import abort_checkout
+    # Recovery remains service-only and available when new purchases are paused.
+    _require_server_to_server_token(settings,authorization)
+    try:
+        result=await abort_checkout(store=get_payment_purchase_store(settings.payment_purchase_db_path),settings=settings,
+            purchase_id=payload.purchase_id,load_artifact=lambda:load_signed_public_artifact(settings))
+        return dict(purchaseId=payload.purchase_id,checkoutHold=result)
+    except PaymentPurchaseNotFound as exc:
+        raise HTTPException(status_code=404,detail=str(exc)) from exc
+    except (PaymentPurchaseConflict,ValueError,TypeError,KeyError,ValidatorQuorumError) as exc:
+        raise HTTPException(status_code=409,detail='Canceled-payment proof is incomplete. Inventory remains held for review.') from exc
+    except (httpx.HTTPError,OSError,TimeoutError) as exc:
+        raise HTTPException(status_code=503,detail='Cancellation observation unavailable. Retry this same purchase.') from exc
 
 
 @router.post("/inventory/extend")
@@ -538,6 +588,22 @@ async def reserve_smartdeed_inventory(
         ),
         require_inventory_reservation=False,
     )
+    from .inventory_payment_hold_claims import payment_hold_activation
+    try:
+        first=group.contexts[0]
+        hold_capability=payment_hold_activation(first.genesis_artifact,settings.runtime_environment+'-alpha',required=False)
+        if hold_capability is not None and hold_capability['adapterVersion']==2:
+            from .purchase_admission import require_admission_owner
+            require_admission_owner(_hex32(first.purchase.vault_launcher_id),first.credential_owner_auth_type,
+                                    '0x'+first.credential_owner_key.hex())
+            if len(group.contexts)>hold_capability['maxReservedDeedsPerIdentity']:
+                raise ValueError('reviewed alpha admission permits one exact deed per identity')
+            store.begin_admitted_reservation(stored=stored,receipt=first.credential_receipt,
+                activation=hold_capability,now=int(time.time()),owner_auth_type=first.credential_owner_auth_type,
+                owner_key='0x'+first.credential_owner_key.hex())
+    except ValueError as exc:
+        raise HTTPException(status_code=429,detail='Inventory admission is unavailable. Recover the existing purchase first.',
+                            headers={'Retry-After':'60'}) from exc
     try:
         transitions = []
         quorums = []

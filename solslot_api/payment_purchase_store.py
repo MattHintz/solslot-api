@@ -13,6 +13,8 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Iterator, Mapping
 from .inventory_extension_store import InventoryExtensionStoreMixin, migrate_extensions
+from .inventory_payment_hold_store import InventoryPaymentHoldStoreMixin, migrate_checkout_holds, assert_no_checkout_hold
+from .purchase_admission import PurchaseAdmissionStoreMixin, migrate_purchase_admission, close_inventory_admission
 
 
 class PaymentPurchaseNotFound(LookupError):
@@ -64,7 +66,7 @@ class StoredPaymentPurchase:
     inventory_extension_receipts: tuple[dict[str, Any], ...] = ()
 
 
-class PaymentPurchaseStore(InventoryExtensionStoreMixin):
+class PaymentPurchaseStore(InventoryExtensionStoreMixin, InventoryPaymentHoldStoreMixin, PurchaseAdmissionStoreMixin):
     def __init__(self, path: str):
         self.path = path
         if path != ":memory:":
@@ -178,6 +180,8 @@ class PaymentPurchaseStore(InventoryExtensionStoreMixin):
                         f"ALTER TABLE payment_purchases ADD COLUMN {name} {declaration}"
                     )
             migrate_extensions(connection)
+            migrate_checkout_holds(connection)
+            migrate_purchase_admission(connection)
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS "
                 "payment_purchases_external_transaction "
@@ -404,6 +408,7 @@ class PaymentPurchaseStore(InventoryExtensionStoreMixin):
         canonical = _canonical_json(binding)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            assert_no_checkout_hold(connection,purchase_id)
             if connection.execute('SELECT 1 FROM payment_inventory_extensions WHERE purchase_id=?', (purchase_id,)).fetchone():
                 raise PaymentPurchaseConflict('payment hold requires authoritative terminal reconciliation; timeout cannot release inventory')
             item = connection.execute(
@@ -724,6 +729,7 @@ class PaymentPurchaseStore(InventoryExtensionStoreMixin):
         encoded = _canonical_json(evidence)
         with self._connect() as connection:
             connection.execute('BEGIN IMMEDIATE')
+            assert_no_checkout_hold(connection,purchase_id)
             try:
                 row = connection.execute('SELECT * FROM payment_purchases WHERE purchase_id=?', (purchase_id,)).fetchone()
                 if row is None:
@@ -755,6 +761,7 @@ class PaymentPurchaseStore(InventoryExtensionStoreMixin):
                 connection.execute('INSERT INTO payment_inventory_expiries VALUES (?,?)', (purchase_id, encoded))
                 connection.execute("UPDATE payment_purchases SET inventory_state='AUTHORIZATION_EXPIRED' WHERE purchase_id=?", (purchase_id,))
                 connection.execute("UPDATE payment_purchase_inventory_items SET state='AUTHORIZATION_EXPIRED' WHERE purchase_id=?", (purchase_id,))
+                close_inventory_admission(connection,purchase_id)
                 result = connection.execute('SELECT * FROM payment_purchases WHERE purchase_id=?', (purchase_id,)).fetchone()
                 connection.execute('COMMIT')
                 return _record(result)
@@ -797,6 +804,7 @@ class PaymentPurchaseStore(InventoryExtensionStoreMixin):
         encoded = _canonical_json(evidence)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            assert_no_checkout_hold(connection,purchase_id)
             if connection.execute('SELECT 1 FROM payment_inventory_extensions WHERE purchase_id=?', (purchase_id,)).fetchone():
                 raise PaymentPurchaseConflict('payment hold requires authoritative terminal reconciliation; timeout cannot release inventory')
             try:
@@ -832,6 +840,7 @@ class PaymentPurchaseStore(InventoryExtensionStoreMixin):
                 connection.execute("UPDATE payment_purchases SET inventory_state='RELEASED' WHERE purchase_id=?", (purchase_id,))
                 connection.execute("UPDATE payment_purchase_inventory_items SET state='RELEASED' WHERE purchase_id=?", (purchase_id,))
                 connection.execute("UPDATE payment_inventory_timeouts SET state='CONFIRMED',lease_owner=NULL,lease_until=0 WHERE purchase_id=?", (purchase_id,))
+                close_inventory_admission(connection,purchase_id)
                 result = connection.execute("SELECT * FROM payment_purchases WHERE purchase_id=?", (purchase_id,)).fetchone()
                 connection.execute("COMMIT")
                 return _record(result)

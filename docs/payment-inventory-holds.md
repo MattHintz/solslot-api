@@ -1,15 +1,16 @@
 # Private payment inventory holds
 
-This is source support for the presale payment lifecycle. It does not enable
-presale checkout, start a payment, renew a reservation, submit a timeout, or
-reconcile the coordinator's available-inventory cursor. Those integrations and
+This is gated source support for private holds, coordinator journaling and the
+backend's create/retain/arm/confirm integration. It does not enable presale
+checkout, renew a reservation automatically, submit a timeout, or reconcile the
+coordinator's available-inventory cursor. Those remaining integrations and
 customer transaction outcomes must be verified before activation. Alpha uses
 Testnet11 assets with no monetary value or real property rights.
 
 ## Authority and ordering
 
 A payment must not be confirmed until the exact deed and an unconfirmed Stripe
-PaymentIntent have a durable private two-of-three hold. The intended integration
+PaymentIntent have a durable private two-of-three hold. The integration
 order is: create an unconfirmed intent without exposing its client secret;
 retain its exact identifier; journal the hold request; collect and retain the
 private quorum acknowledgment; then confirm that same intent. A missing response
@@ -75,9 +76,66 @@ must not open a v12 ledger or silently discard its holds. A source revert before
 activation is ordinary; rollback after any hold is armed requires a reviewed
 recovery procedure retaining every acknowledgment and exclusion.
 
-Still required: customer checkout create/retain/arm/confirm integration; durable
-start-event capture; monitored renewal and ten-day ACH review without retries;
+## Partial cancellation and coordinator recovery
+
+Adapter 2 / validator ledger 13 adds a separately reviewed
+`canceled-unfunded-original-timeout-v1` policy. The private `/v1/inventory-payment-hold/abort`
+route can acknowledge an original canceled/unfunded payment even when that
+signer never received the arm. It independently proves the original reservation's
+exact confirmed timeout return. A refunded funded payment, extended reservation,
+different hold or earlier signed payment/extension cannot use this path.
+
+The signer commits a permanent abort tombstone before replying. It preserves
+any original arm signature and never invents an arm for a previously unarmed
+signer. Late arms, paid operations and extensions cannot reopen the purchase.
+Version 1 capabilities cannot authorize partial aborts. The v13 migration retains
+all prior tables and signatures; older executables must not open v13 ledgers.
+
+The service-only coordinator `/protocol/native-purchases/inventory/payment-hold/arm`
+journals before private requests and retains the first verified BLS quorum. Lost
+or partial replies retain `ARMING`. Exact `ARMED` retries verify the receipt
+locally instead of repeating provider/validator work. `/payment-hold/abort`
+observes cancellation and the returned coin; it never cancels a payment or
+broadcasts a timeout. `ABORTED` means private cancellation is acknowledged,
+**not** that inventory is reusable. Generic timeout/expiry paths cannot bypass
+checkout journals, including partial and aborted ones.
+
+## Checkout abuse controls
+
+The reviewed adapter-2 capability binds `purchaseAdmissionPolicy=one-pending-identity-v1`,
+`checkoutOwnerPolicy=authenticated-current-vault-owner-v1`, and these limits:
+
+| Limit | Reviewed alpha value |
+| --- | ---: |
+| Soft quote lifetime | 900 seconds |
+| Pending purchases / reserved deeds per scoped identity | 1 / 1 |
+| New quotes per scoped identity per hour | 6 |
+| New quotes across confirmed identities per minute | 60 |
+| Pending purchases across confirmed identities | 128 |
+
+Admission uses a hash of the current server-confirmed scoped nullifier and its
+scope, not a client-selected wallet ID or identity root. The backend supplies the
+authenticated session's owner key; the API checks the current vault owner before
+assigning a slot. Reservation and prepayment hold paths recheck that owner.
+Unverified login accounts cannot consume the global identity-admission budget.
+
+Unsigned quote slots expire. The slot becomes durable **before** the first
+private reservation signature request; partial responses cannot free it by age.
+Only proven authorization expiry or inventory release closes that slot in this
+revision. Successful paid-delivery and checkout-abort slot closure still need the
+terminal reconciler before activation. Existing version-1 batch contracts are
+unchanged; adapter-2 alpha admission deliberately permits one pending deed.
+
+Coordinator quorum requests have one shared SQLite lease per purchase, a five
+second retry cooldown, at most eight arm proofs and four separately reserved
+abort proofs in flight, and a 90-second deadline inside a 120-second lease.
+Recovery is not charged to the new-quote budget. These are application admission
+controls, not evidence that edge/network volumetric DDoS protection is configured
+or that production load capacity has been measured.
+
+Still required: independent verification of the retained payment-start candidate;
+monitored renewal and ten-day ACH review without retries;
 late confirmation and requires-action recovery; cancellation/refund execution;
 current-coin timeout submission; coordinator release quorum/cursor reconciliation;
-provider outage/restart tests; independent launch review and signed Testnet
+paid/aborted admission-slot closure; independent launch review and signed Testnet
 outcomes. Existing presale gates must remain closed until those are complete.
