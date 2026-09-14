@@ -79,6 +79,14 @@ class ProtocolBundleSubmitter:
             Callable[[], Iterable[str | bytes]]
         ] = []
 
+    @property
+    def funding_guard(self) -> asyncio.Lock:
+        """Shared coordinator guard for voucher launcher and fee-till selection."""
+        return self._lock
+
+    def reserved_funding_coin_ids(self) -> set[bytes]:
+        return self._reserved_fee_coin_ids()
+
     def add_fee_coin_reservation_source(
         self,
         source: Callable[[], Iterable[str | bytes]],

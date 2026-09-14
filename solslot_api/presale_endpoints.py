@@ -454,7 +454,10 @@ class CancelRequest(ApiModel):
     reason: str = Field(min_length=8, max_length=1000)
 
 
-class PresaleStore:
+from .voucher_work_store import VoucherWorkStore
+
+
+class PresaleStore(VoucherWorkStore):
     """Fresh V2 tables; unlaunched voucher V1 records are never migrated."""
 
     def __init__(self, path: str) -> None:
@@ -472,6 +475,7 @@ class PresaleStore:
         if path != ":memory:":
             self._conn.execute("PRAGMA journal_mode=WAL")
         self._create_schema()
+        self._create_voucher_work_schema()
 
     def _create_schema(self) -> None:
         self._conn.executescript(
@@ -918,6 +922,11 @@ class PresaleStore:
         return self.get(terms["termsHash"])
 
     def _get_series(self, identifier: str) -> dict[str, Any]:
+        # Workers carry the canonical terms key. Avoid the alias OR query's
+        # table scan for this exact-key path; preserve alias behavior below.
+        exact = self._conn.execute("SELECT * FROM presale_series_v2 WHERE terms_hash=?", (identifier.lower(),)).fetchone()
+        if exact is not None:
+            return self._render_series(exact)
         row = self._conn.execute(
             """
             SELECT * FROM presale_series_v2
@@ -1991,7 +2000,7 @@ class PresaleStore:
         vault_output_coin_id: str | None,
     ) -> dict[str, Any]:
         """Bind REFUNDING only after the exact native bundle is accepted."""
-        series = self.get(terms_hash)
+        series = self._get_series(terms_hash)
         now = int(time.time())
         normalized = {
             "refund_action": int(action),
@@ -2115,7 +2124,7 @@ class PresaleStore:
         series_output_coin_id: str,
     ) -> dict[str, Any]:
         """Bind a Base refund only after its exact Chia terminal bundle is accepted."""
-        series = self.get(terms_hash)
+        series = self._get_series(terms_hash)
         now = int(time.time())
         if (
             series["state"] != "LIVE"
@@ -2233,7 +2242,7 @@ class PresaleStore:
         execution_observed_at: int,
     ) -> dict[str, Any]:
         """Bind a Stripe refund only after its exact V3 bundle is accepted."""
-        series = self.get(terms_hash)
+        series = self._get_series(terms_hash)
         now = int(time.time())
         owner_authorized = action in {
             VoucherAction.REFUND_PRESALE,
@@ -2368,7 +2377,7 @@ class PresaleStore:
         evidence: BaseVoucherRefundChainEvidence,
     ) -> dict[str, Any]:
         """Record Base refund authorization only after exact Chia confirmation."""
-        series = self.get(terms_hash)
+        series = self._get_series(terms_hash)
         now = int(time.time())
         expected = {
             "refund_action": evidence.action,
@@ -2483,7 +2492,7 @@ class PresaleStore:
         evidence: StripeVoucherRefundChainEvidence,
     ) -> dict[str, Any]:
         """Authorize the exact fiat refund only after V3 terminal confirmation."""
-        series = self.get(terms_hash)
+        series = self._get_series(terms_hash)
         now = int(time.time())
         expected = {
             "refund_action": evidence.action,
@@ -2766,7 +2775,7 @@ class PresaleStore:
         evidence: VoucherRefundChainEvidence,
     ) -> dict[str, Any]:
         """Advance store state only after exact atomic chain confirmation."""
-        series = self.get(terms_hash)
+        series = self._get_series(terms_hash)
         now = int(time.time())
         expected = {
             "refund_action": evidence.action,
@@ -2938,7 +2947,7 @@ class PresaleStore:
         execution_observed_at: int | None = None,
     ) -> dict[str, Any]:
         """Bind one accepted atomic voucher-to-SmartDeed settlement."""
-        series = self.get(terms_hash)
+        series = self._get_series(terms_hash)
         if series["state"] != "LIVE":
             raise ValueError("native redemption requires a LIVE series")
         now = int(time.time())
@@ -3065,7 +3074,7 @@ class PresaleStore:
         evidence: VoucherRedemptionChainEvidence,
     ) -> dict[str, Any]:
         """Mark delivery only after every committed input/output confirms atomically."""
-        series = self.get(terms_hash)
+        series = self._get_series(terms_hash)
         now = int(time.time())
         expected = {
             "redemption_bundle_id": evidence.spend_bundle_id.lower(),
@@ -3526,9 +3535,10 @@ class PresaleStore:
         self,
         terms_hash: str,
         evidence: VoucherSeriesPhaseChainEvidence,
+        *, include_vouchers: bool = True,
     ) -> dict[str, Any]:
         """Advance local phase only after exact singleton chain confirmation."""
-        series = self.get(terms_hash)
+        series = self._get_series(terms_hash)
         now = int(time.time())
         with self.txn() as cur:
             row = cur.execute(
@@ -3600,7 +3610,7 @@ class PresaleStore:
                     """,
                     (now, series["termsHash"].lower()),
                 )
-        return self.get(series["termsHash"])
+        return self.get(series["termsHash"]) if include_vouchers else self._get_series(series["termsHash"])
 
     def complete_delivery(
         self, terms_hash: str, serial: int, evidence: DeliveryEvidenceRequest

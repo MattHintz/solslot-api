@@ -3038,32 +3038,21 @@ async def test_worker_advances_stripe_redemption_from_the_shared_queue(
     }
 
     class QueueOnlyStore:
-        def pending_issuance(self):
-            return []
+        def claim_voucher_work(self, lane, owner, now, excluded_series=None):
+            if lane == "stripe_redemption":
+                return dict(lane=lane, owner=owner, termsHash=series['termsHash'], serial=voucher['serial'])
 
-        def pending_stripe_terminal_executions(self):
-            return []
+        def finish_voucher_work(self, job, now, status):
+            pass
 
-        def pending_native_refunds(self):
-            return []
+        def pending_voucher_execution(self, terms, serial):
+            return None
 
-        def pending_base_refunds(self):
-            return []
+        def _get_series(self, terms):
+            return series
 
-        def pending_stripe_refunds(self):
-            return []
-
-        def pending_native_redemptions(self):
-            return []
-
-        def pending_base_redemptions(self):
-            return []
-
-        def pending_stripe_redemptions(self):
-            return [(series, voucher)]
-
-        def pending_phase_transitions(self):
-            return []
+        def voucher(self, terms, serial):
+            return voucher
 
     faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
     worker = VoucherIssuanceWorker(
@@ -3110,32 +3099,21 @@ async def test_worker_never_replaces_an_exact_stripe_redemption_after_deadline(
     }
 
     class QueueOnlyStore:
-        def pending_issuance(self):
-            return []
+        def claim_voucher_work(self, lane, owner, now, excluded_series=None):
+            if lane == "stripe_redemption":
+                return dict(lane=lane, owner=owner, termsHash=series['termsHash'], serial=voucher['serial'])
 
-        def pending_stripe_terminal_executions(self):
-            return []
+        def finish_voucher_work(self, job, now, status):
+            pass
 
-        def pending_native_refunds(self):
-            return []
+        def pending_voucher_execution(self, terms, serial):
+            return None
 
-        def pending_base_refunds(self):
-            return []
+        def _get_series(self, terms):
+            return series
 
-        def pending_stripe_refunds(self):
-            return []
-
-        def pending_native_redemptions(self):
-            return []
-
-        def pending_base_redemptions(self):
-            return []
-
-        def pending_stripe_redemptions(self):
-            return [(series, voucher)]
-
-        def pending_phase_transitions(self):
-            return []
+        def voucher(self, terms, serial):
+            return voucher
 
     worker = VoucherIssuanceWorker(
         settings=Settings(runtime_environment="test", network="testnet11"),

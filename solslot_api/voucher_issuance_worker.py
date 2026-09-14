@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
+from types import SimpleNamespace
 
 import httpx
 
@@ -70,6 +72,7 @@ from solslot_puzzles.primary_purchase_v2_driver import (
     prepare_xch_voucher_redemption_offer,
 )
 
+from .voucher_work_store import LANES
 from .config import Settings
 from .faucet import Faucet
 from .governed_output_index import EvaluatedBundleOutputs
@@ -111,6 +114,11 @@ _CREATE_COIN = 51
 class VoucherIssuanceWorkerConfig:
     enabled: bool = False
     interval_seconds: float = 15.0
+    operation_timeout_seconds: float = 45.0
+
+    def __post_init__(self) -> None:
+        if not (0 < self.operation_timeout_seconds <= 45 and 0 < self.interval_seconds <= 300):
+            raise ValueError("Voucher worker deadlines must fit the 60-second lease")
 
 
 class VoucherIssuanceWorker:
@@ -127,6 +135,7 @@ class VoucherIssuanceWorker:
         config: VoucherIssuanceWorkerConfig,
         submitter: ProtocolBundleSubmitter | None = None,
         exact_executor: KeyOfSolomonExactExecutor | None = None,
+        authorize_dispatch: Callable[[], None] | None = None,
     ) -> None:
         self.settings = settings
         self.faucet = faucet
@@ -136,8 +145,12 @@ class VoucherIssuanceWorker:
         self.config = config
         self.submitter = submitter
         self.exact_executor = exact_executor
+        self.authorize_dispatch = authorize_dispatch
         self._task: Optional[asyncio.Task[None]] = None
         self._stop = asyncio.Event()
+        self._funding_lock = submitter.funding_guard if submitter is not None else asyncio.Lock()
+        if submitter is not None:
+            submitter.add_fee_coin_reservation_source(presales.pending_voucher_funding_coin_ids)
 
     async def start(self) -> None:
         if not self.config.enabled or (self._task is not None and not self._task.done()):
@@ -161,316 +174,432 @@ class VoucherIssuanceWorker:
             self._task = None
 
     async def _run_forever(self) -> None:
+        async with asyncio.TaskGroup() as group:
+            for lane in LANES:
+                group.create_task(self._run_lane_forever(lane))
+
+    async def _run_lane_forever(self, lane: str) -> None:
         while not self._stop.is_set():
             try:
-                await self.reconcile_once()
-            except Exception:  # noqa: BLE001
-                logger.exception("voucher issuance reconciliation failed")
+                await self._run_lane(lane)
+            except Exception:
+                logger.exception("voucher lane %s unavailable", lane)
             try:
-                await asyncio.wait_for(
-                    self._stop.wait(), timeout=self.config.interval_seconds
-                )
-            except asyncio.TimeoutError:
+                await asyncio.wait_for(self._stop.wait(), timeout=self.config.interval_seconds)
+            except TimeoutError:
                 pass
 
     async def reconcile_once(self) -> list[dict[str, Any]]:
-        """Advance at most one voucher per series to avoid singleton races."""
-        results: list[dict[str, Any]] = []
-        seen_series: set[str] = set()
-        for series, voucher in self.presales.pending_issuance():
-            terms_hash = str(series["termsHash"])
-            if terms_hash in seen_series:
-                continue
-            seen_series.add(terms_hash)
-            try:
-                result = await self._advance(series, voucher)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "voucher issuance failed for %s/%s",
-                    terms_hash,
-                    voucher["serial"],
-                )
-                result = {
-                    "termsHash": terms_hash,
-                    "serial": int(voucher["serial"]),
-                    "status": "ERROR",
-                    "detail": str(exc),
-                }
-            results.append(result)
-        for series, voucher in self.presales.pending_stripe_terminal_executions():
-            try:
-                status = await self._resume_stripe_terminal_execution(
-                    series,
-                    voucher,
-                )
-                result = {
-                    "termsHash": str(series["termsHash"]),
-                    "serial": int(voucher["serial"]),
-                    "status": status,
-                }
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "Stripe voucher exact execution retry failed for %s/%s",
-                    series["termsHash"],
-                    voucher["serial"],
-                )
-                result = {
-                    "termsHash": str(series["termsHash"]),
-                    "serial": int(voucher["serial"]),
-                    "status": "STRIPE_TERMINAL_RETRY_ERROR",
-                    "detail": str(exc),
-                }
-            results.append(result)
-        for series, voucher in self.presales.pending_native_refunds():
-            try:
-                confirmed = await self._confirm_refund_if_ready(series, voucher)
-                result = {
-                    "termsHash": str(series["termsHash"]),
-                    "serial": int(voucher["serial"]),
-                    "status": "REFUNDED" if confirmed else "REFUND_CONFIRMING",
-                }
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "voucher refund confirmation failed for %s/%s",
-                    series["termsHash"],
-                    voucher["serial"],
-                )
-                result = {
-                    "termsHash": str(series["termsHash"]),
-                    "serial": int(voucher["serial"]),
-                    "status": "REFUND_ERROR",
-                    "detail": str(exc),
-                }
-            results.append(result)
-        for series, voucher in self.presales.pending_base_refunds():
-            try:
-                confirmed = await self._confirm_base_refund_if_ready(series, voucher)
-                result = {
-                    "termsHash": str(series["termsHash"]),
-                    "serial": int(voucher["serial"]),
-                    "status": (
-                        "BASE_REFUND_AUTHORIZED"
-                        if confirmed
-                        else "BASE_REFUND_CONFIRMING"
-                    ),
-                }
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "Base voucher refund confirmation failed for %s/%s",
-                    series["termsHash"],
-                    voucher["serial"],
-                )
-                result = {
-                    "termsHash": str(series["termsHash"]),
-                    "serial": int(voucher["serial"]),
-                    "status": "BASE_REFUND_ERROR",
-                    "detail": str(exc),
-                }
-            results.append(result)
-        for series, voucher in self.presales.pending_stripe_refunds():
-            try:
-                confirmed = await self._confirm_stripe_refund_if_ready(
+        """One bounded job per independent lane; never queue behind a busy series."""
+        seen: set[str] = set()
+        results = await asyncio.gather(*(self._run_lane(lane, seen) for lane in (*tuple(lane for lane in LANES if lane != "retained"), "retained")))
+        return [result for result in results if result is not None]
+
+    async def _run_lane(self, lane: str, seen: set[str] | None = None) -> dict[str, Any] | None:
+        job = self.presales.claim_voucher_work(lane, uuid.uuid4().hex, time.time(), seen)
+        if job is None:
+            return None
+        if seen is not None:
+            seen.add(job["termsHash"])
+        base = {"termsHash": job["termsHash"]}
+        if lane != "phase":
+            base["serial"] = job["serial"]
+        status = "INTERRUPTED"
+        try:
+            async with asyncio.timeout(self.config.operation_timeout_seconds):
+                series = self.presales._get_series(job["termsHash"])
+                voucher = None if lane == "phase" else self.presales.voucher(job["termsHash"], job["serial"])
+                retained = None if voucher is None else self.presales.pending_voucher_execution(job["termsHash"], job["serial"])
+                if retained:
+                    result = await self._resume_retained_execution(series, voucher, retained)
+                    if result is not None:
+                        status = result["status"]
+                        return result
+                    if lane == "retained":
+                        status = "FUNDING_CONFIRMED"
+                        return {**base, "status": status}
+                    # Funding confirmation allows the next step, using fresh bindings.
+                    series = self.presales._get_series(job["termsHash"])
+                    voucher = self.presales.voucher(job["termsHash"], job["serial"])
+                if lane == "retained":
+                    status = "OBSERVED"
+                    return None
+                result = await getattr(self, "_lane_" + lane)(series, voucher)
+                status = result["status"]
+                return result
+        except TimeoutError:
+            status = "TIMED_OUT"
+            return {**base, "status": status, "detail": "Voucher work timed out; the same purchase and any signed execution are retained."}
+        except Exception as exc:
+            status = "ERROR"
+            logger.exception("voucher lane %s failed", lane)
+            return {**base, "status": status, "detail": str(exc)}
+        finally:
+            self.presales.finish_voucher_work(job, time.time(), status)
+
+    async def _lane_issuance(self, series, voucher):
+        terms_hash = str(series["termsHash"])
+        try:
+            result = await self._advance(series, voucher)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "voucher issuance failed for %s/%s",
+                terms_hash,
+                voucher["serial"],
+            )
+            result = {
+                "termsHash": terms_hash,
+                "serial": int(voucher["serial"]),
+                "status": "ERROR",
+                "detail": str(exc),
+            }
+        return result
+
+    async def _lane_stripe_terminal(self, series, voucher):
+        terms_hash = str(series["termsHash"])
+        try:
+            status = await self._resume_stripe_terminal_execution(
+                series,
+                voucher,
+            )
+            result = {
+                "termsHash": str(series["termsHash"]),
+                "serial": int(voucher["serial"]),
+                "status": status,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "Stripe voucher exact execution retry failed for %s/%s",
+                series["termsHash"],
+                voucher["serial"],
+            )
+            result = {
+                "termsHash": str(series["termsHash"]),
+                "serial": int(voucher["serial"]),
+                "status": "STRIPE_TERMINAL_RETRY_ERROR",
+                "detail": str(exc),
+            }
+        return result
+
+    async def _lane_native_refund(self, series, voucher):
+        terms_hash = str(series["termsHash"])
+        try:
+            confirmed = await self._confirm_refund_if_ready(series, voucher)
+            result = {
+                "termsHash": str(series["termsHash"]),
+                "serial": int(voucher["serial"]),
+                "status": "REFUNDED" if confirmed else "REFUND_CONFIRMING",
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "voucher refund confirmation failed for %s/%s",
+                series["termsHash"],
+                voucher["serial"],
+            )
+            result = {
+                "termsHash": str(series["termsHash"]),
+                "serial": int(voucher["serial"]),
+                "status": "REFUND_ERROR",
+                "detail": str(exc),
+            }
+        return result
+
+    async def _lane_base_refund(self, series, voucher):
+        terms_hash = str(series["termsHash"])
+        try:
+            confirmed = await self._confirm_base_refund_if_ready(series, voucher)
+            result = {
+                "termsHash": str(series["termsHash"]),
+                "serial": int(voucher["serial"]),
+                "status": (
+                    "BASE_REFUND_AUTHORIZED"
+                    if confirmed
+                    else "BASE_REFUND_CONFIRMING"
+                ),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "Base voucher refund confirmation failed for %s/%s",
+                series["termsHash"],
+                voucher["serial"],
+            )
+            result = {
+                "termsHash": str(series["termsHash"]),
+                "serial": int(voucher["serial"]),
+                "status": "BASE_REFUND_ERROR",
+                "detail": str(exc),
+            }
+        return result
+
+    async def _lane_stripe_refund(self, series, voucher):
+        terms_hash = str(series["termsHash"])
+        try:
+            confirmed = await self._confirm_stripe_refund_if_ready(
+                series, voucher
+            )
+            result = {
+                "termsHash": str(series["termsHash"]),
+                "serial": int(voucher["serial"]),
+                "status": (
+                    "STRIPE_REFUND_AUTHORIZED"
+                    if confirmed
+                    else "STRIPE_REFUND_CONFIRMING"
+                ),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "Stripe voucher refund confirmation failed for %s/%s",
+                series["termsHash"],
+                voucher["serial"],
+            )
+            result = {
+                "termsHash": str(series["termsHash"]),
+                "serial": int(voucher["serial"]),
+                "status": "STRIPE_REFUND_ERROR",
+                "detail": str(exc),
+            }
+        return result
+
+    async def _lane_native_redemption(self, series, voucher):
+        terms_hash = str(series["termsHash"])
+        try:
+            if voucher.get("redemptionBundleId"):
+                confirmed = await self._confirm_redemption_if_ready(
                     series, voucher
                 )
-                result = {
-                    "termsHash": str(series["termsHash"]),
-                    "serial": int(voucher["serial"]),
-                    "status": (
-                        "STRIPE_REFUND_AUTHORIZED"
-                        if confirmed
-                        else "STRIPE_REFUND_CONFIRMING"
-                    ),
-                }
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "Stripe voucher refund confirmation failed for %s/%s",
-                    series["termsHash"],
-                    voucher["serial"],
-                )
-                result = {
-                    "termsHash": str(series["termsHash"]),
-                    "serial": int(voucher["serial"]),
-                    "status": "STRIPE_REFUND_ERROR",
-                    "detail": str(exc),
-                }
-            results.append(result)
-        seen_redemption_series: set[str] = set()
-        for series, voucher in self.presales.pending_native_redemptions():
-            terms_hash = str(series["termsHash"])
-            if terms_hash in seen_redemption_series:
-                continue
-            seen_redemption_series.add(terms_hash)
-            try:
-                if voucher.get("redemptionBundleId"):
-                    confirmed = await self._confirm_redemption_if_ready(
-                        series, voucher
-                    )
-                    if confirmed:
-                        status = "REDEEMED"
-                    elif (
-                        int(time.time()) >= int(series.get("deliveryDeadline") or 0)
-                        and await self._redemption_inputs_are_unspent(voucher)
-                    ):
-                        await self._submit_expired_refund(series, voucher)
-                        status = "REFUND_SUBMITTED"
-                    else:
-                        status = "REDEMPTION_CONFIRMING"
-                elif int(time.time()) >= int(
-                    series.get("deliveryDeadline") or 0
+                if confirmed:
+                    status = "REDEEMED"
+                elif (
+                    int(time.time()) >= int(series.get("deliveryDeadline") or 0)
+                    and await self._redemption_inputs_are_unspent(voucher)
                 ):
                     await self._submit_expired_refund(series, voucher)
                     status = "REFUND_SUBMITTED"
                 else:
-                    submitted = await self._submit_redemption(series, voucher)
-                    status = (
-                        "REDEMPTION_SUBMITTED"
-                        if submitted
-                        else "REDEMPTION_WAITING"
-                    )
-                result = {
-                    "termsHash": terms_hash,
-                    "serial": int(voucher["serial"]),
-                    "status": status,
-                }
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "voucher redemption failed for %s/%s",
-                    terms_hash,
-                    voucher["serial"],
+                    status = "REDEMPTION_CONFIRMING"
+            elif int(time.time()) >= int(
+                series.get("deliveryDeadline") or 0
+            ):
+                await self._submit_expired_refund(series, voucher)
+                status = "REFUND_SUBMITTED"
+            else:
+                submitted = await self._submit_redemption(series, voucher)
+                status = (
+                    "REDEMPTION_SUBMITTED"
+                    if submitted
+                    else "REDEMPTION_WAITING"
                 )
-                result = {
-                    "termsHash": terms_hash,
-                    "serial": int(voucher["serial"]),
-                    "status": "REDEMPTION_ERROR",
-                    "detail": str(exc),
-                }
-            results.append(result)
-        for series, voucher in self.presales.pending_base_redemptions():
-            terms_hash = str(series["termsHash"])
-            if terms_hash in seen_redemption_series:
-                continue
-            seen_redemption_series.add(terms_hash)
-            try:
-                if voucher.get("redemptionBundleId"):
-                    confirmed = await self._confirm_base_redemption_if_ready(
-                        series, voucher
-                    )
-                    if confirmed:
-                        status = "BASE_DELIVERY_AUTHORIZED"
-                    elif (
-                        int(time.time()) >= int(series.get("deliveryDeadline") or 0)
-                        and await self._base_terminal_inputs_are_unspent(voucher)
-                    ):
-                        await self._submit_base_expired_refund(series, voucher)
-                        status = "BASE_REFUND_SUBMITTED"
-                    else:
-                        status = "BASE_REDEMPTION_CONFIRMING"
-                elif int(time.time()) >= int(
-                    series.get("deliveryDeadline") or 0
+            result = {
+                "termsHash": terms_hash,
+                "serial": int(voucher["serial"]),
+                "status": status,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "voucher redemption failed for %s/%s",
+                terms_hash,
+                voucher["serial"],
+            )
+            result = {
+                "termsHash": terms_hash,
+                "serial": int(voucher["serial"]),
+                "status": "REDEMPTION_ERROR",
+                "detail": str(exc),
+            }
+        return result
+
+    async def _lane_base_redemption(self, series, voucher):
+        terms_hash = str(series["termsHash"])
+        try:
+            if voucher.get("redemptionBundleId"):
+                confirmed = await self._confirm_base_redemption_if_ready(
+                    series, voucher
+                )
+                if confirmed:
+                    status = "BASE_DELIVERY_AUTHORIZED"
+                elif (
+                    int(time.time()) >= int(series.get("deliveryDeadline") or 0)
+                    and await self._base_terminal_inputs_are_unspent(voucher)
                 ):
                     await self._submit_base_expired_refund(series, voucher)
                     status = "BASE_REFUND_SUBMITTED"
                 else:
-                    submitted = await self._submit_base_redemption(series, voucher)
-                    status = (
-                        "BASE_REDEMPTION_SUBMITTED"
-                        if submitted
-                        else "BASE_REDEMPTION_WAITING"
-                    )
-                result = {
-                    "termsHash": terms_hash,
-                    "serial": int(voucher["serial"]),
-                    "status": status,
-                }
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "Base voucher settlement failed for %s/%s",
-                    terms_hash,
-                    voucher["serial"],
+                    status = "BASE_REDEMPTION_CONFIRMING"
+            elif int(time.time()) >= int(
+                series.get("deliveryDeadline") or 0
+            ):
+                await self._submit_base_expired_refund(series, voucher)
+                status = "BASE_REFUND_SUBMITTED"
+            else:
+                submitted = await self._submit_base_redemption(series, voucher)
+                status = (
+                    "BASE_REDEMPTION_SUBMITTED"
+                    if submitted
+                    else "BASE_REDEMPTION_WAITING"
                 )
+            result = {
+                "termsHash": terms_hash,
+                "serial": int(voucher["serial"]),
+                "status": status,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "Base voucher settlement failed for %s/%s",
+                terms_hash,
+                voucher["serial"],
+            )
+            result = {
+                "termsHash": terms_hash,
+                "serial": int(voucher["serial"]),
+                "status": "BASE_SETTLEMENT_ERROR",
+                "detail": str(exc),
+            }
+        return result
+
+    async def _lane_stripe_redemption(self, series, voucher):
+        terms_hash = str(series["termsHash"])
+        try:
+            if (
+                voucher.get("terminalExactExecution")
+                and not voucher.get("redemptionBundleId")
+            ):
                 result = {
                     "termsHash": terms_hash,
                     "serial": int(voucher["serial"]),
-                    "status": "BASE_SETTLEMENT_ERROR",
-                    "detail": str(exc),
+                    "status": "STRIPE_TERMINAL_RETRY_PENDING",
                 }
-            results.append(result)
-        for series, voucher in self.presales.pending_stripe_redemptions():
-            terms_hash = str(series["termsHash"])
-            if terms_hash in seen_redemption_series:
-                continue
-            seen_redemption_series.add(terms_hash)
-            try:
-                if (
-                    voucher.get("terminalExactExecution")
-                    and not voucher.get("redemptionBundleId")
-                ):
-                    result = {
-                        "termsHash": terms_hash,
-                        "serial": int(voucher["serial"]),
-                        "status": "STRIPE_TERMINAL_RETRY_PENDING",
-                    }
-                    results.append(result)
-                    continue
-                if voucher.get("redemptionBundleId"):
-                    confirmed = await self._confirm_stripe_redemption_if_ready(
-                        series, voucher
-                    )
-                    if confirmed:
-                        status = "STRIPE_DEED_DELIVERED"
-                    else:
-                        status = "STRIPE_REDEMPTION_CONFIRMING"
-                elif int(time.time()) >= int(
-                    series.get("deliveryDeadline") or 0
-                ):
-                    await self._submit_stripe_expired_refund(series, voucher)
-                    status = "STRIPE_REFUND_SUBMITTED"
+                return result
+            if voucher.get("redemptionBundleId"):
+                confirmed = await self._confirm_stripe_redemption_if_ready(
+                    series, voucher
+                )
+                if confirmed:
+                    status = "STRIPE_DEED_DELIVERED"
                 else:
-                    submitted = await self._submit_stripe_redemption(
-                        series, voucher
-                    )
-                    status = (
-                        "STRIPE_REDEMPTION_SUBMITTED"
-                        if submitted
-                        else "STRIPE_REDEMPTION_WAITING"
-                    )
-                result = {
-                    "termsHash": terms_hash,
-                    "serial": int(voucher["serial"]),
-                    "status": status,
-                }
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "Stripe voucher settlement failed for %s/%s",
-                    terms_hash,
-                    voucher["serial"],
+                    status = "STRIPE_REDEMPTION_CONFIRMING"
+            elif int(time.time()) >= int(
+                series.get("deliveryDeadline") or 0
+            ):
+                await self._submit_stripe_expired_refund(series, voucher)
+                status = "STRIPE_REFUND_SUBMITTED"
+            else:
+                submitted = await self._submit_stripe_redemption(
+                    series, voucher
                 )
-                result = {
-                    "termsHash": terms_hash,
-                    "serial": int(voucher["serial"]),
-                    "status": "STRIPE_SETTLEMENT_ERROR",
-                    "detail": str(exc),
-                }
-            results.append(result)
-        for series in self.presales.pending_phase_transitions():
-            try:
-                confirmed = await self._confirm_phase_if_ready(series)
-                result = {
-                    "termsHash": str(series["termsHash"]),
-                    "status": "PHASE_CONFIRMED" if confirmed else "PHASE_CONFIRMING",
-                }
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "voucher phase confirmation failed for %s",
-                    series["termsHash"],
+                status = (
+                    "STRIPE_REDEMPTION_SUBMITTED"
+                    if submitted
+                    else "STRIPE_REDEMPTION_WAITING"
                 )
-                result = {
-                    "termsHash": str(series["termsHash"]),
-                    "status": "PHASE_ERROR",
-                    "detail": str(exc),
-                }
-            results.append(result)
-        return results
+            result = {
+                "termsHash": terms_hash,
+                "serial": int(voucher["serial"]),
+                "status": status,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "Stripe voucher settlement failed for %s/%s",
+                terms_hash,
+                voucher["serial"],
+            )
+            result = {
+                "termsHash": terms_hash,
+                "serial": int(voucher["serial"]),
+                "status": "STRIPE_SETTLEMENT_ERROR",
+                "detail": str(exc),
+            }
+        return result
+
+    async def _lane_phase(self, series, voucher):
+        terms_hash = str(series["termsHash"])
+        try:
+            confirmed = await self._confirm_phase_if_ready(series)
+            result = {
+                "termsHash": str(series["termsHash"]),
+                "status": "PHASE_CONFIRMED" if confirmed else "PHASE_CONFIRMING",
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "voucher phase confirmation failed for %s",
+                series["termsHash"],
+            )
+            result = {
+                "termsHash": str(series["termsHash"]),
+                "status": "PHASE_ERROR",
+                "detail": str(exc),
+            }
+        return result
+
+
+    _RETAINED_KINDS = {
+        "funding": ("record_issuance_funding", "fundingBundleId", "funding_bundle_id", "FUNDING_SUBMITTED"),
+        "issuance": ("record_issuance_submission", "issuanceBundleId", "issuance_bundle_id", "ISSUANCE_SUBMITTED"),
+        "native_refund": ("record_native_refund_submission", "refundBundleId", "spend_bundle_id", "REFUND_SUBMITTED"),
+        "native_redemption": ("record_redemption_submission", "redemptionBundleId", "spend_bundle_id", "REDEMPTION_SUBMITTED"),
+        "base_redemption": ("record_redemption_submission", "redemptionBundleId", "spend_bundle_id", "BASE_REDEMPTION_SUBMITTED"),
+        "base_refund": ("record_base_expired_refund_submission", "refundBundleId", "spend_bundle_id", "BASE_REFUND_SUBMITTED"),
+    }
+
+    def _require_dispatch(self):
+        if not self.config.enabled or self._stop.is_set():
+            raise RuntimeError("Voucher dispatch is paused; known outcomes remain observable")
+        if self.authorize_dispatch is not None:
+            self.authorize_dispatch()
+
+    def _bind_retained_execution(self, series, voucher, execution):
+        method, field, binding, _ = self._RETAINED_KINDS[execution["kind"]]
+        bundle = SpendBundle.from_json_dict(execution["spendBundle"])
+        bundle_id = _hex32(bundle.name())
+        if execution["bindings"][binding] != bundle_id:
+            raise ValueError("Retained voucher bundle differs from its binding")
+        if voucher.get(field):
+            if voucher[field] != bundle_id:
+                raise ValueError("Retained voucher submission was replaced")
+        else:
+            getattr(self.presales, method)(series["termsHash"], voucher["serial"], **execution["bindings"])
+        return bundle
+
+    async def _dispatch_retained_execution(self, series, voucher, bundle, *, kind, bindings):
+        # Persist the signed bytes BEFORE any network dispatch. A deadline or a
+        # lost response cannot cause another funding coin or a replacement spend.
+        execution = dict(kind=kind, spendBundle=bundle.to_json_dict(), bindings=bindings)
+        self.presales.retain_voucher_execution(series["termsHash"], voucher["serial"], execution)
+        self._bind_retained_execution(series, voucher, execution)
+        self._require_dispatch()
+        result = await self.coinset.push_tx(bundle.to_json_dict())
+        _require_push_accepted(result, "retained voucher " + kind)
+        return self.presales.voucher(series["termsHash"], voucher["serial"])
+
+    async def _resume_retained_execution(self, series, voucher, execution):
+        bundle = self._bind_retained_execution(series, voucher, execution)
+        voucher = self.presales.voucher(series["termsHash"], voucher["serial"])
+        kind = execution["kind"]
+        base = dict(termsHash=series["termsHash"], serial=voucher["serial"])
+        if kind == "funding":
+            record = await self.coinset.get_coin_record_by_name(voucher["purchaseLauncherCoinId"])
+            coin = _confirmed_unspent_coin(record)
+            confirmed = coin is not None and _hex32(coin.name()) == voucher["purchaseLauncherCoinId"] and _hex32(coin.puzzle_hash) == voucher["purchaseLauncherPuzzleHash"] and int(coin.amount) == 2
+            final = None
+        else:
+            confirm, terminal_state, status = {
+                "issuance": (self._confirm_if_ready, "ESCROWED", "CONFIRMED"),
+                "native_refund": (self._confirm_refund_if_ready, "REFUNDED", "REFUNDED"),
+                "base_refund": (self._confirm_base_refund_if_ready, "REFUNDED", "BASE_REFUND_AUTHORIZED"),
+                "native_redemption": (self._confirm_redemption_if_ready, "REDEEMED", "REDEEMED"),
+                "base_redemption": (self._confirm_base_redemption_if_ready, "REDEEMED", "BASE_DELIVERY_AUTHORIZED"),
+            }[kind]
+            confirmed = voucher["state"] == terminal_state or await confirm(series, voucher)
+            final = {**base, "status": status}
+        if confirmed:
+            self.presales.confirm_voucher_execution(series["termsHash"], voucher["serial"], kind)
+            return final
+        self._require_dispatch()
+        result = await self.coinset.push_tx(bundle.to_json_dict())
+        _require_push_accepted(result, "retained voucher " + kind)
+        status = {"funding": "FUNDING_SUBMITTED", "issuance": "CONFIRMING", "native_refund": "REFUND_CONFIRMING",
+                  "base_refund": "BASE_REFUND_CONFIRMING", "native_redemption": "REDEMPTION_CONFIRMING",
+                  "base_redemption": "BASE_REDEMPTION_CONFIRMING"}[kind]
+        return {**base, "status": status}
 
     async def _advance(
         self, series: dict[str, Any], voucher: dict[str, Any]
@@ -503,6 +632,10 @@ class VoucherIssuanceWorker:
     async def _fund_purchase_launcher(
         self, series: dict[str, Any], voucher_json: dict[str, Any]
     ) -> dict[str, Any]:
+        async with self._funding_lock:
+            return await self._fund_purchase_launcher_locked(series, voucher_json)
+
+    async def _fund_purchase_launcher_locked(self, series, voucher_json):
         terms = series_terms_from_json(series["terms"])
         if voucher_json["paymentRail"] == "STRIPE_USD":
             voucher = voucher_commitment_v3_from_json(
@@ -528,6 +661,9 @@ class VoucherIssuanceWorker:
         records = await self.coinset.get_coin_records_by_puzzle_hash(
             "0x" + self.faucet.address_puzzle_hash.hex(), include_spent=False
         )
+        reserved = (self.submitter.reserved_funding_coin_ids() if self.submitter is not None
+                    else {bytes.fromhex(value[2:]) for value in self.presales.pending_voucher_funding_coin_ids()})
+        records = [record for record in records if (coin := _confirmed_unspent_coin(record)) is not None and bytes(coin.name()) not in reserved]
         parent = self.faucet.select_coin(
             records,
             min_amount=2,
@@ -566,15 +702,12 @@ class VoucherIssuanceWorker:
             bytes32(launcher_puzzle.get_tree_hash()),
             uint64(2),
         )
-        result = await self.coinset.push_tx(bundle.to_json_dict())
-        _require_push_accepted(result, "voucher funding")
-        return self.presales.record_issuance_funding(
-            str(series["termsHash"]),
-            int(voucher_json["serial"]),
-            funding_bundle_id=_hex32(bundle.name()),
-            purchase_launcher_coin_id=_hex32(purchase_launcher.name()),
-            purchase_launcher_puzzle_hash=_hex32(purchase_launcher.puzzle_hash),
-        )
+        return await self._dispatch_retained_execution(series, voucher_json, bundle,
+            kind="funding", bindings=dict(
+                funding_bundle_id=_hex32(bundle.name()),
+                purchase_launcher_coin_id=_hex32(purchase_launcher.name()),
+                purchase_launcher_puzzle_hash=_hex32(purchase_launcher.puzzle_hash),
+            ))
 
     async def _submit_if_ready(
         self, series: dict[str, Any], voucher_json: dict[str, Any]
@@ -714,25 +847,22 @@ class VoucherIssuanceWorker:
         bundle = SpendBundle(
             list(issuance.coin_spends), quorum.aggregated_signature
         )
-        result = await self.coinset.push_tx(bundle.to_json_dict())
-        _require_push_accepted(result, "voucher issuance")
-        self.presales.record_issuance_submission(
-            str(series["termsHash"]),
-            int(voucher_json["serial"]),
-            issuance_bundle_id=_hex32(bundle.name()),
-            voucher_launcher_id=_hex32(issuance.voucher_launcher_id),
-            voucher_output_coin_id=_hex32(issuance.voucher_coin.name()),
-            payment_commitment_coin_id=_hex32(
+        await self._dispatch_retained_execution(series, voucher_json, bundle,
+            kind="issuance", bindings=dict(
+                issuance_bundle_id=_hex32(bundle.name()),
+                voucher_launcher_id=_hex32(issuance.voucher_launcher_id),
+                voucher_output_coin_id=_hex32(issuance.voucher_coin.name()),
+                payment_commitment_coin_id=_hex32(
                 (
                     issuance.receipt_coin
                     if is_stripe
                     else issuance.payment_coin
                 ).name()
             ),
-            series_input_coin_id=_hex32(series_coin.name()),
-            series_output_coin_id=_hex32(issuance.next_series_coin.name()),
-            signer_indices=quorum.signer_indices,
-        )
+                series_input_coin_id=_hex32(series_coin.name()),
+                series_output_coin_id=_hex32(issuance.next_series_coin.name()),
+                signer_indices=quorum.signer_indices,
+            ))
         return True
 
     async def _confirm_if_ready(
@@ -1098,22 +1228,19 @@ class VoucherIssuanceWorker:
             voucher.payment_principal,
             "exact original-payer refund",
         )
-        result = await self.coinset.push_tx(bundle.to_json_dict())
-        _require_push_accepted(result, "expired voucher refund")
-        self.presales.record_native_refund_submission(
-            str(series["termsHash"]),
-            int(voucher_json["serial"]),
-            action=VoucherAction.REFUND_EXPIRED,
-            spend_bundle_id=_hex32(bundle.name()),
-            refund_output_coin_id=_hex32(terminal.settlement_coin.name()),
-            terminal_voucher_coin_id=_hex32(
+        await self._dispatch_retained_execution(series, voucher_json, bundle,
+            kind="native_refund", bindings=dict(
+                action=VoucherAction.REFUND_EXPIRED,
+                spend_bundle_id=_hex32(bundle.name()),
+                refund_output_coin_id=_hex32(terminal.settlement_coin.name()),
+                terminal_voucher_coin_id=_hex32(
                 terminal.terminal_voucher_coin.name()
             ),
-            series_input_coin_id=_hex32(series_coin.name()),
-            series_output_coin_id=_hex32(terminal.next_series_coin.name()),
-            vault_input_coin_id=None,
-            vault_output_coin_id=None,
-        )
+                series_input_coin_id=_hex32(series_coin.name()),
+                series_output_coin_id=_hex32(terminal.next_series_coin.name()),
+                vault_input_coin_id=None,
+                vault_output_coin_id=None,
+            ))
 
     async def _submit_redemption(
         self,
@@ -1285,21 +1412,18 @@ class VoucherIssuanceWorker:
             1,
             "vault SmartDeed delivery",
         )
-        result = await self.coinset.push_tx(bundle.to_json_dict())
-        _require_push_accepted(result, "voucher redemption")
-        self.presales.record_redemption_submission(
-            str(series["termsHash"]),
-            int(voucher_json["serial"]),
-            spend_bundle_id=_hex32(bundle.name()),
-            treasury_output_coin_id=_hex32(treasury_output.name()),
-            deed_output_coin_id=_hex32(deed_output.name()),
-            terminal_voucher_coin_id=_hex32(
+        await self._dispatch_retained_execution(series, voucher_json, bundle,
+            kind="native_redemption", bindings=dict(
+                spend_bundle_id=_hex32(bundle.name()),
+                treasury_output_coin_id=_hex32(treasury_output.name()),
+                deed_output_coin_id=_hex32(deed_output.name()),
+                terminal_voucher_coin_id=_hex32(
                 terminal.terminal_voucher_coin.name()
             ),
-            series_input_coin_id=_hex32(series_coin.name()),
-            series_output_coin_id=_hex32(terminal.next_series_coin.name()),
-            deed_input_coin_id=_hex32(context.deed_coin.name()),
-        )
+                series_input_coin_id=_hex32(series_coin.name()),
+                series_output_coin_id=_hex32(terminal.next_series_coin.name()),
+                deed_input_coin_id=_hex32(context.deed_coin.name()),
+            ))
         return True
 
     def _stripe_execution_services(
@@ -1310,7 +1434,10 @@ class VoucherIssuanceWorker:
                 "Stripe voucher settlement requires the exact KoS executor and "
                 "protocol fee funding"
             )
-        return self.submitter, self.exact_executor
+        async def dispatch(request, prepared):
+            self._require_dispatch()
+            return await self.exact_executor.dispatch(request, prepared)
+        return self.submitter, SimpleNamespace(dispatch=dispatch)
 
     async def _resume_stripe_terminal_execution(
         self,
@@ -1882,22 +2009,19 @@ class VoucherIssuanceWorker:
             1,
             "vault SmartDeed delivery",
         )
-        result = await self.coinset.push_tx(bundle.to_json_dict())
-        _require_push_accepted(result, "Base voucher redemption")
-        self.presales.record_redemption_submission(
-            str(series["termsHash"]),
-            int(voucher_json["serial"]),
-            spend_bundle_id=_hex32(bundle.name()),
-            treasury_output_coin_id=_hex32(treasury_output.name()),
-            deed_output_coin_id=_hex32(deed_output.name()),
-            terminal_voucher_coin_id=_hex32(
+        await self._dispatch_retained_execution(series, voucher_json, bundle,
+            kind="base_redemption", bindings=dict(
+                spend_bundle_id=_hex32(bundle.name()),
+                treasury_output_coin_id=_hex32(treasury_output.name()),
+                deed_output_coin_id=_hex32(deed_output.name()),
+                terminal_voucher_coin_id=_hex32(
                 terminal.terminal_voucher_coin.name()
             ),
-            series_input_coin_id=_hex32(series_coin.name()),
-            series_output_coin_id=_hex32(terminal.next_series_coin.name()),
-            deed_input_coin_id=_hex32(context.deed_coin.name()),
-            external_settlement_evidence_hash=_hex32(evidence_hash),
-        )
+                series_input_coin_id=_hex32(series_coin.name()),
+                series_output_coin_id=_hex32(terminal.next_series_coin.name()),
+                deed_input_coin_id=_hex32(context.deed_coin.name()),
+                external_settlement_evidence_hash=_hex32(evidence_hash),
+            ))
         return True
 
     async def _submit_stripe_expired_refund(
@@ -2179,19 +2303,16 @@ class VoucherIssuanceWorker:
             list(terminal.coin_spends),
             quorum.aggregated_signature,
         )
-        result = await self.coinset.push_tx(bundle.to_json_dict())
-        _require_push_accepted(result, "Base expired voucher refund")
-        self.presales.record_base_expired_refund_submission(
-            str(series["termsHash"]),
-            int(voucher_json["serial"]),
-            spend_bundle_id=_hex32(bundle.name()),
-            external_settlement_evidence_hash=_hex32(evidence_hash),
-            terminal_voucher_coin_id=_hex32(
+        await self._dispatch_retained_execution(series, voucher_json, bundle,
+            kind="base_refund", bindings=dict(
+                spend_bundle_id=_hex32(bundle.name()),
+                external_settlement_evidence_hash=_hex32(evidence_hash),
+                terminal_voucher_coin_id=_hex32(
                 terminal.terminal_voucher_coin.name()
             ),
-            series_input_coin_id=_hex32(series_coin.name()),
-            series_output_coin_id=_hex32(terminal.next_series_coin.name()),
-        )
+                series_input_coin_id=_hex32(series_coin.name()),
+                series_output_coin_id=_hex32(terminal.next_series_coin.name()),
+            ))
 
     async def _confirm_redemption_if_ready(
         self,
@@ -2820,6 +2941,7 @@ class VoucherIssuanceWorker:
                 launchAnchor=launch_anchor,
                 confirmedHeight=confirmed_height,
             ),
+            include_vouchers=False,
         )
         return True
 
