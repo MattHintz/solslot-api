@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 import sqlite3
 from typing import Any, Iterator, Mapping
+from .inventory_extension_store import InventoryExtensionStoreMixin, migrate_extensions
 
 
 class PaymentPurchaseNotFound(LookupError):
@@ -60,9 +61,10 @@ class StoredPaymentPurchase:
     inventory_signature: str | None = None
     inventory_mempool_observed_at: str | None = None
     inventory_confirmation_height: int | None = None
+    inventory_extension_receipts: tuple[dict[str, Any], ...] = ()
 
 
-class PaymentPurchaseStore:
+class PaymentPurchaseStore(InventoryExtensionStoreMixin):
     def __init__(self, path: str):
         self.path = path
         if path != ":memory:":
@@ -168,12 +170,14 @@ class PaymentPurchaseStore:
                 "inventory_signature": "TEXT",
                 "inventory_mempool_observed_at": "TEXT",
                 "inventory_confirmation_height": "INTEGER",
+                "inventory_extension_receipts_json": "TEXT NOT NULL DEFAULT '[]'",
             }
             for name, declaration in inventory_columns.items():
                 if name not in columns:
                     cursor = connection.execute(
                         f"ALTER TABLE payment_purchases ADD COLUMN {name} {declaration}"
                     )
+            migrate_extensions(connection)
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS "
                 "payment_purchases_external_transaction "
@@ -400,6 +404,8 @@ class PaymentPurchaseStore:
         canonical = _canonical_json(binding)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if connection.execute('SELECT 1 FROM payment_inventory_extensions WHERE purchase_id=?', (purchase_id,)).fetchone():
+                raise PaymentPurchaseConflict('payment hold requires authoritative terminal reconciliation; timeout cannot release inventory')
             item = connection.execute(
                 "SELECT state FROM payment_purchase_inventory_items WHERE purchase_id=? AND ordinal=?",
                 (purchase_id, ordinal)).fetchone()
@@ -791,6 +797,8 @@ class PaymentPurchaseStore:
         encoded = _canonical_json(evidence)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if connection.execute('SELECT 1 FROM payment_inventory_extensions WHERE purchase_id=?', (purchase_id,)).fetchone():
+                raise PaymentPurchaseConflict('payment hold requires authoritative terminal reconciliation; timeout cannot release inventory')
             try:
                 parent = connection.execute("SELECT * FROM payment_purchases WHERE purchase_id=?", (purchase_id,)).fetchone()
                 rows = connection.execute("SELECT * FROM payment_purchase_inventory_items WHERE purchase_id=? ORDER BY ordinal", (purchase_id,)).fetchall()
@@ -970,6 +978,7 @@ def _record(row: sqlite3.Row) -> StoredPaymentPurchase:
     external_json = row["external_message_json"]
     inventory_bundle_json = row["inventory_bundle_json"]
     return StoredPaymentPurchase(
+        inventory_extension_receipts=tuple(json.loads(row["inventory_extension_receipts_json"])),
         purchase_id=row["purchase_id"],
         artifact_hash=row["artifact_hash"],
         purchase_intent_id=row["purchase_intent_id"],

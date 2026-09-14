@@ -1437,9 +1437,18 @@ async def collect_primary_purchase_quorum(
     )
 
 
-async def collect_inventory_reservation_quorum(
+async def collect_inventory_reservation_quorum(settings, claim, *, client=None):
+    return await _collect_inventory_quorum(settings, claim, "/v1/inventory-reservation/sign", client=client)
+
+
+async def collect_inventory_extension_quorum(settings, claim, *, client=None):
+    return await _collect_inventory_quorum(settings, claim, "/v1/inventory-extension/sign", client=client)
+
+
+async def _collect_inventory_quorum(
     settings: Settings,
-    claim: InventoryReservationClaim,
+    claim,
+    path: str,
     *,
     client: httpx.AsyncClient | None = None,
 ) -> ValidatorQuorumResult:
@@ -1458,7 +1467,7 @@ async def collect_inventory_reservation_quorum(
     ) -> tuple[int, G2Element] | None:
         try:
             response = await client.post(
-                url.rstrip("/") + "/v1/inventory-reservation/sign",
+                url.rstrip("/") + path,
                 json={
                     "claim": claim.model_dump(mode="json"),
                     "claimHash": claim_hash,

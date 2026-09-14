@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 import httpx
 from dataclasses import dataclass
-from typing import Annotated, Any, Mapping
+from typing import Annotated, Any, Mapping, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -253,12 +253,61 @@ async def inventory_purchase_status(
     normalized = "0x" + _hex_bytes(purchase_id, 32, "purchaseId").hex()
     store = get_payment_purchase_store(settings.payment_purchase_db_path)
     try:
-        return retained_inventory_status(store.inventory_status_snapshot(normalized),
+        result = retained_inventory_status(store.inventory_status_snapshot(normalized),
             environment=settings.runtime_environment + "-alpha", network=settings.network)
+        from .inventory_extensions import hold_status
+        hold = hold_status(store.get(normalized), store.inventory_extension_operations(normalized), now=int(time.time()))
+        if hold is not None:
+            from .inventory_extension_chain import current_position, validate_execution
+            from .inventory_extension_claims import InventoryExtensionClaim
+            stored = store.get(normalized)
+            position = current_position(stored, store.inventory_items(normalized), load_signed_public_artifact(settings))
+            pending = store.pending_inventory_extension(normalized)
+            if pending and pending["protocol"] is not None:
+                validate_execution(position, InventoryExtensionClaim.model_validate(pending["claim"]), pending)
+            result["paymentHold"] = hold
+        return result
     except PaymentPurchaseNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (PaymentPurchaseConflict, ValueError, TypeError, KeyError) as exc:
         raise HTTPException(status_code=409, detail="Inventory evidence is incomplete. The purchase remains held for review.") from exc
+
+
+class InventoryExtensionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True, strict=True)
+    purchase_id: str = Field(alias="purchaseId", pattern=r"^0x[0-9a-f]{64}$")
+    payment_intent_id: str = Field(alias="paymentIntentId", pattern=r"^pi_[A-Za-z0-9]{1,200}$")
+    payment_event_id: str = Field(alias="paymentEventId", pattern=r"^evt_[A-Za-z0-9]{1,200}$")
+    payment_started_at: int = Field(alias="paymentStartedAt", gt=0)
+    payment_method: Literal["card", "us_bank_account"] = Field(alias="paymentMethod")
+    observe_only: bool = Field(default=False, alias="observeOnly")
+
+
+@router.post("/inventory/extend")
+async def extend_inventory(payload: InventoryExtensionRequest, request: Request,
+                           settings: Annotated[Settings, Depends(get_settings)],
+                           authorization: Annotated[str | None, Header()] = None):
+    from .inventory_extensions import advance_extension
+    from .presale_endpoints import get_presale_store
+    _require_server_to_server_token(settings, authorization)
+    def authorize():
+        _require_server_to_server_token(settings, authorization)
+        require_minting_writes(settings)
+        require_operation_gate(settings, "purchases")
+    try:
+        result = await advance_extension(store=get_payment_purchase_store(settings.payment_purchase_db_path),
+            node=request.app.state.coinset, submitter=getattr(request.app.state, "protocol_submitter", None),
+            settings=settings, presales=get_presale_store(settings), purchase_id=payload.purchase_id,
+            payment={key: getattr(payload, key) for key in ("payment_intent_id", "payment_event_id", "payment_started_at", "payment_method")},
+            load_artifact=lambda: load_signed_public_artifact(settings), authorize=authorize,
+            observe_only=payload.observe_only)
+        return dict(purchaseId=payload.purchase_id, paymentHold=result)
+    except PaymentPurchaseNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (PaymentPurchaseConflict, ValueError, TypeError, KeyError, ValidatorQuorumError) as exc:
+        raise HTTPException(status_code=409, detail="Extension needs review. Inventory remains held: " + str(exc)) from exc
+    except (httpx.HTTPError, OSError, TimeoutError) as exc:
+        raise HTTPException(status_code=503, detail="Extension service unavailable. Retain this purchase and retry recovery.") from exc
 
 
 @router.post("/inventory/reconcile-timeout")
@@ -1209,6 +1258,9 @@ async def _load_context(
             status_code=409,
             detail="The native purchase quote is missing, invalid, or expired.",
         ) from exc
+    if require_inventory_reservation and get_payment_purchase_store(settings.payment_purchase_db_path).pending_inventory_extension(normalized_purchase_id):
+        raise HTTPException(status_code=409, detail="Reservation extension is unresolved. Resume its exact operation before delivery.")
+    extended_position = None
     if purchase.rail not in allowed_rails:
         raise HTTPException(
             status_code=409,
@@ -1395,10 +1447,15 @@ async def _load_context(
             purchase.quote_expires_at,
             purchase.authorization_expires_at,
         )
+        if require_inventory_reservation and getattr(stored, "inventory_extension_receipts", ()):
+            from .inventory_extension_chain import current_position
+            current_store = get_payment_purchase_store(settings.payment_purchase_db_path)
+            extended_position = current_position(stored, current_store.inventory_items(normalized_purchase_id), genesis)
+            terms = extended_position.terms
         reservation = InventoryReservationV1(
             artifact=purchase,
             expires_at=(
-                stored.inventory_expires_at
+                (extended_position.reservation.expires_at if extended_position else stored.inventory_expires_at)
                 if require_inventory_reservation
                 and stored.inventory_expires_at is not None
                 else initial_reservation_expiry
@@ -1420,7 +1477,7 @@ async def _load_context(
     released_cursor = (get_payment_purchase_store(settings.payment_purchase_db_path)
                        .latest_released_inventory(_hex32(purchase.deed_launcher_id)))
     expected_coin_id = (
-        str(inventory_item.reserved_coin_id)
+        (_hex32(extended_position.coin.name()) if extended_position else str(inventory_item.reserved_coin_id))
         if require_inventory_reservation
         and inventory_item is not None
         else (str(released_cursor["availableCoinId"]) if released_cursor
@@ -1454,7 +1511,7 @@ async def _load_context(
         or (
             require_inventory_reservation
             and _hex32(deed_coin.puzzle_hash)
-            != inventory_item.reserved_puzzle_hash
+            != (_hex32(extended_position.coin.puzzle_hash) if extended_position else inventory_item.reserved_puzzle_hash)
         )
     ):
         raise HTTPException(
@@ -1476,7 +1533,19 @@ async def _load_context(
     ):
         raise HTTPException(status_code=409, detail="SmartDeed launcher lineage is unavailable.")
     lineage = LineageProof(parent_name=launcher_coin.parent_coin_info, amount=launcher_coin.amount)
-    if require_inventory_reservation:
+    if extended_position:
+        from .inventory_extension_chain import inspect_position
+        from .inventory_recovery import release_peak
+        from chia.wallet.puzzles.singleton_top_layer_v1_1 import lineage_proof_for_coinsol
+        try:
+            peak = await release_peak(coinset, settings.network)
+            await inspect_position(coinset, extended_position, peak)
+            if await release_peak(coinset, settings.network) != peak:
+                raise PaymentPurchaseConflict("chain tip changed during extended inventory loading")
+            lineage = lineage_proof_for_coinsol(extended_position.creation_spend)
+        except PaymentPurchaseConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    elif require_inventory_reservation:
         # The reservation may spend a released successor instead of the eve coin.
         available_id = inventory_item.available_coin_id
         if available_id != str(deed["outputCoinId"]).lower():
