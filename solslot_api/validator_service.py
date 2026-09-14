@@ -307,6 +307,8 @@ def load_validator_artifact(
     try:
         from .inventory_extension_claims import extension_activation
         extension_activation(artifact, settings.deployment_environment, required=False)
+        from .inventory_payment_hold_claims import payment_hold_activation
+        payment_hold_activation(artifact, settings.deployment_environment, required=False)
         activation = activation_from_artifact(artifact, environment=settings.deployment_environment)
     except ValueError as exc:
         raise ValidatorEvidenceError(str(exc)) from exc
@@ -2495,6 +2497,16 @@ def verify_voucher_issuance_claim(
         raise ValidatorEvidenceError("voucher validator message changed on re-derivation")
 
 
+def _voucher_payment_hold_binding(claim) -> tuple[str | None, str | None]:
+    # Called only after the complete independent voucher verifier. Native/Base
+    # artifacts have different commitments and cannot reinterpret a held V3 PI.
+    if claim.voucher_commitment.get("schema") != "solslot.voucher-commitment.v3":
+        return None, None
+    purchase = purchase_artifact_v3_from_json(claim.purchase_artifact)
+    evidence = stripe_settlement_evidence_from_json(claim.payment_evidence)
+    return "0x" + bytes(purchase.purchase_id).hex(), evidence.payment_intent_id
+
+
 def sign_voucher_issuance_claim(
     settings: ValidatorSettings,
     ledger: ValidatorLedger,
@@ -2508,6 +2520,7 @@ def sign_voucher_issuance_claim(
             claim.signature_message(),
         )
     ).hex()
+    purchase_id, payment_intent_id = _voucher_payment_hold_binding(claim)
     try:
         return ledger.record_voucher_issuance_or_recover(
             claim_hash=claim_hash.lower(),
@@ -2516,6 +2529,8 @@ def sign_voucher_issuance_claim(
             series_coin_id=claim.series_coin_id,
             purchase_launcher_coin_id=claim.purchase_launcher_coin_id,
             signature=signature,
+            purchase_id=purchase_id,
+            payment_intent_id=payment_intent_id,
         )
     except ValidatorLedgerConflict as exc:
         raise ValidatorEvidenceError(str(exc)) from exc
@@ -3437,6 +3452,7 @@ def sign_voucher_transition_claim(
             ]
         )
     ).hex()
+    purchase_id, payment_intent_id = _voucher_payment_hold_binding(claim)
     try:
         return ledger.record_voucher_transition_or_recover(
             claim_hash=claim_hash.lower(),
@@ -3447,6 +3463,8 @@ def sign_voucher_transition_claim(
             payment_coin_id=claim.payment_coin_id,
             deed_coin_id=claim.deed_coin_id,
             signature=signature,
+            purchase_id=purchase_id,
+            payment_intent_id=payment_intent_id,
         )
     except ValidatorLedgerConflict as exc:
         raise ValidatorEvidenceError(str(exc)) from exc

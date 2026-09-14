@@ -115,6 +115,8 @@ def _verify_runtime_bindings(settings: Settings, payload: Mapping[str, Any]) -> 
         validate_inventory_activation(payload, environment=settings.runtime_environment + "-alpha")
         from .inventory_extension_claims import extension_activation
         extension_activation(payload, settings.runtime_environment + "-alpha", required=False)
+        from .inventory_payment_hold_claims import payment_hold_activation
+        payment_hold_activation(payload, settings.runtime_environment + "-alpha", required=False)
     except ValueError as exc:
         raise PublicArtifactError(str(exc)) from exc
     from solslot_puzzles.enrollment_activation import activation_from_artifact
