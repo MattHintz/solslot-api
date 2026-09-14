@@ -393,6 +393,9 @@ async def lifespan(app: FastAPI):
             presale_store.pending_stripe_terminal_fee_coin_ids
         )
         app.state.protocol_submitter.add_fee_coin_reservation_source(
+            presale_store.pending_voucher_funding_coin_ids
+        )
+        app.state.protocol_submitter.add_fee_coin_reservation_source(
             get_payment_purchase_store(settings.payment_purchase_db_path).pending_timeout_fee_coin_ids
         )
         app.state.protocol_submitter.add_fee_coin_reservation_source(
@@ -461,6 +464,12 @@ async def lifespan(app: FastAPI):
             VoucherIssuanceWorkerConfig,
         )
 
+        from .credential_auth import require_minting_writes
+        def authorize_voucher_dispatch():
+            if not settings.voucher_issuance_worker_enabled or not settings.protocol_fee_funding_enabled:
+                raise RuntimeError("Voucher transaction dispatch is paused")
+            require_minting_writes(settings)
+
         voucher_worker = VoucherIssuanceWorker(
             settings=settings,
             faucet=app.state.faucet,
@@ -469,6 +478,7 @@ async def lifespan(app: FastAPI):
             purchases=get_payment_purchase_store(settings.payment_purchase_db_path),
             submitter=app.state.protocol_submitter,
             exact_executor=app.state.kos_exact_executor,
+            authorize_dispatch=authorize_voucher_dispatch,
             config=VoucherIssuanceWorkerConfig(
                 enabled=True,
                 interval_seconds=settings.voucher_issuance_interval_seconds,

@@ -4,6 +4,7 @@ Real SQLite, group loader, lineage loader, CLVM builders, claim signatures and
 exact-execution persistence. Authority/RPC/payment/fee/executor are synthetic.
 These are not public-chain outcomes or proof of presale reservation extension.
 """
+import asyncio
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
@@ -169,7 +170,8 @@ def voucher_case(tmp_path, monkeypatch, inventory_version=2, *, after_authorizat
 
     worker = delivery.VoucherIssuanceWorker(settings=case.worker.settings, faucet=case.worker.faucet,
         coinset=case.worker.provider, presales=store, purchases=PaymentPurchaseStore(case.purchases.path),
-        submitter=SimpleNamespace(prepare_and_dispatch=prepare_and_dispatch),
+        submitter=SimpleNamespace(prepare_and_dispatch=prepare_and_dispatch, funding_guard=asyncio.Lock(),
+            add_fee_coin_reservation_source=lambda source: None),
         exact_executor=SimpleNamespace(dispatch=dispatch), config=delivery.VoucherIssuanceWorkerConfig(enabled=True))
     return SimpleNamespace(**vars(case), voucher_worker=worker, presales=store, presale_path=store_path,
         current=current, clock=clock, dispatched=dispatched, prepared_bundles=prepared_bundles,
