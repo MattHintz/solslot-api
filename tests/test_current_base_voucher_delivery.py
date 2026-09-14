@@ -5,6 +5,8 @@ exact-execution persistence. Authority/RPC/payment/fee/executor are synthetic.
 These are not public-chain outcomes or proof of presale reservation extension.
 """
 import asyncio
+import hashlib
+import json
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
@@ -266,6 +268,19 @@ async def test_base_restart_confirms_exact_delivery_and_authorizes_settlement(tm
     assert authorization["chia"]["deedInputCoinId"] == hx(case.reserved.name())
     assert authorization["chia"]["deedOutputCoinId"] == saved["redemptionDeedOutputCoinId"]
     assert authorization["payment"]["principal"] == case.purchase.rail_amount
+    canonical = json.dumps(authorization, sort_keys=True, separators=(",", ":")).encode()
+    assert settlement["authorizationId"] == "0x" + hashlib.sha256(canonical).hexdigest()
+    evidence = presale_endpoints.BaseSettlementRelayEvidenceRequest(
+        warpMessageId=hx(_b32(133)), baseTransactionHash=hx(_b32(134)),
+        confirmedBlockNumber=123456, confirmedAt=NOW + 200_000,
+    )
+    acknowledged = store.record_base_settlement_relay_evidence(settlement["authorizationId"], evidence)
+    assert acknowledged["state"] == "RELAYED"
+    assert store.pending_base_settlement_authorizations() == []
+    assert store.record_base_settlement_relay_evidence(settlement["authorizationId"], evidence) == acknowledged
+    with pytest.raises(ValueError, match="different relay evidence"):
+        store.record_base_settlement_relay_evidence(settlement["authorizationId"],
+            evidence.model_copy(update={"warp_message_id": hx(_b32(135))}))
     assert await case.voucher_worker.reconcile_once() == []
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import time
 from pathlib import Path
@@ -40,6 +41,11 @@ def _sign(account, typed_data: dict) -> str:
 
 
 def _client(tmp_path) -> tuple[TestClient, GenesisStore, Settings]:
+    # Callers can import this helper without importing TestClient, so the
+    # module-detection fixture cannot protect this boundary. Finalize prior
+    # CLVM exception cycles on their owning test thread before starting an
+    # HTTP portal thread. Keep unraisable exceptions fatal in the test runner.
+    gc.collect()
     release_tag = "solslot-v2-alpha-rc27-20260804"
     release_branch = "release/testnet-alpha-rc27-20260804"
     source_shas = {
@@ -124,6 +130,35 @@ def _client(tmp_path) -> tuple[TestClient, GenesisStore, Settings]:
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_genesis_store] = lambda: store
     return TestClient(app), store, settings
+
+
+def test_client_helper_finalizes_prior_program_cycles_on_owner_thread(tmp_path):
+    import threading
+    from chia.types.blockchain_format.program import Program
+
+    released_on = []
+
+    class OwnerSentinel:
+        def __del__(self):
+            released_on.append(threading.get_ident())
+
+    # Model a retained exception-frame cycle from an earlier protocol test.
+    # Disable automatic GC to exercise the helper's explicit boundary.
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        cycle = [Program.from_bytes(b"\xff\x01\x80"), OwnerSentinel()]
+        cycle.append(cycle)
+        del cycle
+        client, _, _ = _client(tmp_path)
+        try:
+            assert released_on == [threading.get_ident()]
+        finally:
+            client.close()
+    finally:
+        gc.collect()
+        if enabled:
+            gc.enable()
 
 
 def _plan_template(kos_pubkey: bytes) -> dict:

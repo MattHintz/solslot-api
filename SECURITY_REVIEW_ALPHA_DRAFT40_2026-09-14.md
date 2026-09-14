@@ -28,10 +28,17 @@ confirmation height now match the committed artifact and SQLite inventory row.
 
 Proof limits: synthetic payment/provider/authority and node fixtures are not live
 chain outcomes. A pre-existing long reservation is the delivery test input;
-initial reservation policy and the missing long-lived extension orchestration
-still need end-to-end evidence. Late first Base webhook processing is also
+Base support in the existing Stripe reservation-extension architecture
+still needs end-to-end evidence. Late first Base webhook processing is also
 constrained by the existing current-time quote verification gate and requires
 separate reviewed recovery coverage. No release promotion or network action.
 Agent capacity prevented fresh investigator/reviewer workers; separate parent
 passes are not independent launch approval. Original46 remains 18 fixed_at_source,
 26 still_vulnerable, 2 inconclusive; broader launch is NO-GO.
+
+The initial full run and PR CI found a Chia LazyNode finalization error when an
+HTTP test indirectly imported the launch-client helper. The helper now collects
+prior test cycles on the owning thread before creating a portal, with a lifecycle
+regression test. Strict unraisable-warning failures remain enabled. Current Base
+recovery tests also retain canonical settlement ID, relay acknowledgement, identical
+retry and conflicting-evidence rejection coverage for both inventory versions.
