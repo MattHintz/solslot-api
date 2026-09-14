@@ -309,6 +309,9 @@ def load_validator_artifact(
         extension_activation(artifact, settings.deployment_environment, required=False)
         from .inventory_payment_hold_claims import payment_hold_activation
         payment_hold_activation(artifact, settings.deployment_environment, required=False)
+        if 'checkoutLifecycle' in artifact:
+            from .checkout_lifecycle import lifecycle_activation
+            lifecycle_activation(artifact, settings.deployment_environment)
         activation = activation_from_artifact(artifact, environment=settings.deployment_environment)
     except ValueError as exc:
         raise ValidatorEvidenceError(str(exc)) from exc

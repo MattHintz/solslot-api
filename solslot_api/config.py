@@ -650,6 +650,10 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
                     settings.voucher_issuance_worker_enabled,
                 ),
                 (
+                    "SOLSLOT_CHECKOUT_LIFECYCLE_WORKER_ENABLED",
+                    settings.checkout_lifecycle_worker_enabled,
+                ),
+                (
                     "SOLSLOT_FAUCET_CONSOLIDATION_ENABLED",
                     settings.faucet_consolidation_enabled,
                 ),
@@ -1198,6 +1202,7 @@ class Settings(BaseSettings):
     stripe_api_url: str = "https://api.stripe.com"
     stripe_delivery_db_path: str = "./state/stripe_deliveries_v1.db"
     stripe_delivery_worker_enabled: bool = False
+    checkout_lifecycle_worker_enabled: bool = False
     stripe_delivery_interval_seconds: float = Field(15.0, ge=5.0, le=300.0)
     stripe_delivery_lease_seconds: int = Field(60, ge=30, le=600)
     # The coordinator signs only exact execution envelopes. Key of Solomon

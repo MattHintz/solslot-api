@@ -226,6 +226,9 @@ class StripeDeliveryWorker:
             except asyncio.CancelledError:
                 self.store.record_error(operation.purchase_id, 'Delivery observation interrupted; retain exact execution for recovery')
                 raise
+            except TimeoutError:
+                return self.store.record_error(operation.purchase_id,
+                    'Delivery observation timed out. Retry this same purchase; the exact execution is retained.')
             except StripeDeliveryManualReview as exc:
                 logger.error(
                     "Stripe purchase %s requires manual review: %s",
@@ -243,6 +246,11 @@ class StripeDeliveryWorker:
                     exc,
                 )
                 return self.store.record_error(operation.purchase_id, str(exc))
+
+    def unavailable_detail(self):
+        if not self._writes_are_open():
+            return 'Delivery is paused. Your payment and progress are retained; recover this same purchase when service resumes.'
+        return 'Delivery is busy. Retry this same purchase shortly; do not make another payment.'
 
     def _writes_are_open(self) -> bool:
         if not (
