@@ -2127,3 +2127,20 @@ def test_verify_rejects_receipt_that_is_no_longer_current(monkeypatch):
     assert verified.status_code == 200
     assert verified.json()["valid"] is False
     assert "credential_not_current_on_chia" in verified.json()["reasons"]
+
+
+def test_active_presale_xch_quote_is_off_before_a_purchase_is_saved(monkeypatch, tmp_path):
+    now=int(time.time())
+    _configure_native_quote(monkeypatch,tmp_path,now)
+    terms_hash='0x'+'91'*32
+    monkeypatch.setattr('solslot_api.protocol_artifacts._active_presale_terms_for_deed',lambda *_:terms_hash)
+    monkeypatch.setattr('solslot_api.presale_endpoints.get_presale_store',lambda _:SimpleNamespace(
+        get=lambda _: {'terms':{'saleClose':now+600}}))
+    payload=_request(rail='chia_xch',purchase_intent_id='pi_xch_presale_disabled',expires_at=now+240,
+        payment_terms={'currency':'XCH','quantity':1},authorization_nonce='0x'+'14'*32,
+        authorization_expires_at=now+600)
+    payload.pop('deed_launcher_id');payload.pop('share_ppm')
+    with TestClient(app) as client:
+        result=client.post('/protocol/offer-artifacts',json=payload)
+    assert result.status_code==503,result.text
+    assert 'XCH voucher purchases are off' in result.json()['detail']

@@ -1488,6 +1488,9 @@ def _build_canonical_payment_artifact(
         expected_deed_launcher,
     )
     is_voucher = voucher_terms_hash is not None
+    if is_voucher and body.rail == "chia_xch":
+        from .voucher_rail_policy import require_xch_voucher_sales
+        require_xch_voucher_sales(settings)
     quote_expires_at = body.expires_at
     if voucher_terms_hash is not None:
         from .presale_endpoints import get_presale_store
@@ -1507,7 +1510,7 @@ def _build_canonical_payment_artifact(
     }:
         raise PaymentArtifactError(
             "active presale inventory is available only through governed "
-            "XCH, Base USDC, or Stripe vouchers"
+            "approved stablecoin or Stripe vouchers"
         )
     common = {
         "network": settings.network,

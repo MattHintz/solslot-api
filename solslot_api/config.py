@@ -878,6 +878,8 @@ class Settings(BaseSettings):
     alpha_writes_enabled: bool = False
     minting_enabled: bool = False
     presale_enabled: bool = False
+    # Additional server ceiling beneath the signed XCH voucher admin window.
+    presale_xch_enabled: bool = False
     # Bridge and governed-liquidity adapters ship dark. A statutes record is
     # necessary but never sufficient to make either customer action live.
     sols_bridge_enabled: bool = False

@@ -127,7 +127,7 @@ SOURCE_MANIFEST_VERSION = 4
 RECOVERY_DEPENDENCY_MANIFEST_HASH_HEX = (
     "0x" + RECOVERY_DEPENDENCY_MANIFEST_HASH
 )
-GATE_NAMES = ("ceremonyBroadcast", "minting", "presale", "purchases")
+GATE_NAMES = ("ceremonyBroadcast", "minting", "presale", "purchases", "xchVouchers")
 CREATE_COIN = 51
 MAX_EVIDENCE_BYTES = 2 * 1024 * 1024
 PLACEHOLDER_FUNDING_IDS = {
@@ -197,6 +197,7 @@ class ActionPrepareRequest(ApiModel):
         "gate:minting",
         "gate:presale",
         "gate:purchases",
+        "gate:xchVouchers",
     ] = Field(alias="actionType")
 
 
@@ -208,7 +209,7 @@ class ActionApproveRequest(ActionPrepareRequest):
 
 
 class GateProposalRequest(ApiModel):
-    gate: Literal["ceremonyBroadcast", "minting", "presale", "purchases"]
+    gate: Literal["ceremonyBroadcast", "minting", "presale", "purchases", "xchVouchers"]
     starts_in_seconds: int = Field(0, alias="startsInSeconds", ge=0, le=86400)
     duration_seconds: int = Field(alias="durationSeconds", ge=300, le=86400)
 
@@ -837,6 +838,11 @@ def _decision_receipt(action_type: str, payload_hash: str) -> dict[str, Any]:
             "Open presale",
             "Temporarily permits governed refundable voucher reservations on Testnet11.",
             "The window closes automatically.",
+        ),
+        "gate:xchVouchers": (
+            "Enable XCH voucher purchases",
+            "Temporarily allows new XCH vouchers only after this release is approved for XCH.",
+            "Off by default. Closing this control preserves existing refunds and recovery.",
         ),
         "gate:purchases": (
             "Open purchases",
@@ -1994,6 +2000,8 @@ async def launch_workspace(
             session.ceremony_id, str(abandon_intent["actionId"]), settings=settings
         )
     gate_states = store.gates(session.ceremony_id)
+    from .voucher_rail_policy import xch_voucher_control
+    xch_control = xch_voucher_control(settings)
     for gate_name, gate in gate_states.items():
         if gate["state"] == "open":
             try:
@@ -2001,6 +2009,9 @@ async def launch_workspace(
             except GenesisStoreError as exc:
                 gate["state"] = "closed"
                 gate["unavailableReason"] = str(exc)
+    if not xch_control["canOpen"] and "xchVouchers" in gate_states:
+        gate_states["xchVouchers"]["state"] = "closed"
+        gate_states["xchVouchers"]["unavailableReason"] = xch_control["reason"]
     return {
         "session": {
             "slot": session.slot,
@@ -2013,6 +2024,7 @@ async def launch_workspace(
         "readiness": readiness,
         "nextTask": _task_for(record, readiness),
         "gates": gate_states,
+        "voucherRailControls": {"xch": xch_control},
         "actionApprovals": action_approvals,
         "notice": "TESTNET, NO REAL INVESTMENT OR LEGAL RIGHT.",
     }
@@ -2322,6 +2334,11 @@ async def propose_gate(
     session: Annotated[LaunchSession, Depends(require_launch_session)],
 ) -> dict[str, Any]:
     _require_wallet_session(session)
+    if body.gate == "xchVouchers":
+        from .voucher_rail_policy import xch_voucher_control
+        control = xch_voucher_control(settings)
+        if not control["canOpen"]:
+            raise HTTPException(status_code=409, detail=control["reason"])
     if body.duration_seconds > settings.launch_gate_max_seconds:
         raise HTTPException(status_code=400, detail="Requested window exceeds the release limit.")
     opens_at = int(time.time()) + body.starts_in_seconds
@@ -2333,6 +2350,8 @@ async def propose_gate(
         "opensAt": opens_at,
         "closesAt": closes_at,
     }
+    if body.gate == "xchVouchers":
+        payload["requestNonce"] = secrets.token_hex(16)
     payload_hash = _hash_json(payload)
     gate = store.upsert_gate(
         session.ceremony_id,
@@ -2507,6 +2526,11 @@ async def activate_gate(
     _require_owner(session)
     if gate_name not in GATE_NAMES:
         raise HTTPException(status_code=404, detail="Unknown launch gate.")
+    if gate_name == "xchVouchers":
+        from .voucher_rail_policy import xch_voucher_control
+        control = xch_voucher_control(settings)
+        if not control["canOpen"]:
+            raise HTTPException(status_code=409, detail=control["reason"])
     launch = store.get(session.ceremony_id)
     if gate_name != "ceremonyBroadcast" and launch["state"] != "locked":
         raise HTTPException(
@@ -2520,7 +2544,7 @@ async def activate_gate(
     gate = store.gates(session.ceremony_id).get(gate_name)
     if not gate:
         raise HTTPException(status_code=409, detail="Gate proposal is missing.")
-    if gate_name in {"presale", "purchases"}:
+    if gate_name in {"presale", "purchases", "xchVouchers"}:
         try:
             require_completed_rehearsal(settings, store, session.ceremony_id)
         except GenesisStoreError as exc:
@@ -2952,3 +2976,17 @@ async def launch_archive(
 
 
 __all__ = ["LAUNCH_COOKIE_NAME", "LaunchSession", "require_launch_session", "router"]
+
+
+@router.post("/gates/xchVouchers/close")
+async def close_xch_vouchers(
+    store: Annotated[GenesisStore, Depends(get_genesis_store)],
+    session: Annotated[LaunchSession, Depends(require_launch_session)],
+) -> dict[str, Any]:
+    _require_owner(session)
+    now = int(time.time())
+    payload = {"ceremonyId": session.ceremony_id, "gate": "xchVouchers",
+               "enabled": False, "requestNonce": secrets.token_hex(16)}
+    return store.upsert_gate(session.ceremony_id, gate_name="xchVouchers",
+                             opens_at=now, closes_at=now + 1,
+                             payload_hash=_hash_json(payload), state="closed")
