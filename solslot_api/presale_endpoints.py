@@ -109,6 +109,7 @@ from .evm_auth import recover_evm_signer
 from .faucet import AGG_SIG_ME_DATA
 from .omnichain_evidence import OmnichainEvidenceError, load_omnichain_evidence
 from .launch_gates import require_operation_gate
+from .voucher_rail_policy import require_xch_voucher_sales
 from .native_purchases import (
     _coin_from_record,
     _coin_spend_json,
@@ -5212,6 +5213,7 @@ async def prepare_native_voucher(
     store: Annotated[PresaleStore, Depends(get_presale_store)],
     authorization: Annotated[Optional[str], Header()] = None,
 ) -> PrepareNativeVoucherResponse:
+    require_xch_voucher_sales(settings)
     require_presale_writes(settings)
     require_operation_gate(settings, "presale")
     series, issued, artifact, approved, deed = _load_native_voucher_context(
@@ -5303,6 +5305,7 @@ async def complete_native_voucher(
     store: Annotated[PresaleStore, Depends(get_presale_store)],
     authorization: Annotated[Optional[str], Header()] = None,
 ) -> CompleteNativeVoucherResponse:
+    require_xch_voucher_sales(settings)
     require_presale_writes(settings)
     require_operation_gate(settings, "presale")
     series, issued, artifact, approved, deed = _load_native_voucher_context(
@@ -5441,6 +5444,7 @@ async def complete_native_voucher(
             [buyer_offer.aggregated_signature(), quorum.aggregated_signature]
         ),
     )
+    require_xch_voucher_sales(settings)
     result = await request.app.state.coinset.push_tx(bundle.to_json_dict())
     network_status = str(result.get("status") or "").upper()
     if not result.get("success") and network_status not in {"SUCCESS", "PENDING"}:

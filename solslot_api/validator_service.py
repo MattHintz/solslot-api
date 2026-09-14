@@ -2287,6 +2287,8 @@ def verify_voucher_issuance_claim(
                         "voucher payment confirmation time is missing"
                     )
             elif voucher.payment_rail == VoucherPaymentRail.CHIA_XCH:
+                from .voucher_rail_policy import require_xch_voucher_issuance_release
+                require_xch_voucher_issuance_release()
                 authorization_time = int(time.time())
             else:
                 raise ValueError("voucher payment rail is unsupported")
