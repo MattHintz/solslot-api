@@ -54,7 +54,11 @@ snapshots accept only an empty missing extension-history field.
 ACH holds require review after ten days, without inventory reuse or automatic
 payment retries. Failed attempts retain their exact operation and an explicit
 review status. Once an extension attempt is retained, local timeout dispatch
-and timeout-based inventory release cannot remove the payment hold. Confirmed
+and timeout-based inventory release cannot remove the payment hold. The private
+initial-reservation signer also refuses a different buyer for a SmartDeed with
+a retained extension hold, even if a permissionless timeout created a new
+available coin. Authoritative terminal reconciliation must clear that hold
+through a separately reviewed method; no clearing method is exposed here. Confirmed
 history is bounded to 128 extensions; exhaustion requires review and keeps the
 hold. Terminal-payment/refund recovery must be separately completed before
 this capability is activated.

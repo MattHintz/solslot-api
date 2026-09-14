@@ -199,6 +199,7 @@ async def sign_inventory_extension_claim(settings,ledger,claim,claim_hash):
         return ledger.record_inventory_extension_or_recover(claim_hash=claim_hash,
             canonical_claim=canonical(claim.model_dump(mode='json')),
             purchase_id=hx(purchase_artifact_v3_from_json(claim.purchase_artifact).purchase_id),
-            reserved_coin_id=claim.reserved_coin_id,signature=signature)
+            reserved_coin_id=claim.reserved_coin_id,signature=signature,
+            deed_launcher_id=hx(purchase_artifact_v3_from_json(claim.purchase_artifact).deed_launcher_id))
     except ValidatorLedgerConflict as exc:
         raise ValidatorEvidenceError(str(exc)) from exc

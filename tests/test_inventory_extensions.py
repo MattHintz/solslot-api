@@ -430,3 +430,25 @@ def test_signer_conflicts_cover_every_terminal_writer(tmp_path,terminal_kind,ter
         if not terminal_first and terminal_kind=='native_batch':
             assert a.record_inventory_extension_or_recover(claim_hash='other-extension',canonical_claim='{}',purchase_id='other',reserved_coin_id='other',signature='signed')=='signed'
     finally: a.close();b.close()
+
+
+@pytest.mark.asyncio
+async def test_private_reservation_entry_refuses_reassignment_after_recorded_hold(tmp_path,monkeypatch):
+    c=await extension_case(tmp_path,monkeypatch)
+    try:
+        await advance(c)
+        monkeypatch.setattr(validator_service,'verify_inventory_reservation_claim',lambda *_:None)
+        # The existing available-lineage verifier is a separate boundary. Once
+        # it returns, even a valid new available coin cannot bypass the hold.
+        claim=SimpleNamespace(purchase_artifact=c.original.purchase_artifact,available_coin_id=hx(_b32(95)),
+            purchase_id=lambda:hx(_b32(94)),signature_message=lambda:b'new buyer',
+            model_dump=lambda **_: {'newBuyer':True})
+        for signer,ledger in zip(c.signers,c.ledgers,strict=True):
+            with pytest.raises(validator_service.ValidatorEvidenceError,match='payment hold'):
+                validator_service.sign_inventory_reservation_claim(signer,ledger,claim,hx(_b32(96)))
+            assert ledger.active_inventory_authorization(claim.available_coin_id) is None
+        # Other deeds preserve the ordinary reservation contract.
+        assert c.ledgers[0].record_inventory_reservation_or_recover(claim_hash='unrelated',canonical_claim='{}',
+            purchase_id='other',available_coin_id='other-coin',signature='sig',deed_launcher_id=hx(_b32(97)))=='sig'
+    finally:
+        for ledger in c.ledgers: ledger.close()

@@ -245,8 +245,10 @@ class ValidatorLedger:
                     CREATE TABLE inventory_extension_signatures (
                         claim_hash TEXT PRIMARY KEY, canonical_claim TEXT NOT NULL,
                         purchase_id TEXT NOT NULL, reserved_coin_id TEXT NOT NULL UNIQUE,
-                        signature TEXT NOT NULL, signed_at INTEGER NOT NULL
+                        signature TEXT NOT NULL, signed_at INTEGER NOT NULL,
+                        deed_launcher_id TEXT
                     );
+                    CREATE INDEX inventory_extension_deed_hold ON inventory_extension_signatures(deed_launcher_id);
                     PRAGMA user_version = 11;
                     COMMIT;
                 """)
@@ -265,13 +267,13 @@ class ValidatorLedger:
                 (purchase_id,)).fetchone()
             return dict(row) if row is not None else None
 
-    def record_inventory_extension_or_recover(self, *, claim_hash, canonical_claim, purchase_id, reserved_coin_id, signature):
+    def record_inventory_extension_or_recover(self, *, claim_hash, canonical_claim, purchase_id, reserved_coin_id, signature, deed_launcher_id=None):
         with self._lock:
             self._conn.execute('BEGIN IMMEDIATE')
             try:
                 old = self._conn.execute('SELECT * FROM inventory_extension_signatures WHERE reserved_coin_id=?', (reserved_coin_id,)).fetchone()
                 if old is not None:
-                    if old['claim_hash'] != claim_hash or old['canonical_claim'] != canonical_claim or old['purchase_id'] != purchase_id:
+                    if old['claim_hash'] != claim_hash or old['canonical_claim'] != canonical_claim or old['purchase_id'] != purchase_id or old['deed_launcher_id'] != deed_launcher_id:
                         raise ValidatorLedgerConflict('This inventory input already has a different extension authorization.')
                     self._conn.execute('COMMIT')
                     return old['signature']
@@ -280,8 +282,8 @@ class ValidatorLedger:
                         ('voucher_transition_signatures','deed_coin_id')]:
                     if self._conn.execute(f'SELECT 1 FROM {table} WHERE {column}=?', (reserved_coin_id,)).fetchone():
                         raise ValidatorLedgerConflict('This inventory input already has a terminal authorization.')
-                self._conn.execute('INSERT INTO inventory_extension_signatures VALUES (?,?,?,?,?,?)',
-                    (claim_hash, canonical_claim, purchase_id, reserved_coin_id, signature, int(time.time())))
+                self._conn.execute('INSERT INTO inventory_extension_signatures VALUES (?,?,?,?,?,?,?)',
+                    (claim_hash, canonical_claim, purchase_id, reserved_coin_id, signature, int(time.time()), deed_launcher_id))
                 self._conn.execute('COMMIT')
                 return signature
             except Exception:
@@ -591,6 +593,7 @@ class ValidatorLedger:
     def record_inventory_reservation_or_recover(
         self, *, claim_hash: str, canonical_claim: str, purchase_id: str,
         available_coin_id: str, signature: str,
+        deed_launcher_id: str | None = None,
         retire_claim_hash: str | None = None, retirement_evidence: dict | None = None,
     ) -> str:
         """Atomically retire an independently verified claim and record its successor.
@@ -610,6 +613,9 @@ class ValidatorLedger:
         with self._lock:
             self._conn.execute('BEGIN IMMEDIATE')
             try:
+                if deed_launcher_id is not None and self._conn.execute(
+                        'SELECT 1 FROM inventory_extension_signatures WHERE deed_launcher_id=?', (deed_launcher_id,)).fetchone():
+                    raise ValidatorLedgerConflict('This SmartDeed has a payment hold; a timeout cannot authorize another buyer.')
                 active = self._conn.execute('SELECT claim_hash FROM inventory_reservation_active WHERE available_coin_id=?',
                                             (available_coin_id,)).fetchone()
                 existing = self._conn.execute('SELECT * FROM inventory_reservation_history WHERE claim_hash=?',
