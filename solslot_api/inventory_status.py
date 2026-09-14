@@ -227,7 +227,8 @@ def validated_recovery_receipt(snapshot, *, network):
                     or expired["purchaseId"] != stored.purchase_id
                     or previous["inventory_state"] not in {"PREPARED", "SUBMITTED"}
                     or current != {**previous, "deed_launcher_ids": tuple(previous["deed_launcher_ids"]),
-                                   "inventory_signer_indices": tuple(previous["inventory_signer_indices"])}
+                                   "inventory_signer_indices": tuple(previous["inventory_signer_indices"]),
+                                   "inventory_extension_receipts": tuple(previous.get("inventory_extension_receipts", []))}
                     or len(expired["items"]) != len(rows) or len(expired["chainProofs"]) != len(rows)):
                 raise ValueError("invalid expiry snapshot")
             for row, old, proof, reservation in zip(rows, expired["items"], expired["chainProofs"], expected, strict=True):

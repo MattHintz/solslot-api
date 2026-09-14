@@ -305,6 +305,8 @@ def load_validator_artifact(
             raise ValidatorEvidenceError(f"signed artifact {label} does not match signer config")
     from solslot_puzzles.enrollment_activation import activation_from_artifact
     try:
+        from .inventory_extension_claims import extension_activation
+        extension_activation(artifact, settings.deployment_environment, required=False)
         activation = activation_from_artifact(artifact, environment=settings.deployment_environment)
     except ValueError as exc:
         raise ValidatorEvidenceError(str(exc)) from exc
@@ -912,6 +914,7 @@ def sign_inventory_reservation_claim(
             canonical_claim=canonical_inventory_reservation_claim_json(claim),
             purchase_id=claim.purchase_id(),
             available_coin_id=claim.available_coin_id,
+            deed_launcher_id="0x" + purchase_artifact_v3_from_json(claim.purchase_artifact).deed_launcher_id.hex(),
             signature=signature,
             retire_claim_hash=old['claim_hash'] if retirement is not None else None,
             retirement_evidence=retirement,

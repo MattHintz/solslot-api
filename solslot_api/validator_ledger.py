@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 class ValidatorLedgerConflict(RuntimeError):
@@ -238,6 +238,58 @@ class ValidatorLedger:
                     COMMIT;
                 """)
 
+                version = 10
+            if version < 11:
+                self._conn.executescript("""
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE inventory_extension_signatures (
+                        claim_hash TEXT PRIMARY KEY, canonical_claim TEXT NOT NULL,
+                        purchase_id TEXT NOT NULL, reserved_coin_id TEXT NOT NULL UNIQUE,
+                        signature TEXT NOT NULL, signed_at INTEGER NOT NULL,
+                        deed_launcher_id TEXT
+                    );
+                    CREATE INDEX inventory_extension_deed_hold ON inventory_extension_signatures(deed_launcher_id);
+                    PRAGMA user_version = 11;
+                    COMMIT;
+                """)
+
+    def _assert_no_extension_signature(self, coin_id: str | None) -> None:
+        # Called under the same BEGIN IMMEDIATE transaction as terminal writes.
+        if coin_id is not None and self._conn.execute(
+                'SELECT 1 FROM inventory_extension_signatures WHERE reserved_coin_id=?', (coin_id,)).fetchone():
+            raise ValidatorLedgerConflict('This inventory input already has an extension authorization.')
+
+    def inventory_extension_payment_anchor(self, purchase_id):
+        """Own previously verified start claim; Stripe retains event retrieval for 30 days."""
+        with self._lock:
+            row = self._conn.execute(
+                'SELECT claim_hash,canonical_claim FROM inventory_extension_signatures WHERE purchase_id=? ORDER BY signed_at, rowid LIMIT 1',
+                (purchase_id,)).fetchone()
+            return dict(row) if row is not None else None
+
+    def record_inventory_extension_or_recover(self, *, claim_hash, canonical_claim, purchase_id, reserved_coin_id, signature, deed_launcher_id=None):
+        with self._lock:
+            self._conn.execute('BEGIN IMMEDIATE')
+            try:
+                old = self._conn.execute('SELECT * FROM inventory_extension_signatures WHERE reserved_coin_id=?', (reserved_coin_id,)).fetchone()
+                if old is not None:
+                    if old['claim_hash'] != claim_hash or old['canonical_claim'] != canonical_claim or old['purchase_id'] != purchase_id or old['deed_launcher_id'] != deed_launcher_id:
+                        raise ValidatorLedgerConflict('This inventory input already has a different extension authorization.')
+                    self._conn.execute('COMMIT')
+                    return old['signature']
+                for table, column in [('primary_purchase_signatures','deed_coin_id'),
+                        ('stripe_settlement_delivery_locks','delivery_coin_id'),
+                        ('voucher_transition_signatures','deed_coin_id')]:
+                    if self._conn.execute(f'SELECT 1 FROM {table} WHERE {column}=?', (reserved_coin_id,)).fetchone():
+                        raise ValidatorLedgerConflict('This inventory input already has a terminal authorization.')
+                self._conn.execute('INSERT INTO inventory_extension_signatures VALUES (?,?,?,?,?,?,?)',
+                    (claim_hash, canonical_claim, purchase_id, reserved_coin_id, signature, int(time.time()), deed_launcher_id))
+                self._conn.execute('COMMIT')
+                return signature
+            except Exception:
+                self._conn.execute('ROLLBACK')
+                raise
+
     def record_or_recover(
         self,
         *,
@@ -313,6 +365,8 @@ class ValidatorLedger:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                for coin_id in delivery_ids:
+                    self._assert_no_extension_signature(coin_id)
                 existing = self._conn.execute(
                     """
                     SELECT canonical_claim, signature
@@ -400,6 +454,7 @@ class ValidatorLedger:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                self._assert_no_extension_signature(deed_coin_id)
                 existing = self._conn.execute(
                     """
                     SELECT canonical_claim, signature
@@ -468,6 +523,8 @@ class ValidatorLedger:
             self._conn.execute("BEGIN IMMEDIATE")
             recovered: list[str] = []
             try:
+                for coin_id in deed_coin_ids:
+                    self._assert_no_extension_signature(coin_id)
                 for claim_hash, canonical_claim, purchase_id, deed_coin_id, signature in zip(
                     claim_hashes,
                     canonical_claims,
@@ -536,6 +593,7 @@ class ValidatorLedger:
     def record_inventory_reservation_or_recover(
         self, *, claim_hash: str, canonical_claim: str, purchase_id: str,
         available_coin_id: str, signature: str,
+        deed_launcher_id: str | None = None,
         retire_claim_hash: str | None = None, retirement_evidence: dict | None = None,
     ) -> str:
         """Atomically retire an independently verified claim and record its successor.
@@ -555,6 +613,9 @@ class ValidatorLedger:
         with self._lock:
             self._conn.execute('BEGIN IMMEDIATE')
             try:
+                if deed_launcher_id is not None and self._conn.execute(
+                        'SELECT 1 FROM inventory_extension_signatures WHERE deed_launcher_id=?', (deed_launcher_id,)).fetchone():
+                    raise ValidatorLedgerConflict('This SmartDeed has a payment hold; a timeout cannot authorize another buyer.')
                 active = self._conn.execute('SELECT claim_hash FROM inventory_reservation_active WHERE available_coin_id=?',
                                             (available_coin_id,)).fetchone()
                 existing = self._conn.execute('SELECT * FROM inventory_reservation_history WHERE claim_hash=?',
@@ -676,6 +737,7 @@ class ValidatorLedger:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                self._assert_no_extension_signature(canonical_delivery_coin_id)
                 existing = self._conn.execute(
                     """
                     SELECT canonical_claim, signature
@@ -745,6 +807,7 @@ class ValidatorLedger:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                self._assert_no_extension_signature(deed_coin_id)
                 existing = self._conn.execute(
                     """
                     SELECT canonical_claim, signature

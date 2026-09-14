@@ -9,6 +9,8 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, ConfigDict
 
+from .inventory_extension_claims import InventoryExtensionClaim
+from .validator_inventory_extension import sign_inventory_extension_claim
 from .release_metadata import load_release_metadata
 from .validator_ledger import ValidatorLedger
 from .validator_quorum import (
@@ -56,6 +58,12 @@ class InventoryReservationSignRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     claim: InventoryReservationClaim
+    claimHash: str
+
+
+class InventoryExtensionSignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    claim: InventoryExtensionClaim
     claimHash: str
 
 
@@ -221,6 +229,36 @@ def create_validator_app(
         active_ledger: ValidatorLedger = application.state.validator_ledger
         try:
             signature = sign_inventory_reservation_claim(
+                signer_settings,
+                active_ledger,
+                request.claim,
+                request.claimHash,
+            )
+        except ValidatorEvidenceError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        return ValidatorSignatureResponse(
+            claimHash=request.claim.canonical_hash(),
+            signerIndex=signer_settings.signer_index,
+            validatorPubkey=signer_settings.roster_pubkeys[
+                signer_settings.signer_index
+            ],
+            signature=signature,
+        )
+
+    @application.post(
+        "/v1/inventory-extension/sign",
+        response_model=ValidatorSignatureResponse,
+    )
+    async def sign_inventory_extension(
+        request: InventoryExtensionSignRequest,
+    ) -> ValidatorSignatureResponse:
+        signer_settings = current_settings()
+        active_ledger: ValidatorLedger = application.state.validator_ledger
+        try:
+            signature = await sign_inventory_extension_claim(
                 signer_settings,
                 active_ledger,
                 request.claim,
