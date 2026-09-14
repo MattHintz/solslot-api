@@ -266,6 +266,11 @@ async def lifespan(app: FastAPI):
     validate_runtime_environment_namespace()
     validate_secret_env_file_permissions()
     settings = get_settings()
+    if settings.checkout_lifecycle_worker_enabled:
+        from .checkout_lifecycle import lifecycle_activation
+        lifecycle_activation(load_signed_public_artifact(settings), settings.runtime_environment + '-alpha')
+        if settings.network != 'testnet11':
+            raise RuntimeError('automatic checkout lifecycle requires isolated testnet11')
     validate_server_hardening_at_startup(settings)
     preflight_challenge_storage(settings)
     genesis_store = _load_genesis_store_for_runtime(settings)
@@ -472,6 +477,21 @@ async def lifespan(app: FastAPI):
         await voucher_worker.start()
         app.state.voucher_issuance_worker = voucher_worker
 
+    app.state.checkout_lifecycle_worker = None
+    if settings.checkout_lifecycle_worker_enabled:
+        from .checkout_lifecycle import CheckoutLifecycleWorker
+        from .credential_auth import require_minting_writes
+        from .launch_gates import require_operation_gate
+        def authorize_checkout_renewal():
+            require_minting_writes(settings)
+            require_operation_gate(settings, 'purchases')
+        lifecycle_worker = CheckoutLifecycleWorker(
+            store=get_payment_purchase_store(settings.payment_purchase_db_path), presales=get_presale_store(settings),
+            settings=settings, node=app.state.coinset, submitter=app.state.protocol_submitter,
+            load_artifact=lambda: load_signed_public_artifact(settings), authorize=authorize_checkout_renewal)
+        await lifecycle_worker.start()
+        app.state.checkout_lifecycle_worker = lifecycle_worker
+
     # POP-CANON-008: faucet UTXO consolidation worker.  Opt-in via
     # SOLSLOT_FAUCET_CONSOLIDATION_ENABLED=true.  Started here so the
     # task is owned by the FastAPI event loop and properly cancelled on
@@ -509,6 +529,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if app.state.checkout_lifecycle_worker is not None:
+            await app.state.checkout_lifecycle_worker.stop()
         if app.state.stripe_delivery_worker is not None:
             await app.state.stripe_delivery_worker.stop()
         if app.state.voucher_issuance_worker is not None:
@@ -519,6 +541,7 @@ async def lifespan(app: FastAPI):
         # Lifespan services may retain thread-affine chia_rs Program/LazyNode
         # values. Release every owned reference on this event-loop thread so a
         # later TestClient or server restart cannot finalize it on another one.
+        app.state.checkout_lifecycle_worker = None
         app.state.stripe_delivery_worker = None
         app.state.voucher_issuance_worker = None
         app.state.faucet_worker = None

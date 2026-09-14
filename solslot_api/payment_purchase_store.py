@@ -16,6 +16,7 @@ from .inventory_extension_store import InventoryExtensionStoreMixin, migrate_ext
 from .inventory_payment_hold_store import InventoryPaymentHoldStoreMixin, migrate_checkout_holds, assert_no_checkout_hold
 from .purchase_admission import PurchaseAdmissionStoreMixin, migrate_purchase_admission, close_inventory_admission
 from .checkout_terminal_store import CheckoutTerminalStoreMixin, migrate_checkout_terminals
+from .checkout_lifecycle_store import CheckoutLifecycleStoreMixin, migrate_lifecycle
 
 
 class PaymentPurchaseNotFound(LookupError):
@@ -67,7 +68,7 @@ class StoredPaymentPurchase:
     inventory_extension_receipts: tuple[dict[str, Any], ...] = ()
 
 
-class PaymentPurchaseStore(InventoryExtensionStoreMixin, InventoryPaymentHoldStoreMixin, PurchaseAdmissionStoreMixin, CheckoutTerminalStoreMixin):
+class PaymentPurchaseStore(InventoryExtensionStoreMixin, InventoryPaymentHoldStoreMixin, PurchaseAdmissionStoreMixin, CheckoutTerminalStoreMixin, CheckoutLifecycleStoreMixin):
     def __init__(self, path: str):
         self.path = path
         if path != ":memory:":
@@ -184,6 +185,7 @@ class PaymentPurchaseStore(InventoryExtensionStoreMixin, InventoryPaymentHoldSto
             migrate_checkout_holds(connection)
             migrate_checkout_terminals(connection)
             migrate_purchase_admission(connection)
+            migrate_lifecycle(connection)
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS "
                 "payment_purchases_external_transaction "

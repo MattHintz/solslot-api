@@ -275,6 +275,8 @@ async def inventory_purchase_status(
             if pending and pending["protocol"] is not None:
                 validate_execution(position, InventoryExtensionClaim.model_validate(pending["claim"]), pending)
             result["paymentHold"] = hold
+        if checkout is not None:
+            result["paymentLifecycle"] = store.checkout_job_status(normalized)
         return result
     except PaymentPurchaseNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -313,6 +315,51 @@ async def _reconcile_checkout_terminal(payload,request,settings,authorization,*,
         raise HTTPException(status_code=409,detail='Terminal proof is incomplete. Keep this purchase for recovery.') from exc
     except (httpx.HTTPError,OSError,TimeoutError) as exc:
         raise HTTPException(status_code=503,detail='Terminal observation is unavailable. Retry the same purchase.') from exc
+
+
+class PaymentStartCandidateRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid', populate_by_name=True, strict=True)
+    purchase_id: str = Field(alias='purchaseId', pattern=r'^0x[0-9a-f]{64}$')
+    payment_intent_id: str = Field(alias='paymentIntentId', pattern=r'^pi_[A-Za-z0-9]{1,200}$')
+    payment_event_id: str = Field(alias='paymentEventId', pattern=r'^evt_[A-Za-z0-9]{1,200}$')
+    payment_started_at: int = Field(alias='paymentStartedAt', gt=0)
+    payment_method: Literal['card', 'us_bank_account'] = Field(alias='paymentMethod')
+
+
+@router.get('/inventory/payment-hold/lifecycle-health')
+async def checkout_lifecycle_health(settings: Annotated[Settings, Depends(get_settings)],
+        authorization: Annotated[str | None, Header()] = None):
+    from .checkout_lifecycle import lifecycle_activation
+    _require_server_to_server_token(settings, authorization)
+    if not settings.checkout_lifecycle_worker_enabled or settings.network != 'testnet11':
+        raise HTTPException(status_code=503, detail='Automatic checkout lifecycle is disabled.')
+    try:
+        binding = lifecycle_activation(load_signed_public_artifact(settings), settings.runtime_environment + '-alpha')
+        receipts = get_payment_purchase_store(settings.payment_purchase_db_path).lifecycle_health_receipts()
+        now = int(time.time())
+        healthy = (len(receipts) == 2 and {r['lane'] for r in receipts} == {'renewal','terminal'}
+            and all(r['binding'] == binding and 0 <= now-r['observedAt'] <= 90
+                and r['status'] in {'IDLE','COMPLETE','PAYMENT_HELD','WAITING_FOR_PAYMENT','WAITING_FOR_CHAIN'} for r in receipts))
+        return dict(healthy=healthy, observedAt=now, receipts=receipts)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=503, detail='Checkout lifecycle evidence is unavailable or mismatched.') from exc
+
+
+@router.post('/inventory/payment-hold/observe-payment')
+async def observe_checkout_payment(payload: PaymentStartCandidateRequest,
+        settings: Annotated[Settings, Depends(get_settings)], authorization: Annotated[str | None, Header()] = None):
+    from .checkout_lifecycle import enqueue_candidate
+    _require_server_to_server_token(settings, authorization)
+    try:
+        enqueue_candidate(store=get_payment_purchase_store(settings.payment_purchase_db_path), settings=settings,
+            purchase_id=payload.purchase_id,
+            payment={k:getattr(payload,k) for k in ('payment_intent_id','payment_event_id','payment_started_at','payment_method')},
+            load_artifact=lambda:load_signed_public_artifact(settings))
+        return dict(purchaseId=payload.purchase_id, observationQueued=True, independentlyVerified=False)
+    except PaymentPurchaseNotFound as exc:
+        raise HTTPException(status_code=404, detail='Retained purchase was not found.') from exc
+    except (PaymentPurchaseConflict, ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(status_code=409, detail='Payment observation binding needs review. Retain the same purchase.') from exc
 
 
 class InventoryExtensionRequest(BaseModel):

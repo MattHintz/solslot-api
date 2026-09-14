@@ -104,6 +104,11 @@ async def advance_extension(*, store, node, submitter, settings, presales, purch
         if await release_peak(node, settings.network) != peak:
             raise PaymentPurchaseConflict('chain tip changed before extension dispatch')
 
+    if not operations:
+        await preflight()
+        from .payment_start import adopt_payment_start
+        await adopt_payment_start(store=store, settings=settings, purchase_id=purchase_id,
+            payment=payment, load_artifact=load_artifact)
     owner = uuid.uuid4().hex
     retained = store.claim_inventory_extension(purchase_id, claim=claim.model_dump(mode='json'),
         binding=dict(artifactHash=artifact['artifactHash'], activation=active), owner=owner,

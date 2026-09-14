@@ -81,7 +81,8 @@ async def reconcile_stripe_delivery(
     if operation is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="The signed purchase window is closed.",
+            detail=worker.unavailable_detail(),
+            headers={"Retry-After": "2"},
         )
     outputs = get_governed_output_index(
         settings.payment_purchase_db_path

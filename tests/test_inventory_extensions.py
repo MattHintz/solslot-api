@@ -138,6 +138,13 @@ async def extension_case(tmp_path, monkeypatch, method='card'):
         if c.fail_after_quorum: raise OSError('response lost after quorum')
         return SimpleNamespace(signer_indices=(0,1),aggregated_signature=AugSchemeMPL.aggregate(signatures))
     monkeypatch.setattr(extensions,'collect_inventory_extension_quorum',quorum)
+    from solslot_api import payment_start
+    async def observation_quorum(settings, claim):
+        signatures = [G2Element.from_bytes(bytes.fromhex((await payment_start.sign_payment_start(s,claim,claim.canonical_hash()))[2:]))
+            for s in c.signers[:2]]
+        return SimpleNamespace(signer_indices=(0,1), aggregated_signature=AugSchemeMPL.aggregate(signatures))
+    monkeypatch.setattr(payment_start, 'collect_payment_start_quorum', observation_quorum)
+
     c.funded=[]; c.extension_dispatches=[]; c.fail_push=False
     async def dispatch(prepared,before_push):
         await before_push()

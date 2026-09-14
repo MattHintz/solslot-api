@@ -44,7 +44,7 @@ async def test_slow_delivery_has_deadline_and_no_waiter_queue():
     b=SimpleNamespace(purchase_id='next',state='PAYMENT_VERIFIED')
     queue=[a,b];errors=[];entered=asyncio.Event()
     worker.store=SimpleNamespace(claim_next=lambda **kw:queue.pop(0),
-        record_error=lambda purchase_id,error:errors.append(purchase_id) or a)
+        record_error=lambda purchase_id,error:errors.append((purchase_id,error)) or a)
     async def advance(op):
         if op is a:
             entered.set();await asyncio.Event().wait()
@@ -53,7 +53,12 @@ async def test_slow_delivery_has_deadline_and_no_waiter_queue():
     task=asyncio.create_task(worker.reconcile_once());await entered.wait()
     # A busy caller does not wait behind the slow provider or claim another row.
     assert await asyncio.wait_for(worker.reconcile_once(),.02) is None
-    assert await asyncio.wait_for(task,.2) is a and errors==['slow']
+    assert await asyncio.wait_for(task,.2) is a and errors[0][0]=='slow'
+    assert 'timed out' in errors[0][1] and 'same purchase' in errors[0][1]
+    assert 'busy' in worker.unavailable_detail()
+    worker._writes_are_open=lambda:False
+    assert 'paused' in worker.unavailable_detail()
+    worker._writes_are_open=lambda:True
     assert await worker.reconcile_once() is b
 
 
