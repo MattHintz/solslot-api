@@ -961,12 +961,16 @@ class VoucherTransitionClaim(BaseModel):
             self.voucher_commitment.get("schema")
             == "solslot.voucher-commitment.v3"
         )
+        is_current_base = (
+            self.voucher_commitment.get("paymentRail") == 1
+            and self.purchase_artifact.get("schema") == "solslot.purchase-artifact.v3"
+        )
         if self.action == 3:
             if any(value is None for value in redemption_fields):
                 raise ValueError("voucher redemption requires exact deed evidence")
-            if is_stripe and self.reservation_expires_at is None:
+            if (is_stripe or is_current_base) and self.reservation_expires_at is None:
                 raise ValueError(
-                    "Stripe voucher redemption requires its inventory reservation expiry"
+                    "current voucher redemption requires its inventory reservation expiry"
                 )
             if self.owner_authorization:
                 raise ValueError("voucher redemption cannot request a second owner signature")
@@ -985,7 +989,7 @@ class VoucherTransitionClaim(BaseModel):
                 raise ValueError("voucher refund cannot carry deed evidence")
         if self.action != 3 and self.reservation_expires_at is not None:
             raise ValueError("voucher refund cannot carry inventory reservation data")
-        if not is_stripe and self.reservation_expires_at is not None:
+        if not (is_stripe or is_current_base) and self.reservation_expires_at is not None:
             raise ValueError(
                 "legacy voucher transition cannot carry V3 reservation data"
             )

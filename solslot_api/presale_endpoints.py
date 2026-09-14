@@ -33,6 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from web3 import Web3
 from web3.logs import DISCARD
 
+from solslot_puzzles.voucher_purchase import voucher_purchase_from_json, validate_base_voucher_purchase
 from solslot_puzzles import load_puzzle
 from solslot_puzzles.payment_artifacts_v2 import (
     PaymentArtifactError,
@@ -1041,12 +1042,10 @@ class PresaleStore(VoucherWorkStore):
         now_seconds: Optional[int] = None,
     ) -> dict[str, Any]:
         series = self.get(terms_hash)
-        if series["state"] != "PRESALE":
-            raise ValueError("voucher series is not in PRESALE")
         if evidence.confirmed_at > int(now_seconds or time.time()) + 300:
             raise ValueError("payment confirmation time is in the future")
         try:
-            artifact = purchase_artifact_from_json(evidence.purchase_artifact)
+            artifact = voucher_purchase_from_json(evidence.purchase_artifact)
             artifact.assert_live(evidence.confirmed_at)
         except PaymentArtifactError as exc:
             raise ValueError(f"purchase artifact is invalid: {exc}") from exc
@@ -1108,6 +1107,9 @@ class PresaleStore(VoucherWorkStore):
                 if existing["evidence_id"] != evidence.evidence_id:
                     raise ValueError("global payment ID is bound to different evidence")
                 return self._render_payment_event(existing)
+            current_phase = cur.execute("SELECT state FROM presale_series_v2 WHERE terms_hash=?", (terms_hash.lower(),)).fetchone()
+            if current_phase is None or current_phase["state"] != "PRESALE":
+                raise ValueError("voucher series is not in PRESALE")
             last = cur.execute(
                 """
                 SELECT order_key FROM presale_payment_events_v2
@@ -4061,7 +4063,7 @@ def _voucher_commitment(
 ) -> VoucherCommitmentV2:
     terms = series["terms"]
     fee_bps = int(terms["technologyFeeBps"])
-    return VoucherCommitmentV2(
+    commitment = VoucherCommitmentV2(
         series_terms_hash=_b32(series["termsHash"]),
         series_singleton_id=_b32(terms["seriesSingletonId"]),
         collection_id=_b32(terms["collectionId"]),
@@ -4092,6 +4094,11 @@ def _voucher_commitment(
         global_payment_id=_b32(global_payment_id, nonzero=True),
         state=VoucherState.ESCROWED,
     )
+
+    if artifact.rail == PaymentRail.EVM_TEST_USD:
+        from solslot_puzzles.voucher_presale_v2 import series_terms_from_json
+        validate_base_voucher_purchase(commitment, artifact, series_terms_from_json(terms))
+    return commitment
 
 
 def _validate_artifact_against_series(
@@ -4142,7 +4149,7 @@ def _validate_artifact_binding(
 ) -> None:
     terms = series["terms"]
     try:
-        stored_artifact = purchase_artifact_from_json(issued_purchase.purchase_artifact)
+        stored_artifact = voucher_purchase_from_json(issued_purchase.purchase_artifact)
     except PaymentArtifactError as exc:
         raise ValueError("coordinator-issued purchase artifact is invalid") from exc
     if stored_artifact != artifact:
@@ -4497,7 +4504,7 @@ def _load_issued_purchase(
     evidence: VoucherIssuanceEvidenceRequest,
 ) -> tuple[Any, StoredPaymentPurchase]:
     try:
-        artifact = purchase_artifact_from_json(evidence.purchase_artifact)
+        artifact = voucher_purchase_from_json(evidence.purchase_artifact)
         stored = get_payment_purchase_store(settings.payment_purchase_db_path).get(
             _hex32(artifact.purchase_id)
         )
