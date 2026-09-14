@@ -10,14 +10,16 @@ from collections.abc import Sequence
 from pathlib import Path
 
 
-SCHEMA_VERSION = 11
+from .inventory_payment_hold_ledger import InventoryPaymentHoldLedgerMixin, migrate_payment_holds
+
+SCHEMA_VERSION = 12
 
 
 class ValidatorLedgerConflict(RuntimeError):
     """A claim attempted to reuse one-time credential evidence."""
 
 
-class ValidatorLedger:
+class ValidatorLedger(InventoryPaymentHoldLedgerMixin):
     def __init__(self, path: str | Path, timeout: float = 10.0) -> None:
         self.path = str(path) if path == ":memory:" else str(Path(path))
         if self.path != ":memory:":
@@ -253,6 +255,9 @@ class ValidatorLedger:
                     COMMIT;
                 """)
 
+            if version < 12:
+                migrate_payment_holds(self._conn)
+
     def _assert_no_extension_signature(self, coin_id: str | None) -> None:
         # Called under the same BEGIN IMMEDIATE transaction as terminal writes.
         if coin_id is not None and self._conn.execute(
@@ -271,6 +276,8 @@ class ValidatorLedger:
         with self._lock:
             self._conn.execute('BEGIN IMMEDIATE')
             try:
+                if self._conn.execute('SELECT 1 FROM inventory_payment_holds WHERE purchase_id=?', (purchase_id,)).fetchone():
+                    self._assert_payment_hold_identity(purchase_id, json.loads(canonical_claim).get('payment_intent_id'))
                 old = self._conn.execute('SELECT * FROM inventory_extension_signatures WHERE reserved_coin_id=?', (reserved_coin_id,)).fetchone()
                 if old is not None:
                     if old['claim_hash'] != claim_hash or old['canonical_claim'] != canonical_claim or old['purchase_id'] != purchase_id or old['deed_launcher_id'] != deed_launcher_id:
@@ -365,6 +372,7 @@ class ValidatorLedger:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                self._assert_payment_hold_identity(purchase_id, payment_intent_id)
                 for coin_id in delivery_ids:
                     self._assert_no_extension_signature(coin_id)
                 existing = self._conn.execute(
@@ -613,8 +621,10 @@ class ValidatorLedger:
         with self._lock:
             self._conn.execute('BEGIN IMMEDIATE')
             try:
+                if deed_launcher_id is not None:
+                    self._assert_no_payment_hold(deed_launcher_id)
                 if deed_launcher_id is not None and self._conn.execute(
-                        'SELECT 1 FROM inventory_extension_signatures WHERE deed_launcher_id=?', (deed_launcher_id,)).fetchone():
+                        "SELECT 1 FROM inventory_extension_signatures e WHERE deed_launcher_id=? AND NOT EXISTS (SELECT 1 FROM inventory_payment_holds h WHERE h.purchase_id=e.purchase_id AND h.state='RELEASED')", (deed_launcher_id,)).fetchone():
                     raise ValidatorLedgerConflict('This SmartDeed has a payment hold; a timeout cannot authorize another buyer.')
                 active = self._conn.execute('SELECT claim_hash FROM inventory_reservation_active WHERE available_coin_id=?',
                                             (available_coin_id,)).fetchone()
@@ -662,11 +672,14 @@ class ValidatorLedger:
         series_coin_id: str,
         purchase_launcher_coin_id: str,
         signature: str,
+        purchase_id: str | None = None,
+        payment_intent_id: str | None = None,
     ) -> str:
         """Record one series transition or recover an exact retry."""
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                self._assert_payment_hold_identity(purchase_id, payment_intent_id)
                 existing = self._conn.execute(
                     """
                     SELECT canonical_claim, signature
@@ -737,6 +750,7 @@ class ValidatorLedger:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                self._assert_payment_hold_identity(purchase_id, payment_intent_id)
                 self._assert_no_extension_signature(canonical_delivery_coin_id)
                 existing = self._conn.execute(
                     """
@@ -801,12 +815,15 @@ class ValidatorLedger:
         voucher_coin_id: str,
         payment_coin_id: str,
         signature: str,
+        purchase_id: str | None = None,
+        payment_intent_id: str | None = None,
         deed_coin_id: str | None = None,
     ) -> str:
         """Record one terminal voucher transition or recover an exact retry."""
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                self._assert_payment_hold_identity(purchase_id, payment_intent_id)
                 self._assert_no_extension_signature(deed_coin_id)
                 existing = self._conn.execute(
                     """

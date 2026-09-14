@@ -10,6 +10,8 @@ from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, ConfigDict
 
 from .inventory_extension_claims import InventoryExtensionClaim
+from .inventory_payment_hold_claims import InventoryPaymentHoldClaim, InventoryPaymentHoldReleaseClaim
+from .validator_inventory_payment_hold import sign_inventory_payment_hold, sign_inventory_payment_hold_release
 from .validator_inventory_extension import sign_inventory_extension_claim
 from .release_metadata import load_release_metadata
 from .validator_ledger import ValidatorLedger
@@ -64,6 +66,18 @@ class InventoryReservationSignRequest(BaseModel):
 class InventoryExtensionSignRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     claim: InventoryExtensionClaim
+    claimHash: str
+
+
+class InventoryPaymentHoldSignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    claim: InventoryPaymentHoldClaim
+    claimHash: str
+
+
+class InventoryPaymentHoldReleaseSignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    claim: InventoryPaymentHoldReleaseClaim
     claimHash: str
 
 
@@ -247,6 +261,25 @@ def create_validator_app(
             ],
             signature=signature,
         )
+
+    async def payment_hold_response(body, *, release=False):
+        signer_settings = current_settings()
+        try:
+            signer = sign_inventory_payment_hold_release if release else sign_inventory_payment_hold
+            signature = await signer(signer_settings, application.state.validator_ledger, body.claim, body.claimHash)
+        except ValidatorEvidenceError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return ValidatorSignatureResponse(claimHash=body.claim.canonical_hash(),
+            signerIndex=signer_settings.signer_index,
+            validatorPubkey=signer_settings.roster_pubkeys[signer_settings.signer_index], signature=signature)
+
+    @application.post("/v1/inventory-payment-hold/sign", response_model=ValidatorSignatureResponse)
+    async def arm_payment_hold(body: InventoryPaymentHoldSignRequest):
+        return await payment_hold_response(body)
+
+    @application.post("/v1/inventory-payment-hold/release", response_model=ValidatorSignatureResponse)
+    async def release_payment_hold(body: InventoryPaymentHoldReleaseSignRequest):
+        return await payment_hold_response(body, release=True)
 
     @application.post(
         "/v1/inventory-extension/sign",

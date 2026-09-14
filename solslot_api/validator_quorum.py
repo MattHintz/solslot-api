@@ -1441,6 +1441,14 @@ async def collect_inventory_reservation_quorum(settings, claim, *, client=None):
     return await _collect_inventory_quorum(settings, claim, "/v1/inventory-reservation/sign", client=client)
 
 
+async def collect_inventory_payment_hold_quorum(settings, claim, *, client=None):
+    if settings.zkpassport_validator_threshold != 2 or len(configured_validator_pubkeys(settings)) != 3:
+        raise ValidatorQuorumError("payment holds require the reviewed two-of-three quorum")
+    release = claim.schema_version == 'solslot.inventory-payment-hold-release.v1'
+    path = '/v1/inventory-payment-hold/release' if release else '/v1/inventory-payment-hold/sign'
+    return await _collect_inventory_quorum(settings, claim, path, client=client)
+
+
 async def collect_inventory_extension_quorum(settings, claim, *, client=None):
     return await _collect_inventory_quorum(settings, claim, "/v1/inventory-extension/sign", client=client)
 
