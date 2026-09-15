@@ -426,10 +426,10 @@ async def build_protocol_offer_artifact(
     from .inventory_payment_hold_claims import payment_hold_activation
     try:
         hold_capability=payment_hold_activation(genesis_artifact,settings.runtime_environment+'-alpha',required=False)
-        if body.rail in ('base_usdc', 'evm_usdc') and 'baseInventoryHold' in genesis_artifact:
-            from .base_inventory_hold import base_hold_activation
-            hold_capability=base_hold_activation(genesis_artifact,settings.runtime_environment+'-alpha')
-        if hold_capability is not None and (hold_capability['adapterVersion']==2 or hold_capability.get('schema')=='solslot.base-inventory-hold.v1'):
+        if body.rail in ('base_usdc', 'evm_usdc') and any(k in genesis_artifact for k in ('baseInventoryHold', 'baseReservationLifecycle')):
+            from .base_inventory_hold import current_base_hold_activation
+            hold_capability=current_base_hold_activation(genesis_artifact,settings.runtime_environment+'-alpha')
+        if hold_capability is not None and (hold_capability['adapterVersion']==2 or hold_capability.get('schema') in ('solslot.base-inventory-hold.v1', 'solslot.base-reservation-lifecycle.v1')):
             from .purchase_admission import require_admission_owner
             require_admission_owner(vault_launcher_id,body.checkout_owner_auth_type,body.checkout_owner_key)
             if body.payment_terms.quantity>hold_capability['maxReservedDeedsPerIdentity']:

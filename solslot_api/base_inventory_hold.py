@@ -81,6 +81,29 @@ class BaseInventoryHoldClaim(BaseModel):
         return b'SOLSLOT_BASE_INVENTORY_HOLD_V1\x00' + bytes.fromhex(self.canonical_hash()[2:])
 
 
+class BaseInventoryHoldClaimV2(BaseInventoryHoldClaim):
+    """Fresh holds bind the current lifecycle release, without a hash self-reference."""
+    schema_version: Literal['solslot.base-inventory-hold-claim.v2'] = 'solslot.base-inventory-hold-claim.v2'
+
+    def signature_message(self):
+        return b'SOLSLOT_BASE_INVENTORY_HOLD_V2\x00' + bytes.fromhex(self.canonical_hash()[2:])
+
+
+BaseHoldClaim = BaseInventoryHoldClaim | BaseInventoryHoldClaimV2
+
+
+def parse_base_hold(value):
+    cls = BaseInventoryHoldClaimV2 if value.get('schema_version') == 'solslot.base-inventory-hold-claim.v2' else BaseInventoryHoldClaim
+    return cls.model_validate(value)
+
+
+def current_base_hold_activation(artifact, environment):
+    if artifact.get('baseReservationLifecycle') is not None:
+        from .base_lifecycle_claims import base_lifecycle_activation
+        return base_lifecycle_activation(artifact, environment)
+    return base_hold_activation(artifact, environment)
+
+
 def base_hold_coordinates(claim, artifact, environment):
     from chia_rs.sized_bytes import bytes32
     from solslot_puzzles.payment_artifacts_v3 import purchase_artifact_v3_from_json, purchase_artifact_v3_to_json
@@ -92,7 +115,8 @@ def base_hold_coordinates(claim, artifact, environment):
     require_current_base_presale(purchase)
     if claim.purchase_artifact != purchase_artifact_v3_to_json(purchase):
         raise ValueError('Base hold purchase must use its exact canonical serialized identity')
-    active = base_hold_activation(artifact, environment)
+    active = (current_base_hold_activation(artifact, environment) if isinstance(claim, BaseInventoryHoldClaimV2)
+              else base_hold_activation(artifact, environment))
     if (claim.activation != active or claim.genesis_artifact_hash != artifact['artifactHash']
             or claim.network != purchase.network or claim.depositor == '0x'+'0'*40
             or '0x'+purchase.protocol_treasury_puzzle_hash.hex() != artifact['puzzleHashes']['protocolTreasuryPuzzleHash']

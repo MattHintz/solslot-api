@@ -55,7 +55,7 @@ from tests.test_presale_endpoints import terms as sample_terms, create_series
 NOW = 1_900_000_000
 
 
-def base_case(tmp_path, monkeypatch, inventory_version=2, *, after_authorization=False):
+def base_case(tmp_path, monkeypatch, inventory_version=2, *, after_authorization=False, payment_evidence=None):
     # A pre-existing confirmed reservation is this worker's input. Long-lived
     # snapshot coverage does not claim the missing extension orchestrator works.
     current = sample_terms(NOW)
@@ -97,6 +97,8 @@ def base_case(tmp_path, monkeypatch, inventory_version=2, *, after_authorization
         deedLauncherId=hx(case.purchase.deed_launcher_id), vaultLauncherId=hx(case.purchase.vault_launcher_id),
         destinationPuzzle=hx(case.purchase.vault_p2_puzzle_hash), quoteExpiresAt=case.purchase.quote_expires_at)
     deposit["source"]["blockHash"] = deposit["blockHash"]
+    if payment_evidence is not None:
+        deposit = deepcopy(payment_evidence)
     stored = case.purchases.bind_external_message(hx(case.purchase.purchase_id), deposit)
     payer = hx(bytes32(b"\x00"*12 + bytes.fromhex(deposit["depositor"][2:])))
     evidence = VoucherIssuanceEvidenceRequest(purchaseArtifact=stored.purchase_artifact,
@@ -188,7 +190,7 @@ def base_case(tmp_path, monkeypatch, inventory_version=2, *, after_authorization
         config=delivery.VoucherIssuanceWorkerConfig(enabled=True))
     return SimpleNamespace(**vars(case), voucher_worker=worker, presales=store, presale_path=store_path,
         current=current, clock=clock, dispatched=dispatched, prepared_bundles=prepared_bundles,
-        voucher_claims=claims, fail=fail, issuance=issuance)
+        voucher_claims=claims, fail=fail, issuance=issuance, launch=phase)
 
 
 async def submit(case):

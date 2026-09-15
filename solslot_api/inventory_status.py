@@ -194,6 +194,12 @@ def validated_recovery_receipt(snapshot, *, network, artifact=None):
                 or (released is not None) != (state == "RELEASED")):
             raise ValueError("contradictory recovery receipts")
         receipt = None
+        if released is not None and released.get('schema') == 'solslot.base-checkout-terminal-evidence.v1':
+            from .base_checkout_terminals import validate_base_terminal_evidence
+            if released.get('kind') != 'RETURNED' or network != 'testnet11':
+                raise ValueError('invalid Base inventory return')
+            validate_base_terminal_evidence(snapshot, released, artifact)
+            return dict(kind='base-payment-return', confirmationHeight=released['claim']['confirmation_height'])
         if released is not None and released.get('schema') == 'solslot.checkout-terminal.v1':
             from .checkout_terminals import validate_terminal_evidence
             if released.get('kind') != 'RETURNED' or network != 'testnet11':

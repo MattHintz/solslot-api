@@ -13,15 +13,16 @@ from pathlib import Path
 from .inventory_payment_hold_ledger import InventoryPaymentHoldLedgerMixin, migrate_payment_holds, migrate_payment_hold_aborts
 
 from .base_inventory_hold_ledger import BaseInventoryHoldLedgerMixin, migrate_base_holds
+from .base_lifecycle_ledger import BaseLifecycleLedgerMixin, migrate_base_lifecycle
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 
 class ValidatorLedgerConflict(RuntimeError):
     """A claim attempted to reuse one-time credential evidence."""
 
 
-class ValidatorLedger(BaseInventoryHoldLedgerMixin, InventoryPaymentHoldLedgerMixin):
+class ValidatorLedger(BaseLifecycleLedgerMixin, BaseInventoryHoldLedgerMixin, InventoryPaymentHoldLedgerMixin):
     def __init__(self, path: str | Path, timeout: float = 10.0) -> None:
         self.path = str(path) if path == ":memory:" else str(Path(path))
         if self.path != ":memory:":
@@ -265,6 +266,8 @@ class ValidatorLedger(BaseInventoryHoldLedgerMixin, InventoryPaymentHoldLedgerMi
 
             if version < 14:
                 migrate_base_holds(self._conn)
+            if version < 15:
+                migrate_base_lifecycle(self._conn)
 
     def _assert_no_extension_signature(self, coin_id: str | None) -> None:
         # Called under the same BEGIN IMMEDIATE transaction as terminal writes.
@@ -284,7 +287,9 @@ class ValidatorLedger(BaseInventoryHoldLedgerMixin, InventoryPaymentHoldLedgerMi
         with self._lock:
             self._conn.execute('BEGIN IMMEDIATE')
             try:
-                if self.inventory_payment_hold(purchase_id) is not None or self.base_inventory_hold(purchase_id) is not None:
+                if json.loads(canonical_claim).get('schema_version') == 'solslot.base-inventory-extension.v1':
+                    self._assert_base_extension_payment(purchase_id, json.loads(canonical_claim))
+                elif self.inventory_payment_hold(purchase_id) is not None or self.base_inventory_hold(purchase_id) is not None:
                     self._assert_payment_hold_identity(purchase_id, json.loads(canonical_claim).get('payment_intent_id'))
                 old = self._conn.execute('SELECT * FROM inventory_extension_signatures WHERE reserved_coin_id=?', (reserved_coin_id,)).fetchone()
                 if old is not None:
@@ -629,10 +634,11 @@ class ValidatorLedger(BaseInventoryHoldLedgerMixin, InventoryPaymentHoldLedgerMi
         with self._lock:
             self._conn.execute('BEGIN IMMEDIATE')
             try:
+                self._assert_base_not_terminal(purchase_id)
                 if deed_launcher_id is not None:
                     self._assert_no_payment_hold(deed_launcher_id)
                 if deed_launcher_id is not None and self._conn.execute(
-                        "SELECT 1 FROM inventory_extension_signatures e WHERE deed_launcher_id=? AND NOT EXISTS (SELECT 1 FROM inventory_payment_holds h WHERE h.purchase_id=e.purchase_id AND h.state='RELEASED')", (deed_launcher_id,)).fetchone():
+                        "SELECT 1 FROM inventory_extension_signatures e WHERE deed_launcher_id=? AND NOT EXISTS (SELECT 1 FROM inventory_payment_holds h WHERE h.purchase_id=e.purchase_id AND h.state='RELEASED') AND NOT EXISTS (SELECT 1 FROM base_lifecycle_terminals b WHERE b.purchase_id=e.purchase_id)", (deed_launcher_id,)).fetchone():
                     raise ValidatorLedgerConflict('This SmartDeed has a payment hold; a timeout cannot authorize another buyer.')
                 active = self._conn.execute('SELECT claim_hash FROM inventory_reservation_active WHERE available_coin_id=?',
                                             (available_coin_id,)).fetchone()

@@ -316,6 +316,8 @@ def load_validator_artifact(
         payment_hold_activation(artifact, settings.deployment_environment, required=False)
         from .base_inventory_hold import base_hold_activation
         base_hold_activation(artifact, settings.deployment_environment, required=False)
+        from .base_lifecycle_claims import base_lifecycle_activation
+        base_lifecycle_activation(artifact, settings.deployment_environment, required=False)
         if 'checkoutLifecycle' in artifact:
             from .checkout_lifecycle import lifecycle_activation
             lifecycle_activation(artifact, settings.deployment_environment)
@@ -2427,19 +2429,35 @@ def _retain_verified_base_hold_payment(settings, ledger, claim):
         return
     held = ledger.base_inventory_hold(purchase_id)
     artifact, _ = load_validator_artifact(settings)
-    if held is None and 'baseInventoryHold' not in artifact:
+    if held is None and 'baseInventoryHold' not in artifact and 'baseReservationLifecycle' not in artifact:
         return  # Historical recovery does not invent a prepayment acknowledgment.
     try:
-        from .base_inventory_hold import BaseInventoryHoldClaim, base_hold_coordinates
+        from .base_inventory_hold import parse_base_hold, base_hold_coordinates
         if held is None:
+            from .base_lifecycle_claims import base_lifecycle_activation, historical_direct_payment_digest
+            cap = base_lifecycle_activation(artifact, settings.deployment_environment, required=False)
+            if cap is not None and historical_direct_payment_digest(claim.purchase_artifact, claim.payment_evidence) in cap['historicalDirectPaymentSha256']:
+                return  # Full independent payment proof already ran; ordinary replay locks still apply.
             raise ValueError('Base payment has no original private hold')
-        hold = BaseInventoryHoldClaim.model_validate_json(held['claim_json'])
-        base_hold_coordinates(hold, artifact, settings.deployment_environment)
+        hold = parse_base_hold(json.loads(held['claim_json']))
+        origin = artifact
+        if artifact.get('baseReservationLifecycle') is not None:
+            from .base_lifecycle_claims import hold_origin
+            origin = hold_origin(hold, artifact, settings.deployment_environment)
+        base_hold_coordinates(hold, origin, settings.deployment_environment)
         if hold.purchase_artifact != claim.purchase_artifact:
             raise ValueError('Base payment changes the held purchase')
         ledger.retain_base_payment_start(purchase_id, claim.payment_evidence)
-        if hold.activation['paymentConfirmationEnabled'] is not True:
+        if artifact.get('baseReservationLifecycle') is None:
             raise ValueError('Base lifecycle remains unavailable; retain this verified payment for recovery')
+        from .base_lifecycle_claims import BasePaymentStartClaim, base_lifecycle_activation, validate_base_start
+        start = BasePaymentStartClaim(network=settings.network, genesis_artifact_hash=artifact['artifactHash'],
+            activation=base_lifecycle_activation(artifact, settings.deployment_environment),
+            hold=hold, purchase_artifact=claim.purchase_artifact,
+            payment_evidence=json.loads(ledger.base_inventory_hold(purchase_id)['payment_start_json']))
+        validate_base_start(start, artifact, settings.deployment_environment)
+        ledger.record_base_lifecycle_observation(start,
+            '0x'+bytes(AugSchemeMPL.sign(load_validator_private_key(settings), start.signature_message())).hex())
     except (ValueError, ValidatorLedgerConflict) as exc:
         raise ValidatorEvidenceError('Base payment start does not match its independent prepayment hold') from exc
 

@@ -59,6 +59,16 @@ async def bounded_unfunded_proof(settings, claim):
 
 
 def verify_unfunded_base_hold(settings, claim, *, web3_factory=Web3):
+    return _verify_unfunded_base_hold(settings, claim, web3_factory=web3_factory, expired=False)
+
+
+def verify_unfunded_base_timeout(settings, claim, *, web3_factory=Web3):
+    return _verify_unfunded_base_hold(settings, claim, web3_factory=web3_factory, expired=True)
+
+
+def _verify_unfunded_base_hold(settings, claim, *, web3_factory, expired):
+    from solslot_puzzles.payment_artifacts_v3 import purchase_artifact_v3_from_json
+    purchase = purchase_artifact_v3_from_json(claim.purchase_artifact)
     active = claim.activation
     if (not settings.base_sepolia_rpc_url
             or settings.base_sepolia_spoke_address.lower() != active['spoke']
@@ -87,12 +97,21 @@ def verify_unfunded_base_hold(settings, claim, *, web3_factory=Web3):
     if query(lambda: w3.eth.chain_id) != active['chainId']:
         raise ValueError('Base hold provider is on another network')
     tip = query(lambda: w3.eth.get_block('latest'))
+    if expired:
+        if type(tip.get('number')) is not int or tip['number'] < active['minConfirmations']:
+            raise ValueError('Base expiry does not have mature chain evidence')
+        height = tip['number'] - active['minConfirmations'] + 1
+        tip = query(lambda: w3.eth.get_block(height))
+        if tip.get('number') != height:
+            raise ValueError('Base expiry provider returned another confirmed block')
+    valid_clock = (tip.get('timestamp', 0) >= purchase.quote_expires_at if expired
+                   else 0 < tip.get('timestamp', 0) < claim.reservation_expires_at)
     if (type(tip['number']) is not int or tip['number'] <= 0
-            or type(tip['timestamp']) is not int or not 0 < tip['timestamp'] < claim.reservation_expires_at):
+            or type(tip['timestamp']) is not int or not valid_clock):
         raise ValueError('Base chain clock has expired the original reservation')
     contract = w3.eth.contract(address=Web3.to_checksum_address(active['spoke']), abi=ABI)
     if (query(lambda: contract.functions.localChainSelector().call(block_identifier=tip['number'])) != active['sourceChainSelector']
-            or query(lambda: contract.functions.paused().call(block_identifier=tip['number'])) is not False):
+            or (not expired and query(lambda: contract.functions.paused().call(block_identifier=tip['number'])) is not False)):
         raise ValueError('Base escrow route is paused or differs from its reviewed deployment')
     lookup = contract.functions.globalPaymentForPurchase(claim.purchase_artifact['purchaseId'])
     # The contract has one deposit per purchase. Check current state twice and
@@ -105,10 +124,23 @@ def verify_unfunded_base_hold(settings, claim, *, web3_factory=Web3):
 
 
 async def sign_base_inventory_hold(settings, ledger, claim, claim_hash):
+    from .validator_service import ValidatorEvidenceError
+    try:
+        async with asyncio.timeout(30):
+            return await _sign_base_inventory_hold(settings, ledger, claim, claim_hash)
+    except TimeoutError as exc:
+        raise ValidatorEvidenceError('Base prepayment full proof timed out') from exc
+
+
+async def _sign_base_inventory_hold(settings, ledger, claim, claim_hash):
     from .validator_service import load_validator_artifact, load_validator_private_key, ValidatorEvidenceError
     try:
         artifact, _ = load_validator_artifact(settings)
-        purchase, struct, terms = base_hold_coordinates(claim, artifact, settings.deployment_environment)
+        origin = artifact
+        if artifact.get('baseReservationLifecycle') is not None:
+            from .base_lifecycle_claims import hold_origin
+            origin = hold_origin(claim, artifact, settings.deployment_environment)
+        purchase, struct, terms = base_hold_coordinates(claim, origin, settings.deployment_environment)
         if (claim_hash != claim.canonical_hash() or settings.network != claim.network
                 or settings.roster_pubkeys != artifact['validatorSet']['pubkeys']
                 or len(settings.roster_pubkeys) != 3 or artifact['validatorSet']['threshold'] != 2):

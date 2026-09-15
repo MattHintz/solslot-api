@@ -14,6 +14,7 @@ from solslot_puzzles.stripe_settlement_v1_driver import (
 )
 from .faucet import AGG_SIG_ME_DATA
 from .inventory_extension_claims import InventoryExtensionClaim, extension_activation
+from .base_lifecycle_claims import parse_extension, BaseInventoryExtensionClaim, validate_base_start
 from .inventory_recovery import timeout_items, hx, record_coin, decode_spend, release_peak
 from .payment_purchase_store import PaymentPurchaseConflict
 from .validator_inventory_extension import extension_coordinates
@@ -110,11 +111,16 @@ def current_position(stored, rows, artifact):
         position = InventoryPosition(original.release_spend.coin, original.reservation_spend,
             InventoryReservationV1(purchase, stored.inventory_expires_at), struct, terms, stored.inventory_confirmation_height)
         for receipt in history:
-            claim = InventoryExtensionClaim.model_validate(receipt['claim'])
+            claim = parse_extension(receipt['claim'])
             binding = receipt['binding']
+            if isinstance(claim, BaseInventoryExtensionClaim):
+                validate_base_start(claim, artifact, claim.activation['environment'])
+                active = claim.activation
+            else:
+                active = extension_activation(artifact, claim.activation['environment'])
             if (binding != dict(artifactHash=claim.genesis_artifact_hash, activation=claim.activation)
-                    or claim.activation != extension_activation(artifact, claim.activation['environment'])
-                    or claim.genesis_artifact_hash != artifact['artifactHash']
+                    or claim.activation != active
+                    or (not isinstance(claim, BaseInventoryExtensionClaim) and claim.genesis_artifact_hash != artifact['artifactHash'])
                     or claim.smart_deed_inner_hash != inner_hash):
                 raise ValueError('retained extension deployment changed')
             transition, bundle = validate_execution(position, claim, receipt)

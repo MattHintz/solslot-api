@@ -4,7 +4,7 @@ import time
 import uuid
 
 from chia_rs import AugSchemeMPL, G1Element, G2Element
-from .base_inventory_hold import BaseInventoryHoldClaim, base_hold_coordinates
+from .base_inventory_hold import parse_base_hold, base_hold_coordinates
 from .inventory_extension_store import conflict
 from .inventory_recovery import hx
 from .purchase_admission import recheck_admitted_owner
@@ -12,6 +12,9 @@ from .validator_quorum import _collect_inventory_quorum, configured_validator_pu
 
 
 def verify_base_hold_receipt(claim, receipt, artifact):
+    if artifact.get('baseReservationLifecycle') is not None:
+        from .base_lifecycle_claims import hold_origin
+        artifact = hold_origin(claim, artifact, claim.activation['environment'])
     base_hold_coordinates(claim, artifact, claim.activation['environment'])
     try:
         indices = receipt['signerIndices']
@@ -29,9 +32,13 @@ def verify_base_hold_receipt(claim, receipt, artifact):
 
 
 def base_checkout_status(operation, artifact):
-    claim = BaseInventoryHoldClaim.model_validate(operation['claim'])
-    base_hold_coordinates(claim, artifact, claim.activation['environment'])
-    if operation['state'] not in ('ARMING', 'ARMED'):
+    claim = parse_base_hold(operation['claim'])
+    origin = artifact
+    if artifact.get('baseReservationLifecycle') is not None:
+        from .base_lifecycle_claims import hold_origin
+        origin = hold_origin(claim, artifact, claim.activation['environment'])
+    base_hold_coordinates(claim, origin, claim.activation['environment'])
+    if operation['state'] not in ('ARMING', 'ARMED', 'TERMINATING', 'RETURNED', 'DELIVERED'):
         raise conflict('Unknown Base hold state requires review')
     if operation['receipt'] is not None:
         verify_base_hold_receipt(claim, operation['receipt'], artifact)
@@ -39,7 +46,7 @@ def base_checkout_status(operation, artifact):
         raise conflict('Base hold is missing its quorum')
     return dict(**operation, confirmationAllowed=False, inventoryReusable=False,
         paymentRetryAllowed=False, lifecycleReady=False,
-        reason='Base reservation renewal and terminal recovery are not activated.')
+        reason='Base customer payment is not enabled for this release. Keep this checkout for recovery.')
 
 
 async def arm_base_checkout(*, store, settings, claim, load_artifact, authorize):
@@ -47,7 +54,11 @@ async def arm_base_checkout(*, store, settings, claim, load_artifact, authorize)
     if creating:
         authorize()
     artifact = load_artifact()
-    base_hold_coordinates(claim, artifact, settings.runtime_environment+'-alpha')
+    origin = artifact
+    if not creating and artifact.get('baseReservationLifecycle') is not None:
+        from .base_lifecycle_claims import hold_origin
+        origin = hold_origin(claim, artifact, settings.runtime_environment+'-alpha')
+    base_hold_coordinates(claim, origin, settings.runtime_environment+'-alpha')
     if (settings.network != 'testnet11' or settings.zkpassport_validator_threshold != 2
             or [hx(k) for k in configured_validator_pubkeys(settings)] != artifact['validatorSet']['pubkeys']):
         raise conflict('Base hold coordinator requires the reviewed isolated validator roster')
@@ -61,7 +72,7 @@ async def arm_base_checkout(*, store, settings, claim, load_artifact, authorize)
     # the independently reserved abort/return budget.
     store.claim_checkout_quorum(purchase_id, kind='arm', owner=owner, now=int(time.time()))
     try:
-        quorum = await asyncio.wait_for(_collect_inventory_quorum(settings, claim, '/v1/base-inventory-hold/sign'), timeout=90)
+        quorum = await asyncio.wait_for(_collect_inventory_quorum(settings, claim, '/v1/base-inventory-hold/sign'), timeout=35)
         if creating:
             authorize()
         recheck_admitted_owner(store, purchase_id)

@@ -104,6 +104,23 @@ def verify_escrow_deposit(
     *, rpc_url: str, evidence: Mapping[str, Any], chain_id: int,
     spoke: str, token: str, confirmations: int, web3_factory=Web3,
 ) -> None:
+    _verify_deposit(rpc_url=rpc_url, evidence=evidence, chain_id=chain_id, spoke=spoke,
+        token=token, confirmations=confirmations, web3_factory=web3_factory, disposition='ELIGIBLE')
+
+
+def _verify_deposit(*, rpc_url, evidence, chain_id, spoke, token, confirmations,
+                    web3_factory, disposition):
+    """Shared authenticated origin; only trusted wrappers choose current policy."""
+    if disposition not in ('ELIGIBLE', 'REFUNDED', 'SETTLED_SUCCESS'):
+        raise EscrowDepositError('unknown escrow disposition policy')
+    def current_policy(deposit):
+        if disposition == 'ELIGIBLE':
+            _eligible(deposit)
+        elif disposition == 'REFUNDED':
+            if type(deposit['status']) is not int or deposit['status'] not in (4, 5) or deposit['succeeded'] is not False:
+                raise EscrowDepositError('EVM escrow refund is not settled')
+        elif type(deposit['status']) is not int or deposit['status'] != 3 or deposit['succeeded'] is not True:
+            raise EscrowDepositError('EVM escrow success is not settled')
     if not rpc_url:
         raise EscrowProviderUnavailable("EVM escrow RPC is not configured")
     deadline = time.monotonic() + PROOF_DEADLINE_SECONDS
@@ -179,7 +196,8 @@ def verify_escrow_deposit(
         for deposit in (historical, current):
             if any(deposit[name] != value for name, value in expected.items()):
                 raise EscrowDepositError("EVM escrow deposit differs from payment commitments")
-            _eligible(deposit)
+        _eligible(historical)
+        current_policy(current)
         immutable = [name for name, _ in DEPOSIT_FIELDS
                      if name not in ("status", "succeeded", "resultMessageId", "warpNonce")]
         if (any(historical[name] != current[name] for name in immutable)
@@ -200,10 +218,12 @@ def verify_escrow_deposit(
         if (rpc_hex(final_block["hash"]) != source["blockHash"]
                 or rpc_hex(final_tip["hash"]) != rpc_hex(tip["hash"])):
             raise EscrowDepositError("EVM escrow canonical blocks changed during verification")
-        _eligible(latest_deposit)
+        current_policy(latest_deposit)
         if (any(latest_deposit[name] != current[name] for name in immutable)
                 or latest_deposit["status"] < current["status"]):
             raise EscrowDepositError("EVM escrow current deposit changed")
+        return dict(query=query, web3=w3, deposit=latest_deposit, lookup=lookup,
+                    sourceBlock=block, tip=tip, immutable=immutable)
     except EscrowDepositError:
         raise
     except (KeyError, IndexError, TypeError, ValueError, OverflowError, DecodingError, EncodingError) as exc:

@@ -34,6 +34,19 @@ def lifecycle_activation(artifact, environment):
     return dict(value)
 
 
+def worker_activation(artifact, environment):
+    """Keep each rail's strict capability; Base never satisfies a Stripe gate."""
+    from .base_lifecycle_claims import base_lifecycle_activation
+    base = base_lifecycle_activation(artifact, environment, required=False)
+    if base is None:
+        return lifecycle_activation(artifact, environment)
+    if 'checkoutLifecycle' not in artifact:
+        return base
+    stripe = lifecycle_activation(artifact, environment)
+    return dict(schema='solslot.checkout-worker-rails.v1', base=base, stripe=stripe,
+        advanceDeadlineSeconds=45, workerLeaseSeconds=60)
+
+
 def enqueue_candidate(*, store, settings, purchase_id, payment, load_artifact):
     if not settings.checkout_lifecycle_worker_enabled or settings.network != 'testnet11':
         raise HTTPException(status_code=503, detail='Automatic payment recovery is not enabled for this release.')
@@ -63,7 +76,7 @@ class CheckoutLifecycleWorker:
     async def start(self):
         if not self.settings.checkout_lifecycle_worker_enabled or self.tasks:
             return
-        lifecycle_activation(self.load_artifact(), self.settings.runtime_environment + '-alpha')
+        worker_activation(self.load_artifact(), self.settings.runtime_environment + '-alpha')
         if self.settings.network != 'testnet11':
             raise conflict('lifecycle worker requires isolated testnet11')
         self.tasks = [asyncio.create_task(self.run(lane), name='checkout-' + lane) for lane in ('renewal', 'terminal')]
@@ -90,7 +103,7 @@ class CheckoutLifecycleWorker:
     async def reconcile_once(self, lane):
         if not self.settings.checkout_lifecycle_worker_enabled or self.settings.network != 'testnet11':
             return False
-        binding = lifecycle_activation(self.load_artifact(), self.settings.runtime_environment + '-alpha')
+        binding = worker_activation(self.load_artifact(), self.settings.runtime_environment + '-alpha')
         self.store.seed_checkout_jobs()
         owner = self.owner + ':' + uuid.uuid4().hex
         job = self.store.claim_checkout_job(lane, owner=owner, now=int(time.time()))
@@ -120,6 +133,15 @@ class CheckoutLifecycleWorker:
         return True
 
     async def advance(self, purchase_id, lane, binding):
+        artifact = self.load_artifact()
+        if worker_activation(artifact, self.settings.runtime_environment+'-alpha') != binding:
+            raise conflict('worker deployment changed')
+        if self.store.base_checkout_hold(purchase_id) is not None:
+            from .base_checkout_lifecycle import advance_base_lifecycle
+            return await advance_base_lifecycle(self, purchase_id, lane)
+        # Stripe continues to require its own complete activation, including in
+        # releases where the worker also serves Base recovery.
+        binding = lifecycle_activation(artifact, self.settings.runtime_environment+'-alpha')
         from .checkout_terminals import (reconcile_paid_checkout, reconcile_checkout_return,
             terminal_status, active_context, observe_return)
         from .inventory_payment_holds import abort_checkout

@@ -210,11 +210,11 @@ async def native_purchase_status(
     )
 
 
-from .base_inventory_hold import BaseInventoryHoldClaim
+from .base_inventory_hold import BaseHoldClaim
 
 
 @router.post('/inventory/base-payment-hold/arm')
-async def arm_base_inventory_hold(payload: BaseInventoryHoldClaim,
+async def arm_base_inventory_hold(payload: BaseHoldClaim,
         settings: Annotated[Settings, Depends(get_settings)], authorization: Annotated[str | None, Header()] = None):
     from .base_inventory_hold_coordinator import arm_base_checkout
     _require_server_to_server_token(settings, authorization)
@@ -235,6 +235,72 @@ async def arm_base_inventory_hold(payload: BaseInventoryHoldClaim,
 
 class InventoryReservationRequest(NativePurchaseModel):
     purchase_id: str = Field(alias="purchaseId", min_length=66, max_length=66)
+
+
+class BaseTerminalRecoveryRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid', populate_by_name=True, strict=True)
+    purchase_id: str = Field(alias='purchaseId', pattern=r'^0x[0-9a-f]{64}$')
+    settlement: dict[str, Any] | None = None
+    spend_bundle: dict[str, Any] | None = Field(alias='spendBundle', default=None)
+
+
+class BaseCheckoutPrepareRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid', populate_by_name=True, strict=True)
+    purchase_id: str = Field(alias='purchaseId', pattern=r'^0x[0-9a-f]{64}$')
+    depositor: str = Field(pattern=r'^0x[0-9a-f]{40}$')
+
+
+@router.post('/inventory/base-payment-hold/prepare')
+async def prepare_base_inventory_checkout(payload: BaseCheckoutPrepareRequest,
+        settings: Annotated[Settings, Depends(get_settings)], authorization: Annotated[str | None, Header()] = None):
+    from .base_checkout_prepare import prepare_base_checkout
+    _require_server_to_server_token(settings, authorization)
+    def authorize():
+        require_minting_writes(settings)
+        require_operation_gate(settings, 'purchases')
+    try:
+        return await prepare_base_checkout(store=get_payment_purchase_store(settings.payment_purchase_db_path),
+            settings=settings, purchase_id=payload.purchase_id, depositor=payload.depositor,
+            load_artifact=lambda:load_signed_public_artifact(settings), authorize=authorize)
+    except PaymentPurchaseNotFound as exc:
+        raise HTTPException(status_code=404, detail='Retained Base reservation was not found.') from exc
+    except (PaymentPurchaseConflict, ValueError, KeyError, TypeError, ValidatorQuorumError) as exc:
+        raise HTTPException(status_code=409, detail='Base checkout needs review. Keep the original purchase and paying wallet.') from exc
+    except (httpx.HTTPError, OSError, TimeoutError) as exc:
+        raise HTTPException(status_code=503, detail='Base checkout is unavailable. Retry the same purchase.') from exc
+
+
+@router.post('/inventory/base-payment-hold/reconcile-terminal')
+async def reconcile_base_checkout_terminal(payload: BaseTerminalRecoveryRequest, request: Request,
+        settings: Annotated[Settings, Depends(get_settings)], authorization: Annotated[str | None, Header()] = None):
+    """Service-only observation; no token transfer, cancellation or chain dispatch."""
+    from .base_checkout_terminals import reconcile_base_terminal
+    _require_server_to_server_token(settings, authorization)
+    try:
+        store = get_payment_purchase_store(settings.payment_purchase_db_path)
+        if payload.settlement is None and payload.spend_bundle is None and store.get(payload.purchase_id).external_message is not None:
+            # Customer recovery accepts no provider facts. Resolve the original
+            # retained settlement/transaction through the same observer lane.
+            import asyncio
+            from types import SimpleNamespace
+            from .base_checkout_lifecycle import advance_base_lifecycle
+            from .presale_endpoints import get_presale_store
+            worker = SimpleNamespace(store=store, settings=settings, node=request.app.state.coinset,
+                presales=get_presale_store(settings), load_artifact=lambda:load_signed_public_artifact(settings))
+            async with asyncio.timeout(45):
+                state, complete = await advance_base_lifecycle(worker, payload.purchase_id, 'terminal')
+            return dict(purchaseId=payload.purchase_id, observationState=state, complete=complete)
+        result = await reconcile_base_terminal(store=store,
+            node=request.app.state.coinset, settings=settings, purchase_id=payload.purchase_id,
+            load_artifact=lambda:load_signed_public_artifact(settings), settlement=payload.settlement,
+            spend_bundle=payload.spend_bundle)
+        return dict(purchaseId=payload.purchase_id, baseCheckoutHold=result)
+    except PaymentPurchaseNotFound as exc:
+        raise HTTPException(status_code=404, detail='Retained Base checkout was not found.') from exc
+    except (PaymentPurchaseConflict, ValueError, TypeError, KeyError, ValidatorQuorumError) as exc:
+        raise HTTPException(status_code=409, detail='Base terminal proof is incomplete. Keep the original purchase for recovery.') from exc
+    except (httpx.HTTPError, OSError, TimeoutError) as exc:
+        raise HTTPException(status_code=503, detail='Base terminal observation is unavailable. Retry the same purchase.') from exc
 
 
 class InventoryReservationItemResponse(NativePurchaseModel):
@@ -283,7 +349,11 @@ async def inventory_purchase_status(
             environment=settings.runtime_environment + "-alpha", network=settings.network, artifact=terminal_artifact)
         if base_checkout is not None:
             from .base_inventory_hold_coordinator import base_checkout_status
-            result['baseCheckoutHold'] = base_checkout_status(base_checkout, terminal_artifact)
+            if base_checkout['state'] in ('RETURNED', 'DELIVERED'):
+                from .base_checkout_terminals import base_terminal_status
+                result['baseCheckoutHold'] = base_terminal_status(store, normalized, terminal_artifact)
+            else:
+                result['baseCheckoutHold'] = base_checkout_status(base_checkout, terminal_artifact)
         from .inventory_payment_holds import checkout_status
         if checkout is not None:
             if checkout['state'] in {'RETURNED','DELIVERED'}:
@@ -293,16 +363,17 @@ async def inventory_purchase_status(
                 result['checkoutHold']=checkout_status(checkout,terminal_artifact,now=int(time.time()))
         from .inventory_extensions import hold_status
         hold = hold_status(store.get(normalized), store.inventory_extension_operations(normalized), now=int(time.time()))
-        if hold is not None and (checkout is None or checkout['state'] not in {'RETURNED','DELIVERED'}):
+        if (hold is not None and (checkout is None or checkout['state'] not in {'RETURNED','DELIVERED'})
+                and (base_checkout is None or base_checkout['state'] not in {'RETURNED','DELIVERED'})):
             from .inventory_extension_chain import current_position, validate_execution
-            from .inventory_extension_claims import InventoryExtensionClaim
+            from .base_lifecycle_claims import parse_extension
             stored = store.get(normalized)
             position = current_position(stored, store.inventory_items(normalized), load_signed_public_artifact(settings))
             pending = store.pending_inventory_extension(normalized)
             if pending and pending["protocol"] is not None:
-                validate_execution(position, InventoryExtensionClaim.model_validate(pending["claim"]), pending)
+                validate_execution(position, parse_extension(pending["claim"]), pending)
             result["paymentHold"] = hold
-        if checkout is not None:
+        if checkout is not None or base_checkout is not None:
             result["paymentLifecycle"] = store.checkout_job_status(normalized)
         return result
     except PaymentPurchaseNotFound as exc:
@@ -356,17 +427,17 @@ class PaymentStartCandidateRequest(BaseModel):
 @router.get('/inventory/payment-hold/lifecycle-health')
 async def checkout_lifecycle_health(settings: Annotated[Settings, Depends(get_settings)],
         authorization: Annotated[str | None, Header()] = None):
-    from .checkout_lifecycle import lifecycle_activation
+    from .checkout_lifecycle import worker_activation
     _require_server_to_server_token(settings, authorization)
     if not settings.checkout_lifecycle_worker_enabled or settings.network != 'testnet11':
         raise HTTPException(status_code=503, detail='Automatic checkout lifecycle is disabled.')
     try:
-        binding = lifecycle_activation(load_signed_public_artifact(settings), settings.runtime_environment + '-alpha')
+        binding = worker_activation(load_signed_public_artifact(settings), settings.runtime_environment + '-alpha')
         receipts = get_payment_purchase_store(settings.payment_purchase_db_path).lifecycle_health_receipts()
         now = int(time.time())
         healthy = (len(receipts) == 2 and {r['lane'] for r in receipts} == {'renewal','terminal'}
             and all(r['binding'] == binding and 0 <= now-r['observedAt'] <= 90
-                and r['status'] in {'IDLE','COMPLETE','PAYMENT_HELD','WAITING_FOR_PAYMENT','WAITING_FOR_CHAIN'} for r in receipts))
+                and r['status'] in {'IDLE','COMPLETE','PAYMENT_HELD','WAITING_FOR_PAYMENT','WAITING_FOR_CHAIN','WAITING_FOR_ESCROW_PROOF'} for r in receipts))
         return dict(healthy=healthy, observedAt=now, receipts=receipts)
     except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(status_code=503, detail='Checkout lifecycle evidence is unavailable or mismatched.') from exc
@@ -704,10 +775,10 @@ async def reserve_smartdeed_inventory(
     try:
         first=group.contexts[0]
         hold_capability=payment_hold_activation(first.genesis_artifact,settings.runtime_environment+'-alpha',required=False)
-        if stored.rail in ('base_usdc', 'evm_usdc') and 'baseInventoryHold' in first.genesis_artifact:
-            from .base_inventory_hold import base_hold_activation
-            hold_capability=base_hold_activation(first.genesis_artifact,settings.runtime_environment+'-alpha')
-        if hold_capability is not None and (hold_capability['adapterVersion']==2 or hold_capability.get('schema')=='solslot.base-inventory-hold.v1'):
+        if stored.rail in ('base_usdc', 'evm_usdc') and any(k in first.genesis_artifact for k in ('baseInventoryHold', 'baseReservationLifecycle')):
+            from .base_inventory_hold import current_base_hold_activation
+            hold_capability=current_base_hold_activation(first.genesis_artifact,settings.runtime_environment+'-alpha')
+        if hold_capability is not None and (hold_capability['adapterVersion']==2 or hold_capability.get('schema') in ('solslot.base-inventory-hold.v1', 'solslot.base-reservation-lifecycle.v1')):
             from .purchase_admission import require_admission_owner
             require_admission_owner(_hex32(first.purchase.vault_launcher_id),first.credential_owner_auth_type,
                                     '0x'+first.credential_owner_key.hex())

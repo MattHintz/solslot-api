@@ -69,7 +69,7 @@ def test_validator_ledger_migrates_voucher_redemption_schema() -> None:
         }
     finally:
         ledger.close()
-    assert version == SCHEMA_VERSION == 14
+    assert version == SCHEMA_VERSION == 15
     assert table is not None
     assert stripe_table is not None
     assert "deed_coin_id" in columns

@@ -9,9 +9,12 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, ConfigDict
 
-from .base_inventory_hold import BaseInventoryHoldClaim
+from .base_inventory_hold import BaseHoldClaim
 from .validator_base_inventory_hold import sign_base_inventory_hold
 from .inventory_extension_claims import InventoryExtensionClaim
+from .base_lifecycle_claims import BaseInventoryExtensionClaim, BasePaymentStartClaim, BaseTerminalClaim
+from .validator_base_terminal import sign_base_terminal
+from .validator_base_lifecycle import sign_base_extension, sign_base_payment_start
 from .payment_start import PaymentStartClaim, sign_payment_start
 from .inventory_payment_hold_claims import InventoryPaymentHoldClaim, InventoryPaymentHoldReleaseClaim, InventoryPaymentHoldAbortClaim
 from .validator_inventory_payment_hold import sign_inventory_payment_hold, sign_inventory_payment_hold_release, sign_inventory_payment_hold_abort
@@ -68,7 +71,7 @@ class InventoryReservationSignRequest(BaseModel):
 
 class BaseInventoryHoldSignRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    claim: BaseInventoryHoldClaim
+    claim: BaseHoldClaim
     claimHash: str
 
 
@@ -80,7 +83,19 @@ class PaymentStartSignRequest(BaseModel):
 
 class InventoryExtensionSignRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    claim: InventoryExtensionClaim
+    claim: InventoryExtensionClaim | BaseInventoryExtensionClaim
+    claimHash: str
+
+
+class BasePaymentStartSignRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    claim: BasePaymentStartClaim
+    claimHash: str
+
+
+class BaseTerminalSignRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    claim: BaseTerminalClaim
     claimHash: str
 
 
@@ -326,6 +341,26 @@ def create_validator_app(
         return ValidatorSignatureResponse(claimHash=body.claim.canonical_hash(), signerIndex=signer_settings.signer_index,
             validatorPubkey=signer_settings.roster_pubkeys[signer_settings.signer_index], signature=signature)
 
+    @application.post('/v1/base-payment-start/observe', response_model=ValidatorSignatureResponse)
+    async def observe_base_payment_start(body: BasePaymentStartSignRequest):
+        signer_settings = current_settings()
+        try:
+            signature = await sign_base_payment_start(signer_settings, application.state.validator_ledger, body.claim, body.claimHash)
+        except ValidatorEvidenceError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return ValidatorSignatureResponse(claimHash=body.claim.canonical_hash(), signerIndex=signer_settings.signer_index,
+            validatorPubkey=signer_settings.roster_pubkeys[signer_settings.signer_index], signature=signature)
+
+    @application.post('/v1/base-checkout/terminal', response_model=ValidatorSignatureResponse)
+    async def observe_base_terminal(body: BaseTerminalSignRequest):
+        signer_settings = current_settings()
+        try:
+            signature = await sign_base_terminal(signer_settings, application.state.validator_ledger, body.claim, body.claimHash)
+        except ValidatorEvidenceError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return ValidatorSignatureResponse(claimHash=body.claim.canonical_hash(), signerIndex=signer_settings.signer_index,
+            validatorPubkey=signer_settings.roster_pubkeys[signer_settings.signer_index], signature=signature)
+
     @application.post(
         "/v1/inventory-extension/sign",
         response_model=ValidatorSignatureResponse,
@@ -336,7 +371,8 @@ def create_validator_app(
         signer_settings = current_settings()
         active_ledger: ValidatorLedger = application.state.validator_ledger
         try:
-            signature = await sign_inventory_extension_claim(
+            signer = sign_base_extension if isinstance(request.claim, BaseInventoryExtensionClaim) else sign_inventory_extension_claim
+            signature = await signer(
                 signer_settings,
                 active_ledger,
                 request.claim,
