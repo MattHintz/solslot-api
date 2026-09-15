@@ -25,11 +25,19 @@ from .inventory_recovery import hx, record_coin, decode_spend
 
 def extension_coordinates(claim, artifact):
     purchase = purchase_artifact_v3_from_json(claim.purchase_artifact)
-    if (purchase.network != 'testnet11' or purchase.rail != PaymentRail.STRIPE
+    if purchase.rail != PaymentRail.STRIPE:
+        from solslot_puzzles.voucher_purchase import require_current_base_presale
+        from solslot_puzzles.payment_artifacts_v3 import purchase_artifact_v3_to_json
+        from .base_lifecycle_claims import base_lifecycle_activation
+        require_current_base_presale(purchase)
+        base_lifecycle_activation(artifact, artifact['inventoryActivation']['environment'])
+        if claim.purchase_artifact != purchase_artifact_v3_to_json(purchase):
+            raise ValueError('Base extension purchase must use its canonical identity')
+    if (purchase.network != 'testnet11'
             or purchase.purchase_kind != PurchaseKind.PRESALE
             or purchase.delivery_kind != PurchaseDeliveryKind.SMARTDEED
             or hx(purchase.protocol_treasury_puzzle_hash) != artifact['puzzleHashes']['protocolTreasuryPuzzleHash']):
-        raise ValueError('extension supports only the exact current Stripe presale SmartDeed')
+        raise ValueError('extension supports only an exact current presale SmartDeed')
     did = singleton_struct(bytes32.fromhex(artifact['launcherIds']['did'].removeprefix('0x')))
     struct = deed_singleton_struct(deed_launcher_id=purchase.deed_launcher_id, protocol_did_singleton_struct=did)
     terms = PrimaryMintTermsV3.for_artifact(artifact=purchase,

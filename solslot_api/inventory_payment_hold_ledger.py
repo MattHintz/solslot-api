@@ -34,13 +34,15 @@ class InventoryPaymentHoldLedgerMixin:
 
     def _assert_payment_hold_identity(self, purchase_id, payment_intent_id):
         from .validator_ledger import ValidatorLedgerConflict
+        self._assert_base_not_terminal(purchase_id)
         base = self.base_inventory_hold(purchase_id)
         if base:
             if base['global_payment_id'] != payment_intent_id:
                 raise ValidatorLedgerConflict('This purchase has a different Base payment hold.')
-            # v1 is protection-only. No paid/extension signing entry point may
-            # treat its observation acknowledgment as completed lifecycle authority.
-            raise ValidatorLedgerConflict('Base lifecycle signing remains unavailable for this prepayment hold.')
+            # The old acknowledgment is never paid authority. A separately
+            # reviewed lifecycle observation must exist after full verification.
+            self._assert_base_paid_payment(purchase_id, payment_intent_id)
+            return
         if self._conn.execute('SELECT 1 FROM inventory_payment_hold_aborts WHERE purchase_id=?',(purchase_id,)).fetchone():
             raise ValidatorLedgerConflict('This purchase has a terminal payment abort tombstone.')
         hold=self._conn.execute('SELECT * FROM inventory_payment_holds WHERE purchase_id=?',(purchase_id,)).fetchone()
@@ -49,7 +51,11 @@ class InventoryPaymentHoldLedgerMixin:
 
     def _assert_no_payment_hold(self, deed_launcher_id):
         from .validator_ledger import ValidatorLedgerConflict
-        if self._conn.execute('SELECT 1 FROM base_inventory_holds WHERE deed_launcher_id=?', (deed_launcher_id,)).fetchone():
+        if self._conn.execute('''SELECT 1 FROM (
+                SELECT purchase_id,deed_launcher_id FROM base_inventory_holds UNION ALL
+                SELECT purchase_id,deed_launcher_id FROM base_inventory_hold_generations
+            ) h WHERE h.deed_launcher_id=? AND NOT EXISTS (
+                SELECT 1 FROM base_lifecycle_terminals t WHERE t.purchase_id=h.purchase_id)''', (deed_launcher_id,)).fetchone():
             raise ValidatorLedgerConflict('Base inventory remains held; expiry is not payment release authority.')
         if self._conn.execute("SELECT 1 FROM inventory_payment_holds WHERE deed_launcher_id=? AND state!='RELEASED'",(deed_launcher_id,)).fetchone():
             raise ValidatorLedgerConflict('This SmartDeed is held before payment; expiry is not payment release authority.')

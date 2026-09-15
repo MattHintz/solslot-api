@@ -127,6 +127,12 @@ class VoucherWorkStore:
             raise ValueError('Voucher has conflicting unfinished executions')
         return json.loads(rows[0]['execution_json']) if rows else None
 
+    def retained_voucher_execution(self, terms: str, serial: int, kind: str) -> dict[str, Any] | None:
+        """Original bytes remain available for independent terminal observation."""
+        row = self._conn.execute('SELECT execution_json FROM voucher_worker_executions WHERE terms_hash=? AND serial=? AND kind=?',
+            (terms, serial, kind)).fetchone()
+        return json.loads(row['execution_json']) if row else None
+
     def confirm_voucher_execution(self, terms: str, serial: int, kind: str) -> None:
         with self.txn() as cur:
             cur.execute("UPDATE voucher_worker_executions SET confirmed=1 WHERE terms_hash=? AND serial=? AND kind=?", (terms, serial, kind))

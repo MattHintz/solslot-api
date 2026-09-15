@@ -267,8 +267,8 @@ async def lifespan(app: FastAPI):
     validate_secret_env_file_permissions()
     settings = get_settings()
     if settings.checkout_lifecycle_worker_enabled:
-        from .checkout_lifecycle import lifecycle_activation
-        lifecycle_activation(load_signed_public_artifact(settings), settings.runtime_environment + '-alpha')
+        from .checkout_lifecycle import worker_activation
+        worker_activation(load_signed_public_artifact(settings), settings.runtime_environment + '-alpha')
         if settings.network != 'testnet11':
             raise RuntimeError('automatic checkout lifecycle requires isolated testnet11')
     validate_server_hardening_at_startup(settings)

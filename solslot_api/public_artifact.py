@@ -115,6 +115,8 @@ def _verify_runtime_bindings(settings: Settings, payload: Mapping[str, Any]) -> 
         validate_inventory_activation(payload, environment=settings.runtime_environment + "-alpha")
         from .inventory_extension_claims import extension_activation
         extension_activation(payload, settings.runtime_environment + "-alpha", required=False)
+        from .base_lifecycle_claims import base_lifecycle_activation
+        base_lifecycle_activation(payload, settings.runtime_environment + '-alpha', required=False)
         from .inventory_payment_hold_claims import payment_hold_activation
         payment_hold_activation(payload, settings.runtime_environment + "-alpha", required=False)
         from .base_inventory_hold import base_hold_activation

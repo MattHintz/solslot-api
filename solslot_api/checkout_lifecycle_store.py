@@ -27,7 +27,13 @@ def migrate_lifecycle(db):
         );
         CREATE TABLE IF NOT EXISTS payment_checkout_backfill (id INTEGER PRIMARY KEY CHECK(id=1), cursor TEXT NOT NULL);
         INSERT OR IGNORE INTO payment_checkout_backfill VALUES (1,'');
+        CREATE TABLE IF NOT EXISTS payment_base_checkout_backfill (id INTEGER PRIMARY KEY CHECK(id=1), cursor TEXT NOT NULL);
+        INSERT OR IGNORE INTO payment_base_checkout_backfill VALUES (1,'');
         CREATE TRIGGER IF NOT EXISTS checkout_schedule_after_hold AFTER INSERT ON payment_checkout_holds BEGIN
+            INSERT OR IGNORE INTO payment_checkout_jobs(purchase_id,lane) VALUES (NEW.purchase_id,'renewal');
+            INSERT OR IGNORE INTO payment_checkout_jobs(purchase_id,lane) VALUES (NEW.purchase_id,'terminal');
+        END;
+        CREATE TRIGGER IF NOT EXISTS checkout_schedule_after_base_hold AFTER INSERT ON payment_base_inventory_holds BEGIN
             INSERT OR IGNORE INTO payment_checkout_jobs(purchase_id,lane) VALUES (NEW.purchase_id,'renewal');
             INSERT OR IGNORE INTO payment_checkout_jobs(purchase_id,lane) VALUES (NEW.purchase_id,'terminal');
         END;
@@ -49,6 +55,14 @@ class CheckoutLifecycleStoreMixin:
                         db.execute('INSERT OR IGNORE INTO payment_checkout_jobs(purchase_id,lane) VALUES (?,?)', (row['purchase_id'], lane))
             if rows:
                 db.execute('UPDATE payment_checkout_backfill SET cursor=? WHERE id=1', (rows[-1]['purchase_id'],))
+            cursor = db.execute('SELECT cursor FROM payment_base_checkout_backfill WHERE id=1').fetchone()[0]
+            rows = db.execute('SELECT purchase_id,state FROM payment_base_inventory_holds WHERE purchase_id>? ORDER BY purchase_id LIMIT 64', (cursor,)).fetchall()
+            for row in rows:
+                if row['state'] not in ('RETURNED', 'DELIVERED'):
+                    for lane in ('renewal','terminal'):
+                        db.execute('INSERT OR IGNORE INTO payment_checkout_jobs(purchase_id,lane) VALUES (?,?)', (row['purchase_id'],lane))
+            if rows:
+                db.execute('UPDATE payment_base_checkout_backfill SET cursor=? WHERE id=1', (rows[-1]['purchase_id'],))
             db.execute('COMMIT')
 
     def payment_start(self, purchase_id):
@@ -73,6 +87,12 @@ class CheckoutLifecycleStoreMixin:
                 if (hold['state'] != 'ARMED' or hold['payment_intent_id'] != claim.payment_intent_id
                         or bound['payment_method'] != claim.payment_method):
                     raise conflict('payment start changes a partial, terminal or different checkout')
+            base = db.execute('SELECT * FROM payment_base_inventory_holds WHERE purchase_id=?', (purchase_id,)).fetchone()
+            from .base_lifecycle_claims import BasePaymentStartClaim
+            if base or isinstance(claim, BasePaymentStartClaim):
+                if (base is None or not isinstance(claim, BasePaymentStartClaim) or base['state'] != 'ARMED'
+                        or base['receipt_json'] is None or base['claim_json'] != canonical(claim.hold.model_dump(mode='json'))):
+                    raise conflict('Base payment start changes its original complete checkout hold')
             old = db.execute('SELECT * FROM payment_start_observations WHERE purchase_id=?', (purchase_id,)).fetchone()
             encoded = canonical(claim.model_dump(mode='json'))
             if old and old['claim_json'] != encoded:

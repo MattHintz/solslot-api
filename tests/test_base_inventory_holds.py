@@ -290,7 +290,7 @@ async def test_atomic_base_hold_blocks_competing_payment_and_preserves_old_schem
         c.ledgers[1]._conn.execute("INSERT INTO voucher_issuance_signatures VALUES (?,?,?,?,?,?,?)",
             ('original','original exact bytes','global','series','launcher','original signature',1))
         before=tuple(c.ledgers[1]._conn.execute('SELECT * FROM voucher_issuance_signatures').fetchone())
-        c.ledgers[1]._conn.executescript('DROP TABLE base_inventory_holds; PRAGMA user_version=13;')
+        c.ledgers[1]._conn.executescript('DROP TABLE base_inventory_holds; DROP TABLE base_lifecycle_observations; DROP TABLE base_lifecycle_terminals; DROP TABLE base_inventory_hold_generations; PRAGMA user_version=13;')
         c.ledgers[1].close();c.ledgers[1]=ValidatorLedger(tmp_path/'extension-signer-1.db')
         assert tuple(c.ledgers[1]._conn.execute('SELECT * FROM voucher_issuance_signatures').fetchone())==before
         assert c.ledgers[1].healthcheck()

@@ -21,14 +21,15 @@ from .inventory_timeout_submission import canonical_time
 from .payment_purchase_store import PaymentPurchaseConflict
 from .validator_inventory_extension import require_timely_extension
 from .validator_quorum import collect_inventory_extension_quorum
+from .base_lifecycle_claims import BaseInventoryExtensionClaim, base_lifecycle_activation, parse_extension
 
 
 def hold_status(stored, operations, *, now):
     if not operations:
         return None
     first, latest = operations[0], operations[-1]
-    claim = InventoryExtensionClaim.model_validate(latest['claim'])
-    original = InventoryExtensionClaim.model_validate(first['claim'])
+    claim = parse_extension(latest['claim'])
+    original = parse_extension(first['claim'])
     expiry = claim.next_expires_at if latest['state'] == 'CONFIRMED' else claim.reservation_expires_at
     review = (latest.get('lastError') is not None or now >= expiry or (original.payment_method == 'us_bank_account'
         and now - original.payment_started_at >= ACH_REVIEW_SECONDS))
@@ -46,22 +47,33 @@ async def advance_extension(*, store, node, submitter, settings, presales, purch
                             payment, load_artifact, authorize, observe_only=False):
     """Exact claim before quorum, signed bytes before funding, funded bytes before push."""
     artifact = load_artifact()
-    active = extension_activation(artifact, settings.runtime_environment + '-alpha')
+    stored = store.get(purchase_id)
+    base = stored.rail in ('base_usdc', 'evm_usdc')
+    activation = base_lifecycle_activation if base else extension_activation
+    active = activation(artifact, settings.runtime_environment + '-alpha')
     if settings.network != 'testnet11':
         raise PaymentPurchaseConflict('extension requires the isolated testnet11 deployment')
-    stored = store.get(purchase_id)
     position = current_position(stored, store.inventory_items(purchase_id), artifact)
     operations = store.inventory_extension_operations(purchase_id)
     pending = store.pending_inventory_extension(purchase_id)
     # The first independently verified processing/success event is immutable across renewals.
     if operations:
-        anchor = InventoryExtensionClaim.model_validate(operations[0]['claim'])
-        if payment['payment_intent_id'] != anchor.payment_intent_id or payment['payment_method'] != anchor.payment_method:
-            raise PaymentPurchaseConflict('payment hold cannot be reassigned to another intent or method')
-        payment = {key: getattr(anchor, key) for key in ('payment_intent_id', 'payment_event_id', 'payment_started_at', 'payment_method')}
+        anchor = parse_extension(operations[0]['claim'])
+        if base:
+            from .escrow_deposit import same_deposit_message
+            if payment['hold'] != anchor.hold.model_dump(mode='json') or not same_deposit_message(anchor.payment_evidence, payment['payment_evidence']):
+                raise PaymentPurchaseConflict('Base extension cannot replace its original hold or deposit')
+            payment = anchor.payment()
+        else:
+            if payment['payment_intent_id'] != anchor.payment_intent_id or payment['payment_method'] != anchor.payment_method:
+                raise PaymentPurchaseConflict('payment hold cannot be reassigned to another intent or method')
+            payment = {key: getattr(anchor, key) for key in ('payment_intent_id', 'payment_event_id', 'payment_started_at', 'payment_method')}
     if pending:
-        claim = InventoryExtensionClaim.model_validate(pending['claim'])
-        if claim.activation != active or claim.genesis_artifact_hash != artifact['artifactHash']:
+        claim = parse_extension(pending['claim'])
+        if base:
+            from .base_lifecycle_claims import validate_base_start
+            validate_base_start(claim, artifact, settings.runtime_environment+'-alpha')
+        elif claim.activation != active or claim.genesis_artifact_hash != artifact['artifactHash']:
             raise PaymentPurchaseConflict('pending extension requires its original reviewed release')
         if pending['protocol'] is not None:
             evidence = await observe_extension(node, position, claim, pending)
@@ -80,7 +92,8 @@ async def advance_extension(*, store, node, submitter, settings, presales, purch
         transition = build_inventory_extension_spend(reserved_coin=position.coin,
             deed_singleton_struct=position.struct, lineage_proof=lineage_proof_for_coinsol(position.creation_spend),
             reservation=position.reservation, next_expires_at=next_expiry, signer_indices=(0, 1), terms=position.terms)
-        claim = InventoryExtensionClaim(network='testnet11', genesis_artifact_hash=artifact['artifactHash'], activation=active,
+        cls = BaseInventoryExtensionClaim if base else InventoryExtensionClaim
+        claim = cls(network='testnet11', genesis_artifact_hash=artifact['artifactHash'], activation=active,
             purchase_artifact=stored.purchase_artifact, smart_deed_inner_hash=hx(position.terms.smart_deed_inner_hash),
             reserved_coin_id=hx(position.coin.name()), reserved_puzzle_hash=hx(position.coin.puzzle_hash),
             reservation_expires_at=position.reservation.expires_at, next_expires_at=next_expiry,
@@ -92,8 +105,11 @@ async def advance_extension(*, store, node, submitter, settings, presales, purch
     async def preflight():
         authorize()
         fresh = load_artifact()
-        if extension_activation(fresh, settings.runtime_environment + '-alpha') != active or fresh['artifactHash'] != artifact['artifactHash']:
+        if activation(fresh, settings.runtime_environment + '-alpha') != active or fresh['artifactHash'] != artifact['artifactHash']:
             raise PaymentPurchaseConflict('extension release changed before dispatch')
+        if base:
+            from .purchase_admission import recheck_admitted_owner
+            recheck_admitted_owner(store, purchase_id)
         require_timely_extension(claim, int(time.time()))
         if store.get(purchase_id) != stored:
             raise PaymentPurchaseConflict('purchase changed before extension dispatch')
@@ -111,7 +127,7 @@ async def advance_extension(*, store, node, submitter, settings, presales, purch
             payment=payment, load_artifact=load_artifact)
     owner = uuid.uuid4().hex
     retained = store.claim_inventory_extension(purchase_id, claim=claim.model_dump(mode='json'),
-        binding=dict(artifactHash=artifact['artifactHash'], activation=active), owner=owner,
+        binding=dict(artifactHash=claim.genesis_artifact_hash, activation=claim.activation), owner=owner,
         now=int(time.time()), expected_snapshot=stored)
     receipt = None
     try:

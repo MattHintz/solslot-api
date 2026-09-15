@@ -78,6 +78,13 @@ class InventoryExtensionStoreMixin:
                 if (held['state']!='ARMED' or hold['payment_intent_id']!=claim['payment_intent_id']
                         or hold['payment_method']!=claim['payment_method']):
                     raise conflict('extension cannot replace a partial, canceled or different checkout payment')
+            base = db.execute('SELECT * FROM payment_base_inventory_holds WHERE purchase_id=?', (purchase_id,)).fetchone()
+            if base or claim.get('schema_version') == 'solslot.base-inventory-extension.v1':
+                from .base_lifecycle_claims import BaseInventoryExtensionClaim
+                parsed = BaseInventoryExtensionClaim.model_validate(claim)
+                if (base is None or base['state'] != 'ARMED' or base['receipt_json'] is None
+                        or base['claim_json'] != canonical(parsed.hold.model_dump(mode='json'))):
+                    raise conflict('Base extension needs its original complete checkout hold')
             if len(expected_snapshot.inventory_extension_receipts) >= 128:
                 raise conflict('extension history requires review; inventory remains held')
             if db.execute('SELECT 1 FROM payment_inventory_timeouts WHERE purchase_id=?', (purchase_id,)).fetchone():

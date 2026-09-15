@@ -345,7 +345,7 @@ async def test_v11_migration_preserves_prior_authorizations_and_absent_capabilit
     try:
         sibling(c.ledgers[0],c,'issuance')
         before=c.ledgers[0]._conn.execute('SELECT * FROM voucher_issuance_signatures').fetchall()
-        c.ledgers[0]._conn.executescript('DROP TABLE inventory_payment_holds; DROP TABLE base_inventory_holds; PRAGMA user_version=11;')
+        c.ledgers[0]._conn.executescript('DROP TABLE inventory_payment_holds; DROP TABLE base_inventory_holds; DROP TABLE base_lifecycle_observations; DROP TABLE base_lifecycle_terminals; DROP TABLE base_inventory_hold_generations; PRAGMA user_version=11;')
         c.ledgers[0].close();c.ledgers[0]=ValidatorLedger(tmp_path/'extension-signer-0.db')
         assert [tuple(r) for r in before]==[tuple(r) for r in c.ledgers[0]._conn.execute('SELECT * FROM voucher_issuance_signatures')]
         assert c.ledgers[0].healthcheck()

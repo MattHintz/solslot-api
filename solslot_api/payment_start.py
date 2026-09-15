@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .inventory_extension_claims import extension_activation
 from .inventory_extension_store import canonical, conflict
 from .inventory_recovery import hx
+from .base_lifecycle_claims import BasePaymentStartClaim, BaseTerminalClaim, base_lifecycle_activation, validate_base_start
 
 
 class PaymentStartClaim(BaseModel):
@@ -50,7 +51,13 @@ def validate_start(claim, artifact, environment):
 
 
 def verify_start_receipt(claim, receipt, artifact):
-    validate_start(claim, artifact, claim.activation['environment'])
+    if isinstance(claim, BaseTerminalClaim):
+        from .validator_base_terminal import terminal_context
+        terminal_context(claim, artifact, claim.activation['environment'])
+    elif isinstance(claim, BasePaymentStartClaim):
+        validate_base_start(claim, artifact, claim.activation['environment'])
+    else:
+        validate_start(claim, artifact, claim.activation['environment'])
     try:
         indices = receipt['signerIndices']
         if (set(receipt) != {'claimHash', 'signerIndices', 'signature'} or receipt['claimHash'] != claim.canonical_hash()
@@ -88,22 +95,32 @@ async def collect_payment_start_quorum(settings, claim, *, client=None):
     from .validator_quorum import _collect_inventory_quorum, configured_validator_pubkeys, ValidatorQuorumError
     if settings.zkpassport_validator_threshold != 2 or len(configured_validator_pubkeys(settings)) != 3:
         raise ValidatorQuorumError('payment observation requires the reviewed two-of-three quorum')
-    return await _collect_inventory_quorum(settings, claim, '/v1/payment-start/observe', client=client)
+    path = '/v1/base-payment-start/observe' if isinstance(claim, BasePaymentStartClaim) else '/v1/payment-start/observe'
+    return await _collect_inventory_quorum(settings, claim, path, client=client)
 
 
 async def adopt_payment_start(*, store, settings, purchase_id, payment, load_artifact):
     """Reject bad candidates before they can pin the immutable extension journal."""
     artifact = load_artifact()
     stored = store.get(purchase_id)
-    claim = PaymentStartClaim(network=settings.network, genesis_artifact_hash=artifact['artifactHash'],
-        activation=extension_activation(artifact, settings.runtime_environment + '-alpha'),
+    base = stored.rail in ('base_usdc', 'evm_usdc')
+    cls = BasePaymentStartClaim if base else PaymentStartClaim
+    activation = base_lifecycle_activation if base else extension_activation
+    claim = cls(network=settings.network, genesis_artifact_hash=artifact['artifactHash'],
+        activation=activation(artifact, settings.runtime_environment + '-alpha'),
         purchase_artifact=stored.purchase_artifact, **payment)
-    validate_start(claim, artifact, settings.runtime_environment + '-alpha')
+    (validate_base_start if base else validate_start)(claim, artifact, settings.runtime_environment + '-alpha')
     old = store.payment_start(purchase_id)
     if old:
-        retained = PaymentStartClaim.model_validate(old['claim'])
+        retained = cls.model_validate(old['claim'])
         verify_start_receipt(retained, old['receipt'], artifact)
-        if retained != claim:
+        if base:
+            from .escrow_deposit import same_deposit_message
+            equal = (retained.hold == claim.hold and retained.purchase_artifact == claim.purchase_artifact and retained.network == claim.network
+                and same_deposit_message(retained.payment_evidence, claim.payment_evidence))
+        else:
+            equal = retained == claim
+        if not equal:
             raise conflict('the independently verified payment start cannot be replaced')
         return retained.payment()
     quorum = await collect_payment_start_quorum(settings, claim)

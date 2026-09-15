@@ -13,8 +13,20 @@ from tests.test_single_external_delivery_context import hx
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('problem',['legitimate','forged_owner','missing_owner','batch','long_quote','unauthenticated'])
-async def test_quote_admission_precedes_construction_and_ignores_wallet_aliases(tmp_path,monkeypatch,problem):
-    c=await coordinator(tmp_path,monkeypatch)
+@pytest.mark.parametrize('rail',['stripe','base_usdc','evm_usdc'])
+async def test_quote_admission_precedes_construction_and_ignores_wallet_aliases(tmp_path,monkeypatch,problem,rail):
+    if rail == 'stripe':
+        c=await coordinator(tmp_path,monkeypatch)
+    else:
+        from tests.test_base_lifecycle import lifecycle_case
+        from tests.test_purchase_admission import receipt as admission_receipt
+        c=await lifecycle_case(tmp_path,monkeypatch,fresh=True,rail=rail)
+        c.admission_receipt={**admission_receipt(),'vaultLauncherId':hx(c.purchase.vault_launcher_id)}
+        from solslot_api import state
+        monkeypatch.setattr(state,'get_registry',lambda:SimpleNamespace(get=lambda _:SimpleNamespace(auth_type=1,owner_pubkey=bytes(c.keys[0].get_g1()))))
+        # Admission is the boundary under test; the separate reviewed
+        # omnichain deployment gate has its own suite and stays closed live.
+        monkeypatch.setattr(artifacts,'load_omnichain_evidence',lambda *a,**kw:None)
     class ReachedConstruction(Exception):pass
     try:
         with c.purchases._connect() as db:db.execute('DELETE FROM payment_purchase_admission')
@@ -27,10 +39,11 @@ async def test_quote_admission_precedes_construction_and_ignores_wallet_aliases(
         def build(*a,**kw):calls.append('construction');raise ReachedConstruction()
         monkeypatch.setattr(artifacts,'_build_canonical_payment_artifact',build)
         body=dict(protocol_version='solslot-v2',network='testnet11',genesis_artifact_hash=c.genesis['artifactHash'],
-            instance_id='staging-alpha',purchase_intent_id='new-quote',rail='stripe',property_id='fixture-property',
+            instance_id='staging-alpha',purchase_intent_id='new-quote',rail=rail,property_id='fixture-property',
             collection_id='fixture-collection',vault_launcher_id=hx(c.purchase.vault_launcher_id),
             current_vault_coin_id='0x'+'a'*64,identity_attest_root='0x'+'b'*64,expires_at=c.clock[0]+900,
             payment_terms=dict(currency='USD',quantity=1),checkout_owner_auth_type=1,checkout_owner_key=hx(c.keys[0].get_g1()))
+        if rail != 'stripe':body['payment_terms']['chain_id']=84532
         if problem=='forged_owner':body['checkout_owner_key']=hx(c.keys[1].get_g1())
         elif problem=='missing_owner':body.pop('checkout_owner_key')
         elif problem=='batch':body['payment_terms']['quantity']=100
@@ -54,8 +67,18 @@ async def test_quote_admission_precedes_construction_and_ignores_wallet_aliases(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('admitted',[False,True])
-async def test_reservation_pins_admission_before_first_private_request(tmp_path,monkeypatch,admitted):
-    c=await coordinator(tmp_path,monkeypatch)
+@pytest.mark.parametrize('rail',['stripe','base_usdc','evm_usdc'])
+async def test_reservation_pins_admission_before_first_private_request(tmp_path,monkeypatch,admitted,rail):
+    if rail == 'stripe':
+        c=await coordinator(tmp_path,monkeypatch)
+    else:
+        from tests.test_base_lifecycle import lifecycle_case
+        from tests.test_purchase_admission import receipt as admission_receipt
+        c=await lifecycle_case(tmp_path,monkeypatch,fresh=True,rail=rail)
+        c.admission_receipt={**admission_receipt(),'vaultLauncherId':hx(c.purchase.vault_launcher_id)}
+        from solslot_api import state
+        monkeypatch.setattr(state,'get_registry',lambda:SimpleNamespace(get=lambda _:SimpleNamespace(auth_type=1,owner_pubkey=bytes(c.keys[0].get_g1()))))
+        monkeypatch.setattr(native_purchases,'get_payment_purchase_store',lambda _:c.purchases)
     try:
         with c.purchases._connect() as db:
             db.execute("UPDATE payment_purchases SET inventory_state='UNRESERVED'")
