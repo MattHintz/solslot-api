@@ -261,3 +261,29 @@ async def test_relayer_retry_with_more_confirmations_preserves_first_receipt(tmp
     newer['source']['blockHash']='0x'+'ff'*32
     from solslot_api.payment_purchase_store import PaymentPurchaseConflict
     with pytest.raises(PaymentPurchaseConflict):c.store.bind_external_message(c.raw['purchaseId'],newer)
+
+
+@pytest.mark.asyncio
+async def test_completed_worker_waits_for_short_writer_contention_without_recycling_lease(tmp_path,monkeypatch):
+    c=callback_case(tmp_path,monkeypatch);started=threading.Event();release=threading.Event()
+    def proof():
+        started.set()
+        assert release.wait(3)
+        return 'verified'
+    task=asyncio.create_task(work.run_deposit_verification(c.settings.payment_purchase_db_path,c.raw['purchaseId'],proof))
+    db=sqlite3.connect(c.settings.payment_purchase_db_path,isolation_level=None)
+    try:
+        await spin_until(started.is_set)
+        db.execute('BEGIN IMMEDIATE')
+        release.set()
+        # Admission stays fail-fast, but worker completion can tolerate a short
+        # concurrent SQLite writer without abandoning its successful-proof lease.
+        await asyncio.sleep(.2)
+        assert not task.done()
+        db.execute('ROLLBACK')
+        assert await asyncio.wait_for(task,2)=='verified'
+        assert _lease_finished(c)
+    finally:
+        if db.in_transaction:db.execute('ROLLBACK')
+        db.close();release.set()
+        await asyncio.gather(task,return_exceptions=True)

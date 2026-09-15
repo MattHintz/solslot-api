@@ -20,6 +20,7 @@ MAX_WORKERS = 4
 RESPONSE_DEADLINE_SECONDS = 15.0
 LEASE_SECONDS = 120
 FAILURE_COOLDOWN_SECONDS = 5
+WORKER_CLEANUP_BUSY_TIMEOUT_SECONDS = 1.0
 _executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="escrow-proof")
 _slots = threading.BoundedSemaphore(MAX_WORKERS)
 
@@ -37,10 +38,10 @@ def migrate_escrow_verifications(db):
         ON payment_escrow_verification_leases(lease_until)""")
 
 
-def _connect(path):
+def _connect(path, *, busy_timeout_seconds=0.05):
     # Do not allow a contended lease table to stall the event loop. Never hold
     # a database transaction across provider I/O or sleep while holding a lock.
-    db = sqlite3.connect(path, timeout=0.05, isolation_level=None)
+    db = sqlite3.connect(path, timeout=busy_timeout_seconds, isolation_level=None)
     db.execute("PRAGMA foreign_keys=ON")
     return db
 
@@ -67,8 +68,8 @@ def acquire(path, purchase_id, owner, *, now):
         db.close()
 
 
-def finish(path, purchase_id, owner, *, now, succeeded):
-    db = _connect(path)
+def finish(path, purchase_id, owner, *, now, succeeded, busy_timeout_seconds=0.05):
+    db = _connect(path, busy_timeout_seconds=busy_timeout_seconds)
     try:
         db.execute("""UPDATE payment_escrow_verification_leases
             SET owner=NULL,lease_until=0,retry_after=? WHERE purchase_id=? AND owner=?""",
@@ -99,7 +100,11 @@ async def run_deposit_verification(path, purchase_id, verifier):
             return result
         finally:
             try:
-                finish(path, purchase_id, owner, now=time.time(), succeeded=succeeded)
+                # Cleanup runs in the bounded worker, not the event loop. Give
+                # simultaneous completions a bounded opportunity to acquire the
+                # writer lock; admission and pre-submit failures remain fast.
+                finish(path, purchase_id, owner, now=time.time(), succeeded=succeeded,
+                       busy_timeout_seconds=WORKER_CLEANUP_BUSY_TIMEOUT_SECONDS)
             finally:
                 _slots.release()
 
