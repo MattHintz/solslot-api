@@ -161,3 +161,9 @@ def _admin_state_reset():
         reset_collection_store_for_tests()
     except ImportError:
         pass
+
+    # Monkeypatch rollback and cache resets have now dropped cyclic test helpers.
+    # Finalize their thread-affine CLVM nodes here, on the creating test thread,
+    # before a later Base/escrow RPC worker triggers process-wide cyclic GC.
+    # Keep ordinary GC and strict unraisable warnings enabled.
+    gc.collect()
