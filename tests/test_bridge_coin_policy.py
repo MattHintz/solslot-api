@@ -189,3 +189,54 @@ def test_ineligible_bls_record_cannot_issue_a_new_relay_challenge(monkeypatch):
     with pytest.raises(HTTPException) as error:
         enrollments.create_bls_relay_challenge(VAULT_A, enrollments.RelayChallengeRequest(data="0x12345678"), _request())
     assert error.value.status_code == 409
+
+
+@pytest.mark.parametrize("entry", ["context", "request", "imported-helper"])
+def test_client_portal_finalizes_prior_program_cycles_on_owner_thread(monkeypatch, tmp_path, entry):
+    """An imported helper must preserve the same thread boundary as direct clients."""
+    import gc
+    import threading
+    import weakref
+    from chia.types.blockchain_format.program import Program
+    from fastapi import FastAPI
+    from starlette.testclient import TestClient
+
+    class Cycle:
+        pass
+
+    owner = threading.get_ident()
+    finalized = []
+    gc.collect()
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        cycle = Cycle()
+        cycle.program = Program.from_bytes(b"\xff\x01\x80")
+        cycle.self = cycle
+        reference = weakref.ref(cycle)
+        weakref.finalize(cycle, lambda: finalized.append(threading.get_ident()))
+        del cycle
+        if entry == "imported-helper":
+            client = _client(monkeypatch, tmp_path)
+        else:
+            test_app = FastAPI()
+            @test_app.get('/thread')
+            async def thread():
+                return {'id': threading.get_ident()}
+            client = TestClient(test_app)
+        if entry == "request":
+            try:
+                response = client.get('/thread')
+                assert response.status_code == 200 and response.json()['id'] != owner
+            finally:
+                client.close()
+        else:
+            with client:
+                assert client.portal is not None
+        assert reference() is None
+        assert finalized == [owner]
+    finally:
+        # Even a failed regression cleans up on its owning test thread.
+        gc.collect()
+        if was_enabled:
+            gc.enable()

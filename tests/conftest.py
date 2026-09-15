@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import gc
 import os
+from contextlib import contextmanager
+from functools import wraps
 
 import pytest
 from starlette.testclient import TestClient
@@ -71,8 +73,38 @@ os.environ["SOLSLOT_CORS_ORIGINS"] = "http://localhost:4200,http://localhost:517
 os.environ["SOLSLOT_ADMIN_OPERATION_APPROVALS_ENABLED"] = "false"
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _collect_before_test_client_portals():
+    """Finalize prior test-thread CLVM cycles before any client starts a portal.
+
+    A module-import heuristic misses helpers imported from other test modules.
+    Cover both lifespan clients and requests made without a context manager;
+    retain strict unraisable warnings so actual foreign-thread leaks still fail.
+    """
+    original_enter = TestClient.__enter__
+    original_portal = TestClient._portal_factory
+
+    @wraps(original_enter)
+    def enter(client):
+        gc.collect()
+        return original_enter(client)
+
+    @contextmanager
+    @wraps(original_portal)
+    def portal(client):
+        if client.portal is None:
+            gc.collect()
+        with original_portal(client) as active:
+            yield active
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(TestClient, "__enter__", enter)
+        patch.setattr(TestClient, "_portal_factory", portal)
+        yield
+
+
 @pytest.fixture(autouse=True)
-def _admin_state_reset(request):
+def _admin_state_reset():
     """Clear cached state between tests so per-test env changes
     actually re-flow through ``get_settings``.
 
@@ -107,12 +139,6 @@ def _admin_state_reset(request):
         reset_collection_store_for_tests()
     except ImportError:
         pass
-    if TestClient in vars(request.module).values():
-        # Finalize request/task cycles on pytest's owning thread before another
-        # Starlette portal thread starts. This makes chia_rs thread-affinity
-        # leaks deterministic without penalizing pure unit-test modules.
-        gc.collect()
-
     yield
 
     try:
