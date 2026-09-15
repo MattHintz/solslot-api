@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import sqlite3
 import time
@@ -2826,6 +2827,7 @@ async def test_worker_advances_stripe_redemption_from_the_shared_queue(
     }
 
     class QueueOnlyStore:
+        campaign_funding_guard = asyncio.Lock()
         def claim_voucher_work(self, lane, owner, now, excluded_series=None):
             if lane == "stripe_redemption":
                 return dict(lane=lane, owner=owner, termsHash=series['termsHash'], serial=voucher['serial'])
@@ -2887,6 +2889,7 @@ async def test_worker_never_replaces_an_exact_stripe_redemption_after_deadline(
     }
 
     class QueueOnlyStore:
+        campaign_funding_guard = asyncio.Lock()
         def claim_voucher_work(self, lane, owner, now, excluded_series=None):
             if lane == "stripe_redemption":
                 return dict(lane=lane, owner=owner, termsHash=series['termsHash'], serial=voucher['serial'])

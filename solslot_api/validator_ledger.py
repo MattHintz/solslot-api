@@ -15,7 +15,7 @@ from .inventory_payment_hold_ledger import InventoryPaymentHoldLedgerMixin, migr
 from .base_inventory_hold_ledger import BaseInventoryHoldLedgerMixin, migrate_base_holds
 from .base_lifecycle_ledger import BaseLifecycleLedgerMixin, migrate_base_lifecycle
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 
 class ValidatorLedgerConflict(RuntimeError):
@@ -268,6 +268,43 @@ class ValidatorLedger(BaseLifecycleLedgerMixin, BaseInventoryHoldLedgerMixin, In
                 migrate_base_holds(self._conn)
             if version < 15:
                 migrate_base_lifecycle(self._conn)
+            if version < 16:
+                self._conn.executescript('''BEGIN IMMEDIATE;
+                    CREATE TABLE voucher_series_phase_retry_signatures (
+                      sequence INTEGER PRIMARY KEY, predecessor_claim_hash TEXT NOT NULL,
+                      claim_hash TEXT NOT NULL UNIQUE, canonical_claim TEXT NOT NULL,
+                      series_coin_id TEXT NOT NULL, transition INTEGER NOT NULL,
+                      signature TEXT NOT NULL, signed_at INTEGER NOT NULL);
+                    CREATE INDEX idx_phase_retry_coin ON voucher_series_phase_retry_signatures(series_coin_id,sequence);
+                    CREATE TABLE voucher_phase_expiry_observations (
+                      claim_hash TEXT PRIMARY KEY, proof_json TEXT NOT NULL, observed_at INTEGER NOT NULL);
+                    PRAGMA user_version=16; COMMIT;''')
+
+    def phase_for_coin(self, series_coin_id):
+        with self._lock:
+            row = self._conn.execute('SELECT * FROM voucher_series_phase_retry_signatures WHERE series_coin_id=? ORDER BY sequence DESC LIMIT 1', (series_coin_id,)).fetchone()
+            if row is None:
+                row = self._conn.execute('SELECT * FROM voucher_series_phase_signatures WHERE series_coin_id=?', (series_coin_id,)).fetchone()
+            return dict(row) if row else None
+
+    def _assert_series_coin_available(self, series_coin_id, kind, expired_phase_claim_hash=None):
+        # All signature domains share the singleton exclusion. Expired launch
+        # authorization is usable only with this signer's independent proof;
+        # its immutable signature remains in the original/history table.
+        for other, table in (('issuance', 'voucher_issuance_signatures'), ('terminal', 'voucher_transition_signatures')):
+            if other != kind and self._conn.execute(f'SELECT 1 FROM {table} WHERE series_coin_id=?', (series_coin_id,)).fetchone():
+                raise ValidatorLedgerConflict('Series coin already has another voucher authorization.')
+        phase = self.phase_for_coin(series_coin_id)
+        if phase is not None:
+            if (phase['claim_hash'] != expired_phase_claim_hash or not self._conn.execute(
+                    'SELECT 1 FROM voucher_phase_expiry_observations WHERE claim_hash=?', (expired_phase_claim_hash,)).fetchone()):
+                raise ValidatorLedgerConflict('Series coin was already authorized for an unexpired phase transition.')
+
+    def retain_phase_expiry(self, claim_hash, proof):
+        import json
+        with self._lock:
+            self._conn.execute('INSERT OR IGNORE INTO voucher_phase_expiry_observations VALUES (?,?,?)',
+                (claim_hash, json.dumps(proof, sort_keys=True, separators=(',', ':')), int(time.time())))
 
     def _assert_no_extension_signature(self, coin_id: str | None) -> None:
         # Called under the same BEGIN IMMEDIATE transaction as terminal writes.
@@ -688,6 +725,7 @@ class ValidatorLedger(BaseLifecycleLedgerMixin, BaseInventoryHoldLedgerMixin, In
         signature: str,
         purchase_id: str | None = None,
         payment_intent_id: str | None = None,
+        expired_phase_claim_hash: str | None = None,
     ) -> str:
         """Record one series transition or recover an exact retry."""
         with self._lock:
@@ -709,6 +747,7 @@ class ValidatorLedger(BaseLifecycleLedgerMixin, BaseInventoryHoldLedgerMixin, In
                         )
                     self._conn.execute("COMMIT")
                     return str(existing["signature"])
+                self._assert_series_coin_available(series_coin_id, 'issuance', expired_phase_claim_hash)
                 self._conn.execute(
                     """
                     INSERT INTO voucher_issuance_signatures(
@@ -832,6 +871,7 @@ class ValidatorLedger(BaseLifecycleLedgerMixin, BaseInventoryHoldLedgerMixin, In
         purchase_id: str | None = None,
         payment_intent_id: str | None = None,
         deed_coin_id: str | None = None,
+        expired_phase_claim_hash: str | None = None,
     ) -> str:
         """Record one terminal voucher transition or recover an exact retry."""
         with self._lock:
@@ -854,6 +894,7 @@ class ValidatorLedger(BaseLifecycleLedgerMixin, BaseInventoryHoldLedgerMixin, In
                         )
                     self._conn.execute("COMMIT")
                     return str(existing["signature"])
+                self._assert_series_coin_available(series_coin_id, 'terminal', expired_phase_claim_hash)
                 self._conn.execute(
                     """
                     INSERT INTO voucher_transition_signatures(
@@ -885,6 +926,19 @@ class ValidatorLedger(BaseLifecycleLedgerMixin, BaseInventoryHoldLedgerMixin, In
                 self._conn.execute("ROLLBACK")
                 raise
 
+    def recover_voucher_series_phase(self, claim_hash: str, canonical_claim: str) -> str | None:
+        """Read only the signature for exactly the original evidence."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT canonical_claim,signature FROM voucher_series_phase_signatures WHERE claim_hash=? UNION ALL SELECT canonical_claim,signature FROM voucher_series_phase_retry_signatures WHERE claim_hash=?",
+                (claim_hash, claim_hash),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["canonical_claim"] != canonical_claim:
+                raise ValidatorLedgerConflict("Series phase claim hash collides with different evidence.")
+            return str(row["signature"])
+
     def record_voucher_series_phase_or_recover(
         self,
         *,
@@ -893,6 +947,7 @@ class ValidatorLedger(BaseLifecycleLedgerMixin, BaseInventoryHoldLedgerMixin, In
         series_coin_id: str,
         transition: int,
         signature: str,
+        expired_phase_claim_hash: str | None = None,
     ) -> str:
         """Record one phase advance or recover an exact idempotent retry."""
         with self._lock:
@@ -901,10 +956,10 @@ class ValidatorLedger(BaseLifecycleLedgerMixin, BaseInventoryHoldLedgerMixin, In
                 existing = self._conn.execute(
                     """
                     SELECT canonical_claim, signature
-                    FROM voucher_series_phase_signatures
-                    WHERE claim_hash = ?
+                    FROM voucher_series_phase_signatures WHERE claim_hash = ?
+                    UNION ALL SELECT canonical_claim, signature FROM voucher_series_phase_retry_signatures WHERE claim_hash = ?
                     """,
-                    (claim_hash,),
+                    (claim_hash, claim_hash),
                 ).fetchone()
                 if existing is not None:
                     if existing["canonical_claim"] != canonical_claim:
@@ -913,6 +968,14 @@ class ValidatorLedger(BaseLifecycleLedgerMixin, BaseInventoryHoldLedgerMixin, In
                         )
                     self._conn.execute("COMMIT")
                     return str(existing["signature"])
+                self._assert_series_coin_available(series_coin_id, 'phase', expired_phase_claim_hash)
+                previous = self.phase_for_coin(series_coin_id)
+                if previous is not None:
+                    self._conn.execute('''INSERT INTO voucher_series_phase_retry_signatures(
+                        predecessor_claim_hash,claim_hash,canonical_claim,series_coin_id,transition,signature,signed_at)
+                        VALUES (?,?,?,?,?,?,?)''', (previous['claim_hash'], claim_hash, canonical_claim, series_coin_id, transition, signature, int(time.time())))
+                    self._conn.execute('COMMIT')
+                    return signature
                 self._conn.execute(
                     """
                     INSERT INTO voucher_series_phase_signatures(

@@ -36,11 +36,13 @@ from solslot_puzzles.base_voucher_v5 import (
     prepare_base_voucher_redemption_offer_v5, build_base_voucher_primary_offer_v5,
 )
 from solslot_puzzles import load_puzzle
+from .voucher_refund_authorization import (
+    build_vault_refund_spend, UNSUPPORTED_OWNER,
+)
 from solslot_puzzles.vault_driver import (
     AUTH_TYPE_BLS,
     AUTH_TYPE_SECP256K1,
     DEFAULT_IDENTITY_ATTEST_ROOT,
-    build_vault_receive_spend,
     compact_signature_from_evm,
     eip712_typed_data_for_vault_spend,
     one_leaf_merkle_root,
@@ -2469,6 +2471,7 @@ def sign_voucher_issuance_claim(
     claim_hash: str,
 ) -> str:
     verify_voucher_issuance_claim(settings, claim, claim_hash)
+    expired_phase = _expired_phase_authorization(settings, ledger, claim.series_coin_id)
     _retain_verified_base_hold_payment(settings, ledger, claim)
     signature = "0x" + bytes(
         AugSchemeMPL.sign(
@@ -2487,6 +2490,7 @@ def sign_voucher_issuance_claim(
             signature=signature,
             purchase_id=purchase_id,
             payment_intent_id=payment_intent_id,
+            expired_phase_claim_hash=expired_phase,
         )
     except ValidatorLedgerConflict as exc:
         raise ValidatorEvidenceError(str(exc)) from exc
@@ -2599,11 +2603,11 @@ def _verify_governed_deed_launchers(
             )
 
 
-def verify_voucher_series_phase_claim(
+def _verify_voucher_series_phase_trust(
     settings: ValidatorSettings,
     claim: VoucherSeriesPhaseClaim,
     claim_hash: str,
-) -> None:
+) -> tuple:
     if claim.canonical_hash() != claim_hash.lower():
         raise ValidatorEvidenceError(
             "series phase claim hash does not match canonical evidence"
@@ -2639,6 +2643,15 @@ def verify_voucher_series_phase_claim(
         != "0x" + bytes(terms.trusted_protocol_treasury).hex()
     ):
         raise ValidatorEvidenceError("series phase trust coordinates changed")
+    return artifact, terms, state, transition
+
+
+def verify_voucher_series_phase_claim(
+    settings: ValidatorSettings,
+    claim: VoucherSeriesPhaseClaim,
+    claim_hash: str,
+) -> None:
+    artifact, terms, state, transition = _verify_voucher_series_phase_trust(settings, claim, claim_hash)
     if transition == SeriesTransition.LAUNCH:
         if abs(int(time.time()) - claim.launch_anchor) > 90:
             raise ValidatorEvidenceError("series launch anchor is stale")
@@ -2675,7 +2688,24 @@ def sign_voucher_series_phase_claim(
     claim: VoucherSeriesPhaseClaim,
     claim_hash: str,
 ) -> str:
+    # A previously signed exact claim remains recoverable after its freshness
+    # window or coin changes. Trust and signature integrity are still mandatory;
+    # only new signatures require current unspent and freshness evidence.
+    _verify_voucher_series_phase_trust(settings, claim, claim_hash)
+    try:
+        recovered = ledger.recover_voucher_series_phase(
+            claim_hash.lower(), canonical_voucher_series_phase_claim_json(claim)
+        )
+        if recovered is not None:
+            pubkey = G1Element.from_bytes(bytes.fromhex(settings.roster_pubkeys[settings.signer_index].removeprefix("0x")))
+            signature = G2Element.from_bytes(bytes.fromhex(recovered.removeprefix("0x")))
+            if not AugSchemeMPL.verify(pubkey, claim.signature_message(), signature):
+                raise ValueError("original signature does not match the active signer")
+            return recovered
+    except (ValidatorLedgerConflict, ValueError) as exc:
+        raise ValidatorEvidenceError("series phase signature recovery failed: " + str(exc)) from exc
     verify_voucher_series_phase_claim(settings, claim, claim_hash)
+    expired_phase = _expired_phase_authorization(settings, ledger, claim.series_coin_id)
     signature = "0x" + bytes(
         AugSchemeMPL.sign(
             load_validator_private_key(settings),
@@ -2689,9 +2719,36 @@ def sign_voucher_series_phase_claim(
             series_coin_id=claim.series_coin_id,
             transition=claim.transition,
             signature=signature,
+            expired_phase_claim_hash=expired_phase,
         )
     except ValidatorLedgerConflict as exc:
         raise ValidatorEvidenceError(str(exc)) from exc
+
+
+def _expired_phase_authorization(settings, ledger, series_coin_id):
+    """A different signature domain may reuse only a provably expired launch."""
+    prior = ledger.phase_for_coin(series_coin_id)
+    if prior is None:
+        return None
+    try:
+        from .campaign_expiry import launch_deadline, independently_prove_expiry
+        old = VoucherSeriesPhaseClaim.model_validate(json.loads(prior['canonical_claim']))
+        _verify_voucher_series_phase_trust(settings, old, prior['claim_hash'])
+        pubkey = G1Element.from_bytes(bytes.fromhex(settings.roster_pubkeys[settings.signer_index].removeprefix('0x')))
+        signature = G2Element.from_bytes(bytes.fromhex(prior['signature'].removeprefix('0x')))
+        if old.series_coin_id != series_coin_id or not AugSchemeMPL.verify(pubkey, old.signature_message(), signature):
+            raise ValueError('Original phase signature does not bind this input and signer')
+        coin, lineage = _confirmed_coin_and_lineage(settings, series_coin_id, 'original phase input')
+        deadline = launch_deadline(old, coin, lineage)
+        if deadline is None:
+            raise ValueError('Original phase has no consensus expiry')
+        proof = independently_prove_expiry(settings, coin, deadline)
+        if proof is None:
+            raise ValueError('Original phase remains executable on the canonical chain')
+        ledger.retain_phase_expiry(prior['claim_hash'], proof)
+        return prior['claim_hash']
+    except (ValueError, KeyError, TypeError, httpx.HTTPError) as exc:
+        raise ValidatorEvidenceError('Series authorization is still reserved: ' + str(exc)) from exc
 
 
 def canonical_voucher_transition_claim_json(
@@ -3023,42 +3080,20 @@ def verify_voucher_transition_claim(
             raise ValidatorEvidenceError(
                 "voucher owner authorization is malformed"
             ) from exc
-        signature_data: bytes | None = None
-        if claim.vault_owner_auth_type == AUTH_TYPE_SECP256K1:
-            typed_data = eip712_typed_data_for_vault_spend(
-                b"i",
-                bytes32.fromhex(claim.voucher_launcher_id.removeprefix("0x")),
-                vault_coin.name(),
-            )
-            try:
-                recovered = recover_evm_signer(
-                    typed_data, claim.owner_authorization
-                )
-                if recovered.compressed_pubkey != owner_key:
-                    raise ValueError(
-                        "EVM signature does not belong to the vault owner"
-                    )
-                signature_data = compact_signature_from_evm(
-                    claim.owner_authorization
-                )
-            except ValueError as exc:
-                raise ValidatorEvidenceError(
-                    "voucher EVM owner authorization is invalid"
-                ) from exc
-        vault_spend = build_vault_receive_spend(
+        if claim.vault_owner_auth_type != AUTH_TYPE_BLS:
+            raise ValidatorEvidenceError(UNSUPPORTED_OWNER)
+        vault_spend = build_vault_refund_spend(
             vault_coin=vault_coin,
             vault_launcher_id=launcher,
-            owner_pubkey_bytes=owner_key,
+            owner_pubkey=owner_key,
             auth_type=claim.vault_owner_auth_type,
             members_merkle_root=one_leaf_merkle_root(owner_key),
             pool_launcher_id=pool_launcher,
-            deed_launcher_id=bytes32.fromhex(
+            voucher_launcher_id=bytes32.fromhex(
                 claim.voucher_launcher_id.removeprefix("0x")
             ),
-            p2_vault_coin_id=voucher_coin.name(),
             current_timestamp=claim.current_timestamp,
             lineage_proof=vault_lineage,
-            signature_data=signature_data,
             identity_attest_root=identity_root,
             zkpassport_bridge_policy_hash=bridge_policy_hash,
         )
@@ -3419,6 +3454,7 @@ def sign_voucher_transition_claim(
     claim_hash: str,
 ) -> str:
     verify_voucher_transition_claim(settings, claim, claim_hash)
+    expired_phase = _expired_phase_authorization(settings, ledger, claim.series_coin_id)
     _retain_verified_base_hold_payment(settings, ledger, claim)
     private_key = load_validator_private_key(settings)
     signature = "0x" + bytes(
@@ -3438,6 +3474,7 @@ def sign_voucher_transition_claim(
             series_coin_id=claim.series_coin_id,
             voucher_coin_id=claim.voucher_coin_id,
             payment_coin_id=claim.payment_coin_id,
+            expired_phase_claim_hash=expired_phase,
             deed_coin_id=claim.deed_coin_id,
             signature=signature,
             purchase_id=purchase_id,

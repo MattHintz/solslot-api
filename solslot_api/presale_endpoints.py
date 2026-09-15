@@ -90,10 +90,12 @@ from solslot_puzzles.voucher_presale_v3_driver import (
     build_stripe_voucher_terminal_spends,
     stripe_voucher_evidence_message,
 )
+from .voucher_refund_authorization import (
+    build_vault_refund_spend, UNSUPPORTED_OWNER,
+)
 from solslot_puzzles.vault_driver import (
     AUTH_TYPE_BLS,
     AUTH_TYPE_SECP256K1,
-    build_vault_receive_spend,
     compact_signature_from_evm,
     eip712_typed_data_for_vault_spend,
     one_leaf_merkle_root,
@@ -457,9 +459,10 @@ class CancelRequest(ApiModel):
 
 
 from .voucher_work_store import VoucherWorkStore
+from .campaign_store import CampaignStore
 
 
-class PresaleStore(VoucherWorkStore):
+class PresaleStore(CampaignStore, VoucherWorkStore):
     """Fresh V2 tables; unlaunched voucher V1 records are never migrated."""
 
     def __init__(self, path: str) -> None:
@@ -477,6 +480,7 @@ class PresaleStore(VoucherWorkStore):
         if path != ":memory:":
             self._conn.execute("PRAGMA journal_mode=WAL")
         self._create_schema()
+        self._create_campaign_schema()
         self._create_voucher_work_schema()
 
     def _create_schema(self) -> None:
@@ -873,6 +877,7 @@ class PresaleStore(VoucherWorkStore):
         terms: dict[str, Any],
         *,
         singleton_launch: Optional[dict[str, str]] = None,
+        campaign_operation: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         now = int(time.time())
         singleton_launch = singleton_launch or {}
@@ -921,6 +926,10 @@ class PresaleStore(VoucherWorkStore):
                     now,
                 ),
             )
+            if campaign_operation is not None:
+                if campaign_operation['kind'] != 'creation':
+                    raise ValueError('Series creation requires a creation operation')
+                self._insert_campaign_operation(cur, terms['termsHash'], campaign_operation)
         return self.get(terms["termsHash"])
 
     def _get_series(self, identifier: str) -> dict[str, Any]:
@@ -1887,6 +1896,8 @@ class PresaleStore(VoucherWorkStore):
         series = self.get(terms_hash)
         now = int(time.time())
         with self.txn() as cur:
+            if self.pending_campaign_operation(series['termsHash']) is not None:
+                raise ValueError('Voucher terminal execution cannot compete with retained campaign work')
             row = cur.execute(
                 "SELECT * FROM voucher_records_v2 WHERE terms_hash=? AND serial=?",
                 (series["termsHash"].lower(), serial),
@@ -2002,7 +2013,7 @@ class PresaleStore(VoucherWorkStore):
         vault_input_coin_id: str | None,
         vault_output_coin_id: str | None,
     ) -> dict[str, Any]:
-        """Bind REFUNDING only after the exact native bundle is accepted."""
+        """Bind REFUNDING to the exact native bundle retained before dispatch."""
         series = self._get_series(terms_hash)
         now = int(time.time())
         normalized = {
@@ -2036,6 +2047,8 @@ class PresaleStore(VoucherWorkStore):
         else:
             raise ValueError("native refund action is invalid")
         with self.txn() as cur:
+            if self.pending_campaign_operation(series['termsHash']) is not None:
+                raise ValueError('Voucher terminal execution cannot compete with retained campaign work')
             existing = cur.execute(
                 """
                 SELECT payment_rail, state, refund_action, refund_bundle_id,
@@ -3605,6 +3618,8 @@ class PresaleStore(VoucherWorkStore):
             ).rowcount
             if updated != 1:
                 raise ValueError("series state changed during phase confirmation")
+            if self.campaign_operation(series['termsHash'], 'phase') is not None:
+                self._confirm_campaign_operation(cur, series['termsHash'], 'phase', evidence.confirmed_height)
             if evidence.target_state == "LIVE":
                 cur.execute(
                     """
@@ -3706,6 +3721,9 @@ class PresaleStore(VoucherWorkStore):
 
     def _render_series(self, row: sqlite3.Row) -> dict[str, Any]:
         terms = json.loads(row["terms_json"])
+        campaign = {r['kind']: r['confirmed_height'] for r in self._conn.execute(
+            'SELECT kind,confirmed_height FROM campaign_operations WHERE terms_hash=?', (row['terms_hash'],)
+        )}
         deadline = (
             int(row["launched_at"]) + DELIVERY_WINDOW_SECONDS
             if row["launched_at"] is not None
@@ -3740,6 +3758,10 @@ class PresaleStore(VoucherWorkStore):
                 "status": (
                     "CONFIRMED"
                     if row["phase_confirmed_height"] is not None
+                    else "AWAITING_CONFIRMATION"
+                    if 'phase' in campaign and row["phase_bundle_id"]
+                    else "PREPARING"
+                    if 'phase' in campaign
                     else "MEMPOOL_ACCEPTED"
                     if row["phase_bundle_id"]
                     else "NOT_SUBMITTED"
@@ -3750,7 +3772,11 @@ class PresaleStore(VoucherWorkStore):
                 "fullPuzzleHash": row["singleton_full_puzzle_hash"],
                 "spendBundleId": row["singleton_launch_bundle_id"],
                 "status": (
-                    "MEMPOOL_ACCEPTED"
+                    "CONFIRMED"
+                    if campaign.get('creation') is not None
+                    else "AWAITING_CONFIRMATION"
+                    if 'creation' in campaign
+                    else "MEMPOOL_ACCEPTED"
                     if row["singleton_launch_bundle_id"]
                     else "LEGACY_TEST_FIXTURE"
                 ),
@@ -4254,6 +4280,16 @@ async def _submit_series_phase_transition(
     collection: Optional[dict[str, Any]] = None,
     cancel_reason: Optional[str] = None,
 ) -> dict[str, Any]:
+    from .campaign_runtime import campaign_context, resume_campaign
+    intent = dict(transition=int(transition), cancelReason=cancel_reason)
+    context = campaign_context(settings)
+    original = store.campaign_operation(series["termsHash"], "phase")
+    if original is not None:
+        if original['intent'] != intent or original['context'] != context:
+            raise ValueError('Original campaign phase intent cannot be replaced')
+        await resume_campaign(settings=settings, store=store, node=request.app.state.coinset,
+                              series=series, operation=original)
+        return store.get(series['termsHash'])
     if series["state"] != "PRESALE":
         raise ValueError("only a PRESALE series can change phase")
     if series["phaseTransition"]["status"] != "NOT_SUBMITTED":
@@ -4336,40 +4372,52 @@ async def _submit_series_phase_transition(
         governed_deed_puzzle_hashes=governed_deed_puzzle_hashes,
         validator_message=_hex32(provisional.validator_message),
     )
+    operation = dict(kind='phase', intent=intent, context=context, preparation=dict(
+        claim=claim.model_dump(mode='json'), seriesCoin=series_coin.to_json_dict(),
+        lineage=lineage.to_json_dict(), governanceExecutionIds=governance_execution_ids,
+    ))
+    store.retain_campaign_phase(series['termsHash'], operation, series['chainState'])
+    await resume_campaign(settings=settings, store=store, node=request.app.state.coinset,
+                          series=series)
+    return store.get(series['termsHash'])
+
+
+async def _sign_retained_series_phase(settings, store, series, operation):
+    """Select quorum for the original claim without changing its coin or anchor."""
+    from .campaign_runtime import campaign_context
+    if operation['context'] != campaign_context(settings):
+        raise ValueError('Campaign phase context changed')
+    prep = operation['preparation']
+    claim = VoucherSeriesPhaseClaim.model_validate(prep['claim'])
+    if claim.series_terms != series['terms'] or claim.series_coin_id != series['chainState']['currentCoinId']:
+        raise ValueError('Original phase singleton commitments changed')
+    terms = _series_program(series['terms'])
+    state = _chain_series_state(series)
+    series_coin = Coin.from_json_dict(prep['seriesCoin'])
+    lineage = LineageProof.from_json_dict(prep['lineage'])
+    if _hex32(series_coin.name()) != claim.series_coin_id:
+        raise ValueError('Original phase input coin changed')
     quorum = await collect_voucher_series_phase_quorum(settings, claim)
     phase = build_voucher_series_phase_spend(
-        terms=terms,
-        state=state,
-        series_coin=series_coin,
-        series_lineage_proof=lineage,
-        transition=transition,
-        launch_anchor=launch_anchor,
+        terms=terms, state=state, series_coin=series_coin, series_lineage_proof=lineage,
+        transition=SeriesTransition(claim.transition), launch_anchor=claim.launch_anchor,
         signer_indices=quorum.signer_indices,
     )
-    if phase.validator_message != provisional.validator_message:
-        raise ValueError("series phase transition changed after quorum selection")
-    bundle = WalletSpendBundle(
-        [phase.series_spend],
-        quorum.aggregated_signature,
-    )
-    result = await request.app.state.coinset.push_tx(bundle.to_json_dict())
-    network_status = str(result.get("status") or "").upper()
-    if not result.get("success") and network_status not in {"SUCCESS", "PENDING"}:
-        raise ValueError("series phase transition was rejected by the Chia node")
+    if _hex32(phase.validator_message) != claim.validator_message:
+        raise ValueError('Original series phase transition changed after quorum selection')
+    bundle = WalletSpendBundle([phase.series_spend], quorum.aggregated_signature)
     next_inner = curry_series(terms, phase.next_series_state)
-    return store.record_phase_submission(
-        series["termsHash"],
-        target_state=(
-            "LIVE" if transition == SeriesTransition.LAUNCH else "CANCELED"
-        ),
-        spend_bundle_id=_hex32(bundle.name()),
-        series_input_coin_id=_hex32(series_coin.name()),
+    bindings = dict(
+        target_state='LIVE' if claim.transition == int(SeriesTransition.LAUNCH) else 'CANCELED',
+        spend_bundle_id=_hex32(bundle.name()), series_input_coin_id=_hex32(series_coin.name()),
         series_output_coin_id=_hex32(phase.next_series_coin.name()),
         series_output_inner_puzzle_hash=_hex32(next_inner.get_tree_hash()),
-        launch_anchor=launch_anchor,
-        governance_execution_ids=governance_execution_ids,
-        cancel_reason=cancel_reason,
+        launch_anchor=claim.launch_anchor, governance_execution_ids=prep['governanceExecutionIds'],
+        cancel_reason=operation['intent']['cancelReason'],
     )
+    store.retain_campaign_execution(series['termsHash'], 'phase', dict(
+        spendBundleId=_hex32(bundle.name()), spendBundle=bundle.to_json_dict(), bindings=bindings,
+    ), expected_operation=operation)
 
 
 def _require_ingest(settings: Settings, authorization: Optional[str]) -> None:
@@ -4718,8 +4766,8 @@ async def _vault_refund_context(
     record = get_registry().get(_b32(approved.launcher_id, nonzero=True))
     if record is None:
         raise ValueError("approved vault owner record is unavailable")
-    if record.auth_type not in {AUTH_TYPE_BLS, AUTH_TYPE_SECP256K1}:
-        raise ValueError("voucher refunds require a BLS or EVM vault owner")
+    if record.auth_type != AUTH_TYPE_BLS:
+        raise ValueError(UNSUPPORTED_OWNER)
     vault_coin, vault_lineage = await _confirmed_coin_and_lineage(
         request.app.state.coinset,
         approved.current_coin_id,
@@ -4757,31 +4805,16 @@ async def _vault_refund_context(
     if vault_coin.puzzle_hash != expected_full.get_tree_hash() or int(vault_coin.amount) != 1:
         raise ValueError("approved vault coin does not match its registered owner")
 
-    typed_data: Optional[dict[str, Any]] = None
-    signature_data: Optional[bytes] = None
-    if record.auth_type == AUTH_TYPE_SECP256K1:
-        typed_data = eip712_typed_data_for_vault_spend(
-            b"i",
-            voucher_launcher_id,
-            vault_coin.name(),
-        )
-        if owner_authorization is not None:
-            recovered = recover_evm_signer(typed_data, owner_authorization)
-            if recovered.compressed_pubkey != owner_key:
-                raise ValueError("EVM refund signature does not belong to the vault owner")
-            signature_data = compact_signature_from_evm(owner_authorization)
-    vault_spend = build_vault_receive_spend(
+    vault_spend = build_vault_refund_spend(
         vault_coin=vault_coin,
         vault_launcher_id=record.launcher_id,
-        owner_pubkey_bytes=owner_key,
+        owner_pubkey=owner_key,
         auth_type=record.auth_type,
         members_merkle_root=member_root,
         pool_launcher_id=pool_launcher_id,
-        deed_launcher_id=voucher_launcher_id,
-        p2_vault_coin_id=voucher_coin_id,
+        voucher_launcher_id=voucher_launcher_id,
         current_timestamp=current_timestamp,
         lineage_proof=vault_lineage,
-        signature_data=signature_data,
         identity_attest_root=identity_root,
         zkpassport_bridge_policy_hash=bridge_policy_hash,
     )
@@ -4811,7 +4844,7 @@ async def _vault_refund_context(
         record,
         bytes32(inner.get_tree_hash()),
         vault_spend,
-        typed_data,
+        None,
     )
 
 
@@ -5081,86 +5114,15 @@ async def create_presale(
     store: Annotated[PresaleStore, Depends(get_presale_store)],
     collections: Annotated[CollectionStore, Depends(get_collection_store)],
 ) -> dict[str, Any]:
+    from .campaign_runtime import create_campaign
     try:
-        store.get(body.collection_id)
-    except KeyError:
-        pass
-    else:
-        raise HTTPException(
-            status_code=409,
-            detail="collection already has a presale series",
-        )
-
-    faucet = getattr(request.app.state, "faucet", None)
-    coinset = getattr(request.app.state, "coinset", None)
-    if faucet is None or coinset is None:
-        raise HTTPException(
-            status_code=503,
-            detail="signed singleton launch service is unavailable",
-        )
-    records = await coinset.get_coin_records_by_puzzle_hash(
-        "0x" + faucet.address_puzzle_hash.hex(), include_spent=False
-    )
-    parent_coin = faucet.select_coin(
-        records,
-        min_amount=1,
-        max_amount=settings.faucet_max_spend_mojos,
-    )
-    if parent_coin is None:
-        raise HTTPException(
-            status_code=503,
-            detail="faucet has no eligible one-mojo singleton funding coin",
-        )
-
-    series_singleton_id = bytes32(launcher_coin_for_parent(parent_coin).name())
-    try:
-        terms = build_series_terms(
-            body,
-            series_singleton_id=series_singleton_id,
-            collection=collections.get(body.collection_id),
-            settings=settings,
-        )
-        series_program = _series_program(terms)
-        launched = build_and_sign_singleton_launch(
-            faucet=faucet,
-            parent_coin=parent_coin,
-            inner_puzzle_for_launcher=lambda launcher_id: _initial_series_inner(
-                launcher_id,
-                expected_launcher_id=series_singleton_id,
-                terms=series_program,
-            ),
-            launcher_memos=(
-                b"SOLSLOT_PRESALE_SERIES_V2",
-                series_program.collection_id,
-                series_program.terms_hash,
-            ),
-            eve_memos=(series_program.collection_id, series_program.terms_hash),
-        )
-        result = await coinset.push_tx(launched.spend_bundle.to_json_dict())
+        return await create_campaign(body, request, settings, store, collections)
+    except HTTPException:
+        raise
     except (ValueError, VoucherV2Error) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"presale series launch failed: {exc}",
-        ) from exc
-    if not result.get("success"):
-        reason = result.get("error") or result.get("status") or "unknown rejection"
-        raise HTTPException(
-            status_code=502,
-            detail=f"presale series launch was rejected: {reason}",
-        )
-
-    return response_or_404(
-        lambda: store.create(
-            terms,
-            singleton_launch={
-                "parentCoinId": _hex32(bytes32(parent_coin.name())),
-                "fullPuzzleHash": _hex32(launched.full_puzzle_hash),
-                "spendBundleId": launched.spend_bundle_id,
-            },
-        )
-    )
+        raise HTTPException(status_code=502, detail=f"presale series launch retained for recovery: {exc}") from exc
 
 
 @router.get("")
@@ -5627,6 +5589,20 @@ async def complete_voucher_refund(
         session.vault_launcher_id,
         expected_current_coin_id=body.vault_coin_id,
     )
+    import uuid
+    canonical_terms = store._get_series(terms_hash)['termsHash']
+    lease_owner = uuid.uuid4().hex
+    response_or_404(lambda: store.claim_direct_voucher_work(canonical_terms, serial, lease_owner, time.time()))
+    try:
+        async with asyncio.timeout(45):
+            return await _complete_voucher_refund_locked(terms_hash, serial, body, request, store, settings,
+                                                         voucher_json, session, approved)
+    finally:
+        store.finish_direct_voucher_work(canonical_terms, lease_owner)
+
+
+async def _complete_voucher_refund_locked(terms_hash, serial, body, request, store, settings,
+                                        voucher_json, session, approved):
     series = response_or_404(lambda: store.get(terms_hash))
     response_or_404(
         lambda: store.request_refund(
@@ -5951,33 +5927,23 @@ async def complete_voucher_refund(
         transaction_id = str(prepared["spendBundleId"])
         network_status = "MEMPOOL"
     else:
-        result = await request.app.state.coinset.push_tx(bundle.to_json_dict())
-        network_status = str(result.get("status") or "").upper()
-        if not result.get("success") and network_status not in {"SUCCESS", "PENDING"}:
-            raise HTTPException(
-                status_code=502,
-                detail="The atomic voucher refund was rejected by the Chia node.",
-            )
-        submitted = response_or_404(
-            lambda: store.record_native_refund_submission(
-                series["termsHash"],
-                serial,
-                action=refund_action,
-                spend_bundle_id=_hex32(bundle.name()),
-                refund_output_coin_id=_hex32(
-                    terminal.settlement_coin.name()
-                ),
-                terminal_voucher_coin_id=_hex32(
-                    terminal.terminal_voucher_coin.name()
-                ),
-                series_input_coin_id=_hex32(series_coin.name()),
-                series_output_coin_id=_hex32(
-                    terminal.next_series_coin.name()
-                ),
-                vault_input_coin_id=_hex32(vault_coin.name()),
-                vault_output_coin_id=_hex32(next_vault_coin.name()),
-            )
+        bindings = dict(
+            action=refund_action, spend_bundle_id=_hex32(bundle.name()),
+            refund_output_coin_id=_hex32(terminal.settlement_coin.name()),
+            terminal_voucher_coin_id=_hex32(terminal.terminal_voucher_coin.name()),
+            series_input_coin_id=_hex32(series_coin.name()), series_output_coin_id=_hex32(terminal.next_series_coin.name()),
+            vault_input_coin_id=_hex32(vault_coin.name()), vault_output_coin_id=_hex32(next_vault_coin.name()),
         )
+        # The shared lease covers signing; exact bytes cover a lost push reply
+        # after that lease ends. Workers resume this original owner transaction.
+        store.retain_voucher_execution(series['termsHash'], serial, dict(
+            kind='native_refund', spendBundle=bundle.to_json_dict(), bindings=bindings,
+        ))
+        submitted = response_or_404(lambda: store.record_native_refund_submission(series['termsHash'], serial, **bindings))
+        result = await request.app.state.coinset.push_tx(bundle.to_json_dict())
+        network_status = str(result.get('status') or '').upper()
+        if not result.get('success') and network_status not in {'SUCCESS', 'PENDING'}:
+            raise HTTPException(status_code=502, detail='The original atomic voucher refund is retained for recovery.')
         transaction_id = _hex32(bundle.name())
     return CompleteVoucherRefundResponse(
         termsHash=series["termsHash"],
