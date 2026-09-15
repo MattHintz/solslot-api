@@ -9,6 +9,8 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, ConfigDict
 
+from .base_inventory_hold import BaseInventoryHoldClaim
+from .validator_base_inventory_hold import sign_base_inventory_hold
 from .inventory_extension_claims import InventoryExtensionClaim
 from .payment_start import PaymentStartClaim, sign_payment_start
 from .inventory_payment_hold_claims import InventoryPaymentHoldClaim, InventoryPaymentHoldReleaseClaim, InventoryPaymentHoldAbortClaim
@@ -61,6 +63,12 @@ class InventoryReservationSignRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     claim: InventoryReservationClaim
+    claimHash: str
+
+
+class BaseInventoryHoldSignRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    claim: BaseInventoryHoldClaim
     claimHash: str
 
 
@@ -285,6 +293,16 @@ def create_validator_app(
         return ValidatorSignatureResponse(claimHash=body.claim.canonical_hash(),
             signerIndex=signer_settings.signer_index,
             validatorPubkey=signer_settings.roster_pubkeys[signer_settings.signer_index], signature=signature)
+
+    @application.post('/v1/base-inventory-hold/sign', response_model=ValidatorSignatureResponse)
+    async def arm_base_hold(body: BaseInventoryHoldSignRequest):
+        settings = current_settings()
+        try:
+            signature = await sign_base_inventory_hold(settings, application.state.validator_ledger, body.claim, body.claimHash)
+        except ValidatorEvidenceError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return ValidatorSignatureResponse(claimHash=body.claim.canonical_hash(), signerIndex=settings.signer_index,
+            validatorPubkey=settings.roster_pubkeys[settings.signer_index], signature=signature)
 
     @application.post("/v1/inventory-payment-hold/sign", response_model=ValidatorSignatureResponse)
     async def arm_payment_hold(body: InventoryPaymentHoldSignRequest):

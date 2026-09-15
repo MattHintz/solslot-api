@@ -314,6 +314,8 @@ def load_validator_artifact(
         extension_activation(artifact, settings.deployment_environment, required=False)
         from .inventory_payment_hold_claims import payment_hold_activation
         payment_hold_activation(artifact, settings.deployment_environment, required=False)
+        from .base_inventory_hold import base_hold_activation
+        base_hold_activation(artifact, settings.deployment_environment, required=False)
         if 'checkoutLifecycle' in artifact:
             from .checkout_lifecycle import lifecycle_activation
             lifecycle_activation(artifact, settings.deployment_environment)
@@ -2408,10 +2410,38 @@ def _voucher_payment_hold_binding(claim) -> tuple[str | None, str | None]:
     # Called only after the complete independent voucher verifier. Native/Base
     # artifacts have different commitments and cannot reinterpret a held V3 PI.
     if claim.voucher_commitment.get("schema") != "solslot.voucher-commitment.v3":
+        if (claim.purchase_artifact.get('schema') == 'solslot.purchase-artifact.v3'
+                and claim.voucher_commitment.get('paymentRail') == 1):
+            purchase = purchase_artifact_v3_from_json(claim.purchase_artifact)
+            return "0x"+bytes(purchase.purchase_id).hex(), claim.global_payment_id()
         return None, None
     purchase = purchase_artifact_v3_from_json(claim.purchase_artifact)
     evidence = stripe_settlement_evidence_from_json(claim.payment_evidence)
     return "0x" + bytes(purchase.purchase_id).hex(), evidence.payment_intent_id
+
+
+def _retain_verified_base_hold_payment(settings, ledger, claim):
+    # Runs after the full independent voucher verifier and before key access.
+    purchase_id, payment_id = _voucher_payment_hold_binding(claim)
+    if not purchase_id or not payment_id or not payment_id.startswith('0x'):
+        return
+    held = ledger.base_inventory_hold(purchase_id)
+    artifact, _ = load_validator_artifact(settings)
+    if held is None and 'baseInventoryHold' not in artifact:
+        return  # Historical recovery does not invent a prepayment acknowledgment.
+    try:
+        from .base_inventory_hold import BaseInventoryHoldClaim, base_hold_coordinates
+        if held is None:
+            raise ValueError('Base payment has no original private hold')
+        hold = BaseInventoryHoldClaim.model_validate_json(held['claim_json'])
+        base_hold_coordinates(hold, artifact, settings.deployment_environment)
+        if hold.purchase_artifact != claim.purchase_artifact:
+            raise ValueError('Base payment changes the held purchase')
+        ledger.retain_base_payment_start(purchase_id, claim.payment_evidence)
+        if hold.activation['paymentConfirmationEnabled'] is not True:
+            raise ValueError('Base lifecycle remains unavailable; retain this verified payment for recovery')
+    except (ValueError, ValidatorLedgerConflict) as exc:
+        raise ValidatorEvidenceError('Base payment start does not match its independent prepayment hold') from exc
 
 
 def sign_voucher_issuance_claim(
@@ -2421,6 +2451,7 @@ def sign_voucher_issuance_claim(
     claim_hash: str,
 ) -> str:
     verify_voucher_issuance_claim(settings, claim, claim_hash)
+    _retain_verified_base_hold_payment(settings, ledger, claim)
     signature = "0x" + bytes(
         AugSchemeMPL.sign(
             load_validator_private_key(settings),
@@ -3370,6 +3401,7 @@ def sign_voucher_transition_claim(
     claim_hash: str,
 ) -> str:
     verify_voucher_transition_claim(settings, claim, claim_hash)
+    _retain_verified_base_hold_payment(settings, ledger, claim)
     private_key = load_validator_private_key(settings)
     signature = "0x" + bytes(
         AugSchemeMPL.aggregate(

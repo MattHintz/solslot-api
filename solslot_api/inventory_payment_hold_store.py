@@ -37,6 +37,8 @@ def hold_operation(row):
 
 
 def assert_no_checkout_hold(db,purchase_id):
+    if db.execute('SELECT 1 FROM payment_base_inventory_holds WHERE purchase_id=?', (purchase_id,)).fetchone():
+        raise conflict('Base prepayment hold requires terminal recovery; generic expiry cannot release inventory')
     if db.execute('SELECT 1 FROM payment_checkout_holds WHERE purchase_id=?',(purchase_id,)).fetchone():
         raise conflict('checkout payment hold requires terminal reconciliation; generic expiry cannot release inventory')
 
@@ -83,7 +85,7 @@ class InventoryPaymentHoldStoreMixin:
                     or claim['reservation_expires_at']!=expected_snapshot.inventory_expires_at
                     or claim['reservation_expires_at']<=now or expected_snapshot.external_message is not None):
                 raise conflict('checkout requires the exact live unpaid initial reservation')
-            for table in ('payment_inventory_timeouts','payment_inventory_extensions','payment_inventory_releases'):
+            for table in ('payment_inventory_timeouts','payment_inventory_extensions','payment_inventory_releases','payment_base_inventory_holds'):
                 if db.execute(f'SELECT 1 FROM {table} WHERE purchase_id=?',(purchase_id,)).fetchone():
                     raise conflict('checkout conflicts with an existing inventory operation')
             try:
