@@ -81,13 +81,15 @@ class BaseInventoryHoldClaim(BaseModel):
 
 def base_hold_coordinates(claim, artifact, environment):
     from chia_rs.sized_bytes import bytes32
-    from solslot_puzzles.payment_artifacts_v3 import purchase_artifact_v3_from_json
+    from solslot_puzzles.payment_artifacts_v3 import purchase_artifact_v3_from_json, purchase_artifact_v3_to_json
     from solslot_puzzles.voucher_purchase import require_current_base_presale
     from solslot_puzzles.protocol_deployment import singleton_struct
     from solslot_puzzles.mint_publish_driver import deed_singleton_struct, deed_launcher_puzzle_hash
     from solslot_puzzles.stripe_settlement_v1_driver import PrimaryMintTermsV3, PRIMARY_PURCHASE_PROVIDER_ID
     purchase = purchase_artifact_v3_from_json(claim.purchase_artifact)
     require_current_base_presale(purchase)
+    if claim.purchase_artifact != purchase_artifact_v3_to_json(purchase):
+        raise ValueError('Base hold purchase must use its exact canonical serialized identity')
     active = base_hold_activation(artifact, environment)
     if (claim.activation != active or claim.genesis_artifact_hash != artifact['artifactHash']
             or claim.network != purchase.network or claim.depositor == '0x'+'0'*40

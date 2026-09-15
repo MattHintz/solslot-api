@@ -166,6 +166,11 @@ async def test_bad_base_evidence_never_gets_private_signature_or_durable_hold(tm
     try:
         mutations=[('global_payment_id',hx(_b32(90))),('depositor','0x'+'0'*40),('reserved_puzzle_hash',hx(_b32(90))),
             ('reservation_expires_at',c.claim.reservation_expires_at+1),('genesis_artifact_hash',hx(_b32(90)))]
+        for field in ('deedLauncherId', 'purchaseId', 'artifactHash', 'railAssetId'):
+            aliased = deepcopy(original.purchase_artifact)
+            aliased[field] = '0x'+aliased[field][2:].upper()
+            assert aliased != original.purchase_artifact
+            mutations.append(('purchase_artifact', aliased))
         for key,value in mutations:
             claim=original.model_copy(update={key:value})
             with pytest.raises(ValidatorEvidenceError):
