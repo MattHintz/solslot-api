@@ -28,7 +28,7 @@ from chia.wallet.wallet_spend_bundle import WalletSpendBundle
 from chia_rs import AugSchemeMPL, G1Element, G2Element
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from web3 import Web3
 from web3.logs import DISCARD
@@ -303,8 +303,10 @@ class CompleteNativeVoucherResponse(ApiModel):
 class PrepareVoucherRefundResponse(ApiModel):
     terms_hash: str
     serial: int
+    purchase_id: Optional[str] = None
+    payment_rail: Optional[Literal["CHIA_XCH", "STRIPE_USD"]] = None
     auth_type: Literal["chia_bls", "evm"]
-    action: Literal["REFUND_PRESALE"] = "REFUND_PRESALE"
+    action: Literal["REFUND_PRESALE", "REFUND_CANCELED"] = "REFUND_PRESALE"
     vault_coin_id: str
     voucher_coin_id: str
     series_coin_id: str
@@ -315,6 +317,9 @@ class PrepareVoucherRefundResponse(ApiModel):
 
 
 class CompleteVoucherRefundRequest(ApiModel):
+    # Existing clients bind the immutable voucher and exact input coins. New
+    # clients also echo the purchase displayed in the canonical preparation.
+    expected_purchase_id: Optional[str] = Field(default=None, pattern=HEX32_PATTERN)
     vault_coin_id: str = Field(pattern=HEX32_PATTERN)
     voucher_coin_id: str = Field(pattern=HEX32_PATTERN)
     series_coin_id: str = Field(pattern=HEX32_PATTERN)
@@ -5502,6 +5507,7 @@ def get_voucher(
 @router.post(
     "/{terms_hash}/vouchers/{serial}/refund-request",
     response_model=PrepareVoucherRefundResponse,
+    response_model_exclude_unset=True,
 )
 async def request_voucher_refund(
     terms_hash: str,
@@ -5509,6 +5515,7 @@ async def request_voucher_refund(
     request: Request,
     store: Annotated[PresaleStore, Depends(get_presale_store)],
     settings: Annotated[Settings, Depends(get_settings)],
+    contract: Annotated[Optional[Literal["purchase-v1"]], Query()] = None,
 ) -> PrepareVoucherRefundResponse:
     require_presale_writes(settings)
     require_operation_gate(settings, "presale")
@@ -5537,6 +5544,8 @@ async def request_voucher_refund(
     series = response_or_404(lambda: store.get(terms_hash))
     series_coin_id = _b32(series["chainState"]["currentCoinId"], nonzero=True)
     current_timestamp = int(time.time())
+    if series["state"] not in {"PRESALE", "CANCELED"}:
+        raise HTTPException(status_code=409, detail="Expired delivery refunds are processed automatically.")
     try:
         vault_coin, _lineage, record, _inner_hash, vault_spend, typed_data = (
             await _vault_refund_context(
@@ -5553,6 +5562,7 @@ async def request_voucher_refund(
     return PrepareVoucherRefundResponse(
         termsHash=series["termsHash"],
         serial=serial,
+        action="REFUND_CANCELED" if series["state"] == "CANCELED" else "REFUND_PRESALE",
         authType="chia_bls" if record.auth_type == AUTH_TYPE_BLS else "evm",
         vaultCoinId=_hex32(vault_coin.name()),
         voucherCoinId=_hex32(voucher_coin_id),
@@ -5565,6 +5575,10 @@ async def request_voucher_refund(
             else []
         ),
         typedData=typed_data,
+        # Cached native clients reject a purchaseId field. Only an explicit
+        # contract opt-in receives the expanded, canonically bound response.
+        **({"purchaseId": eligible["purchaseId"], "paymentRail": eligible["paymentRail"]}
+           if contract == "purchase-v1" else {}),
     )
 
 
@@ -5584,6 +5598,9 @@ async def complete_voucher_refund(
     require_operation_gate(settings, "presale")
     voucher_json = response_or_404(lambda: store.voucher(terms_hash, serial))
     session = verify_vault_session(settings, request, voucher_json["vaultLauncherId"])
+    if (body.expected_purchase_id is not None
+            and body.expected_purchase_id.lower() != voucher_json["purchaseId"].lower()):
+        raise HTTPException(status_code=409, detail="Refund purchase changed after wallet review.")
     approved = require_current_approved_vault(
         settings,
         session.vault_launcher_id,
