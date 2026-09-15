@@ -152,7 +152,8 @@ class VoucherIssuanceWorker:
         self.authorize_dispatch = authorize_dispatch
         self._task: Optional[asyncio.Task[None]] = None
         self._stop = asyncio.Event()
-        self._funding_lock = submitter.funding_guard if submitter is not None else asyncio.Lock()
+        from .campaign_runtime import funding_guard
+        self._funding_lock = funding_guard(presales, submitter)
         if submitter is not None:
             submitter.add_fee_coin_reservation_source(presales.pending_voucher_funding_coin_ids)
 
@@ -206,13 +207,13 @@ class VoucherIssuanceWorker:
         if seen is not None:
             seen.add(job["termsHash"])
         base = {"termsHash": job["termsHash"]}
-        if lane != "phase":
+        if lane not in {"phase", "campaign"}:
             base["serial"] = job["serial"]
         status = "INTERRUPTED"
         try:
             async with asyncio.timeout(self.config.operation_timeout_seconds):
                 series = self.presales._get_series(job["termsHash"])
-                voucher = None if lane == "phase" else self.presales.voucher(job["termsHash"], job["serial"])
+                voucher = None if lane in {"phase", "campaign"} else self.presales.voucher(job["termsHash"], job["serial"])
                 retained = None if voucher is None else self.presales.pending_voucher_execution(job["termsHash"], job["serial"])
                 if retained:
                     result = await self._resume_retained_execution(series, voucher, retained)
@@ -240,6 +241,11 @@ class VoucherIssuanceWorker:
             return {**base, "status": status, "detail": str(exc)}
         finally:
             self.presales.finish_voucher_work(job, time.time(), status)
+
+    async def _lane_campaign(self, series, voucher):
+        from .campaign_runtime import resume_campaign
+        return await resume_campaign(settings=self.settings, store=self.presales, node=self.coinset,
+                                     series=series, authorize_dispatch=self._require_dispatch)
 
     async def _lane_issuance(self, series, voucher):
         terms_hash = str(series["termsHash"])
@@ -666,7 +672,7 @@ class VoucherIssuanceWorker:
             "0x" + self.faucet.address_puzzle_hash.hex(), include_spent=False
         )
         reserved = (self.submitter.reserved_funding_coin_ids() if self.submitter is not None
-                    else {bytes.fromhex(value[2:]) for value in self.presales.pending_voucher_funding_coin_ids()})
+                    else {bytes.fromhex(value[2:]) for value in self.presales.pending_voucher_funding_coin_ids() | self.presales.pending_campaign_funding_coin_ids()})
         records = [record for record in records if (coin := _confirmed_unspent_coin(record)) is not None and bytes(coin.name()) not in reserved]
         parent = self.faucet.select_coin(
             records,

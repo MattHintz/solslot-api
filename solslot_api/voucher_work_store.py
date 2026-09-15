@@ -10,6 +10,7 @@ import json
 from typing import Any
 
 LANES = {
+    "campaign": "confirmed_height IS NULL",
     "retained": "confirmed=0",
     "issuance": "state IN ('PENDING_ISSUANCE','ISSUANCE_SUBMITTED')",
     "stripe_terminal": "payment_rail='STRIPE_USD' AND terminal_exact_execution_json IS NOT NULL AND refund_bundle_id IS NULL AND redemption_bundle_id IS NULL",
@@ -44,8 +45,8 @@ class VoucherWorkStore:
               PRIMARY KEY(terms_hash,serial,kind));
         """)
         for lane, predicate in LANES.items():
-            table = "voucher_worker_executions" if lane == "retained" else "presale_series_v2" if lane == "phase" else "voucher_records_v2"
-            columns = "terms_hash" if lane == "phase" else "terms_hash,serial"
+            table = "campaign_operations" if lane == "campaign" else "voucher_worker_executions" if lane == "retained" else "presale_series_v2" if lane == "phase" else "voucher_records_v2"
+            columns = "terms_hash" if lane in {"phase", "campaign"} else "terms_hash,serial"
             self._conn.execute(f"CREATE INDEX IF NOT EXISTS idx_voucher_work_{lane} ON {table}({columns}) WHERE {predicate}")
         self._conn.execute("""CREATE INDEX IF NOT EXISTS idx_voucher_work_pinned ON voucher_records_v2(terms_hash,serial)
             WHERE (issuance_bundle_id IS NOT NULL AND issuance_confirmed_height IS NULL)
@@ -54,8 +55,8 @@ class VoucherWorkStore:
 
     def claim_voucher_work(self, lane: str, owner: str, now: float, excluded_series: set[str] | None = None) -> dict[str, Any] | None:
         predicate = LANES[lane]  # Only internal, fixed lane names enter SQL.
-        phase = lane == "phase"
-        table = "voucher_worker_executions" if lane == "retained" else "presale_series_v2" if phase else "voucher_records_v2"
+        phase = lane in {"phase", "campaign"}
+        table = "campaign_operations" if lane == "campaign" else "voucher_worker_executions" if lane == "retained" else "presale_series_v2" if phase else "voucher_records_v2"
         key = "terms_hash" if phase else "(terms_hash,serial)"
         columns = "terms_hash,-1 AS serial" if phase else "terms_hash,serial"
         with self.txn() as cur:
@@ -78,11 +79,13 @@ class VoucherWorkStore:
                 if retry and retry['due_at'] > now:
                     continue
                 series = cur.execute("SELECT state,phase_bundle_id,phase_confirmed_height FROM presale_series_v2 WHERE terms_hash=?", (terms,)).fetchone()
+                if lane != 'campaign' and cur.execute('SELECT 1 FROM campaign_operations WHERE terms_hash=? AND confirmed_height IS NULL', (terms,)).fetchone():
+                    continue
                 if lane == 'issuance' and (series['state'] != 'PRESALE' or series['phase_bundle_id'] is not None):
                     continue
                 if lane.endswith('_redemption') and (series['state'] != 'LIVE' or series['phase_confirmed_height'] is None):
                     continue
-                if lane not in {'retained', 'phase'}:
+                if lane not in {'retained', 'phase', 'campaign'}:
                     # Fair retry does not authorize competing singleton spends.
                     pinned = cur.execute("""SELECT serial FROM voucher_records_v2 INDEXED BY idx_voucher_work_pinned WHERE terms_hash=? AND
                         ((issuance_bundle_id IS NOT NULL AND issuance_confirmed_height IS NULL)
@@ -113,9 +116,40 @@ class VoucherWorkStore:
             due = now + min(240, 15 * 2 ** min(4, attempts - 1)) if failed else now
             cur.execute("INSERT INTO voucher_worker_attempts VALUES (?,?,?,?,?,?,?) ON CONFLICT(lane,terms_hash,serial) DO UPDATE SET due_at=excluded.due_at,attempts=excluded.attempts,status=excluded.status,observed_at=excluded.observed_at", (*key, due, attempts, status, now))
 
+    def claim_direct_voucher_work(self, terms, serial, owner, now):
+        """Owner HTTP transactions share the same singleton lease as workers."""
+        with self.txn() as cur:
+            if self.pending_campaign_operation(terms) is not None:
+                raise ValueError('Campaign phase work is awaiting confirmation or proven expiry')
+            if cur.execute('SELECT 1 FROM voucher_worker_executions WHERE terms_hash=? AND confirmed=0', (terms,)).fetchone():
+                raise ValueError('Original voucher execution is awaiting recovery')
+            pinned = cur.execute("""SELECT 1 FROM voucher_records_v2 WHERE terms_hash=? AND
+                (state IN ('PENDING_ISSUANCE','ISSUANCE_SUBMITTED') OR
+                 (issuance_bundle_id IS NOT NULL AND issuance_confirmed_height IS NULL) OR
+                 ((redemption_bundle_id IS NOT NULL OR refund_bundle_id IS NOT NULL OR terminal_exact_execution_json IS NOT NULL)
+                  AND redemption_confirmed_height IS NULL AND refund_confirmed_height IS NULL)) LIMIT 1""", (terms,)).fetchone()
+            if pinned:
+                raise ValueError('Original voucher submission is awaiting recovery')
+            cur.execute('INSERT OR IGNORE INTO voucher_worker_series VALUES (?,NULL,0)', (terms,))
+            count = cur.execute('UPDATE voucher_worker_series SET owner=?,lease_until=? WHERE terms_hash=? AND lease_until<=?',
+                                (owner, now + LEASE_SECONDS, terms, now)).rowcount
+            if count != 1:
+                raise ValueError('Voucher singleton is busy; retry after the current operation')
+
+    def finish_direct_voucher_work(self, terms, owner):
+        with self.txn() as cur:
+            cur.execute('UPDATE voucher_worker_series SET owner=NULL,lease_until=0 WHERE terms_hash=? AND owner=?', (terms, owner))
+
     def retain_voucher_execution(self, terms: str, serial: int, execution: dict[str, Any]) -> None:
         encoded = json.dumps(execution, sort_keys=True, separators=(',', ':'))
         with self.txn() as cur:
+            if self.pending_campaign_operation(terms) is not None:
+                raise ValueError('Voucher execution cannot compete with retained campaign work')
+            if execution['kind'] == 'funding':
+                from chia_rs import SpendBundle
+                inputs = {'0x' + c.name().hex() for c in SpendBundle.from_json_dict(execution['spendBundle']).removals()}
+                if inputs & self.pending_campaign_funding_coin_ids():
+                    raise ValueError('Voucher funding input is retained for a campaign')
             cur.execute("INSERT OR IGNORE INTO voucher_worker_executions(terms_hash,serial,kind,execution_json) VALUES (?,?,?,?)", (terms, serial, execution['kind'], encoded))
             row = cur.execute("SELECT execution_json FROM voucher_worker_executions WHERE terms_hash=? AND serial=? AND kind=?", (terms, serial, execution['kind'])).fetchone()
             if row['execution_json'] != encoded:

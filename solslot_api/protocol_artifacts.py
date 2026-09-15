@@ -2195,6 +2195,8 @@ def _active_presale_terms_for_deed(
                 raise PaymentArtifactError(
                     "active presale is missing its terms hash"
                 )
+            if get_presale_store(settings).pending_campaign_operation(terms_hash) is not None:
+                raise PaymentArtifactError("governed presale campaign is awaiting chain confirmation")
             matches.add(terms_hash.lower())
     if len(matches) > 1:
         raise PaymentArtifactError(

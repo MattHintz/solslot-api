@@ -384,6 +384,9 @@ async def lifespan(app: FastAPI):
         )
         presale_store = get_presale_store(settings)
         app.state.protocol_submitter.add_fee_coin_reservation_source(
+            presale_store.pending_campaign_funding_coin_ids
+        )
+        app.state.protocol_submitter.add_fee_coin_reservation_source(
             genesis_store.pending_exact_fee_coin_ids
         )
         app.state.protocol_submitter.add_fee_coin_reservation_source(
