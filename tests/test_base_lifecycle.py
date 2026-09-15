@@ -658,7 +658,7 @@ async def test_schema14_upgrade_preserves_original_hold_and_first_deposit(tmp_pa
         pid=c.claim.purchase_artifact['purchaseId']
         c.ledgers[0].retain_base_payment_start(pid,deposit(c))
         original=deepcopy(c.ledgers[0].base_inventory_hold(pid))
-        c.ledgers[0]._conn.executescript('DROP TABLE base_lifecycle_observations; DROP TABLE base_lifecycle_terminals; DROP TABLE base_inventory_hold_generations; PRAGMA user_version=14;')
+        c.ledgers[0]._conn.executescript('DROP TABLE base_lifecycle_observations; DROP TABLE base_lifecycle_terminals; DROP TABLE base_inventory_hold_generations; DROP TABLE voucher_series_phase_retry_signatures; DROP TABLE voucher_phase_expiry_observations; PRAGMA user_version=14;')
         c.ledgers[0].close();c.ledgers[0]=ValidatorLedger(tmp_path/'extension-signer-0.db')
         assert c.ledgers[0]._conn.execute('PRAGMA user_version').fetchone()[0]==16
         assert c.ledgers[0].base_inventory_hold(pid)==original
