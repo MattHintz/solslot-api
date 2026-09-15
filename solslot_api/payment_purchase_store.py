@@ -19,6 +19,7 @@ from .checkout_terminal_store import CheckoutTerminalStoreMixin, migrate_checkou
 from .checkout_lifecycle_store import CheckoutLifecycleStoreMixin, migrate_lifecycle
 from .escrow_verification_work import migrate_escrow_verifications
 from .escrow_deposit import same_deposit_message
+from .base_inventory_hold_store import BaseInventoryHoldStoreMixin, migrate_base_checkout, check_base_deposit_binding
 
 
 class PaymentPurchaseNotFound(LookupError):
@@ -70,7 +71,7 @@ class StoredPaymentPurchase:
     inventory_extension_receipts: tuple[dict[str, Any], ...] = ()
 
 
-class PaymentPurchaseStore(InventoryExtensionStoreMixin, InventoryPaymentHoldStoreMixin, PurchaseAdmissionStoreMixin, CheckoutTerminalStoreMixin, CheckoutLifecycleStoreMixin):
+class PaymentPurchaseStore(BaseInventoryHoldStoreMixin, InventoryExtensionStoreMixin, InventoryPaymentHoldStoreMixin, PurchaseAdmissionStoreMixin, CheckoutTerminalStoreMixin, CheckoutLifecycleStoreMixin):
     def __init__(self, path: str):
         self.path = path
         if path != ":memory:":
@@ -185,6 +186,7 @@ class PaymentPurchaseStore(InventoryExtensionStoreMixin, InventoryPaymentHoldSto
                     )
             migrate_extensions(connection)
             migrate_checkout_holds(connection)
+            migrate_base_checkout(connection)
             migrate_checkout_terminals(connection)
             migrate_purchase_admission(connection)
             migrate_lifecycle(connection)
@@ -951,6 +953,7 @@ class PaymentPurchaseStore(InventoryExtensionStoreMixin, InventoryPaymentHoldSto
                 raise PaymentPurchaseNotFound(
                     "purchase artifact was not found"
                 )
+            check_base_deposit_binding(connection, purchase_id, message)
             existing_json = row["external_message_json"]
             if existing_json is not None:
                 if existing_json != message_json and not same_deposit_message(json.loads(existing_json), message):

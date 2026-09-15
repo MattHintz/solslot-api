@@ -426,7 +426,10 @@ async def build_protocol_offer_artifact(
     from .inventory_payment_hold_claims import payment_hold_activation
     try:
         hold_capability=payment_hold_activation(genesis_artifact,settings.runtime_environment+'-alpha',required=False)
-        if hold_capability is not None and hold_capability['adapterVersion']==2:
+        if body.rail in ('base_usdc', 'evm_usdc') and 'baseInventoryHold' in genesis_artifact:
+            from .base_inventory_hold import base_hold_activation
+            hold_capability=base_hold_activation(genesis_artifact,settings.runtime_environment+'-alpha')
+        if hold_capability is not None and (hold_capability['adapterVersion']==2 or hold_capability.get('schema')=='solslot.base-inventory-hold.v1'):
             from .purchase_admission import require_admission_owner
             require_admission_owner(vault_launcher_id,body.checkout_owner_auth_type,body.checkout_owner_key)
             if body.payment_terms.quantity>hold_capability['maxReservedDeedsPerIdentity']:
@@ -1091,6 +1094,12 @@ async def verify_external_escrow(
                 + ", ".join(mismatches)
             ),
         )
+    try:
+        from .base_inventory_hold_store import check_base_deposit_binding
+        with store._connect() as db:
+            check_base_deposit_binding(db, normalized['purchaseId'], normalized)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail='Base deposit differs from its retained prepayment protection.') from exc
     # Reject a different payment and malformed commitments before spending RPC
     # capacity. An identical replay is still independently checked for refunds.
     if record.external_message is not None and not same_deposit_message(record.external_message, normalized):

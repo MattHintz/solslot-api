@@ -12,14 +12,16 @@ from pathlib import Path
 
 from .inventory_payment_hold_ledger import InventoryPaymentHoldLedgerMixin, migrate_payment_holds, migrate_payment_hold_aborts
 
-SCHEMA_VERSION = 13
+from .base_inventory_hold_ledger import BaseInventoryHoldLedgerMixin, migrate_base_holds
+
+SCHEMA_VERSION = 14
 
 
 class ValidatorLedgerConflict(RuntimeError):
     """A claim attempted to reuse one-time credential evidence."""
 
 
-class ValidatorLedger(InventoryPaymentHoldLedgerMixin):
+class ValidatorLedger(BaseInventoryHoldLedgerMixin, InventoryPaymentHoldLedgerMixin):
     def __init__(self, path: str | Path, timeout: float = 10.0) -> None:
         self.path = str(path) if path == ":memory:" else str(Path(path))
         if self.path != ":memory:":
@@ -261,6 +263,9 @@ class ValidatorLedger(InventoryPaymentHoldLedgerMixin):
             if version < 13:
                 migrate_payment_hold_aborts(self._conn)
 
+            if version < 14:
+                migrate_base_holds(self._conn)
+
     def _assert_no_extension_signature(self, coin_id: str | None) -> None:
         # Called under the same BEGIN IMMEDIATE transaction as terminal writes.
         if coin_id is not None and self._conn.execute(
@@ -279,7 +284,7 @@ class ValidatorLedger(InventoryPaymentHoldLedgerMixin):
         with self._lock:
             self._conn.execute('BEGIN IMMEDIATE')
             try:
-                if self.inventory_payment_hold(purchase_id) is not None:
+                if self.inventory_payment_hold(purchase_id) is not None or self.base_inventory_hold(purchase_id) is not None:
                     self._assert_payment_hold_identity(purchase_id, json.loads(canonical_claim).get('payment_intent_id'))
                 old = self._conn.execute('SELECT * FROM inventory_extension_signatures WHERE reserved_coin_id=?', (reserved_coin_id,)).fetchone()
                 if old is not None:
