@@ -27,6 +27,8 @@ def base_hold_activation(artifact, environment, *, required=True):
     if (environment not in ('staging-alpha', 'production-alpha')
             or not isinstance(sources, dict) or set(sources) != COMPONENTS
             or any(not isinstance(v, str) or not re.fullmatch(r'[0-9a-f]{40}', v) or v == '0'*40 for v in sources.values())
+            or not re.fullmatch(r'0x[0-9a-f]{64}', str(inventory['deploymentId']))
+            or inventory['deploymentId'] == '0x'+'0'*64
             or not isinstance(value, dict)):
         raise ValueError('Base hold requires the exact isolated nine-component release')
     route = {key: value.get(key) for key in ('spoke', 'token', 'sourceChainSelector')}

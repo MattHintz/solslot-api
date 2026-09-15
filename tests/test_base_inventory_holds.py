@@ -220,6 +220,14 @@ async def test_exact_capability_and_false_payment_permission_are_required(tmp_pa
             c.genesis['baseInventoryHold']={**cap,key:value}
             with pytest.raises(ValueError):base_hold_activation(c.genesis,'staging-alpha')
         c.genesis['baseInventoryHold']=cap
+        for deployment in (None, '0x'+'0'*64, 'unreviewed'):
+            malformed=deepcopy(c.genesis)
+            malformed['ceremony']['ceremonyId']=deployment
+            malformed['inventoryActivation']['deploymentId']=deployment
+            malformed['baseInventoryHold']['deploymentId']=deployment
+            committed={k:v for k,v in malformed['baseInventoryHold'].items() if k not in ('releaseIdentity','reviewEvidenceSha256')}
+            malformed['baseInventoryHold']['releaseIdentity']=hashlib.sha256(canonical(committed).encode()).hexdigest()
+            with pytest.raises(ValueError):base_hold_activation(malformed,'staging-alpha')
         altered=c.claim.model_dump();altered['payment_intent_id']='pi_fake'
         with pytest.raises(ValueError):BaseInventoryHoldClaim.model_validate(altered)
         await arm(c)
