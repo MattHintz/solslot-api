@@ -131,6 +131,8 @@ class VaultCredentialReceipt(BaseModel):
     evmTxHash: str
     evmConfirmedBlockIndex: Optional[int] = None
     chiaVaultCoinId: Optional[str] = None
+    chiaStampCoinId: Optional[str] = None
+    genesisArtifactHash: Optional[str] = None
     confirmedBlockIndex: Optional[int] = None
     chiaSpendBundleId: Optional[str] = None
     enrolledAt: int
@@ -924,41 +926,53 @@ def _sync_chia_stamp(settings: Settings, key: str) -> EnrollmentRecord:
     if record.status not in {"stamp_pending", "receipt_syncing", "chia_confirmed"}:
         return record
 
-    coin_id = _normalize_hex32(record.receipt.chiaVaultCoinId, "receipt.chiaVaultCoinId")
-    coin_record = _fetch_coin_record_by_name(settings, coin_id)
-    if coin_record is None:
-        return record
-    try:
-        confirmed_block_index = int(coin_record.get("confirmed_block_index"))
-    except (TypeError, ValueError):
-        return record
+    from .vault_chain_evidence import resolve_enrolled_vault_tip, VaultHistoryError
+    from solslot_puzzles.vault_driver import DEFAULT_IDENTITY_ATTEST_ROOT
+
     expected_puzzle_hash = _expected_stamped_vault_puzzle_hash(
-        settings,
-        vault_launcher_id=key,
+        settings, vault_launcher_id=key,
         identity_attest_root=record.receipt.identityAttestRoot,
     )
+    artifact_hash = _active_artifact_hash(settings)
     try:
-        _verify_current_chia_vault_coin(
-            settings,
-            coin_id=coin_id,
-            confirmed_block_index=confirmed_block_index,
-            expected_puzzle_hash=expected_puzzle_hash,
-            expected_parent_id=_hex32(_find_initial_vault_coin(settings, key).name()),
+        if (record.network != settings.network or record.receipt.network != record.network
+                or record.receipt.vaultLauncherId != key
+                or record.policyVersion != settings.zkpassport_policy_version
+                or record.receipt.policyVersion != record.policyVersion
+                or record.bridgePolicyHash != _active_bridge_policy_hash(settings)
+                or record.receipt.bridgePolicyHash != record.bridgePolicyHash
+                or record.receipt.identityAttestRoot == _hex32(DEFAULT_IDENTITY_ATTEST_ROOT)
+                or (record.receipt.genesisArtifactHash is not None
+                    and record.receipt.genesisArtifactHash != artifact_hash)):
+            raise VaultHistoryError("Receipt differs from the active enrollment release")
+        stamp_id = bytes32.fromhex(_normalize_hex32(
+            record.receipt.chiaStampCoinId or record.receipt.chiaVaultCoinId,
+            "receipt.chiaStampCoinId").removeprefix("0x"))
+        if (record.status != "chia_confirmed"
+                and _fetch_coin_record_by_name(settings, _hex32(stamp_id)) is None):
+            return record
+        tip, stamp_id = resolve_enrolled_vault_tip(
+            stamp_id=stamp_id, launcher_id=bytes32.fromhex(key.removeprefix("0x")),
+            unstamped_puzzle_hash=bytes32.fromhex(_expected_stamped_vault_puzzle_hash(
+                settings, vault_launcher_id=key,
+                identity_attest_root=_hex32(DEFAULT_IDENTITY_ATTEST_ROOT),
+            ).removeprefix("0x")),
+            stamped_puzzle_hash=bytes32.fromhex(expected_puzzle_hash.removeprefix("0x")),
+            fetch_coin=lambda coin_id: _fetch_coin_record_by_name(settings, _hex32(coin_id)),
         )
-    except HTTPException:
+        coin_id = _hex32(tip.coin.name())
+        confirmed_block_index = tip.confirmed_height
+    except (VaultHistoryError, HTTPException) as exc:
         if record.status != "chia_confirmed":
-            raise
+            raise HTTPException(status_code=409, detail=f"Vault receipt history is not current: {exc}") from exc
         latest = EnrollmentRecord.model_validate(ledger.get_enrollment(key) or existing)
         downgraded = latest.model_copy(
             update={"status": "receipt_syncing", "updatedAt": int(time.time())}
         )
         try:
-            ledger.update_enrollment(
-                downgraded.model_dump(),
-                expected_statuses={"chia_confirmed"},
-            )
-        except LedgerConflict as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            ledger.update_enrollment(downgraded.model_dump(), expected_statuses={"chia_confirmed"})
+        except LedgerConflict as conflict:
+            raise HTTPException(status_code=409, detail=str(conflict)) from conflict
         return downgraded
 
     registry = get_registry()
@@ -990,6 +1004,8 @@ def _sync_chia_stamp(settings: Settings, key: str) -> EnrollmentRecord:
     receipt = latest.receipt.model_copy(
         update={
             "chiaVaultCoinId": coin_id,
+            "chiaStampCoinId": _hex32(stamp_id),
+            "genesisArtifactHash": artifact_hash,
             "confirmedBlockIndex": confirmed_block_index,
         }
     )
@@ -1461,6 +1477,7 @@ def record_evm_proof(
         validatorMessage=event.validator_message,
         evmTxHash=event.transaction_hash,
         evmConfirmedBlockIndex=event.block_number,
+        genesisArtifactHash=_active_artifact_hash(settings),
         enrolledAt=now,
     )
     updated = record.model_copy(

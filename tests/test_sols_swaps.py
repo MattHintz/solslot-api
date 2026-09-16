@@ -672,7 +672,7 @@ class FakeProtocolSubmitter(ProtocolBundleSubmitter):
     def __init__(self) -> None:
         self.submitted = None
 
-    async def submit(self, bundle):
+    async def submit(self, bundle, *, expected_backing_mojos=0):
         self.submitted = bundle
         return {
             "status": "MEMPOOL",
@@ -1251,3 +1251,58 @@ def test_evm_swap_signature_rejects_changed_context_with_same_operation(reverse)
         assert mutation.receipt.operation_hash == context.receipt.operation_hash
         with pytest.raises(SolsSwapOfferError, match="signature does not belong"):
             _vault_signature_data(mutation, body)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('evm', [False, True], ids=['bls','evm'])
+async def test_reverse_swap_actual_submitter_funds_exact_mint_and_validates_full_signed_consensus(monkeypatch,evm):
+    import chia_rs
+    from chia.consensus.default_constants import DEFAULT_CONSTANTS
+    from solslot_api.protocol_submission import ProtocolFeePolicy
+    faucet = Faucet.from_seed_hex('77' * 32,'testnet11')
+    context = _reverse_fixture(faucet,evm=evm)
+    backing = context.receipt.deed_to_sols_quote.fresh_sols_mojos_minted
+    assert backing > 0
+    funding = Coin(_b32(198),faucet.address_puzzle_hash,backing+1000)
+    class ConsensusNode(FakeNode):
+        submitted = None
+        async def get_fee_estimate(self,*,target_times,spend_bundle,require_primary):
+            assert require_primary and target_times == [300]
+            chia_rs.validate_clvm_and_signature(chia_rs.SpendBundle.from_json_dict(spend_bundle),
+                11_000_000_000, DEFAULT_CONSTANTS.replace(
+                    AGG_SIG_ME_ADDITIONAL_DATA=bytes32(AGG_SIG_ME_DATA["testnet11"])),
+                chia_rs.MEMPOOL_MODE | chia_rs.ENABLE_SECP_OPS | chia_rs.ENABLE_KECCAK_OPS_OUTSIDE_GUARD)
+            return dict(target_times=target_times, estimates=[420])
+        async def get_coin_records_by_puzzle_hash(self,puzzle_hash,*,include_spent):
+            assert puzzle_hash == faucet.address_hex and not include_spent
+            return [dict(coin=funding.to_json_dict(),confirmed_block_index=1,spent_block_index=0)]
+        async def push_tx_confirmed_in_primary_mempool(self,bundle,**kw):
+            signed = chia_rs.SpendBundle.from_json_dict(bundle)
+            assert kw['required_spend_bundle_id'] == _hex32(signed.name())
+            assert kw['required_coin_id'] == _hex32(funding.name())
+            assert sum(c.amount for c in signed.removals()) - sum(c.amount for c in signed.additions()) == 420
+            chia_rs.validate_clvm_and_signature(signed,11_000_000_000,DEFAULT_CONSTANTS.replace(
+                AGG_SIG_ME_ADDITIONAL_DATA=bytes32(AGG_SIG_ME_DATA["testnet11"])),
+                chia_rs.MEMPOOL_MODE | chia_rs.ENABLE_SECP_OPS | chia_rs.ENABLE_KECCAK_OPS_OUTSIDE_GUARD)
+            self.submitted = signed
+            return dict(provider='synthetic-consensus',observed_at='2026-09-16T00:00:00Z',ambiguous_push=False)
+    node = ConsensusNode()
+    actual = ProtocolBundleSubmitter(provider=node,faucet=faucet,policy=ProtocolFeePolicy(
+        enabled=True, maximum_mojos=1000,maximum_backing_mojos=backing,
+        maximum_funding_coin_mojos=backing+1000))
+    request = _request(node,actual,faucet)
+    async def load_context(**_kw): return context
+    monkeypatch.setattr('solslot_api.sols_swaps._authorize_swap',lambda *_: None)
+    monkeypatch.setattr('solslot_api.sols_swaps._load_reverse_swap_context',load_context)
+    prepared = await prepare_sols_swap(_hex32(VAULT_LAUNCHER),PrepareSolsSwapRequest(
+        direction='DEED_TO_SOLS',deedLauncherId=_hex32(DEED_LAUNCHER)),request,_settings())
+    auth = (dict(vaultOwnerAuthorization='0x'+EVM_ACCOUNT.sign_message(
+        encode_typed_data(full_message=prepared.vault_typed_data)).signature.hex()) if evm
+        else dict(aggregatedSignature='0x'+_reverse_wallet_signature(context).hex()))
+    complete = await complete_sols_swap(_hex32(VAULT_LAUNCHER),CompleteSolsSwapRequest(
+        direction='DEED_TO_SOLS',deedLauncherId=_hex32(DEED_LAUNCHER),
+        operationHash=prepared.operation_hash,quoteExpiresAt=prepared.quote_expires_at,
+        buyerOffer=prepared.buyer_offer,**auth),request,_settings())
+    assert node.submitted is not None
+    assert complete.transaction_id == _hex32(node.submitted.name())
+    assert complete.fee_mojos == '420'

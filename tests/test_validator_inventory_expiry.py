@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 import httpx
 import pytest
 from chia_rs import AugSchemeMPL, Coin, G2Element
+from chia.wallet.puzzles.singleton_top_layer_v1_1 import SINGLETON_LAUNCHER_HASH
 from chia_rs.sized_ints import uint64
 from solslot_puzzles.payment_artifacts_v3 import purchase_artifact_v3_to_json
 from solslot_puzzles.stripe_settlement_v1_driver import inventory_reservation_message
@@ -25,6 +26,11 @@ def signer_case(tmp_path,monkeypatch,inventory_version=2):
         roster_pubkeys=c.artifact['validatorSet']['pubkeys'],coinset_base_url='https://validator-node.invalid')
     c.ledger=ValidatorLedger(tmp_path/'signatures.db')
     ctx=c.contexts[0]; coin=c.transitions[0].spend.coin
+    launcher=Coin(_b32(65),SINGLETON_LAUNCHER_HASH,uint64(1))
+    c.node.records[hx(launcher.name())]=record(launcher,98,99)
+    from solslot_puzzles.vault_driver import puzzle_for_p2_vault
+    ctx=replace(ctx,purchase=replace(ctx.purchase,vault_launcher_id=launcher.name(),
+        vault_p2_puzzle_hash=puzzle_for_p2_vault(launcher.name()).get_tree_hash()))
     owner=bytes(c.keys[0].get_g1())
     def vault(root):
         return puzzle_for_vault_full(ctx.purchase.vault_launcher_id,owner,1,one_leaf_merkle_root(owner),_b32(26),

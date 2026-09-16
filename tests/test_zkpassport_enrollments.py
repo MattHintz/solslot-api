@@ -656,7 +656,10 @@ def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_
             "spent_block_index": 0,
         }
         if coin_id == expected_coin_id
-        else None,
+        else {"coin": current_coin.to_json_dict(), "confirmed_block_index": 101,
+              "spent_block_index": 789} if coin_id == expected_parent
+        else {"coin": LAUNCHER_COIN_A.to_json_dict(), "confirmed_block_index": 100,
+              "spent_block_index": 101} if coin_id == VAULT_A else None,
     )
     synced = zkpassport_enrollments.sync_chia_stamp(
         VAULT_A,

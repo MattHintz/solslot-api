@@ -1,15 +1,18 @@
-"""Mempool-aware Chia submission funded by the existing server fee till."""
+"""Mempool-aware Chia submission with bounded fee and issuance funding."""
 from __future__ import annotations
 
 import asyncio
 import inspect
+import hashlib
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
-from chia.types.blockchain_format.program import Program
+from chia.types.blockchain_format.program import Program, INFINITE_COST
+from chia.consensus.condition_tools import conditions_dict_for_solution
+from chia.types.condition_opcodes import ConditionOpcode
 from chia.types.coin_spend import make_spend
-from chia_rs import G2Element, SpendBundle
+from chia_rs import Coin, G2Element, SpendBundle
 
 from .chia_provider import ChiaProvider, ChiaProviderError
 from .faucet import Faucet
@@ -38,6 +41,7 @@ class ProtocolFeePolicy:
     minimum_mojos: int = 1
     maximum_mojos: int = 10_000_000
     maximum_funding_coin_mojos: int = 10_000_000
+    maximum_backing_mojos: int = 0
     mempool_timeout_seconds: float = 20.0
     mempool_poll_seconds: float = 0.5
 
@@ -47,6 +51,7 @@ class PreparedProtocolBundle:
     bundle: SpendBundle
     fee_mojos: int
     fee_coin_id: str
+    backing_mojos: int = 0
 
     @property
     def spend_bundle_id(self) -> str:
@@ -57,12 +62,13 @@ class PreparedProtocolBundle:
             "spendBundleId": self.spend_bundle_id,
             "feeMojos": str(self.fee_mojos),
             "feeCoinId": self.fee_coin_id,
+            "backingMojos": str(self.backing_mojos),
             "spendBundle": self.bundle.to_json_dict(),
         }
 
 
 class ProtocolBundleSubmitter:
-    """Add one bounded fee-till spend and prove local mempool propagation."""
+    """Fund one exact protocol bundle and prove local mempool propagation."""
 
     def __init__(
         self,
@@ -105,12 +111,14 @@ class ProtocolBundleSubmitter:
         ]
         | None = None,
         selection_purpose: str | None = None,
+        expected_backing_mojos: int = 0,
     ) -> dict[str, Any]:
         # Production keeps one worker for faucet-backed writes. Holding this
         # lock until mempool observation prevents reuse of an unconfirmed coin.
         async with self._lock:
             prepared = await self._prepare_locked(
-                protocol_bundle_json, selection_purpose=selection_purpose
+                protocol_bundle_json, selection_purpose=selection_purpose,
+                expected_backing_mojos=expected_backing_mojos
             )
             if before_push is not None:
                 callback_result = before_push(prepared)
@@ -246,6 +254,7 @@ class ProtocolBundleSubmitter:
         protocol_bundle_json: dict[str, Any],
         *,
         selection_purpose: str | None = None,
+        expected_backing_mojos: int = 0,
     ) -> PreparedProtocolBundle:
         if not self.policy.enabled:
             raise ProtocolSubmissionError("protocol fee funding is disabled")
@@ -263,30 +272,64 @@ class ProtocolBundleSubmitter:
             raise ProtocolSubmissionError(
                 "protocol spend bundle conditions cannot be evaluated"
             ) from exc
-        if existing_fee != 0:
+        if (type(expected_backing_mojos) is not int or expected_backing_mojos < 0
+                or expected_backing_mojos > self.policy.maximum_backing_mojos):
+            raise ProtocolSubmissionError("issuance backing exceeds configured cap or is invalid")
+        if expected_backing_mojos and existing_fee != -expected_backing_mojos:
+            raise ProtocolSubmissionError("bundle deficit does not match authorized issuance backing")
+        if not expected_backing_mojos and existing_fee != 0:
             raise ProtocolSubmissionError(
                 "protocol spend bundle must not carry a separate user-funded fee"
             )
-        preliminary_fee = await self._estimate_fee(protocol_bundle)
+        # The node prevalidates fee-estimate bundles and rejects unfunded
+        # issuance as MintingCoin. Estimate only after attaching its backing.
+        preliminary_fee = (self.policy.minimum_mojos if expected_backing_mojos
+                           else await self._estimate_fee(protocol_bundle))
         protocol_input_ids = {
             bytes(coin.name()) for coin in protocol_bundle.removals()
         }
         fee_coin = await self._select_fee_coin(
-            preliminary_fee,
+            preliminary_fee + expected_backing_mojos,
             excluded_coin_ids=protocol_input_ids,
             selection_purpose=selection_purpose,
         )
-        final_bundle, fee = await self._converge_fee(
+        final_bundle, fee, fee_coin = await self._converge_fee(
             protocol_bundle,
             fee_coin,
             preliminary_fee,
             selection_purpose=selection_purpose,
+            backing_mojos=expected_backing_mojos,
+            backing_conditions=self._backing_conditions(protocol_bundle) if expected_backing_mojos else (),
         )
         return PreparedProtocolBundle(
             bundle=final_bundle,
             fee_mojos=fee,
             fee_coin_id="0x" + fee_coin.name().hex(),
+            backing_mojos=expected_backing_mojos,
         )
+
+    @staticmethod
+    def _backing_conditions(bundle: SpendBundle) -> tuple[Program, ...]:
+        """Tie the subsidy to every protocol input and its emitted commitments."""
+        conditions = []
+        announcements = 0
+        for spend in bundle.coin_spends:
+            conditions.append(Program.to([ConditionOpcode.ASSERT_CONCURRENT_SPEND, spend.coin.name()]))
+            emitted = conditions_dict_for_solution(
+                Program.from_bytes(bytes(spend.puzzle_reveal)),
+                Program.from_bytes(bytes(spend.solution)), INFINITE_COST,
+            )
+            for create, assertion, origin in (
+                (ConditionOpcode.CREATE_COIN_ANNOUNCEMENT, ConditionOpcode.ASSERT_COIN_ANNOUNCEMENT, spend.coin.name()),
+                (ConditionOpcode.CREATE_PUZZLE_ANNOUNCEMENT, ConditionOpcode.ASSERT_PUZZLE_ANNOUNCEMENT, spend.coin.puzzle_hash),
+            ):
+                for condition in emitted.get(create, []):
+                    announcements += 1
+                    digest = hashlib.sha256(bytes(origin) + condition.vars[0]).digest()
+                    conditions.append(Program.to([assertion, digest]))
+        if not announcements:
+            raise ProtocolSubmissionError("issuance backing requires protocol announcement commitments")
+        return tuple(conditions)
 
     async def _estimate_fee(self, bundle: SpendBundle) -> int:
         try:
@@ -414,12 +457,20 @@ class ProtocolBundleSubmitter:
         preliminary_fee: int,
         *,
         selection_purpose: str | None,
-    ) -> tuple[SpendBundle, int]:
+        backing_mojos: int = 0,
+        backing_conditions: tuple[Program, ...] = (),
+    ) -> tuple[SpendBundle, int, Coin]:
         fee = preliminary_fee
         for _ in range(3):
-            if fee > int(fee_coin.amount):
-                raise ProtocolSubmissionError(
-                    "selected protocol fee coin is smaller than the medium fee"
+            if fee + backing_mojos > int(fee_coin.amount):
+                if not backing_mojos:
+                    raise ProtocolSubmissionError(
+                        "selected protocol funding coin is smaller than backing plus the medium fee"
+                    )
+                fee_coin = await self._select_fee_coin(
+                    fee + backing_mojos,
+                    excluded_coin_ids={bytes(c.name()) for c in protocol_bundle.removals()},
+                    selection_purpose=selection_purpose,
                 )
             aggregate = SpendBundle.aggregate(
                 [
@@ -428,13 +479,19 @@ class ProtocolBundleSubmitter:
                         fee_coin,
                         fee,
                         selection_purpose=selection_purpose,
+                        backing_mojos=backing_mojos,
+                        backing_conditions=backing_conditions,
                     ),
                 ]
             )
             estimated = await self._estimate_fee(aggregate)
             next_fee = max(fee, estimated)
             if next_fee == fee:
-                return aggregate, fee
+                net_fee = sum(int(c.amount) for c in aggregate.removals()) - sum(
+                    int(c.amount) for c in aggregate.additions())
+                if net_fee != fee:
+                    raise ProtocolSubmissionError("funded bundle does not preserve the reserved fee")
+                return aggregate, fee, fee_coin
             fee = next_fee
         raise ProtocolSubmissionError("medium fee estimate did not converge")
 
@@ -444,9 +501,11 @@ class ProtocolBundleSubmitter:
         fee: int,
         *,
         selection_purpose: str | None,
+        backing_mojos: int = 0,
+        backing_conditions: tuple[Program, ...] = (),
     ) -> SpendBundle:
-        conditions = [Program.to([RESERVE_FEE, fee])]
-        change = int(coin.amount) - fee
+        conditions = [Program.to([RESERVE_FEE, fee]), *backing_conditions]
+        change = int(coin.amount) - fee - backing_mojos
         if change:
             conditions.insert(
                 0,

@@ -376,6 +376,21 @@ def _fetch_coin(
     return record
 
 
+def _verify_purchase_vault_history(settings, claim, launcher_id, unstamped_puzzle, stamped_puzzle):
+    from .vault_chain_evidence import verify_enrolled_vault_tip, VaultHistoryError
+    try:
+        return verify_enrolled_vault_tip(
+            tip_id=bytes32.fromhex(claim.credential_vault_coin_id.removeprefix("0x")),
+            launcher_id=launcher_id,
+            unstamped_puzzle_hash=unstamped_puzzle.get_tree_hash(),
+            stamped_puzzle_hash=stamped_puzzle.get_tree_hash(),
+            fetch_coin=lambda coin_id: _fetch_coin(settings, "0x" + coin_id.hex(),
+                "credential vault history", require_unspent=False),
+        )
+    except VaultHistoryError as exc:
+        raise ValidatorEvidenceError(str(exc)) from exc
+
+
 def _fetch_coin_spend(
     settings: ValidatorSettings,
     coin: Coin,
@@ -738,32 +753,6 @@ def verify_inventory_reservation_claim(
         raise ValidatorEvidenceError(
             "reservation has no matching current zkPassport credential"
         )
-    credential_record = _fetch_coin(
-        settings,
-        claim.credential_vault_coin_id,
-        "reservation credential vault coin",
-    )
-    credential_coin = _coin_from_record(
-        credential_record,
-        "reservation credential vault coin",
-    )
-    credential_parent = _coin_from_record(
-        _fetch_coin(
-            settings,
-            "0x" + credential_coin.parent_coin_info.hex(),
-            "reservation pre-credential vault coin",
-            require_unspent=False,
-        ),
-        "reservation pre-credential vault coin",
-    )
-    if (
-        credential_parent.parent_coin_info != purchase.vault_launcher_id
-        or int(credential_parent.amount) != 1
-        or int(credential_coin.amount) != 1
-    ):
-        raise ValidatorEvidenceError(
-            "reservation credential is not the approved vault successor"
-        )
     try:
         owner_key = bytes.fromhex(claim.credential_owner_key.removeprefix("0x"))
         pool_launcher = bytes32.fromhex(
@@ -797,13 +786,8 @@ def verify_inventory_reservation_claim(
         raise ValidatorEvidenceError(
             "reservation vault ownership data is malformed"
         ) from exc
-    if (
-        credential_parent.puzzle_hash != unstamped_puzzle.get_tree_hash()
-        or credential_coin.puzzle_hash != stamped_puzzle.get_tree_hash()
-    ):
-        raise ValidatorEvidenceError(
-            "reservation credential root is not committed by the vault"
-        )
+    _verify_purchase_vault_history(settings, claim, purchase.vault_launcher_id,
+                                   unstamped_puzzle, stamped_puzzle)
 
     raw_pubkeys = validator_set.get("pubkeys")
     if (
@@ -1029,34 +1013,6 @@ def verify_primary_purchase_claim(
         raise ValidatorEvidenceError(
             "purchase does not bind the current zkPassport root"
         )
-    credential_record = _fetch_coin(
-        settings,
-        claim.credential_vault_coin_id,
-        "credential vault coin",
-    )
-    credential_coin = _coin_from_record(
-        credential_record,
-        "credential vault coin",
-    )
-    credential_parent_record = _fetch_coin(
-        settings,
-        "0x" + bytes(credential_coin.parent_coin_info).hex(),
-        "pre-credential vault coin",
-        require_unspent=False,
-    )
-    credential_parent = _coin_from_record(
-        credential_parent_record,
-        "pre-credential vault coin",
-    )
-    if (
-        credential_parent.parent_coin_info != purchase.vault_launcher_id
-        or int(credential_parent.amount) != 1
-        or int(credential_coin.amount) != 1
-    ):
-        raise ValidatorEvidenceError(
-            "credential coin is not the stamped successor of this vault"
-        )
-
     try:
         owner_key = bytes.fromhex(claim.credential_owner_key.removeprefix("0x"))
         pool_launcher = bytes32.fromhex(
@@ -1090,13 +1046,8 @@ def verify_primary_purchase_claim(
         raise ValidatorEvidenceError(
             "credential vault ownership data is malformed"
         ) from exc
-    if (
-        credential_parent.puzzle_hash != unstamped_puzzle.get_tree_hash()
-        or credential_coin.puzzle_hash != stamped_puzzle.get_tree_hash()
-    ):
-        raise ValidatorEvidenceError(
-            "credential root is not committed by the current vault puzzle"
-        )
+    _verify_purchase_vault_history(settings, claim, purchase.vault_launcher_id,
+                                   unstamped_puzzle, stamped_puzzle)
 
     raw_pubkeys = validator_set.get("pubkeys")
     if (
@@ -1795,25 +1746,6 @@ def verify_stripe_settlement_claim(
         raise ValidatorEvidenceError(
             "Stripe delivery has no matching zkPassport-approved vault root"
         )
-    credential_record = _fetch_coin(
-        settings,
-        claim.credential_vault_coin_id,
-        "Stripe credential vault coin",
-    )
-    credential_coin = _coin_from_record(
-        credential_record,
-        "Stripe credential vault coin",
-    )
-    credential_parent_record = _fetch_coin(
-        settings,
-        "0x" + credential_coin.parent_coin_info.hex(),
-        "Stripe credential parent coin",
-        require_unspent=False,
-    )
-    credential_parent = _coin_from_record(
-        credential_parent_record,
-        "Stripe credential parent coin",
-    )
     owner_key = bytes.fromhex(claim.credential_owner_key.removeprefix("0x"))
     try:
         pool_launcher = bytes32.fromhex(
@@ -1834,15 +1766,15 @@ def verify_stripe_settlement_claim(
         raise ValidatorEvidenceError(
             "Stripe vault ownership evidence is malformed"
         ) from exc
-    if (
-        credential_parent.parent_coin_info != purchase.vault_launcher_id
-        or int(credential_parent.amount) != 1
-        or int(credential_coin.amount) != 1
-        or credential_coin.puzzle_hash != expected_credential_puzzle.get_tree_hash()
-    ):
-        raise ValidatorEvidenceError(
-            "Stripe vault credential is not the approved singleton state"
-        )
+    unstamped_puzzle = puzzle_for_vault_full(
+        purchase.vault_launcher_id, owner_key, claim.credential_owner_auth_type,
+        one_leaf_merkle_root(owner_key), pool_launcher,
+        identity_attest_root=DEFAULT_IDENTITY_ATTEST_ROOT,
+        zkpassport_bridge_policy_hash=bytes32.fromhex(
+            claim.credential_bridge_policy_hash.removeprefix("0x")),
+    )
+    _verify_purchase_vault_history(settings, claim, purchase.vault_launcher_id,
+                                   unstamped_puzzle, expected_credential_puzzle)
 
     try:
         validator_pubkeys = tuple(
