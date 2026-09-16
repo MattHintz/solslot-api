@@ -4,10 +4,14 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import hashlib
+import json
 import sqlite3
 from threading import RLock
 from time import time
-from typing import Iterator
+from typing import Any, Iterator, Mapping
+
+from .sols_swap_execution import hx, validate_execution
 
 
 @dataclass(frozen=True)
@@ -59,7 +63,7 @@ class SolsSwapStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=10000")
-        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA synchronous=FULL")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -138,6 +142,78 @@ class SolsSwapStore:
                 ON sols_swap_operations(vault_launcher_id, updated_at DESC)
                 """
             )
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS sols_swap_executions (
+                    operation_hash TEXT PRIMARY KEY REFERENCES sols_swap_operations(operation_hash),
+                    execution_json TEXT NOT NULL,
+                    execution_sha256 TEXT NOT NULL
+                )
+            """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS sols_swap_input_reservations (
+                    coin_id TEXT PRIMARY KEY,
+                    operation_hash TEXT NOT NULL REFERENCES sols_swap_executions(operation_hash)
+                )
+            """)
+
+    def reserve_execution(self, operation_hash: str, execution: Mapping[str, Any]) -> None:
+        """Seal a signed funded transaction and claim all its inputs atomically."""
+        encoded = json.dumps(dict(execution), sort_keys=True, separators=(",", ":"), allow_nan=False)
+        digest = hashlib.sha256(encoded.encode()).hexdigest()
+        with self._transaction() as connection:
+            row = connection.execute("SELECT * FROM sols_swap_operations WHERE operation_hash=?",
+                                     (operation_hash,)).fetchone()
+            if row is None:
+                raise ValueError("prepared Sols swap operation does not exist")
+            record = self._record(row)
+            bundle = validate_execution(execution, pool_input_id=record.pool_input_coin_id,
+                                        pool_output_id=record.expected_pool_output_coin_id)
+            existing = connection.execute("SELECT * FROM sols_swap_executions WHERE operation_hash=?",
+                                          (operation_hash,)).fetchone()
+            if existing is not None:
+                if existing["execution_json"] != encoded or existing["execution_sha256"] != digest:
+                    raise ValueError("Sols swap already has a different exact execution")
+                return
+            if record.status != "PREPARED" or record.transaction_id is not None:
+                raise ValueError("Sols swap can no longer reserve a new execution")
+            connection.execute("INSERT INTO sols_swap_executions VALUES (?, ?, ?)",
+                               (operation_hash, encoded, digest))
+            try:
+                connection.executemany("INSERT INTO sols_swap_input_reservations VALUES (?, ?)",
+                                       [(hx(coin.name()), operation_hash) for coin in bundle.removals()])
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("a Sols swap input is reserved by another execution") from exc
+            connection.execute("""
+                UPDATE sols_swap_operations SET transaction_id=?, fee_mojos=?,
+                    fee_target_seconds=?, updated_at=? WHERE operation_hash=?
+            """, (execution["spendBundleId"], execution["feeMojos"], execution["feeTargetSeconds"],
+                  time(), operation_hash))
+
+    def execution(self, operation_hash: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute("""
+                SELECT e.*, o.pool_input_coin_id, o.expected_pool_output_coin_id,
+                    o.transaction_id, o.fee_mojos, o.fee_target_seconds
+                FROM sols_swap_executions e JOIN sols_swap_operations o USING (operation_hash)
+                WHERE operation_hash=?
+            """, (operation_hash,)).fetchone()
+        if row is None:
+            return None
+        if hashlib.sha256(row["execution_json"].encode()).hexdigest() != row["execution_sha256"]:
+            raise ValueError("durable Sols swap execution checksum differs")
+        execution = json.loads(row["execution_json"])
+        validate_execution(execution, pool_input_id=row["pool_input_coin_id"],
+                           pool_output_id=row["expected_pool_output_coin_id"])
+        if (execution["spendBundleId"] != row["transaction_id"] or execution["feeMojos"] != row["fee_mojos"]
+                or execution["feeTargetSeconds"] != row["fee_target_seconds"]):
+            raise ValueError("durable Sols swap execution metadata differs")
+        return execution
+
+    def reserved_input_coin_ids(self) -> tuple[str, ...]:
+        """No wall-clock expiry: a signed transaction may already be on chain."""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute("SELECT coin_id FROM sols_swap_input_reservations ORDER BY coin_id").fetchall()
+        return tuple(row["coin_id"] for row in rows)
 
     def record_prepared(
         self,
@@ -228,6 +304,11 @@ class SolsSwapStore:
             if row is None:
                 raise ValueError("prepared Sols swap operation does not exist")
             existing = self._record(row)
+            if existing.transaction_id is not None and (
+                existing.transaction_id != transaction_id or existing.fee_mojos != fee_mojos
+                or existing.fee_target_seconds != fee_target_seconds
+            ):
+                raise ValueError("submission differs from the retained Sols swap execution")
             if existing.status in ("SUBMITTED", "CONFIRMED"):
                 if existing.transaction_id != transaction_id:
                     raise ValueError(
@@ -267,7 +348,10 @@ class SolsSwapStore:
                 """
                 UPDATE sols_swap_operations
                 SET status='CONFIRMED', updated_at=?
-                WHERE operation_hash=? AND status='SUBMITTED'
+                WHERE operation_hash=? AND (status='SUBMITTED' OR
+                    (status='PREPARED' AND transaction_id IS NOT NULL AND EXISTS (
+                        SELECT 1 FROM sols_swap_executions e
+                        WHERE e.operation_hash=sols_swap_operations.operation_hash)))
                 """,
                 (time(), operation_hash),
             )
@@ -275,6 +359,9 @@ class SolsSwapStore:
                 "SELECT * FROM sols_swap_operations WHERE operation_hash=?",
                 (operation_hash,),
             ).fetchone()
+            if row is not None and row["status"] == "CONFIRMED":
+                connection.execute("DELETE FROM sols_swap_input_reservations WHERE operation_hash=?",
+                                   (operation_hash,))
         if row is None:
             raise ValueError("Sols swap operation does not exist")
         return self._record(row)

@@ -27,6 +27,7 @@ from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
     puzzle_for_singleton,
 )
 from chia.wallet.trading.offer import OFFER_MOD_HASH, Offer
+from chia.wallet.wallet_spend_bundle import WalletSpendBundle
 from chia_rs import AugSchemeMPL
 from chia_rs.sized_bytes import bytes32
 from fastapi import HTTPException
@@ -667,21 +668,32 @@ class FakeNode:
     async def get_mempool_items_by_coin_name(self, _coin_id):
         return [{"pending": True}] if self.pending else []
 
+    async def get_coin_record_by_name_primary(self, _coin_id):
+        return None
+
 
 class FakeProtocolSubmitter(ProtocolBundleSubmitter):
     def __init__(self) -> None:
+        from solslot_api.protocol_submission import ProtocolFeePolicy
+        faucet = Faucet.from_seed_hex("78" * 32, "testnet11")
+        funding = Coin(_b32(197), faucet.address_puzzle_hash, 10**12)
+        class FundingNode(FakeNode):
+            async def get_fee_estimate(self, *, target_times, **_kwargs):
+                return dict(target_times=target_times, estimates=[420])
+            async def get_coin_records_by_puzzle_hash(self, *_args, **_kwargs):
+                return [dict(coin=funding.to_json_dict(), confirmed_block_index=1, spent_block_index=0)]
+            async def push_tx_confirmed_in_primary_mempool(self, bundle, **_kwargs):
+                self.pushed = bundle
+                return dict(provider="primary", observed_at="2026-07-27T14:30:00Z", ambiguous_push=False)
+        super().__init__(provider=FundingNode(), faucet=faucet, policy=ProtocolFeePolicy(
+            enabled=True, maximum_mojos=1000, maximum_backing_mojos=10**12,
+            maximum_funding_coin_mojos=10**12,
+        ))
         self.submitted = None
 
-    async def submit(self, bundle, *, expected_backing_mojos=0):
+    async def submit(self, bundle, *, expected_backing_mojos=0, before_push=None):
         self.submitted = bundle
-        return {
-            "status": "MEMPOOL",
-            "spendBundleId": "0x" + "99" * 32,
-            "feeMojos": "420",
-            "feeTargetSeconds": 300,
-            "submissionProvider": "primary",
-            "mempoolObservedAt": "2026-07-27T14:30:00Z",
-        }
+        return await super().submit(bundle, expected_backing_mojos=expected_backing_mojos, before_push=before_push)
 
 
 def _settings() -> Settings:
@@ -887,7 +899,7 @@ async def test_prepare_and_complete_sols_swap_is_atomic_and_fee_funded(
     assert completed.status == "MEMPOOL"
     assert completed.schema_version == 3
     assert completed.direction == "SOLS_TO_DEED"
-    assert completed.transaction_id == "0x" + "99" * 32
+    assert completed.transaction_id == _hex32(WalletSpendBundle.from_json_dict(submitter.provider.pushed).name())
     assert completed.fee_mojos == "420"
     assert completed.fee_target_seconds == 300
     assert completed.submission_provider == "primary"

@@ -16,6 +16,7 @@ which is the first wallet address (address index 0).
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Optional
 
@@ -104,6 +105,21 @@ class Faucet:
         self.agg_sig_me_data = AGG_SIG_ME_DATA[network]
         self.key = self._derive_wallet_key(0)
         self._exclusive_selection_purpose: str | None = None
+        self._coin_reservation_sources: list[Callable[[], Iterable[str]]] = []
+
+    def add_coin_reservation_source(self, source: Callable[[], Iterable[str]]) -> None:
+        if source not in self._coin_reservation_sources:
+            self._coin_reservation_sources.append(source)
+
+    def reserved_coin_ids(self) -> set[bytes32]:
+        try:
+            return {_hex_to_bytes32(value) for source in self._coin_reservation_sources for value in source()}
+        except Exception as exc:
+            raise FaucetSelectionRestricted("durable faucet reservations are unavailable") from exc
+
+    def require_unreserved_coin(self, coin: Coin) -> None:
+        if coin.name() in self.reserved_coin_ids():
+            raise FaucetSelectionRestricted("faucet coin is reserved by an unresolved exact execution")
 
     def restrict_coin_selection_to(self, purpose: str) -> None:
         """Fail closed for unrelated faucet spenders during one-shot work."""
@@ -224,6 +240,7 @@ class Faucet:
                 operator's configured ceiling on per-spend faucet usage.
         """
         self.require_spend_purpose(purpose)
+        reserved = self.reserved_coin_ids()
         usable: list[Coin] = []
         for rec in candidate_coins:
             if rec.get("spent_block_index") not in (0, None):
@@ -243,6 +260,9 @@ class Faucet:
             )
         if not usable:
             return None
+        usable = [coin for coin in usable if coin.name() not in reserved]
+        if not usable:
+            return None
         usable.sort(key=lambda c: c.amount)
         return usable[0]
 
@@ -260,6 +280,7 @@ class Faucet:
         and the signer is the wallet secret key.
         """
         self.require_spend_purpose(purpose)
+        self.require_unreserved_coin(coin)
         delegated_puzzle = Program.to((1, conditions))  # (q . conditions)
         message = (
             bytes(delegated_puzzle.get_tree_hash())

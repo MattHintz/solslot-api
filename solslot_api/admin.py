@@ -210,6 +210,9 @@ async def top_up_zkpassport_bridge_pool(
         for rec in coin_records
         if rec.get("spent_block_index") in (0, None)
     ]
+    if body.source_coin_id is None:
+        reserved = faucet.reserved_coin_ids()
+        unspent = [coin for coin in unspent if coin.name() not in reserved]
 
     if body.source_coin_id is None and settings.faucet_max_spend_mojos > 0:
         unspent = [coin for coin in unspent if int(coin.amount) <= settings.faucet_max_spend_mojos]
@@ -220,6 +223,7 @@ async def top_up_zkpassport_bridge_pool(
         total_required,
         "bridge_pool_source_coin",
     )
+    faucet.require_unreserved_coin(source_coin)
     bridge_policy_b32 = _bytes32_from_hex(bridge_policy_hash)
     coins = [
         BridgePoolCoin(
@@ -364,7 +368,7 @@ def _build_single_coin_create_bundle(
 ):
     from chia.types.blockchain_format.program import Program
     from chia.types.coin_spend import make_spend
-    from chia_rs import AugSchemeMPL, SpendBundle
+    from chia_rs import G2Element, SpendBundle
 
     faucet.require_spend_purpose("bridge-top-up")
 
@@ -389,12 +393,9 @@ def _build_single_coin_create_bundle(
     delegated_puzzle = Program.to((1, conditions))
     solution = Program.to([0, delegated_puzzle, Program.to(0)])
     coin_spend = make_spend(source_coin, faucet.key.puzzle, solution)
-    sig_msg = (
-        bytes(delegated_puzzle.get_tree_hash())
-        + bytes(source_coin.name())
-        + faucet.agg_sig_me_data
-    )
-    signature = AugSchemeMPL.sign(faucet.key.wallet_sk, sig_msg)
+    signature = G2Element.from_bytes(faucet.sign_delegated_spend(
+        source_coin, conditions, purpose="bridge-top-up",
+    ))
     return SpendBundle([coin_spend], signature)
 
 

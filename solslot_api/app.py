@@ -261,6 +261,14 @@ def _enforce_genesis_faucet_isolation(
 
 # ─── App lifecycle ──────────────────────────────────────────────────────
 
+def _load_swap_store_for_runtime(settings: Settings, faucet: Faucet | None):
+    from .sols_swap_store import SolsSwapStore
+
+    store = SolsSwapStore(settings.admin_db_path)
+    if faucet is not None:
+        faucet.add_coin_reservation_source(store.reserved_input_coin_ids)
+    return store
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     validate_runtime_environment_namespace()
@@ -337,6 +345,9 @@ async def lifespan(app: FastAPI):
         )
 
     app.state.protocol_submitter = None
+    # Existing reservations still protect the faucet if fee funding was
+    # switched off after a restart. Register before starting any worker.
+    app.state.sols_swap_store = _load_swap_store_for_runtime(settings, app.state.faucet)
     if settings.protocol_fee_funding_enabled:
         if app.state.faucet is None:
             raise RuntimeError(
@@ -404,6 +415,11 @@ async def lifespan(app: FastAPI):
         )
         app.state.protocol_submitter.add_fee_coin_reservation_source(
             get_payment_purchase_store(settings.payment_purchase_db_path).pending_extension_fee_coin_ids
+        )
+        # Register retained swaps before any faucet-backed worker can select
+        # funding, including after a coordinator restart without a swap request.
+        app.state.protocol_submitter.add_fee_coin_reservation_source(
+            app.state.sols_swap_store.reserved_input_coin_ids
         )
 
     app.state.voucher_issuance_worker = None

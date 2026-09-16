@@ -122,6 +122,7 @@ from .sols_market import (
     _statutes_snapshot,
 )
 from .sols_swap_store import SolsSwapStore, StoredSolsSwap
+from .sols_swap_execution import execution_confirmed, validate_execution
 from .state import VaultRecord
 from .vault_eligibility import ApprovedVault, require_current_approved_vault
 
@@ -237,8 +238,8 @@ class CompleteSolsSwapResponse(SolsSwapModel):
     status: str
     fee_mojos: str = Field(alias="feeMojos")
     fee_target_seconds: int = Field(alias="feeTargetSeconds")
-    submission_provider: str = Field(alias="submissionProvider")
-    mempool_observed_at: str = Field(alias="mempoolObservedAt")
+    submission_provider: str | None = Field(alias="submissionProvider")
+    mempool_observed_at: str | None = Field(alias="mempoolObservedAt")
 
 
 class SolsSwapOperationResponse(SolsSwapModel):
@@ -613,6 +614,9 @@ async def complete_sols_swap(
     lock = _swap_lock(request)
     async with lock:
         try:
+            resumed = await _resume_swap_execution(request, settings, store, body.operation_hash)
+            if resumed is not None:
+                return _complete_response(resumed)
             if body.buyer_offer is None:
                 raise SolsSwapOfferError(
                     "Prepared Sols payment offer is required."
@@ -722,7 +726,10 @@ async def complete_sols_swap(
                         "not submitted."
                     ),
                 )
-            result = await submitter.submit(valid_spend.to_json_dict())
+            result = await submitter.submit(
+                valid_spend.to_json_dict(),
+                before_push=_seal_swap_execution(request, settings, store, existing, valid_spend),
+            )
             stored = store.mark_submitted(
                 body.operation_hash,
                 transaction_id=str(result["spendBundleId"]),
@@ -741,10 +748,7 @@ async def complete_sols_swap(
         except ProtocolSubmissionError as exc:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=(
-                    "The atomic Sols swap was not accepted into the local "
-                    f"mempool: {exc}"
-                ),
+                detail=_swap_submission_error(store, body.operation_hash, exc),
             ) from exc
         except (KeyError, TypeError, ValueError, SolsSwapOfferError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -797,6 +801,9 @@ async def _complete_deed_to_sols_swap(
     lock = _swap_lock(request)
     async with lock:
         try:
+            resumed = await _resume_swap_execution(request, settings, store, body.operation_hash)
+            if resumed is not None:
+                return _complete_response(resumed)
             context = await _load_reverse_swap_context(
                 settings=settings,
                 provider=request.app.state.coinset,
@@ -906,6 +913,7 @@ async def _complete_deed_to_sols_swap(
             result = await submitter.submit(
                 valid_spend.to_json_dict(),
                 expected_backing_mojos=context.receipt.deed_to_sols_quote.fresh_sols_mojos_minted,
+                before_push=_seal_swap_execution(request, settings, store, existing, valid_spend),
             )
             stored = store.mark_submitted(
                 body.operation_hash,
@@ -925,10 +933,7 @@ async def _complete_deed_to_sols_swap(
         except ProtocolSubmissionError as exc:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=(
-                    "The atomic SmartDeed swap was not accepted into the "
-                    f"local mempool: {exc}"
-                ),
+                detail=_swap_submission_error(store, body.operation_hash, exc),
             ) from exc
         except (KeyError, TypeError, ValueError, SolsSwapOfferError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -950,7 +955,21 @@ async def sols_swap_status(
     if record is None:
         raise HTTPException(status_code=404, detail="Sols swap was not found.")
     verify_vault_session(settings, request, record.vault_launcher_id)
-    if record.status == "SUBMITTED":
+    try:
+        execution = store.execution(normalized)
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=f"Sols swap confirmation is unavailable: {exc}") from exc
+    if execution is not None and record.status != "CONFIRMED":
+        try:
+            if execution["network"] != settings.network:
+                raise ValueError("retained swap belongs to another network")
+            bundle = validate_execution(execution, pool_input_id=record.pool_input_coin_id,
+                                        pool_output_id=record.expected_pool_output_coin_id)
+            if await execution_confirmed(request.app.state.coinset, bundle, record.expected_pool_output_coin_id):
+                record = store.mark_confirmed(normalized)
+        except (ChiaProviderError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail=f"Sols swap confirmation is unavailable: {exc}") from exc
+    elif record.status == "SUBMITTED":
         try:
             coin_record = await request.app.state.coinset.get_coin_record_by_name(
                 record.expected_pool_output_coin_id
@@ -2080,11 +2099,89 @@ def _request_swap_store(
     settings: Settings,
 ) -> SolsSwapStore:
     store = getattr(request.app.state, "sols_swap_store", None)
-    if isinstance(store, SolsSwapStore):
-        return store
-    store = _cached_swap_store(settings.admin_db_path)
-    request.app.state.sols_swap_store = store
+    if not isinstance(store, SolsSwapStore):
+        store = _cached_swap_store(settings.admin_db_path)
+        request.app.state.sols_swap_store = store
+    submitter = getattr(request.app.state, "protocol_submitter", None)
+    if isinstance(submitter, ProtocolBundleSubmitter):
+        submitter.add_fee_coin_reservation_source(store.reserved_input_coin_ids)
+        submitter.faucet.add_coin_reservation_source(store.reserved_input_coin_ids)
+    faucet = getattr(request.app.state, "faucet", None)
+    if isinstance(faucet, Faucet):
+        faucet.add_coin_reservation_source(store.reserved_input_coin_ids)
     return store
+
+
+def _seal_swap_execution(request, settings, store, record, protocol_bundle):
+    """The submitter holds its shared funding lock while this hook commits."""
+    expected_spends = {bytes(spend) for spend in protocol_bundle.coin_spends}
+
+    async def before_push(prepared):
+        _authorize_swap(settings, request, record.vault_launcher_id)
+        submitter = request.app.state.protocol_submitter
+        execution = {
+            **prepared.to_json(), "network": settings.network,
+            "feeTargetSeconds": submitter.policy.target_seconds,
+        }
+        bundle = validate_execution(execution, pool_input_id=record.pool_input_coin_id,
+                                    pool_output_id=record.expected_pool_output_coin_id)
+        actual_spends = {bytes(spend) for spend in bundle.coin_spends}
+        if (len(actual_spends) != len(expected_spends) + 1 or not expected_spends < actual_spends
+                or any(_hex32(spend.coin.name()) == prepared.fee_coin_id
+                       for spend in protocol_bundle.coin_spends)
+                or submitter.faucet.network != settings.network):
+            raise ValueError("funded swap differs from the authorized protocol transaction")
+        await run_offer_job("swap_signature", bundle=WalletSpendBundle.from_bytes(bytes(bundle)), network=settings.network)
+        _authorize_swap(settings, request, record.vault_launcher_id)
+        store.reserve_execution(record.operation_hash, execution)
+        _authorize_swap(settings, request, record.vault_launcher_id)
+
+    return before_push
+
+
+def _swap_submission_error(store, operation_hash, error):
+    record = store.get(operation_hash)
+    if record is not None and record.transaction_id is not None:
+        return ("Sols swap submission is unresolved. Retry this exact operation "
+                f"to reconcile its retained transaction: {error}")
+    return f"Sols swap was not submitted: {error}"
+
+
+async def _resume_swap_execution(request, settings, store, operation_hash):
+    """Read again after acquiring the swap lock; never rebuild sealed swaps."""
+    record = store.get(operation_hash)
+    if record is None:
+        raise ValueError("prepared Sols swap operation does not exist")
+    if record.status in ("SUBMITTED", "CONFIRMED"):
+        return record
+    execution = store.execution(operation_hash)
+    if execution is None:
+        if record.status != "PREPARED" or record.transaction_id is not None:
+            raise ValueError("Sols swap has no recoverable exact execution")
+        return None
+    submitter = getattr(request.app.state, "protocol_submitter", None)
+    if not isinstance(submitter, ProtocolBundleSubmitter):
+        raise HTTPException(status_code=503, detail="Protocol submission recovery is unavailable.")
+    if execution["network"] != settings.network or submitter.faucet.network != settings.network:
+        raise ValueError("retained swap belongs to another network")
+    bundle = validate_execution(execution, pool_input_id=record.pool_input_coin_id,
+                                pool_output_id=record.expected_pool_output_coin_id)
+    if await execution_confirmed(request.app.state.coinset, bundle, record.expected_pool_output_coin_id):
+        return store.mark_confirmed(operation_hash)
+    fee_spend = next(spend for spend in bundle.coin_spends if _hex32(spend.coin.name()) == execution["feeCoinId"])
+    if (not submitter.policy.enabled or int(execution["backingMojos"]) > submitter.policy.maximum_backing_mojos
+            or fee_spend.coin.puzzle_hash != submitter.faucet.address_puzzle_hash):
+        raise ValueError("retained swap funding no longer matches the active policy")
+    _authorize_swap(settings, request, record.vault_launcher_id)
+    result = await submitter.reconcile_reserved(
+        execution,
+        before_push=lambda: _authorize_swap(settings, request, record.vault_launcher_id),
+    )
+    return store.mark_submitted(
+        operation_hash, transaction_id=str(result["spendBundleId"]), fee_mojos=str(result["feeMojos"]),
+        fee_target_seconds=execution["feeTargetSeconds"], submission_provider=str(result["submissionProvider"]),
+        mempool_observed_at=str(result["mempoolObservedAt"]),
+    )
 
 
 @lru_cache(maxsize=8)
@@ -2118,8 +2215,8 @@ def _complete_response(
         record.transaction_id is None
         or record.fee_mojos is None
         or record.fee_target_seconds is None
-        or record.submission_provider is None
-        or record.mempool_observed_at is None
+        or (record.status != "CONFIRMED" and (record.submission_provider is None
+                                             or record.mempool_observed_at is None))
     ):
         raise HTTPException(
             status_code=409,
