@@ -177,7 +177,9 @@ class FaucetConsolidationWorker:
         records = await self.coinset.get_coin_records_by_puzzle_hash(
             "0x" + self.faucet.address_puzzle_hash.hex(), include_spent=False
         )
-        unspent = [r for r in records if r.get("spent_block_index") in (0, None)]
+        reserved = self.faucet.reserved_coin_ids()
+        unspent = [r for r in records if r.get("spent_block_index") in (0, None)
+                   and _record_coin(r).name() not in reserved]
 
         if len(unspent) < self.config.threshold:
             logger.debug(
@@ -225,14 +227,7 @@ class FaucetConsolidationWorker:
         if len(records) < 2:
             return None
 
-        coins: list[Coin] = []
-        for rec in records:
-            payload = rec.get("coin") or rec
-            coins.append(Coin(
-                parent_coin_info=_b32(payload["parent_coin_info"]),
-                puzzle_hash=_b32(payload["puzzle_hash"]),
-                amount=uint64(int(payload["amount"])),
-            ))
+        coins = [_record_coin(rec) for rec in records]
 
         total = sum(int(c.amount) for c in coins) - fee
         if total <= 0:
@@ -272,19 +267,19 @@ class FaucetConsolidationWorker:
 
             # AGG_SIG_ME message:
             #   sha256tree(delegated_puzzle) || coin.name() || network_data
-            sig_msg = (
-                bytes(delegated_puzzle.get_tree_hash())
-                + bytes(coin.name())
-                + self.faucet.agg_sig_me_data
-            )
-            sig_bytes = AugSchemeMPL.sign(self.faucet.key.wallet_sk, sig_msg)
-            sigs.append(G2Element.from_bytes(bytes(sig_bytes)) if isinstance(sig_bytes, bytes) else sig_bytes)
+            sigs.append(G2Element.from_bytes(self.faucet.sign_delegated_spend(
+                coin, conditions, purpose="faucet-consolidation",
+            )))
 
         aggregated = AugSchemeMPL.aggregate(sigs)
         return SpendBundle(coin_spends, aggregated)
 
 
 # ── helpers ─────────────────────────────────────────────────────────
+
+def _record_coin(record: dict[str, Any]) -> Coin:
+    payload = record.get("coin") or record
+    return Coin(_b32(payload["parent_coin_info"]), _b32(payload["puzzle_hash"]), uint64(int(payload["amount"])))
 
 
 def _b32(h: str) -> bytes32:
