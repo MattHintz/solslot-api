@@ -30,7 +30,8 @@ class SyntheticSubmitter(ProtocolBundleSubmitter):
         super().__init__(provider=self, faucet=SimpleNamespace(network="testnet11", address_hex=hx(_b32(91))),
                          policy=ProtocolFeePolicy(enabled=True))
 
-    async def _prepare_locked(self, raw, *, selection_purpose=None):
+    async def _prepare_locked(self, raw, *, selection_purpose=None, expected_backing_mojos=0):
+        assert expected_backing_mojos == 0
         self.preparations += 1
         bundle = SpendBundle.from_json_dict(raw)
         puzzle = Program.to((1, [[51, _b32(93), 9]]))
