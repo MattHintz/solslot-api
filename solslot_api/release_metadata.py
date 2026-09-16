@@ -26,6 +26,11 @@ class ReleaseMetadata(BaseModel):
 
 @cache
 def load_release_metadata(path_text: str) -> ReleaseMetadata | None:
+    return read_release_metadata(path_text)
+
+
+def read_release_metadata(path_text: str) -> ReleaseMetadata | None:
+    """Read current identity across an authorization-to-use boundary."""
     path = Path(path_text)
     if not path.is_file():
         return None
@@ -51,4 +56,4 @@ def load_release_metadata(path_text: str) -> ReleaseMetadata | None:
     )
 
 
-__all__ = ["ReleaseMetadata", "load_release_metadata"]
+__all__ = ["ReleaseMetadata", "load_release_metadata", "read_release_metadata"]

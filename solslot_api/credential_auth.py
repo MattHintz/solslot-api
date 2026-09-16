@@ -91,6 +91,7 @@ class VerifiedVaultSession:
     expires_at: int
     vault_record: VaultRecord
     scope: Literal['vault', 'relay_recovery'] = 'vault'
+    session_id: str = ''
 
 
 VAULT_SESSION_COOKIE = "solslot_vault_session_v2"
@@ -208,6 +209,7 @@ def verify_vault_session(
         expires_at=int(claims["exp"]),
         vault_record=record,
         scope=scope,
+        session_id=claims.get("jti", ""),
     )
 
 

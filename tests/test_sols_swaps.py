@@ -678,7 +678,10 @@ class FakeProtocolSubmitter(ProtocolBundleSubmitter):
         faucet = Faucet.from_seed_hex("78" * 32, "testnet11")
         funding = Coin(_b32(197), faucet.address_puzzle_hash, 10**12)
         class FundingNode(FakeNode):
+            async def get_coin_record_by_name_primary(self, coin_id):
+                return dict(coin=funding.to_json_dict(), confirmed_block_index=1, spent_block_index=0, spent=False) if coin_id == _hex32(funding.name()) else None
             async def get_fee_estimate(self, *, target_times, **_kwargs):
+                self.estimates = [*getattr(self, 'estimates', []), _kwargs]
                 return dict(target_times=target_times, estimates=[420])
             async def get_coin_records_by_puzzle_hash(self, *_args, **_kwargs):
                 return [dict(coin=funding.to_json_dict(), confirmed_block_index=1, spent_block_index=0)]
@@ -694,6 +697,20 @@ class FakeProtocolSubmitter(ProtocolBundleSubmitter):
     async def submit(self, bundle, *, expected_backing_mojos=0, before_push=None):
         self.submitted = bundle
         return await super().submit(bundle, expected_backing_mojos=expected_backing_mojos, before_push=before_push)
+
+
+@pytest.fixture(autouse=True)
+def funding_runtime(monkeypatch):
+    """Synthetic authenticated release context for swap integration fixtures."""
+    from solslot_api.sols_swap_funding import digest
+    def binding(request, settings, context):
+        return dict(vaultLauncherId=_hex32(context.vault_record.launcher_id),
+            ownerKey="synthetic-owner", authType="evm" if context.vault_record.auth_type == AUTH_TYPE_SECP256K1 else "chia_bls",
+            sessionFingerprint=getattr(request.app.state, "funding_session", "synthetic-session"),
+            sessionExpiresAt=QUOTE_EXPIRES+10_000, network=settings.network,
+            artifactHash=digest(context.artifact), apiCommit="a"*40, protocolCommit="b"*40)
+    monkeypatch.setattr("solslot_api.sols_swaps._funding_binding", binding)
+    return binding
 
 
 def _settings() -> Settings:
@@ -888,7 +905,7 @@ async def test_prepare_and_complete_sols_swap_is_atomic_and_fee_funded(
         CompleteSolsSwapRequest(
             deedLauncherId=_hex32(DEED_LAUNCHER),
             operationHash=prepared.operation_hash,
-            quoteExpiresAt=prepared.quote_expires_at,
+            quoteExpiresAt=prepared.quote_expires_at, fundingReservationHash=prepared.funding_evidence["reservationHash"],
             buyerOffer=prepared.buyer_offer,
             aggregatedSignature="0x" + signature.hex(),
         ),
@@ -903,8 +920,8 @@ async def test_prepare_and_complete_sols_swap_is_atomic_and_fee_funded(
     assert completed.fee_mojos == "420"
     assert completed.fee_target_seconds == 300
     assert completed.submission_provider == "primary"
-    assert submitter.submitted is not None
-    assert len(submitter.submitted["coin_spends"]) == 6
+    assert hasattr(submitter.provider, "pushed")
+    assert len(submitter.provider.pushed["coin_spends"]) == 7
 
 
 @pytest.mark.asyncio
@@ -928,7 +945,7 @@ async def test_evm_vault_can_swap_sols_to_deed_with_one_typed_signature(
         CompleteSolsSwapRequest(
             deedLauncherId=_hex32(DEED_LAUNCHER),
             operationHash=prepared.operation_hash,
-            quoteExpiresAt=prepared.quote_expires_at,
+            quoteExpiresAt=prepared.quote_expires_at, fundingReservationHash=prepared.funding_evidence["reservationHash"],
             buyerOffer=prepared.buyer_offer,
             vaultOwnerAuthorization="0x" + signature.hex(),
         ),
@@ -937,7 +954,7 @@ async def test_evm_vault_can_swap_sols_to_deed_with_one_typed_signature(
     )
 
     assert completed.status == "MEMPOOL"
-    assert submitter.submitted is not None
+    assert hasattr(submitter.provider, "pushed")
 
 
 @pytest.mark.asyncio
@@ -961,7 +978,7 @@ async def test_evm_sols_swap_rejects_a_different_wallet(
             CompleteSolsSwapRequest(
                 deedLauncherId=_hex32(DEED_LAUNCHER),
                 operationHash=prepared.operation_hash,
-                quoteExpiresAt=prepared.quote_expires_at,
+                quoteExpiresAt=prepared.quote_expires_at, fundingReservationHash=prepared.funding_evidence["reservationHash"],
                 buyerOffer=prepared.buyer_offer,
                 vaultOwnerAuthorization="0x" + signature.hex(),
             ),
@@ -1050,7 +1067,7 @@ async def test_prepare_and_complete_deed_to_sols_is_atomic_and_fee_funded(
             direction="DEED_TO_SOLS",
             deedLauncherId=_hex32(DEED_LAUNCHER),
             operationHash=prepared.operation_hash,
-            quoteExpiresAt=prepared.quote_expires_at,
+            quoteExpiresAt=prepared.quote_expires_at, fundingReservationHash=prepared.funding_evidence["reservationHash"],
             buyerOffer=prepared.buyer_offer,
             aggregatedSignature="0x" + signature.hex(),
         ),
@@ -1063,8 +1080,8 @@ async def test_prepare_and_complete_deed_to_sols_is_atomic_and_fee_funded(
     assert completed.status == "MEMPOOL"
     assert completed.destination_puzzle_hash == prepared.destination_puzzle_hash
     assert completed.fee_mojos == "420"
-    assert submitter.submitted is not None
-    assert len(submitter.submitted["coin_spends"]) == 7
+    assert hasattr(submitter.provider, "pushed")
+    assert len(submitter.provider.pushed["coin_spends"]) == 8
 
 
 @pytest.mark.asyncio
@@ -1107,7 +1124,7 @@ async def test_evm_vault_can_swap_deed_to_vault_bound_sols(
             direction="DEED_TO_SOLS",
             deedLauncherId=_hex32(DEED_LAUNCHER),
             operationHash=prepared.operation_hash,
-            quoteExpiresAt=prepared.quote_expires_at,
+            quoteExpiresAt=prepared.quote_expires_at, fundingReservationHash=prepared.funding_evidence["reservationHash"],
             buyerOffer=prepared.buyer_offer,
             vaultOwnerAuthorization="0x" + signature.hex(),
         ),
@@ -1117,7 +1134,7 @@ async def test_evm_vault_can_swap_deed_to_vault_bound_sols(
 
     assert completed.status == "MEMPOOL"
     assert completed.destination_puzzle_hash == prepared.destination_puzzle_hash
-    assert submitter.submitted is not None
+    assert hasattr(submitter.provider, "pushed")
 
 
 @pytest.mark.asyncio
@@ -1136,7 +1153,7 @@ async def test_complete_rejects_stale_operation_before_submission(
             CompleteSolsSwapRequest(
                 deedLauncherId=_hex32(DEED_LAUNCHER),
                 operationHash="0x" + "ff" * 32,
-                quoteExpiresAt=prepared.quote_expires_at,
+                quoteExpiresAt=prepared.quote_expires_at, fundingReservationHash=prepared.funding_evidence["reservationHash"],
                 buyerOffer=prepared.buyer_offer,
                 aggregatedSignature="0x" + "00" * 96,
             ),
@@ -1159,7 +1176,7 @@ async def test_complete_is_idempotent_after_mempool_submission(
     body = CompleteSolsSwapRequest(
         deedLauncherId=_hex32(DEED_LAUNCHER),
         operationHash=prepared.operation_hash,
-        quoteExpiresAt=prepared.quote_expires_at,
+        quoteExpiresAt=prepared.quote_expires_at, fundingReservationHash=prepared.funding_evidence["reservationHash"],
         buyerOffer=prepared.buyer_offer,
         aggregatedSignature="0x" + signature.hex(),
     )
@@ -1200,7 +1217,7 @@ async def test_complete_rejects_invalid_wallet_signature(
             CompleteSolsSwapRequest(
                 deedLauncherId=_hex32(DEED_LAUNCHER),
                 operationHash=prepared.operation_hash,
-                quoteExpiresAt=prepared.quote_expires_at,
+                quoteExpiresAt=prepared.quote_expires_at, fundingReservationHash=prepared.funding_evidence["reservationHash"],
                 buyerOffer=prepared.buyer_offer,
                 aggregatedSignature="0x" + bytes(wrong_signature).hex(),
             ),
@@ -1228,7 +1245,7 @@ async def test_complete_rejects_pending_input_without_double_submission(
             CompleteSolsSwapRequest(
                 deedLauncherId=_hex32(DEED_LAUNCHER),
                 operationHash=prepared.operation_hash,
-                quoteExpiresAt=prepared.quote_expires_at,
+                quoteExpiresAt=prepared.quote_expires_at, fundingReservationHash=prepared.funding_evidence["reservationHash"],
                 buyerOffer=prepared.buyer_offer,
                 aggregatedSignature="0x" + signature.hex(),
             ),
@@ -1278,8 +1295,13 @@ async def test_reverse_swap_actual_submitter_funds_exact_mint_and_validates_full
     funding = Coin(_b32(198),faucet.address_puzzle_hash,backing+1000)
     class ConsensusNode(FakeNode):
         submitted = None
-        async def get_fee_estimate(self,*,target_times,spend_bundle,require_primary):
+        async def get_coin_record_by_name_primary(self, coin_id):
+            return dict(coin=funding.to_json_dict(), confirmed_block_index=1, spent_block_index=0, spent=False) if coin_id == _hex32(funding.name()) else None
+        async def get_fee_estimate(self,*,target_times,spend_bundle=None,cost=None,require_primary):
             assert require_primary and target_times == [300]
+            if cost is not None:
+                assert cost == 11_000_000_000 and spend_bundle is None
+                return dict(target_times=target_times, estimates=[420])
             chia_rs.validate_clvm_and_signature(chia_rs.SpendBundle.from_json_dict(spend_bundle),
                 11_000_000_000, DEFAULT_CONSTANTS.replace(
                     AGG_SIG_ME_ADDITIONAL_DATA=bytes32(AGG_SIG_ME_DATA["testnet11"])),
@@ -1313,7 +1335,7 @@ async def test_reverse_swap_actual_submitter_funds_exact_mint_and_validates_full
         else dict(aggregatedSignature='0x'+_reverse_wallet_signature(context).hex()))
     complete = await complete_sols_swap(_hex32(VAULT_LAUNCHER),CompleteSolsSwapRequest(
         direction='DEED_TO_SOLS',deedLauncherId=_hex32(DEED_LAUNCHER),
-        operationHash=prepared.operation_hash,quoteExpiresAt=prepared.quote_expires_at,
+        operationHash=prepared.operation_hash,quoteExpiresAt=prepared.quote_expires_at, fundingReservationHash=prepared.funding_evidence["reservationHash"],
         buyerOffer=prepared.buyer_offer,**auth),request,_settings())
     assert node.submitted is not None
     assert complete.transaction_id == _hex32(node.submitted.name())

@@ -420,6 +420,31 @@ async def test_protocol_fee_estimate_fails_closed_without_primary() -> None:
 
 
 @pytest.mark.asyncio
+async def test_unsigned_cost_fee_estimate_uses_only_synchronized_primary() -> None:
+    primary, fallback = FakeRpc(fee_estimate=7), FakeRpc(fee_estimate=1)
+    provider = ChiaProvider(primary, fallback, config())
+    await provider.start()
+    result = await provider.get_fee_estimate(target_times=[300], cost=11_000_000_000, require_primary=True)
+    assert result['estimates'] == [7]
+    assert ('get_fee_estimate', ([300], None, 11_000_000_000)) in primary.calls
+    assert not any(name == 'get_fee_estimate' for name, _ in fallback.calls)
+    unavailable = ChiaProvider(None, fallback, config(primary_url=None))
+    with pytest.raises(ChiaProviderError, match='local Chia full node'):
+        await unavailable.get_fee_estimate(target_times=[300], cost=11_000_000_000, require_primary=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kwargs', [dict(cost=True), dict(cost=0), dict(cost=-1),
+    dict(cost=11_000_000_001), dict(cost=1.5), {}, dict(cost=1, spend_bundle={})])
+async def test_fee_estimate_rejects_ambiguous_or_invalid_cost_before_rpc(kwargs) -> None:
+    primary = FakeRpc()
+    provider = ChiaProvider(primary, None, config())
+    with pytest.raises(ValueError):
+        await provider.get_fee_estimate(target_times=[300], require_primary=True, **kwargs)
+    assert primary.calls == []
+
+
+@pytest.mark.asyncio
 async def test_protocol_push_rejection_or_missing_mempool_evidence_fails_closed() -> None:
     bundle = spend_bundle()
     [coin_id] = _input_coin_ids(bundle)

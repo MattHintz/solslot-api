@@ -140,6 +140,8 @@ def test_evm_owner_challenge_is_payload_bound_and_single_use(tmp_path):
     assert public_session.protocolVersion == "solslot-v2"
     assert recovered.owner_key == account.address.lower()
     assert recovered.vault_launcher_id == VAULT
+    assert len(recovered.session_id) == 32
+    assert 'session_id' not in public_session.model_dump()
     with pytest.raises(HTTPException, match="does not match") as mismatch:
         verify_vault_session(settings, request, "0x" + "99" * 32)
     assert mismatch.value.status_code == 403

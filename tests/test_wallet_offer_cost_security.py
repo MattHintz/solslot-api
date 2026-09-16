@@ -1,5 +1,6 @@
 """Bounded synthetic regressions; no signing service or network writes."""
 from types import SimpleNamespace
+from tests.test_sols_swaps import funding_runtime
 import pytest
 from fastapi import HTTPException
 from chia.types.blockchain_format.coin import Coin
@@ -427,7 +428,7 @@ async def test_native_worker_preserves_supported_batch_and_cat(quantity, cat):
 
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.asyncio
-async def test_swap_rejects_changed_solution_before_evaluation_or_submission(reverse, monkeypatch):
+async def test_swap_rejects_changed_solution_before_evaluation_or_submission(reverse, monkeypatch, funding_runtime):
     import solslot_api.sols_swaps as swaps
     import chia.wallet.trading.offer as offer_module
     from solslot_api.wallet_offer_validation import decode_offer
@@ -483,6 +484,7 @@ async def test_swap_rejects_changed_solution_before_evaluation_or_submission(rev
                 deedLauncherId=_hex32(DEED_LAUNCHER),
                 operationHash=prepared.operation_hash,
                 quoteExpiresAt=prepared.quote_expires_at,
+                fundingReservationHash=prepared.funding_evidence['reservationHash'],
                 buyerOffer=encode_bundle(bundle),
                 aggregatedSignature="0x" + bytes(G2Element()).hex(),
             ),
