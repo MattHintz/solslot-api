@@ -365,6 +365,7 @@ async def lifespan(app: FastAPI):
                 minimum_mojos=settings.protocol_minimum_fee_mojos,
                 maximum_mojos=settings.protocol_maximum_fee_mojos,
                 maximum_funding_coin_mojos=settings.faucet_max_spend_mojos,
+                maximum_backing_mojos=settings.protocol_issuance_backing_max_mojos,
                 mempool_timeout_seconds=settings.protocol_mempool_timeout_seconds,
                 mempool_poll_seconds=settings.protocol_mempool_poll_seconds,
             ),

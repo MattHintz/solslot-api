@@ -903,7 +903,10 @@ async def _complete_deed_to_sols_swap(
                         "not submitted."
                     ),
                 )
-            result = await submitter.submit(valid_spend.to_json_dict())
+            result = await submitter.submit(
+                valid_spend.to_json_dict(),
+                expected_backing_mojos=context.receipt.deed_to_sols_quote.fresh_sols_mojos_minted,
+            )
             stored = store.mark_submitted(
                 body.operation_hash,
                 transaction_id=str(result["spendBundleId"]),

@@ -481,3 +481,44 @@ def test_voucher_worker_requires_fee_funding_and_exact_kos_executor() -> None:
                 faucet_seed_hex="01" * 32,
             )
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('backing,cap,coin_amount,allowed', [
+    (20,20,100,True), (0,20,100,False), (19,20,100,False),
+    (21,20,100,False), (20,0,100,False), (20,20,23,False),
+    (True,20,100,False), (-1,20,100,False),
+])
+async def test_issuance_backing_is_exact_bounded_and_separate_from_reserved_fee(backing,cap,coin_amount,allowed):
+    from chia_rs import AugSchemeMPL
+    from chia.consensus.default_constants import DEFAULT_CONSTANTS
+    import chia_rs
+    faucet = Faucet.from_seed_hex('01' * 32, 'testnet11')
+    coin = Coin(b32(191), faucet.address_puzzle_hash, uint64(coin_amount))
+    provider = FakeProvider(fee_coin=coin)
+    # A synthetic protocol issuance has an independently specified 20 mojo deficit.
+    puzzle = Program.to((1, [[51,b32(192),30],[60,b"synthetic-issuance"]]))
+    original = SpendBundle([make_spend(Coin(b32(193),puzzle.get_tree_hash(),uint64(10)),puzzle,Program.to(0))],G2Element())
+    if allowed:
+        small = Coin(b32(194), faucet.address_puzzle_hash, uint64(23))
+        async def records(*_args, **_kwargs):
+            return [coin_record(small),coin_record(coin)]
+        provider.get_coin_records_by_puzzle_hash = records
+    actual = submitter(provider,faucet,maximum_backing_mojos=cap)
+    if not allowed:
+        with pytest.raises(ProtocolSubmissionError):
+            await actual.submit(original.to_json_dict(),expected_backing_mojos=backing)
+        assert provider.submitted is None
+        return
+    result = await actual.submit(original.to_json_dict(),expected_backing_mojos=backing)
+    final = SpendBundle.from_json_dict(provider.submitted)
+    assert result['feeCoinId'] == "0x" + coin.name().hex()
+    assert result['backingMojos'] == '20'
+    assert result['feeMojos'] == '7'
+    assert sum(c.amount for c in final.removals()) - sum(c.amount for c in final.additions()) == 7
+    assert int(compute_additions(final.coin_spends[-1])[0].amount) == 73
+    detached = SpendBundle([final.coin_spends[-1]], final.aggregated_signature)
+    with pytest.raises(ValueError):
+        chia_rs.validate_clvm_and_signature(detached,11_000_000_000,DEFAULT_CONSTANTS,chia_rs.MEMPOOL_MODE)
+    chia_rs.validate_clvm_and_signature(final,11_000_000_000,DEFAULT_CONSTANTS.replace(AGG_SIG_ME_ADDITIONAL_DATA=bytes32(
+        __import__("solslot_api.faucet",fromlist=["AGG_SIG_ME_DATA"]).AGG_SIG_ME_DATA["testnet11"])),chia_rs.MEMPOOL_MODE)
