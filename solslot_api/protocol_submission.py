@@ -1,4 +1,4 @@
-"""Mempool-aware Chia submission funded by the existing server fee till."""
+"""Mempool-aware Chia submission with bounded fee and issuance funding."""
 from __future__ import annotations
 
 import asyncio
@@ -68,7 +68,7 @@ class PreparedProtocolBundle:
 
 
 class ProtocolBundleSubmitter:
-    """Add one bounded fee-till spend and prove local mempool propagation."""
+    """Fund one exact protocol bundle and prove local mempool propagation."""
 
     def __init__(
         self,

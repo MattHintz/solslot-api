@@ -15,7 +15,7 @@ from fastapi import HTTPException
 from chia.consensus.condition_tools import conditions_dict_for_solution, pkm_pairs_for_conditions_dict
 from chia.types.blockchain_format.program import Program
 from chia.wallet.lineage_proof import LineageProof
-from chia.wallet.puzzles.singleton_top_layer_v1_1 import SINGLETON_MOD, lineage_proof_for_coinsol
+from chia.wallet.puzzles.singleton_top_layer_v1_1 import SINGLETON_MOD, SINGLETON_LAUNCHER_HASH, lineage_proof_for_coinsol
 from chia.wallet.wallet_spend_bundle import WalletSpendBundle
 from chia_rs import AugSchemeMPL, Coin, G2Element
 from chia_rs.sized_ints import uint64
@@ -143,12 +143,23 @@ async def handoff_case(tmp_path, monkeypatch, recovery, *, purchase_transform=No
     c.purchases = PaymentPurchaseStore(c.purchases.path)
 
     c.buyer = AugSchemeMPL.key_gen(bytes([61])*32)
-    c.fresh = replace(old.purchase, vault_launcher_id=_b32(62),
-        vault_p2_puzzle_hash=puzzle_for_p2_vault(_b32(62)).get_tree_hash(), zkpassport_root=_b32(63),
+    buyer_launcher = Coin(_b32(62), SINGLETON_LAUNCHER_HASH, uint64(1))
+    c.node.records[hx(buyer_launcher.name())] = record(buyer_launcher, 104, 105)
+    c.fresh = replace(old.purchase, vault_launcher_id=buyer_launcher.name(),
+        vault_p2_puzzle_hash=puzzle_for_p2_vault(buyer_launcher.name()).get_tree_hash(), zkpassport_root=_b32(63),
         authorization_nonce=_b32(64), quote_expires_at=NOW+300, authorization_expires_at=NOW+600)
     if purchase_transform is not None:
         c.fresh = purchase_transform(c.fresh)
     receipt = credential(c.fresh, c.buyer)
+    # The new buyer has already performed two same-owner vault operations.
+    # Real private signers must accept this canonical later tip, not only eve+1.
+    current = Coin.from_json_dict(c.node.records[receipt['chiaVaultCoinId']]['coin'])
+    receipt['chiaStampCoinId'] = hx(current.name())
+    for height in (109,110):
+        c.node.records[hx(current.name())].update(spent=True,spent_block_index=height)
+        current = Coin(current.name(), current.puzzle_hash, uint64(1))
+        c.node.records[hx(current.name())] = record(current,height)
+    receipt.update(chiaVaultCoinId=hx(current.name()),confirmedBlockIndex=110)
     monkeypatch.setattr('solslot_api.zkpassport_enrollments._sync_chia_stamp',
         lambda *_: SimpleNamespace(status='chia_confirmed', receipt=SimpleNamespace(**receipt, model_dump=lambda: dict(receipt))))
     monkeypatch.setattr(native, 'get_registry', lambda: SimpleNamespace(get=lambda _: SimpleNamespace(auth_type=1, owner_pubkey=bytes(c.buyer.get_g1()))))

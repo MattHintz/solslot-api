@@ -11,7 +11,7 @@ from chia_rs import G2Element, SpendBundle
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 
-from solslot_api.faucet import Faucet, FaucetSelectionRestricted
+from solslot_api.faucet import AGG_SIG_ME_DATA, Faucet, FaucetSelectionRestricted
 from solslot_api.config import Settings, validate_server_hardening_at_startup
 from solslot_api.protocol_submission import (
     PreparedProtocolBundle,
@@ -490,7 +490,6 @@ def test_voucher_worker_requires_fee_funding_and_exact_kos_executor() -> None:
     (True,20,100,False), (-1,20,100,False),
 ])
 async def test_issuance_backing_is_exact_bounded_and_separate_from_reserved_fee(backing,cap,coin_amount,allowed):
-    from chia_rs import AugSchemeMPL
     from chia.consensus.default_constants import DEFAULT_CONSTANTS
     import chia_rs
     faucet = Faucet.from_seed_hex('01' * 32, 'testnet11')
@@ -517,8 +516,8 @@ async def test_issuance_backing_is_exact_bounded_and_separate_from_reserved_fee(
     assert result['feeMojos'] == '7'
     assert sum(c.amount for c in final.removals()) - sum(c.amount for c in final.additions()) == 7
     assert int(compute_additions(final.coin_spends[-1])[0].amount) == 73
+    constants = DEFAULT_CONSTANTS.replace(AGG_SIG_ME_ADDITIONAL_DATA=bytes32(AGG_SIG_ME_DATA["testnet11"]))
     detached = SpendBundle([final.coin_spends[-1]], final.aggregated_signature)
-    with pytest.raises(ValueError):
-        chia_rs.validate_clvm_and_signature(detached,11_000_000_000,DEFAULT_CONSTANTS,chia_rs.MEMPOOL_MODE)
-    chia_rs.validate_clvm_and_signature(final,11_000_000_000,DEFAULT_CONSTANTS.replace(AGG_SIG_ME_ADDITIONAL_DATA=bytes32(
-        __import__("solslot_api.faucet",fromlist=["AGG_SIG_ME_DATA"]).AGG_SIG_ME_DATA["testnet11"])),chia_rs.MEMPOOL_MODE)
+    with pytest.raises(ValueError, match="Assert.*Failed"):
+        chia_rs.validate_clvm_and_signature(detached,11_000_000_000,constants,chia_rs.MEMPOOL_MODE)
+    chia_rs.validate_clvm_and_signature(final,11_000_000_000,constants,chia_rs.MEMPOOL_MODE)
