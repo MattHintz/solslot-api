@@ -1224,3 +1224,30 @@ async def test_complete_rejects_pending_input_without_double_submission(
             _settings(),
         )
     assert submitter.submitted is None
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_evm_swap_signature_rejects_changed_context_with_same_operation(reverse) -> None:
+    from solslot_api.sols_swaps import _vault_swap_typed_data, _vault_signature_data
+    from solslot_puzzles.sols_swap_v4_driver import SolsSwapOfferError
+
+    context = (_reverse_fixture(Faucet.from_seed_hex("77" * 32, "testnet11"), evm=True)
+               if reverse else _fixture(evm=True).context)
+    signature = EVM_ACCOUNT.sign_message(
+        encode_typed_data(full_message=_vault_swap_typed_data(context))
+    ).signature
+    body = SimpleNamespace(vault_owner_authorization="0x" + signature.hex())
+    assert len(_vault_signature_data(context, body)) == 64
+    changed = [
+        replace(context, pool_coin=Coin(_b32(200), context.pool_coin.puzzle_hash, context.pool_coin.amount)),
+        replace(context, receipt=replace(context.receipt, quote_expires_at=context.receipt.quote_expires_at + 1)),
+    ]
+    if reverse:
+        changed.extend([
+            replace(context, deed=replace(context.deed, coin=Coin(_b32(201), context.deed.coin.puzzle_hash, context.deed.coin.amount))),
+            replace(context, deed=replace(context.deed, smart_deed_inner=Program.to(1))),
+        ])
+    for mutation in changed:
+        assert mutation.receipt.operation_hash == context.receipt.operation_hash
+        with pytest.raises(SolsSwapOfferError, match="signature does not belong"):
+            _vault_signature_data(mutation, body)
