@@ -67,10 +67,13 @@ from solslot_puzzles.sols_pool_v4 import (
 )
 from solslot_puzzles.sols_swap_v4_driver import (
     SolsSwapOfferError,
+    UnsignedSolsSwapEvidence,
     aggregate_sols_to_deed_swap,
     build_deed_to_sols_protocol_offer,
     build_sols_to_deed_protocol_offer,
     prepare_vault_sols_buyer_offer,
+    prepare_unsigned_sols_to_deed_swap,
+    prepare_unsigned_deed_to_sols_swap,
     validate_sols_buyer_offer,
 )
 from solslot_puzzles.vault_sols_v1 import (
@@ -157,6 +160,9 @@ class PrepareSolsSwapResponse(SolsSwapModel):
     vault_launcher_id: str = Field(alias="vaultLauncherId")
     buyer_offer: str | None = Field(default=None, alias="buyerOffer")
     signing_coin_spends: list[dict[str, Any]] = Field(alias="signingCoinSpends")
+    unsigned_protocol_evidence: dict[str, Any] | None = Field(
+        default=None, alias="unsignedProtocolEvidence",
+    )
     selected_payment_public_key: str | None = Field(
         default=None,
         alias="selectedPaymentPublicKey",
@@ -361,6 +367,9 @@ async def prepare_sols_swap(
             vault_launcher_id=context.vault_record.launcher_id,
         )
         signing_spends: list[CoinSpend] = []
+        unsigned_evidence = prepare_unsigned_sols_to_deed_swap(
+            buyer_offer=buyer.offer, **_protocol_offer_arguments(context),
+        )
         vault_typed_data: dict[str, Any] | None = None
         if context.vault_record.auth_type == AUTH_TYPE_BLS:
             protocol = _build_protocol_offer(context, signature_data=None)
@@ -410,6 +419,7 @@ async def prepare_sols_swap(
         vaultLauncherId=_hex32(context.vault_record.launcher_id),
         buyerOffer=buyer.offer.to_bech32(),
         signingCoinSpends=[_coin_spend_json(item) for item in signing_spends],
+        unsignedProtocolEvidence=_unsigned_protocol_evidence_json(unsigned_evidence, settings.network),
         selectedPaymentPublicKey=None,
         selectedPaymentCoinId=_hex32(context.payment_coin.name()),
         quoteExpiresAt=context.receipt.quote_expires_at,
@@ -475,6 +485,9 @@ async def _prepare_deed_to_sols_swap(
             if context.vault_record.auth_type == AUTH_TYPE_BLS
             else None
         )
+        unsigned_evidence = prepare_unsigned_deed_to_sols_swap(
+            **_reverse_protocol_offer_arguments(context),
+        )
         quote = context.receipt.deed_to_sols_quote
         if quote is None:
             raise SolsSwapOfferError("SmartDeed-to-Sols quote is unavailable.")
@@ -520,6 +533,7 @@ async def _prepare_deed_to_sols_swap(
         deedLauncherId=_hex32(context.receipt.record.deed_launcher_id),
         vaultLauncherId=_hex32(context.vault_record.launcher_id),
         buyerOffer=(protocol.offer.to_bech32() if protocol else None),
+        unsignedProtocolEvidence=_unsigned_protocol_evidence_json(unsigned_evidence, settings.network),
         signingCoinSpends=(
             [_coin_spend_json(protocol.vault_spend)]
             if protocol is not None
@@ -1199,47 +1213,48 @@ async def _load_swap_context(
     )
 
 
-def _build_protocol_offer(
-    context: SolsSwapContext,
-    *,
-    signature_data: bytes | None,
-) -> Any:
-    return build_sols_to_deed_protocol_offer(
-        receipt=context.receipt,
-        config=context.config,
-        parameters=context.statutes.parameters,
-        collection=context.collection,
-        pause=context.pause,
-        statutes_state=context.statutes.state,
-        statutes_coin=context.statutes_coin,
-        statutes_launcher_id=_b32(
+def _protocol_offer_arguments(context: SolsSwapContext) -> dict[str, Any]:
+    return {
+        "receipt": context.receipt,
+        "config": context.config,
+        "parameters": context.statutes.parameters,
+        "collection": context.collection,
+        "pause": context.pause,
+        "statutes_state": context.statutes.state,
+        "statutes_coin": context.statutes_coin,
+        "statutes_launcher_id": _b32(
             context.artifact["launcherIds"]["statutes"],
             "statutesLauncherId",
         ),
-        statutes_lineage_proof=context.statutes_lineage,
-        collections=context.statutes.collections,
-        pauses=context.statutes.pauses,
-        vault_coin=context.vault_coin,
-        vault_launcher_id=context.vault_record.launcher_id,
-        vault_lineage_proof=context.vault_lineage,
-        vault_owner_pubkey=bytes(context.vault_record.owner_pubkey),
-        vault_auth_type=context.vault_record.auth_type,
-        vault_members_merkle_root=one_leaf_merkle_root(
+        "statutes_lineage_proof": context.statutes_lineage,
+        "collections": context.statutes.collections,
+        "pauses": context.statutes.pauses,
+        "vault_coin": context.vault_coin,
+        "vault_launcher_id": context.vault_record.launcher_id,
+        "vault_lineage_proof": context.vault_lineage,
+        "vault_owner_pubkey": bytes(context.vault_record.owner_pubkey),
+        "vault_auth_type": context.vault_record.auth_type,
+        "vault_members_merkle_root": one_leaf_merkle_root(
             bytes(context.vault_record.owner_pubkey)
         ),
-        identity_attest_root=_b32(
+        "identity_attest_root": _b32(
             context.approved_vault.identity_attest_root,
             "identityAttestRoot",
         ),
-        zkpassport_bridge_policy_hash=(
-            context.config.permanent_rules.zkpassport_policy_hash
-        ),
-        vault_signature_data=signature_data,
-        pool_coin=context.pool_coin,
-        pool_lineage_proof=context.pool_lineage,
-        custody_coin=context.custody_coin,
-        custody_lineage_proof=context.custody_lineage,
-        quote_expires_at=context.receipt.quote_expires_at,
+        "zkpassport_bridge_policy_hash": context.config.permanent_rules.zkpassport_policy_hash,
+        "pool_coin": context.pool_coin,
+        "pool_lineage_proof": context.pool_lineage,
+        "custody_coin": context.custody_coin,
+        "custody_lineage_proof": context.custody_lineage,
+        "quote_expires_at": context.receipt.quote_expires_at,
+    }
+
+
+def _build_protocol_offer(
+    context: SolsSwapContext, *, signature_data: bytes | None,
+) -> Any:
+    return build_sols_to_deed_protocol_offer(
+        **_protocol_offer_arguments(context), vault_signature_data=signature_data,
     )
 
 
@@ -1461,54 +1476,55 @@ async def _load_reverse_swap_context(
     )
 
 
-def _build_reverse_protocol_offer(
-    context: ReverseSolsSwapContext,
-    *,
-    signature_data: bytes | None,
-) -> Any:
-    return build_deed_to_sols_protocol_offer(
-        receipt=context.receipt,
-        config=context.config,
-        parameters=context.statutes.parameters,
-        collection=context.collection,
-        pause=context.pause,
-        statutes_state=context.statutes.state,
-        statutes_coin=context.statutes_coin,
-        statutes_launcher_id=_b32(
+def _reverse_protocol_offer_arguments(context: ReverseSolsSwapContext) -> dict[str, Any]:
+    return {
+        "receipt": context.receipt,
+        "config": context.config,
+        "parameters": context.statutes.parameters,
+        "collection": context.collection,
+        "pause": context.pause,
+        "statutes_state": context.statutes.state,
+        "statutes_coin": context.statutes_coin,
+        "statutes_launcher_id": _b32(
             context.artifact["launcherIds"]["statutes"],
             "statutesLauncherId",
         ),
-        statutes_lineage_proof=context.statutes_lineage,
-        collections=context.statutes.collections,
-        pauses=context.statutes.pauses,
-        vault_coin=context.vault_coin,
-        vault_launcher_id=context.vault_record.launcher_id,
-        vault_lineage_proof=context.vault_lineage,
-        vault_owner_pubkey=bytes(context.vault_record.owner_pubkey),
-        vault_auth_type=context.vault_record.auth_type,
-        vault_members_merkle_root=one_leaf_merkle_root(
+        "statutes_lineage_proof": context.statutes_lineage,
+        "collections": context.statutes.collections,
+        "pauses": context.statutes.pauses,
+        "vault_coin": context.vault_coin,
+        "vault_launcher_id": context.vault_record.launcher_id,
+        "vault_lineage_proof": context.vault_lineage,
+        "vault_owner_pubkey": bytes(context.vault_record.owner_pubkey),
+        "vault_auth_type": context.vault_record.auth_type,
+        "vault_members_merkle_root": one_leaf_merkle_root(
             bytes(context.vault_record.owner_pubkey)
         ),
-        identity_attest_root=_b32(
+        "identity_attest_root": _b32(
             context.approved_vault.identity_attest_root,
             "identityAttestRoot",
         ),
-        zkpassport_bridge_policy_hash=(
-            context.config.permanent_rules.zkpassport_policy_hash
-        ),
-        vault_signature_data=signature_data,
-        pool_coin=context.pool_coin,
-        pool_lineage_proof=context.pool_lineage,
-        p2_vault_deed_coin=context.deed.coin,
-        p2_vault_deed_lineage_proof=context.deed.lineage,
-        smart_deed_inner=context.deed.smart_deed_inner,
-        par_value=context.deed.par_value,
-        asset_class=context.deed.asset_class,
-        property_id=context.deed.property_id,
-        reserve_cat_coin=context.reserve_coin,
-        reserve_cat_lineage_proof=context.reserve_lineage,
-        reserve_inner_puzzle=context.reserve_inner_puzzle,
-        quote_expires_at=context.receipt.quote_expires_at,
+        "zkpassport_bridge_policy_hash": context.config.permanent_rules.zkpassport_policy_hash,
+        "pool_coin": context.pool_coin,
+        "pool_lineage_proof": context.pool_lineage,
+        'p2_vault_deed_coin': context.deed.coin,
+        'p2_vault_deed_lineage_proof': context.deed.lineage,
+        "smart_deed_inner": context.deed.smart_deed_inner,
+        "par_value": context.deed.par_value,
+        "asset_class": context.deed.asset_class,
+        "property_id": context.deed.property_id,
+        "reserve_cat_coin": context.reserve_coin,
+        "reserve_cat_lineage_proof": context.reserve_lineage,
+        "reserve_inner_puzzle": context.reserve_inner_puzzle,
+        "quote_expires_at": context.receipt.quote_expires_at,
+    }
+
+
+def _build_reverse_protocol_offer(
+    context: ReverseSolsSwapContext, *, signature_data: bytes | None,
+) -> Any:
+    return build_deed_to_sols_protocol_offer(
+        **_reverse_protocol_offer_arguments(context), vault_signature_data=signature_data,
     )
 
 
@@ -2350,6 +2366,38 @@ def _coin_spend_json(spend: CoinSpend) -> dict[str, Any]:
         },
         "puzzleReveal": "0x" + bytes(spend.puzzle_reveal).hex(),
         "solution": "0x" + bytes(spend.solution).hex(),
+    }
+
+
+def _unsigned_protocol_evidence_json(
+    evidence: UnsignedSolsSwapEvidence, network: str,
+) -> dict[str, Any]:
+    """Lossless unsigned protocol evidence; never a signable funding approval."""
+    spends = []
+    for role, spend in zip(evidence.spend_roles, evidence.coin_spends):
+        value = _coin_spend_json(spend)
+        value["coin"]["amount"] = str(spend.coin.amount)
+        spends.append({"role": role, "coinId": _hex32(spend.coin.name()), **value})
+    successor = evidence.expected_vault_successor
+    return {
+        "schemaVersion": 1,
+        "status": "UNSIGNED_PROTOCOL_CANDIDATE",
+        "network": network,
+        "direction": evidence.direction,
+        "protocolCandidateHash": _hex32(evidence.candidate_hash),
+        "vaultCoinId": _hex32(evidence.vault_coin_id),
+        "coinSpends": spends,
+        "expectedVaultSuccessor": {
+            "basis": "PINNED_TEMPLATE_PENDING_AUTHORIZATION",
+            "coinId": _hex32(successor.name()),
+            "parentCoinInfo": _hex32(successor.parent_coin_info),
+            "puzzleHash": _hex32(successor.puzzle_hash),
+            "amount": str(successor.amount),
+        },
+        "requiredBackingMojos": str(evidence.required_backing_mojos),
+        "ownerAuthorization": "PENDING",
+        "feeFunding": "PENDING",
+        "consensusValidated": False,
     }
 
 
