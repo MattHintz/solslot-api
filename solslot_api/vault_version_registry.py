@@ -97,7 +97,7 @@ class VaultVersionRegistrySnapshot:
 
     vault_inner_mod_hash_hex: str
     """``0x``-prefixed tree hash of the *current* uncurried
-    ``vault_singleton_inner.clsp`` mod — the live vault code this API build
+    ``vault_singleton_inner_v2.clsp`` mod — the live vault code this API build
     mints.  This is what the registry's ``VAULT_INNER_MOD_HASH`` should equal
     for an up-to-date deployment; a divergence means a vault-code upgrade has
     shipped on-chain that this API build predates."""

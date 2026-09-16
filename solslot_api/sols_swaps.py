@@ -46,6 +46,7 @@ from solslot_puzzles.pool_economics_v2 import deed_metadata_commitment
 from solslot_puzzles.pool_v4_driver import (
     PoolV4Config,
     make_pool_v4_full,
+    make_pool_v4_inner,
 )
 from solslot_puzzles.protocol_statutes_v1 import (
     CollectionStatute,
@@ -57,6 +58,7 @@ from solslot_puzzles.sols_economics_v3 import (
     quote_sols_to_deed,
 )
 from solslot_puzzles.sols_pool_v4 import (
+    DEED_TO_SOLS,
     PoolInventoryRecord,
     SolsPoolStateV4,
     inventory_root,
@@ -364,10 +366,7 @@ async def prepare_sols_swap(
             signing_spends.append(protocol.vault_spend)
             vault_auth_type = "chia_bls"
         else:
-            vault_typed_data = eip712_typed_data_for_sols_swap(
-                context.receipt.operation_hash,
-                context.vault_coin.name(),
-            )
+            vault_typed_data = _vault_swap_typed_data(context)
             vault_auth_type = "evm"
     except HTTPException:
         raise
@@ -545,10 +544,7 @@ async def _prepare_deed_to_sols_swap(
         vaultTypedData=(
             None
             if context.vault_record.auth_type == AUTH_TYPE_BLS
-            else eip712_typed_data_for_sols_swap(
-                context.receipt.operation_hash,
-                context.vault_coin.name(),
-            )
+            else _vault_swap_typed_data(context)
         ),
         review={
             "network": settings.network,
@@ -1745,6 +1741,25 @@ async def _confirmed_cat_lineage(
     )
 
 
+def _vault_swap_typed_data(context: SolsSwapContext | ReverseSolsSwapContext) -> dict:
+    intent: dict[str, Any] = {
+        "pool_coin_id": context.pool_coin.name(),
+        "pool_inner_puzzle_hash": bytes32(
+            make_pool_v4_inner(context.config, context.receipt.current_state).get_tree_hash()
+        ),
+        "quote_expires_at": context.receipt.quote_expires_at,
+    }
+    if context.receipt.direction == DEED_TO_SOLS:
+        intent.update(
+            deed_launcher_id=context.receipt.record.deed_launcher_id,
+            p2_vault_coin_id=context.deed.coin.name(),
+            smart_deed_inner_puzzle_hash=bytes32(context.deed.smart_deed_inner.get_tree_hash()),
+        )
+    return eip712_typed_data_for_sols_swap(
+        context.receipt.operation_hash, context.vault_coin.name(), **intent,
+    )
+
+
 def _vault_signature_data(
     context: SolsSwapContext | ReverseSolsSwapContext,
     body: CompleteSolsSwapRequest,
@@ -1758,10 +1773,7 @@ def _vault_signature_data(
         return None
     if not body.vault_owner_authorization or not record.owner_evm_address:
         raise SolsSwapOfferError("EVM vault owner authorization is required.")
-    typed_data = eip712_typed_data_for_sols_swap(
-        context.receipt.operation_hash,
-        context.vault_coin.name(),
-    )
+    typed_data = _vault_swap_typed_data(context)
     recovered = recover_evm_signer(
         typed_data,
         body.vault_owner_authorization,
