@@ -13,6 +13,8 @@ from solslot_api import sols_swaps as swaps
 from solslot_puzzles.sols_swap_v4_driver import UnsignedSolsSwapEvidence
 from tests import test_sols_swaps as fixtures
 
+from tests.test_sols_swaps import funding_runtime
+
 pytestmark = pytest.mark.asyncio
 
 

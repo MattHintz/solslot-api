@@ -28,7 +28,7 @@ from solslot_api.sols_swaps import (
     _seal_swap_execution,
 )
 from tests.test_sols_swaps import (
-    DEED_LAUNCHER, VAULT_LAUNCHER, EVM_ACCOUNT, FakeNode, FakeProtocolSubmitter,
+    funding_runtime, DEED_LAUNCHER, VAULT_LAUNCHER, EVM_ACCOUNT, FakeNode, FakeProtocolSubmitter,
     _b32, _fixture, _hex32, _request, _reverse_fixture, _reverse_wallet_signature,
     _settings, _wallet_signature,
 )
@@ -92,7 +92,7 @@ async def signed_case(monkeypatch, tmp_path, *, reverse=False, evm=False):
         auth = dict(aggregatedSignature="0x" + signature.hex())
     body = CompleteSolsSwapRequest(
         direction=direction, deedLauncherId=_hex32(DEED_LAUNCHER), operationHash=prepared.operation_hash,
-        quoteExpiresAt=prepared.quote_expires_at, buyerOffer=prepared.buyer_offer, **auth,
+        quoteExpiresAt=prepared.quote_expires_at, fundingReservationHash=prepared.funding_evidence["reservationHash"], buyerOffer=prepared.buyer_offer, **auth,
     )
     return request, body, path, loader
 

@@ -358,10 +358,16 @@ class ChiaProvider:
         self,
         *,
         target_times: list[int],
-        spend_bundle: dict[str, Any],
+        spend_bundle: dict[str, Any] | None = None,
+        cost: int | None = None,
         require_primary: bool = False,
     ) -> dict[str, Any]:
-        """Return an absolute fee estimate for a complete spend bundle."""
+        """Estimate a complete bundle or a conservative unsigned cost bound."""
+        if (spend_bundle is None) == (cost is None):
+            raise ValueError("provide exactly one of spend_bundle or cost")
+        if cost is not None and (type(cost) is not int or not 0 < cost <= 11_000_000_000):
+            raise ValueError("fee estimation cost is outside the consensus bound")
+        estimate_args = {"spend_bundle": spend_bundle} if spend_bundle is not None else {"cost": cost}
         if require_primary:
             if self.primary is None or not await self._primary_available():
                 raise ChiaProviderError(
@@ -370,7 +376,7 @@ class ChiaProvider:
             try:
                 result = await self.primary.get_fee_estimate(
                     target_times=target_times,
-                    spend_bundle=spend_bundle,
+                    **estimate_args,
                 )
                 self._last_primary_success_at = _utc_now()
                 return result
@@ -383,7 +389,7 @@ class ChiaProvider:
             "get_fee_estimate",
             lambda client: client.get_fee_estimate(
                 target_times=target_times,
-                spend_bundle=spend_bundle,
+                **estimate_args,
             ),
         )
 

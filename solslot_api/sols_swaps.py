@@ -9,7 +9,7 @@ protocol assembler are never advertised as executable.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import lru_cache
 from time import time
 from typing import Annotated, Any, Literal, Mapping, Optional
@@ -126,6 +126,11 @@ from .sols_market import (
 )
 from .sols_swap_store import SolsSwapStore, StoredSolsSwap
 from .sols_swap_execution import execution_confirmed, validate_execution
+from .sols_swap_funding import (
+    digest as funding_digest, funding_identity, require_hold,
+    reserve_funding, submit_reserved_funding,
+)
+from .release_metadata import read_release_metadata
 from .state import VaultRecord
 from .vault_eligibility import ApprovedVault, require_current_approved_vault
 
@@ -163,6 +168,7 @@ class PrepareSolsSwapResponse(SolsSwapModel):
     unsigned_protocol_evidence: dict[str, Any] | None = Field(
         default=None, alias="unsignedProtocolEvidence",
     )
+    funding_evidence: dict[str, Any] | None = Field(default=None, alias="fundingEvidence")
     selected_payment_public_key: str | None = Field(
         default=None,
         alias="selectedPaymentPublicKey",
@@ -194,6 +200,7 @@ class PrepareSolsSwapResponse(SolsSwapModel):
 
 
 class CompleteSolsSwapRequest(SolsSwapModel):
+    funding_reservation_hash: str | None = Field(default=None, alias="fundingReservationHash", pattern=r"^0x[0-9a-f]{64}$")
     direction: Literal["SOLS_TO_DEED", "DEED_TO_SOLS"] = "SOLS_TO_DEED"
     deed_launcher_id: str = Field(
         alias="deedLauncherId",
@@ -412,6 +419,7 @@ async def prepare_sols_swap(
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    funding_evidence = await _prepare_funding_review(request, settings, context, unsigned_evidence)
     return PrepareSolsSwapResponse(
         direction=body.direction,
         operationHash=_hex32(context.receipt.operation_hash),
@@ -420,6 +428,7 @@ async def prepare_sols_swap(
         buyerOffer=buyer.offer.to_bech32(),
         signingCoinSpends=[_coin_spend_json(item) for item in signing_spends],
         unsignedProtocolEvidence=_unsigned_protocol_evidence_json(unsigned_evidence, settings.network),
+        fundingEvidence=funding_evidence,
         selectedPaymentPublicKey=None,
         selectedPaymentCoinId=_hex32(context.payment_coin.name()),
         quoteExpiresAt=context.receipt.quote_expires_at,
@@ -527,6 +536,7 @@ async def _prepare_deed_to_sols_swap(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    funding_evidence = await _prepare_funding_review(request, settings, context, unsigned_evidence)
     return PrepareSolsSwapResponse(
         direction="DEED_TO_SOLS",
         operationHash=_hex32(context.receipt.operation_hash),
@@ -534,6 +544,7 @@ async def _prepare_deed_to_sols_swap(
         vaultLauncherId=_hex32(context.vault_record.launcher_id),
         buyerOffer=(protocol.offer.to_bech32() if protocol else None),
         unsignedProtocolEvidence=_unsigned_protocol_evidence_json(unsigned_evidence, settings.network),
+        fundingEvidence=funding_evidence,
         signingCoinSpends=(
             [_coin_spend_json(protocol.vault_spend)]
             if protocol is not None
@@ -673,6 +684,8 @@ async def complete_sols_swap(
                 config=context.config,
                 vault_launcher_id=context.vault_record.launcher_id,
             )
+            evidence = prepare_unsigned_sols_to_deed_swap(buyer_offer=unsigned, **_protocol_offer_arguments(context))
+            funding = _completion_funding_identity(request, settings, context, evidence, body)
             signature_data = _vault_signature_data(context, body)
             protocol = _build_protocol_offer(
                 context,
@@ -740,9 +753,12 @@ async def complete_sols_swap(
                         "not submitted."
                     ),
                 )
-            result = await submitter.submit(
-                valid_spend.to_json_dict(),
-                before_push=_seal_swap_execution(request, settings, store, existing, valid_spend),
+            result = await submit_reserved_funding(
+                submitter, store, evidence, funding, body.funding_reservation_hash, valid_spend,
+                lambda: _funding_binding(request, settings, context),
+                _seal_swap_execution(request, settings, store, existing, valid_spend,
+                    funding_reservation_hash=body.funding_reservation_hash, funding_identity=funding,
+                    funding_authorize=lambda: _funding_binding(request, settings, context)),
             )
             stored = store.mark_submitted(
                 body.operation_hash,
@@ -858,6 +874,8 @@ async def _complete_deed_to_sols_swap(
                 raise SolsSwapOfferError(
                     "EVM vault settlement is rebuilt from its signed receipt."
                 )
+            evidence = prepare_unsigned_deed_to_sols_swap(**_reverse_protocol_offer_arguments(context))
+            funding = _completion_funding_identity(request, settings, context, evidence, body)
             signature_data = _vault_signature_data(context, body)
             protocol = _build_reverse_protocol_offer(
                 context,
@@ -924,10 +942,12 @@ async def _complete_deed_to_sols_swap(
                         "not submitted."
                     ),
                 )
-            result = await submitter.submit(
-                valid_spend.to_json_dict(),
-                expected_backing_mojos=context.receipt.deed_to_sols_quote.fresh_sols_mojos_minted,
-                before_push=_seal_swap_execution(request, settings, store, existing, valid_spend),
+            result = await submit_reserved_funding(
+                submitter, store, evidence, funding, body.funding_reservation_hash, valid_spend,
+                lambda: _funding_binding(request, settings, context),
+                _seal_swap_execution(request, settings, store, existing, valid_spend,
+                    funding_reservation_hash=body.funding_reservation_hash, funding_identity=funding,
+                    funding_authorize=lambda: _funding_binding(request, settings, context)),
             )
             stored = store.mark_submitted(
                 body.operation_hash,
@@ -2128,7 +2148,61 @@ def _request_swap_store(
     return store
 
 
-def _seal_swap_execution(request, settings, store, record, protocol_bundle):
+def _funding_binding(request, settings, context):
+    vault = _hex32(context.vault_record.launcher_id)
+    _authorize_swap(settings, request, vault)
+    session = verify_vault_session(settings, request, vault)
+    if not isinstance(session.session_id, str) or not session.session_id:
+        raise ValueError("Reconnect the vault owner for a session-bound funding review")
+    expected_owner = (context.vault_record.owner_evm_address.lower() if context.vault_record.owner_evm_address
+                      else "0x" + bytes(context.vault_record.owner_pubkey).hex())
+    expected_auth = "evm" if context.vault_record.auth_type == AUTH_TYPE_SECP256K1 else "chia_bls"
+    if session.owner_key.lower() != expected_owner.lower() or session.auth_type != expected_auth:
+        raise ValueError("canonical vault ownership changed during funding preparation")
+    artifact = load_signed_public_artifact(settings)
+    if funding_digest(artifact) != funding_digest(context.artifact):
+        raise ValueError("signed artifact changed during swap preparation")
+    release = read_release_metadata(settings.release_metadata_path)
+    if release is None:
+        raise ValueError("exact API and protocol release identity is required for funding review")
+    sources = artifact.get("sourceShas")
+    if (not isinstance(sources, Mapping) or sources.get("api") != release.apiCommit
+            or sources.get("protocol") != release.protocolCommit):
+        raise ValueError("current release identity no longer matches the signed artifact")
+    return dict(vaultLauncherId=vault, ownerKey=session.owner_key, authType=session.auth_type,
+        sessionFingerprint=funding_digest(session.session_id), sessionExpiresAt=session.expires_at,
+        network=session.network, artifactHash=funding_digest(artifact),
+        apiCommit=release.apiCommit, protocolCommit=release.protocolCommit)
+
+
+async def _prepare_funding_review(request, settings, context, evidence):
+    try:
+        submitter = getattr(request.app.state, "protocol_submitter", None)
+        if not isinstance(submitter, ProtocolBundleSubmitter):
+            raise ProtocolSubmissionError("Protocol funding is unavailable before owner review")
+        return await reserve_funding(submitter, _request_swap_store(request, settings), evidence,
+            _funding_binding(request, settings, context), _hex32(context.receipt.operation_hash),
+            context.receipt.quote_expires_at, lambda: _funding_binding(request, settings, context))
+    except (ChiaProviderError, PublicArtifactError, ProtocolSubmissionError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+def _completion_funding_identity(request, settings, context, evidence, body):
+    if not body.funding_reservation_hash:
+        raise ValueError("Prepare and return the exact funding reservation hash before owner signing")
+    submitter = getattr(request.app.state, "protocol_submitter", None)
+    if not isinstance(submitter, ProtocolBundleSubmitter):
+        raise ProtocolSubmissionError("Protocol funding is unavailable")
+    identity = funding_identity(submitter, evidence, _funding_binding(request, settings, context),
+        body.operation_hash, body.quote_expires_at)
+    require_hold(_request_swap_store(request, settings), identity, body.funding_reservation_hash)
+    return identity
+
+
+def _seal_swap_execution(request, settings, store, record, protocol_bundle, *,
+                         funding_reservation_hash=None, funding_identity=None, funding_authorize=None):
     """The submitter holds its shared funding lock while this hook commits."""
     expected_spends = {bytes(spend) for spend in protocol_bundle.coin_spends}
 
@@ -2139,6 +2213,8 @@ def _seal_swap_execution(request, settings, store, record, protocol_bundle):
             **prepared.to_json(), "network": settings.network,
             "feeTargetSeconds": submitter.policy.target_seconds,
         }
+        if funding_reservation_hash is not None:
+            execution["fundingReservationHash"] = funding_reservation_hash
         bundle = validate_execution(execution, pool_input_id=record.pool_input_coin_id,
                                     pool_output_id=record.expected_pool_output_coin_id)
         actual_spends = {bytes(spend) for spend in bundle.coin_spends}
@@ -2149,7 +2225,14 @@ def _seal_swap_execution(request, settings, store, record, protocol_bundle):
             raise ValueError("funded swap differs from the authorized protocol transaction")
         await run_offer_job("swap_signature", bundle=WalletSpendBundle.from_bytes(bytes(bundle)), network=settings.network)
         _authorize_swap(settings, request, record.vault_launcher_id)
-        store.reserve_execution(record.operation_hash, execution)
+        if funding_authorize is not None and funding_authorize() != funding_identity["binding"]:
+            raise ValueError("swap funding authorization changed before execution promotion")
+        if funding_identity is not None and (
+                asdict(submitter.policy) != funding_identity["policy"]
+                or _hex32(submitter.faucet.address_puzzle_hash) != funding_identity["feeTillPuzzleHash"]
+                or submitter.faucet.network != funding_identity["binding"]["network"]):
+            raise ValueError("swap funding policy changed before execution promotion")
+        store.reserve_execution(record.operation_hash, execution, funding_reservation_hash=funding_reservation_hash)
         _authorize_swap(settings, request, record.vault_launcher_id)
 
     return before_push

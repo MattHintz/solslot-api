@@ -156,7 +156,88 @@ class SolsSwapStore:
                 )
             """)
 
-    def reserve_execution(self, operation_hash: str, execution: Mapping[str, Any]) -> None:
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS sols_swap_funding_reviews (
+                    operation_hash TEXT PRIMARY KEY REFERENCES sols_swap_operations(operation_hash),
+                    vault_launcher_id TEXT NOT NULL,
+                    fee_coin_id TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    reservation_json TEXT NOT NULL,
+                    reservation_sha256 TEXT NOT NULL
+                )
+            """)
+
+    @staticmethod
+    def _expire_funding(connection) -> None:
+        # Only private, unsealed fee signatures may expire. An execution has
+        # crossed the dispatch boundary and retains its input claims forever
+        # until the existing canonical confirmation proof releases them.
+        connection.execute("""DELETE FROM sols_swap_funding_reviews
+            WHERE expires_at <= ? AND NOT EXISTS (
+                SELECT 1 FROM sols_swap_executions e
+                WHERE e.operation_hash=sols_swap_funding_reviews.operation_hash)""", (time(),))
+
+    def supersede_unsealed_funding(self, operation_hash: str, vault_launcher_id: str) -> None:
+        """An authenticated new quote replaces only private, undispatched holds."""
+        with self._transaction() as connection:
+            row = connection.execute("SELECT * FROM sols_swap_operations WHERE operation_hash=?",
+                                     (operation_hash,)).fetchone()
+            if (row is None or row["vault_launcher_id"] != vault_launcher_id
+                    or row["status"] != "PREPARED" or row["transaction_id"] is not None
+                    or row["quote_expires_at"] <= time()):
+                raise ValueError("replacement funding requires a current prepared operation")
+            connection.execute("""DELETE FROM sols_swap_funding_reviews
+                WHERE vault_launcher_id=? AND operation_hash<>? AND NOT EXISTS (
+                    SELECT 1 FROM sols_swap_executions e
+                    WHERE e.operation_hash=sols_swap_funding_reviews.operation_hash)""",
+                (vault_launcher_id, operation_hash))
+
+    def reserve_funding(self, operation_hash: str, payload: Mapping[str, Any]) -> None:
+        from .sols_swap_funding import canonical, digest, validate_private_hold
+        bundle = validate_private_hold(payload)
+        review = payload["review"]
+        encoded = canonical(payload)
+        with self._transaction() as connection:
+            self._expire_funding(connection)
+            row = connection.execute("SELECT * FROM sols_swap_operations WHERE operation_hash=?", (operation_hash,)).fetchone()
+            if (row is None or row["status"] != "PREPARED" or row["transaction_id"] is not None
+                    or review["operationHash"] != operation_hash
+                    or review["binding"]["vaultLauncherId"] != row["vault_launcher_id"]
+                    or review["quoteExpiresAt"] != row["quote_expires_at"] or review["quoteExpiresAt"] <= time()):
+                raise ValueError("swap funding does not match a current prepared operation")
+            existing = connection.execute("SELECT * FROM sols_swap_funding_reviews WHERE operation_hash=?", (operation_hash,)).fetchone()
+            if existing is not None:
+                if existing["reservation_json"] != encoded or existing["reservation_sha256"] != digest(payload):
+                    raise ValueError("swap already has a different exact funding review")
+                return
+            fee_id = "0x" + bundle.coin_spends[0].coin.name().hex()
+            conflict = connection.execute("""SELECT 1 FROM sols_swap_funding_reviews f
+                WHERE (f.fee_coin_id=? OR f.vault_launcher_id=?) AND NOT EXISTS
+                (SELECT 1 FROM sols_swap_executions e WHERE e.operation_hash=f.operation_hash)""",
+                (fee_id, row["vault_launcher_id"])).fetchone()
+            if conflict or connection.execute("SELECT 1 FROM sols_swap_input_reservations WHERE coin_id=?", (fee_id,)).fetchone():
+                raise ValueError("funding coin or vault already has an active reservation")
+            connection.execute("INSERT INTO sols_swap_funding_reviews VALUES (?, ?, ?, ?, ?, ?)",
+                (operation_hash, row["vault_launcher_id"], fee_id, review["quoteExpiresAt"], encoded, digest(payload)))
+
+    def funding(self, operation_hash: str) -> dict[str, Any] | None:
+        from .sols_swap_funding import digest, validate_private_hold
+        with self._transaction() as connection:
+            self._expire_funding(connection)
+            row = connection.execute("SELECT * FROM sols_swap_funding_reviews WHERE operation_hash=?", (operation_hash,)).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row["reservation_json"])
+        if (digest(payload) != row["reservation_sha256"]
+                or payload["review"]["operationHash"] != operation_hash
+                or payload["review"]["binding"]["vaultLauncherId"] != row["vault_launcher_id"]
+                or payload["review"]["feeCoinId"] != row["fee_coin_id"]
+                or payload["review"]["quoteExpiresAt"] != row["expires_at"]):
+            raise ValueError("private swap funding record changed")
+        validate_private_hold(payload)
+        return payload
+
+    def reserve_execution(self, operation_hash: str, execution: Mapping[str, Any], *, funding_reservation_hash: str | None = None) -> None:
         """Seal a signed funded transaction and claim all its inputs atomically."""
         encoded = json.dumps(dict(execution), sort_keys=True, separators=(",", ":"), allow_nan=False)
         digest = hashlib.sha256(encoded.encode()).hexdigest()
@@ -176,6 +257,34 @@ class SolsSwapStore:
                 return
             if record.status != "PREPARED" or record.transaction_id is not None:
                 raise ValueError("Sols swap can no longer reserve a new execution")
+            hold = connection.execute("SELECT * FROM sols_swap_funding_reviews WHERE operation_hash=?", (operation_hash,)).fetchone()
+            if hold is not None or funding_reservation_hash is not None:
+                from .sols_swap_funding import digest as funding_digest, validate_private_hold
+                if hold is None or hold["expires_at"] <= time():
+                    raise ValueError("swap funding review expired before exact execution promotion")
+                payload = json.loads(hold["reservation_json"])
+                funding_bundle = validate_private_hold(payload)
+                if (funding_digest(payload) != hold["reservation_sha256"]
+                        or payload["review"]["quoteExpiresAt"] != hold["expires_at"]
+                        or hold["expires_at"] != record.quote_expires_at
+                        or payload["review"]["operationHash"] != operation_hash
+                        or payload["review"]["binding"]["vaultLauncherId"] != record.vault_launcher_id
+                        or payload["review"]["feeTargetSeconds"] != execution["feeTargetSeconds"]
+                        or payload["review"]["binding"]["network"] != execution["network"]
+                        or payload["reservationHash"] != funding_reservation_hash
+                        or execution.get("fundingReservationHash") != funding_reservation_hash
+                        or payload["review"]["feeCoinId"] != execution["feeCoinId"]
+                        or payload["review"]["feeMojos"] != execution["feeMojos"]
+                        or payload["review"]["backingMojos"] != execution["backingMojos"]
+                        or funding_bundle.coin_spends[0] not in bundle.coin_spends):
+                    raise ValueError("signed execution changed its reserved funding")
+            for coin in bundle.removals():
+                conflict = connection.execute("""SELECT 1 FROM sols_swap_funding_reviews f
+                    WHERE f.fee_coin_id=? AND f.operation_hash<>? AND f.expires_at>?
+                    AND NOT EXISTS (SELECT 1 FROM sols_swap_executions e WHERE e.operation_hash=f.operation_hash)""",
+                    (hx(coin.name()), operation_hash, time())).fetchone()
+                if conflict:
+                    raise ValueError("execution consumes another operation's reviewed funding")
             connection.execute("INSERT INTO sols_swap_executions VALUES (?, ?, ?)",
                                (operation_hash, encoded, digest))
             try:
@@ -210,9 +319,13 @@ class SolsSwapStore:
         return execution
 
     def reserved_input_coin_ids(self) -> tuple[str, ...]:
-        """No wall-clock expiry: a signed transaction may already be on chain."""
-        with self._lock, self._connect() as connection:
-            rows = connection.execute("SELECT coin_id FROM sols_swap_input_reservations ORDER BY coin_id").fetchall()
+        """Only unsealed private fee holds expire; signed input claims do not."""
+        with self._transaction() as connection:
+            self._expire_funding(connection)
+            rows = connection.execute("""SELECT coin_id FROM sols_swap_input_reservations
+                UNION SELECT f.fee_coin_id AS coin_id FROM sols_swap_funding_reviews f
+                WHERE NOT EXISTS (SELECT 1 FROM sols_swap_executions e WHERE e.operation_hash=f.operation_hash)
+                ORDER BY coin_id""").fetchall()
         return tuple(row["coin_id"] for row in rows)
 
     def record_prepared(

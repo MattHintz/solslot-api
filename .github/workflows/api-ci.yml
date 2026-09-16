@@ -86,7 +86,7 @@ jobs:
 
       - name: Test
         run: >-
-          python -m pytest tests -q
+          python -m pytest tests -q --durations=20
           -W error::pytest.PytestUnraisableExceptionWarning
 
       - name: Namespace gate
