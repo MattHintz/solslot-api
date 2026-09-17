@@ -229,13 +229,31 @@ def _program(value: str) -> Program:
     return Program.from_bytes(bytes.fromhex(value.removeprefix("0x")))
 
 
-def _coin(record: Mapping[str, Any], *, launcher: bool = False) -> LiveCoin:
+def _coin(record: Mapping[str, Any] | None, *, launcher: bool = False) -> LiveCoin:
+    if not isinstance(record, Mapping):
+        raise ValueError("coin record is unavailable")
     payload = record.get("coin")
     if not isinstance(payload, Mapping):
         raise ValueError("coin record has no coin")
     parent = _hex32(str(payload.get("parent_coin_info") or ""), "parent coin id")
     puzzle = _hex32(str(payload.get("puzzle_hash") or ""), "puzzle hash")
-    amount = int(payload.get("amount"))
+    amount = payload.get("amount")
+    confirmed = record.get("confirmed_block_index")
+    spent = record.get("spent_block_index")
+    # Match the full-node JSON contract without coercing bools, floats or strings.
+    if type(amount) is not int or not 0 <= amount < 2**64:
+        raise ValueError("coin amount is not uint64")
+    if (
+        type(confirmed) is not int or not 0 < confirmed < 2**32
+        or type(spent) is not int or not 0 <= spent < 2**32
+    ):
+        raise ValueError("invalid confirmed coin heights")
+    if spent and spent < confirmed:
+        raise ValueError("coin spend precedes confirmation")
+    if "spent" in record and (
+        type(record["spent"]) is not bool or record["spent"] != bool(spent)
+    ):
+        raise ValueError("inconsistent coin spent flag")
     coin_id = _hex(
         Coin(
             bytes32.fromhex(parent.removeprefix("0x")),
@@ -243,13 +261,12 @@ def _coin(record: Mapping[str, Any], *, launcher: bool = False) -> LiveCoin:
             uint64(amount),
         ).name()
     )
-    spent = int(record.get("spent_block_index") or 0)
     return LiveCoin(
         coin_id=coin_id,
         parent_coin_id=parent,
         puzzle_hash=puzzle,
         amount=amount,
-        confirmed_height=int(record.get("confirmed_block_index") or 0),
+        confirmed_height=confirmed,
         spent_height=spent or None,
         is_launcher=launcher,
     )
@@ -260,12 +277,13 @@ def _singleton_child(
     *,
     expected_amount: int,
 ) -> LiveCoin:
-    candidates = [
-        _coin(record)
-        for record in records
-        if isinstance(record.get("coin"), Mapping)
-        and int(record["coin"].get("amount") or -1) == expected_amount
-    ]
+    if not isinstance(records, list):
+        raise ValueError("singleton children must be coin records")
+    candidates = []
+    for record in records:
+        coin = _coin(record)
+        if coin.amount == expected_amount:
+            candidates.append(coin)
     if len(candidates) != 1:
         raise ValueError(
             "singleton continuation is missing or ambiguous"
@@ -279,8 +297,13 @@ async def _singleton_tip(provider: ChiaProvider, launcher_id: str) -> Optional[S
     if launcher_record is None:
         return None
     launcher = _coin(launcher_record, launcher=True)
+    if launcher.coin_id != launcher_id:
+        raise ValueError("launcher coin does not match requested ID")
+    if launcher.amount == 0 or launcher.amount % 2 != 1:
+        raise ValueError("singleton launcher amount must be positive and odd")
     nodes = [launcher]
     if launcher.spent_height is None:
+        await _require_same_coin(provider, launcher)
         return SingletonTip(
             launcher_id,
             launcher,
@@ -302,8 +325,15 @@ async def _singleton_tip(provider: ChiaProvider, launcher_id: str) -> Optional[S
             children,
             expected_amount=launcher.amount,
         )
+        if (
+            child.parent_coin_id != parent
+            or child.confirmed_height != nodes[-1].spent_height
+        ):
+            raise ValueError("singleton continuation is not an atomic child of its parent")
         nodes.append(child)
         if child.spent_height is None:
+            await _require_same_coin(provider, launcher)
+            await _require_same_coin(provider, child)
             return SingletonTip(
                 launcher_id,
                 child,
@@ -315,13 +345,75 @@ async def _singleton_tip(provider: ChiaProvider, launcher_id: str) -> Optional[S
     raise ValueError("singleton lineage exceeds the safety limit")
 
 
+async def _require_same_coin(provider: ChiaProvider, expected: LiveCoin) -> None:
+    current = _coin(
+        await provider.get_coin_record_by_name(expected.coin_id),
+        launcher=expected.is_launcher,
+    )
+    if current != expected:
+        raise ValueError("singleton coin changed during evidence retrieval")
+
+
+def _canonical_spend_program(value: Any) -> Program:
+    # Product evidence bound, not a claim about the network consensus limit.
+    if not isinstance(value, str) or len(value) > 2 * 2**21 + 2:
+        raise ValueError("singleton spend program exceeds the evidence bound")
+    try:
+        raw = bytes.fromhex(value.removeprefix("0x"))
+        if not raw or len(raw) > 2**21:
+            raise ValueError("invalid program length")
+        program = Program.from_bytes(raw)
+        if bytes(program) != raw:
+            raise ValueError("noncanonical program bytes")
+        return program
+    except (TypeError, ValueError) as exc:
+        raise ValueError("singleton spend program is not canonical CLVM") from exc
+
+
+async def _singleton_spend(provider: ChiaProvider, spent: LiveCoin) -> dict[str, Any]:
+    """Bind one provider response to its recorded coin; this is not execution proof."""
+    if spent.spent_height is None:
+        raise ValueError("singleton coin has no confirmed spend")
+    response = await provider.get_puzzle_and_solution(spent.coin_id, spent.spent_height)
+    if not isinstance(response, Mapping):
+        raise ValueError("singleton lineage solution is unavailable")
+    returned = _coin(
+        dict(
+            coin=response.get("coin"),
+            confirmed_block_index=spent.confirmed_height,
+            spent_block_index=spent.spent_height,
+        ),
+        launcher=spent.is_launcher,
+    )
+    if returned != spent:
+        raise ValueError("singleton spend coin does not match recorded input")
+    puzzle = _canonical_spend_program(response.get("puzzle_reveal"))
+    solution = _canonical_spend_program(response.get("solution"))
+    if _hex(puzzle.get_tree_hash()) != spent.puzzle_hash:
+        raise ValueError("singleton spend puzzle does not match recorded input")
+    # Detach accepted bytes before the next await can mutate a provider object.
+    result = dict(
+        coin=dict(
+            parent_coin_info=spent.parent_coin_id,
+            puzzle_hash=spent.puzzle_hash,
+            amount=spent.amount,
+        ),
+        puzzle_reveal=bytes(puzzle).hex(),
+        solution=bytes(solution).hex(),
+    )
+    await _require_same_coin(provider, spent)
+    return result
+
+
 async def _latest_solution(
     provider: ChiaProvider, tip: SingletonTip
 ) -> Optional[dict[str, Any]]:
     spent = tip.latest_spent
     if spent is None or spent.is_launcher or spent.spent_height is None:
         return None
-    return await provider.get_puzzle_and_solution(spent.coin_id, spent.spent_height)
+    result = await _singleton_spend(provider, spent)
+    await _require_same_coin(provider, tip.live)
+    return result
 
 
 def _solution_parts(solution_hex: str, label: str) -> tuple[list[Program], list[Program]]:
@@ -1106,12 +1198,7 @@ async def _resolve_statutes_witnesses(
         if not coin.is_launcher and coin.spent_height is not None
     ]
     for coin in spent:
-        puzzle_solution = await provider.get_puzzle_and_solution(
-            coin.coin_id,
-            int(coin.spent_height),
-        )
-        if puzzle_solution is None:
-            raise ValueError("statutes lineage solution is unavailable")
+        puzzle_solution = await _singleton_spend(provider, coin)
         (
             candidate_parameters,
             candidate_collections,
@@ -1183,6 +1270,7 @@ async def _resolve_statutes_witnesses(
             "current statutes parameters, collections, oracles, routes, "
             "liquidity, or pauses cannot be reconstructed"
         )
+    await _require_same_coin(provider, tip.live)
     return (
         parameters,
         collections,
