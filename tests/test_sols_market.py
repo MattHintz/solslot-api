@@ -298,7 +298,7 @@ def test_pool_v4_reader_rejects_tampered_next_commitment() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('mutation', [None, 'missing_coin', 'foreign_coin', 'wrong_puzzle', 'spent_reorg', 'tip_spent'])
+@pytest.mark.parametrize('mutation', [None, 'missing_coin', 'foreign_coin', 'wrong_puzzle', 'spent_reorg', 'tip_spent', 'uncreated_child'])
 async def test_statutes_reader_applies_collection_update_and_exposes_witness(mutation) -> None:
     old_state = initial_state(
         parameters=PARAMETERS,
@@ -386,6 +386,12 @@ async def test_statutes_reader_applies_collection_update_and_exposes_witness(mut
     elif mutation == 'wrong_puzzle': puzzle_solution['puzzle_reveal'] = '80'
     elif mutation == 'spent_reorg': records[spent.coin_id]['spent_block_index'] += 1
     elif mutation == 'tip_spent': records[live.coin_id]['spent_block_index'] = 103
+    elif mutation == 'uncreated_child':
+        from dataclasses import replace
+        other = Coin(spent_coin.name(), _b32(91), uint64(1))
+        records[_hex(other.name())] = dict(coin=other.to_json_dict(), confirmed_block_index=102, spent_block_index=0)
+        live = _coin(records[_hex(other.name())])
+        tip = replace(tip, live=live, lineage=(spent, live))
     provider = type(
         "Provider",
         (),

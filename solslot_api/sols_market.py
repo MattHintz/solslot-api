@@ -14,6 +14,8 @@ from typing import Annotated, Any, Literal, Mapping, Optional
 
 from chia.types.blockchain_format.coin import Coin
 from chia.types.blockchain_format.program import Program
+from chia.types.coin_spend import make_spend
+from chia.wallet.util.compute_additions import compute_additions_with_cost
 from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
     SINGLETON_LAUNCHER_HASH,
     SINGLETON_MOD,
@@ -110,6 +112,9 @@ LIQUIDITY_INSTALLED_ADAPTERS = frozenset(
 )
 DEED_SPEND_POOL_DEPOSIT = 0x64
 MAX_SINGLETON_DEPTH = 10_000
+# Product limit for one history/witness read, including charged condition costs.
+# Historical evidence need not fit in one block; over-budget reads fail closed.
+MAX_SINGLETON_EVIDENCE_COST = 11_000_000_000
 
 
 class BridgeIntentRequest(BaseModel):
@@ -313,6 +318,7 @@ async def _singleton_tip(provider: ChiaProvider, launcher_id: str) -> Optional[S
         )
 
     parent = launcher.coin_id
+    remaining_cost = MAX_SINGLETON_EVIDENCE_COST
     for _ in range(MAX_SINGLETON_DEPTH):
         children = await provider.get_coin_records_by_parent_ids(
             [parent], include_spent=True
@@ -330,6 +336,10 @@ async def _singleton_tip(provider: ChiaProvider, launcher_id: str) -> Optional[S
             or child.confirmed_height != nodes[-1].spent_height
         ):
             raise ValueError("singleton continuation is not an atomic child of its parent")
+        _, cost = await _singleton_spend(
+            provider, nodes[-1], child, max_cost=remaining_cost
+        )
+        remaining_cost -= cost
         nodes.append(child)
         if child.spent_height is None:
             await _require_same_coin(provider, launcher)
@@ -370,10 +380,24 @@ def _canonical_spend_program(value: Any) -> Program:
         raise ValueError("singleton spend program is not canonical CLVM") from exc
 
 
-async def _singleton_spend(provider: ChiaProvider, spent: LiveCoin) -> dict[str, Any]:
-    """Bind one provider response to its recorded coin; this is not execution proof."""
+async def _singleton_spend(
+    provider: ChiaProvider, spent: LiveCoin, successor: LiveCoin, *, max_cost: int
+) -> tuple[dict[str, Any], int]:
+    """Execute bound evidence and match its child, trusting provider confirmation.
+
+    This checks output consistency, not block inclusion, aggregate signatures or
+    cross-spend assertions. Execute the actual reveal, including custom launchers.
+    """
     if spent.spent_height is None:
         raise ValueError("singleton coin has no confirmed spend")
+    if (
+        successor.parent_coin_id != spent.coin_id
+        or successor.confirmed_height != spent.spent_height
+        or successor.amount != spent.amount
+    ):
+        raise ValueError("singleton successor is not an atomic continuation")
+    if max_cost <= 0:
+        raise ValueError("singleton evidence exceeds the cost budget")
     response = await provider.get_puzzle_and_solution(spent.coin_id, spent.spent_height)
     if not isinstance(response, Mapping):
         raise ValueError("singleton lineage solution is unavailable")
@@ -401,8 +425,22 @@ async def _singleton_spend(provider: ChiaProvider, spent: LiveCoin) -> dict[str,
         puzzle_reveal=bytes(puzzle).hex(),
         solution=bytes(solution).hex(),
     )
+    try:
+        additions, cost = compute_additions_with_cost(
+            make_spend(Coin.from_json_dict(result['coin']), puzzle, solution),
+            max_cost=max_cost,
+        )
+        # The pinned helper charges the final condition after its loop guard.
+        if cost > max_cost:
+            raise ValueError("condition cost exceeds budget")
+    except Exception as exc:
+        raise ValueError("singleton spend cannot execute within its cost budget") from exc
+    continuations = [coin for coin in additions if coin.amount % 2 == 1]
+    if len(continuations) != 1 or _hex(continuations[0].name()) != successor.coin_id:
+        raise ValueError("singleton spend does not create its unique recorded successor")
     await _require_same_coin(provider, spent)
-    return result
+    await _require_same_coin(provider, successor)
+    return result, cost
 
 
 async def _latest_solution(
@@ -411,7 +449,9 @@ async def _latest_solution(
     spent = tip.latest_spent
     if spent is None or spent.is_launcher or spent.spent_height is None:
         return None
-    result = await _singleton_spend(provider, spent)
+    result, _ = await _singleton_spend(
+        provider, spent, tip.live, max_cost=MAX_SINGLETON_EVIDENCE_COST
+    )
     await _require_same_coin(provider, tip.live)
     return result
 
@@ -1193,12 +1233,16 @@ async def _resolve_statutes_witnesses(
         () if state.pauses_root == empty_root else None
     )
     spent = [
-        coin
-        for coin in reversed(tip.lineage)
+        (coin, successor)
+        for coin, successor in reversed(tuple(zip(tip.lineage, tip.lineage[1:])))
         if not coin.is_launcher and coin.spent_height is not None
     ]
-    for coin in spent:
-        puzzle_solution = await _singleton_spend(provider, coin)
+    remaining_cost = MAX_SINGLETON_EVIDENCE_COST
+    for coin, successor in spent:
+        puzzle_solution, cost = await _singleton_spend(
+            provider, coin, successor, max_cost=remaining_cost
+        )
+        remaining_cost -= cost
         (
             candidate_parameters,
             candidate_collections,

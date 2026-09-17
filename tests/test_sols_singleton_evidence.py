@@ -30,7 +30,7 @@ class Chain:
         self.on_read = None
         parent = hx(bytes([9]) * 32)
         for i in range(depth + 1):
-            puzzle = Program.to((1, [[51, bytes([i + 1]) * 32, amount]]))
+            puzzle = Program.to(1)
             height = 100 if same_block else 100 + i
             spent = (height if same_block else height + 1) if i < depth else 0
             name, row = record(parent, puzzle, height, spent, amount)
@@ -38,7 +38,8 @@ class Chain:
             self.records[name] = row
             self.children[parent] = [row]
             self.spends[name] = dict(coin=deepcopy(row['coin']),
-                                     puzzle_reveal=bytes(puzzle).hex(), solution='80')
+                                     puzzle_reveal=bytes(puzzle).hex(),
+                                     solution=bytes(Program.to([[51, puzzle.get_tree_hash(), amount]])).hex())
             parent = name
         self.launcher = self.ids[0]
         self.tip = self.ids[-1]
@@ -186,6 +187,7 @@ async def test_accepted_program_bytes_are_detached_before_await():
     chain = Chain()
     tip = await market._singleton_tip(chain, chain.launcher)
     response = chain.spends[chain.ids[-2]]
+    original_solution = response['solution']
     async def fetch(*_args): return response
     chain.get_puzzle_and_solution = fetch
     def on_read(_name, row):
@@ -194,7 +196,7 @@ async def test_accepted_program_bytes_are_detached_before_await():
         return row
     chain.on_read = on_read
     accepted = await market._latest_solution(chain, tip)
-    assert accepted['solution'] == '80' and accepted['coin']['amount'] == 1
+    assert accepted['solution'] == original_solution and accepted['coin']['amount'] == 1
 
 
 @pytest.mark.asyncio
