@@ -9,7 +9,7 @@ from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
     puzzle_for_singleton,
     solution_for_singleton,
 )
-from chia_rs import G1Element
+from chia_rs import Coin, G1Element
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 import pytest
@@ -298,29 +298,17 @@ def test_pool_v4_reader_rejects_tampered_next_commitment() -> None:
 
 
 @pytest.mark.asyncio
-async def test_statutes_reader_applies_collection_update_and_exposes_witness() -> None:
+@pytest.mark.parametrize('mutation', [None, 'missing_coin', 'foreign_coin', 'wrong_puzzle', 'spent_reorg', 'tip_spent'])
+async def test_statutes_reader_applies_collection_update_and_exposes_witness(mutation) -> None:
     old_state = initial_state(
         parameters=PARAMETERS,
         permanent_rules=RULES,
     )
-    mutation, _, next_state = build_record_mutation(
+    record_mutation, _, next_state = build_record_mutation(
         state=old_state,
         kind=MutationKind.COLLECTION,
         current=(),
         replacement=COLLECTION,
-    )
-    update = build_update_spend(
-        my_id=_b32(50),
-        my_inner_puzzle_hash=_b32(51),
-        my_amount=1,
-        singleton_struct=_singleton_struct(STATUTES_LAUNCHER),
-        governance_singleton_struct=_singleton_struct(GOVERNANCE_LAUNCHER),
-        permanent_rules=RULES,
-        current_state=old_state,
-        next_state=next_state,
-        mutation=mutation,
-        current_entries=(),
-        governance_inner_puzzle_hash=_b32(52),
     )
     old_inner = make_statutes_inner(
         singleton_struct=_singleton_struct(STATUTES_LAUNCHER),
@@ -329,6 +317,20 @@ async def test_statutes_reader_applies_collection_update_and_exposes_witness() -
         state=old_state,
     )
     old_full = puzzle_for_singleton(STATUTES_LAUNCHER, old_inner)
+    spent_coin = Coin(_b32(90), old_full.get_tree_hash(), uint64(1))
+    update = build_update_spend(
+        my_id=spent_coin.name(),
+        my_inner_puzzle_hash=old_inner.get_tree_hash(),
+        my_amount=1,
+        singleton_struct=_singleton_struct(STATUTES_LAUNCHER),
+        governance_singleton_struct=_singleton_struct(GOVERNANCE_LAUNCHER),
+        permanent_rules=RULES,
+        current_state=old_state,
+        next_state=next_state,
+        mutation=record_mutation,
+        current_entries=(),
+        governance_inner_puzzle_hash=_b32(52),
+    )
     next_inner = make_statutes_inner(
         singleton_struct=_singleton_struct(STATUTES_LAUNCHER),
         governance_singleton_struct=_singleton_struct(GOVERNANCE_LAUNCHER),
@@ -344,20 +346,14 @@ async def test_statutes_reader_applies_collection_update_and_exposes_witness() -
         uint64(1),
         update.inner_solution,
     )
-    spent = _live(
-        coin_id=_b32(50),
-        puzzle_hash=bytes32(old_full.get_tree_hash()),
-        spent_height=102,
-    )
-    live = _live(
-        coin_id=_b32(55),
-        puzzle_hash=bytes32(
-            puzzle_for_singleton(
-                STATUTES_LAUNCHER,
-                next_inner,
-            ).get_tree_hash()
-        ),
-    )
+    live_coin = Coin(spent_coin.name(),
+        puzzle_for_singleton(STATUTES_LAUNCHER, next_inner).get_tree_hash(), uint64(1))
+    records = {
+        _hex(spent_coin.name()): dict(coin=spent_coin.to_json_dict(), confirmed_block_index=100, spent_block_index=102),
+        _hex(live_coin.name()): dict(coin=live_coin.to_json_dict(), confirmed_block_index=102, spent_block_index=0),
+    }
+    from solslot_api.sols_market import _coin
+    spent, live = (_coin(records[_hex(coin.name())]) for coin in [spent_coin, live_coin])
     tip = SingletonTip(
         launcher_id=_hex(STATUTES_LAUNCHER),
         live=live,
@@ -366,6 +362,7 @@ async def test_statutes_reader_applies_collection_update_and_exposes_witness() -
         lineage=(spent, live),
     )
     puzzle_solution = {
+        "coin": spent_coin.to_json_dict(),
         "puzzle_reveal": bytes(old_full).hex(),
         "solution": bytes(solution).hex(),
     }
@@ -384,15 +381,25 @@ async def test_statutes_reader_applies_collection_update_and_exposes_witness() -
         liquidity_venues,
         _,
     ) = _statutes_witnesses(puzzle_solution)
+    if mutation == 'missing_coin': del puzzle_solution['coin']
+    elif mutation == 'foreign_coin': puzzle_solution['coin'] = live_coin.to_json_dict()
+    elif mutation == 'wrong_puzzle': puzzle_solution['puzzle_reveal'] = '80'
+    elif mutation == 'spent_reorg': records[spent.coin_id]['spent_block_index'] += 1
+    elif mutation == 'tip_spent': records[live.coin_id]['spent_block_index'] = 103
     provider = type(
         "Provider",
         (),
         {
             "get_puzzle_and_solution": staticmethod(
                 lambda *_args: _async_value(puzzle_solution)
-            )
+            ),
+            "get_coin_record_by_name": staticmethod(lambda name: _async_value(records.get(name))),
         },
     )()
+    if mutation:
+        with pytest.raises(ValueError):
+            await _resolve_statutes_witnesses(provider, tip, next_state, PARAMETERS)
+        return
     (
         resolved_parameters,
         resolved_collections,
