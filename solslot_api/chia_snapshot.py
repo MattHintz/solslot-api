@@ -19,6 +19,7 @@ from chia_rs.sized_bytes import bytes32
 
 from .chia_provider import ChiaProvider, ChiaProviderError
 
+MAX_PERSISTENT_INPUTS = 37  # 32 reserve CATs + statutes, vault, held deed, pool, fee.
 MAX_READS = 2048
 MAX_READ_BYTES = 16 * 1024 * 1024
 SNAPSHOT_TIMEOUT_SECONDS = 60
@@ -185,7 +186,7 @@ class PrimaryReadSnapshot:
             if _canonical(_review_value(operation, await self._node_read(lambda: invoke(self.node)))) != expected:
                 raise ChiaProviderError(f"primary observation changed during swap review: {operation}")
         records = []
-        if not 1 <= len(inputs) <= 16 or len({coin.name() for _, coin in inputs}) != len(inputs):
+        if not 1 <= len(inputs) <= MAX_PERSISTENT_INPUTS or len({coin.name() for _, coin in inputs}) != len(inputs):
             raise ChiaProviderError("swap snapshot requires distinct persistent inputs")
         for role, coin in inputs:
             raw = await self._node_read(lambda: self.node.get_coin_record_by_name("0x" + coin.name().hex()))

@@ -363,6 +363,8 @@ async def _snapshot_prepare(vault_launcher_id, body, request, settings):
         result = await _prepare_sols_swap(vault_launcher_id, body, request, settings)
         evidence, funding = result.unsigned_protocol_evidence, result.funding_evidence
         ephemeral = {"sols_settlement", "smart_deed"}
+        if any(value["role"] == "reserve_consolidation_0" for value in evidence["coinSpends"]):
+            ephemeral.add("sols_reserve")
         inputs = []
         for value in [*evidence["coinSpends"], {"role": "fee", **funding["fundingCoinSpend"]}]:
             if value["role"] in ephemeral:
