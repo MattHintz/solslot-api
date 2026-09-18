@@ -348,6 +348,10 @@ async def lifespan(app: FastAPI):
     # Existing reservations still protect the faucet if fee funding was
     # switched off after a restart. Register before starting any worker.
     app.state.sols_swap_store = _load_swap_store_for_runtime(settings, app.state.faucet)
+    from .redemption_review_store import RedemptionReviewStore
+    app.state.redemption_review_store = RedemptionReviewStore(settings.admin_db_path)
+    if app.state.faucet is not None:
+        app.state.faucet.add_coin_reservation_source(app.state.redemption_review_store.reserved_input_coin_ids)
     if settings.protocol_fee_funding_enabled:
         if app.state.faucet is None:
             raise RuntimeError(
@@ -395,6 +399,8 @@ async def lifespan(app: FastAPI):
             settings.stripe_delivery_db_path
         )
         presale_store = get_presale_store(settings)
+        from .voucher_refund_funding import store_for as refund_funding_store_for
+        refund_funding_store_for(presale_store, app.state.protocol_submitter)
         app.state.protocol_submitter.add_fee_coin_reservation_source(
             presale_store.pending_campaign_funding_coin_ids
         )
@@ -420,6 +426,9 @@ async def lifespan(app: FastAPI):
         # funding, including after a coordinator restart without a swap request.
         app.state.protocol_submitter.add_fee_coin_reservation_source(
             app.state.sols_swap_store.reserved_input_coin_ids
+        )
+        app.state.protocol_submitter.add_fee_coin_reservation_source(
+            app.state.redemption_review_store.reserved_input_coin_ids
         )
 
     app.state.voucher_issuance_worker = None

@@ -169,7 +169,8 @@ async def reserve_funding(submitter, store, evidence, binding, operation, expire
         if (authorize() != binding
                 or funding_identity(submitter, evidence, binding, operation, expires) != identity):
             raise ValueError("swap funding authorization changed")
-        return {**payload["review"], "reservationHash": payload["reservationHash"]}
+        return {**payload["review"], "reservationHash": payload["reservationHash"],
+                "reservationReviewJson": canonical(payload["review"])}
 
 
 async def estimate_swap_fee(submitter):
@@ -191,7 +192,8 @@ def normalize_vault(spend):
     outer = list(Program.from_bytes(bytes(spend.solution)).as_iter())
     inner = list(outer[2].as_iter())
     auth = list(inner[4].as_iter())
-    if len(outer) != 3 or len(inner) != 5 or len(auth) != 5:
+    action = inner[3].as_atom()
+    if len(outer) != 3 or len(inner) != 5 or len(auth) != ({b"s": 5, b"d": 3}.get(action)):
         raise ValueError("unexpected vault authorization shape")
     auth[2] = Program.to(b"")
     inner[4] = Program.to(auth)

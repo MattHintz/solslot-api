@@ -44,6 +44,7 @@ class ExactExecutionRequest:
     artifact_hash: bytes32
     claim_hash: bytes32
     expected_outputs: tuple[ExactExecutionOutput, ...]
+    refund_continuation: tuple[bytes32, bytes32, bytes32] | None = None
 
 
 class KeyOfSolomonExactExecutor:
@@ -108,6 +109,10 @@ class KeyOfSolomonExactExecutor:
             expected_outputs=outputs,
             fee_mojos=prepared.fee_mojos,
         )
+        if request.refund_continuation is not None:
+            if request.action != ExactExecutionAction.VOUCHER_TERMINAL:
+                raise ValueError('Only an owner refund can continue its exact execution')
+            digest = refund_continuation_digest(digest,request.refund_continuation)
         signature = AugSchemeMPL.sign(self.private_key, digest)
         payload = {
             "payment_intent": operation_reference,
@@ -135,6 +140,10 @@ class KeyOfSolomonExactExecutor:
             },
             "signature": "0x" + bytes(signature).hex(),
         }
+        if request.refund_continuation is not None:
+            previous,vault,fee = request.refund_continuation
+            payload['kind'] = {'ProtocolContinueRefund':dict(execution=payload['kind']['ProtocolExecute'],
+                previous_bundle_id=_hex32(previous),vault_coin_id=_hex32(vault),fee_coin_id=_hex32(fee))}
         try:
             async with httpx.AsyncClient(
                 verify=self.verify,
@@ -159,6 +168,12 @@ class KeyOfSolomonExactExecutor:
             "accepted": True,
             "httpStatus": response.status_code,
         }
+
+
+def refund_continuation_digest(exact_digest: bytes, continuation: tuple[bytes32, bytes32, bytes32]) -> bytes:
+    if len(exact_digest)!=32 or len(continuation)!=3 or any(len(v)!=32 for v in continuation):
+        raise ValueError('Refund continuation digest requires exact 32-byte bindings')
+    return hashlib.sha256(b'SOLSLOT_KOS_REFUND_CONTINUATION_V1'+exact_digest+b''.join(continuation)).digest()
 
 
 def exact_execution_digest(

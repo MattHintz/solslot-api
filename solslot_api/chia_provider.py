@@ -190,6 +190,10 @@ class ChiaProvider:
         operation: str,
         invoke: Callable[[CoinsetClient], Awaitable[T]],
     ) -> T:
+        from .chia_snapshot import active_snapshot
+        snapshot = active_snapshot()
+        if snapshot is not None:
+            return await snapshot.read(self, operation, invoke)
         primary_error: Exception | None = None
         if await self._primary_available():
             assert self.primary is not None
@@ -219,6 +223,11 @@ class ChiaProvider:
         invoke: Callable[[CoinsetClient], Awaitable[T]],
     ) -> T:
         """Read only from the synced local primary; never fall back."""
+
+        from .chia_snapshot import active_snapshot
+        snapshot = active_snapshot()
+        if snapshot is not None:
+            return await snapshot.read(self, operation, invoke)
 
         if self.primary is None or not await self._primary_available():
             raise ChiaProviderError(
@@ -368,6 +377,12 @@ class ChiaProvider:
         if cost is not None and (type(cost) is not int or not 0 < cost <= 11_000_000_000):
             raise ValueError("fee estimation cost is outside the consensus bound")
         estimate_args = {"spend_bundle": spend_bundle} if spend_bundle is not None else {"cost": cost}
+        from .chia_snapshot import active_snapshot
+        snapshot = active_snapshot()
+        if snapshot is not None:
+            return await snapshot.read(self, "get_fee_estimate", lambda client: client.get_fee_estimate(
+                target_times=target_times, **estimate_args,
+            ))
         if require_primary:
             if self.primary is None or not await self._primary_available():
                 raise ChiaProviderError(
@@ -394,6 +409,9 @@ class ChiaProvider:
         )
 
     async def push_tx(self, spend_bundle_json: dict[str, Any]) -> dict[str, Any]:
+        from .chia_snapshot import active_snapshot
+        if active_snapshot() is not None:
+            raise ChiaProviderError("swap read snapshots cannot broadcast transactions")
         if await self._primary_available():
             assert self.primary is not None
             try:
@@ -426,6 +444,9 @@ class ChiaProvider:
         poll_seconds: float,
     ) -> dict[str, Any]:
         """Push locally and require this full node to observe the fee input."""
+        from .chia_snapshot import active_snapshot
+        if active_snapshot() is not None:
+            raise ChiaProviderError("swap read snapshots cannot broadcast transactions")
         normalized_coin_id = _normalize_coin_id(required_coin_id)
         try:
             from chia_rs import SpendBundle

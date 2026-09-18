@@ -169,6 +169,7 @@ class PrepareSolsSwapResponse(SolsSwapModel):
         default=None, alias="unsignedProtocolEvidence",
     )
     funding_evidence: dict[str, Any] | None = Field(default=None, alias="fundingEvidence")
+    current_state_evidence: dict[str, Any] | None = Field(default=None, alias="currentStateEvidence")
     selected_payment_public_key: str | None = Field(
         default=None,
         alias="selectedPaymentPublicKey",
@@ -348,6 +349,34 @@ async def prepare_sols_swap(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> PrepareSolsSwapResponse:
     _authorize_swap(settings, request, vault_launcher_id)
+    try:
+        return await _snapshot_prepare(vault_launcher_id, body, request, settings)
+    except (ChiaProviderError, TimeoutError) as exc:
+        raise HTTPException(status_code=503, detail=f"Current swap state is unavailable: {exc}") from exc
+
+
+async def _snapshot_prepare(vault_launcher_id, body, request, settings):
+    from .chia_snapshot import PrimaryReadSnapshot
+    async with PrimaryReadSnapshot(request.app.state.coinset, settings.network) as snapshot:
+        result = await _prepare_sols_swap(vault_launcher_id, body, request, settings)
+        evidence, funding = result.unsigned_protocol_evidence, result.funding_evidence
+        ephemeral = {"sols_settlement", "smart_deed"}
+        inputs = []
+        for value in [*evidence["coinSpends"], {"role": "fee", **funding["fundingCoinSpend"]}]:
+            if value["role"] in ephemeral:
+                continue
+            coin = value["coin"]
+            inputs.append((value["role"], Coin(_b32(coin["parentCoinInfo"], "parent"),
+                _b32(coin["puzzleHash"], "puzzle"), uint64(int(coin["amount"])))))
+        receipt = await snapshot.finish(inputs, {
+            "operationHash": result.operation_hash, "quoteExpiresAt": result.quote_expires_at,
+            "protocolCandidateHash": evidence["protocolCandidateHash"],
+            "fundingReservationHash": funding["reservationHash"], **funding["binding"],
+        })
+        return result.model_copy(update={"current_state_evidence": receipt})
+
+
+async def _prepare_sols_swap(vault_launcher_id, body, request, settings):
     if body.direction == "DEED_TO_SOLS":
         return await _prepare_deed_to_sols_swap(
             vault_launcher_id=vault_launcher_id,
@@ -1049,6 +1078,32 @@ def _authorize_swap(
 
 
 async def _load_swap_context(
+    **kwargs,
+) -> SolsSwapContext:
+    return await _load_observed_context(_derive_swap_context, kwargs)
+
+
+async def _load_observed_context(derive, kwargs):
+    """Completion reconstruction also uses the primary; broadcast is outside this scope."""
+    from .chia_snapshot import PrimaryReadSnapshot, active_snapshot
+    if active_snapshot() is not None:
+        return await derive(**kwargs)
+    settings = kwargs["settings"]
+    async with PrimaryReadSnapshot(kwargs["provider"], settings.network) as snapshot:
+        context = await derive(**kwargs)
+        snapshot.recheck(lambda: funding_digest(load_signed_public_artifact(settings)), funding_digest(context.artifact))
+        snapshot.recheck(lambda: require_vault_record(context.approved_vault.launcher_id) == context.vault_record, True)
+        snapshot.recheck(lambda: require_current_approved_vault(settings, context.approved_vault.launcher_id) == context.approved_vault, True)
+        inputs = [("pool", context.pool_coin), ("statutes", context.statutes_coin), ("vault", context.vault_coin)]
+        if isinstance(context, SolsSwapContext):
+            inputs.extend([("deed_custody", context.custody_coin), ("sols_payment", context.payment_coin)])
+        else:
+            inputs.extend([("held_deed", context.deed.coin), ("sols_reserve", context.reserve_coin)])
+        await snapshot.finish(inputs, {"quoteExpiresAt": context.receipt.quote_expires_at})
+        return context
+
+
+async def _derive_swap_context(
     *,
     settings: Settings,
     provider: ChiaProvider,
@@ -1279,6 +1334,12 @@ def _build_protocol_offer(
 
 
 async def _load_reverse_swap_context(
+    **kwargs,
+) -> ReverseSolsSwapContext:
+    return await _load_observed_context(_derive_reverse_swap_context, kwargs)
+
+
+async def _derive_reverse_swap_context(
     *,
     settings: Settings,
     provider: ChiaProvider,
@@ -2177,6 +2238,16 @@ def _funding_binding(request, settings, context):
 
 async def _prepare_funding_review(request, settings, context, evidence):
     try:
+        from .chia_snapshot import active_snapshot
+        snapshot = active_snapshot()
+        if snapshot is not None:
+            def current_authority():
+                if (require_vault_record(context.approved_vault.launcher_id) != context.vault_record
+                        or require_current_approved_vault(settings, context.approved_vault.launcher_id)
+                        != context.approved_vault):
+                    raise ChiaProviderError("vault authority changed during swap review")
+                return _funding_binding(request, settings, context)
+            snapshot.recheck(current_authority, current_authority())
         submitter = getattr(request.app.state, "protocol_submitter", None)
         if not isinstance(submitter, ProtocolBundleSubmitter):
             raise ProtocolSubmissionError("Protocol funding is unavailable before owner review")

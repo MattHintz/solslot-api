@@ -5,6 +5,7 @@ import time
 from typing import Any, Mapping
 
 from chia.types.blockchain_format.coin import Coin
+from chia.types.blockchain_format.program import Program
 from chia_rs import SpendBundle
 from chia_rs.sized_bytes import bytes32
 
@@ -67,8 +68,13 @@ async def prepare_and_dispatch_stripe_terminal(
     protocol_bundle: SpendBundle,
     expected_outputs: Mapping[str, Coin],
     bindings: Mapping[str, Any],
+    reviewed_bundle: PreparedProtocolBundle | None = None,
 ) -> tuple[dict[str, Any], int]:
     _validate_mode(mode, voucher_action)
+    receipt_fee = _refund_receipt_fee(
+        protocol_bundle, mode=mode, voucher_action=voucher_action,
+        terms_hash=terms_hash, purchase_id=purchase_id, artifact_hash=artifact_hash,
+    )
     role_outputs = _role_outputs(expected_outputs)
     request = ExactExecutionRequest(
         action=ExactExecutionAction.VOUCHER_TERMINAL,
@@ -93,13 +99,26 @@ async def prepare_and_dispatch_stripe_terminal(
             role_outputs=role_outputs,
             bindings=bindings,
         )
+        if reviewed_bundle is not None and mode == 'REFUND_OWNER':
+            # Retain the independent protocol aggregate so a server-owned fee
+            # deadline can renew without a new owner or validator authorization.
+            document['refundProtocolSignature'] = '0x'+bytes(protocol_bundle.aggregated_signature).hex()
         store.bind_stripe_terminal_execution(terms_hash, serial, document)
         return await exact_executor.dispatch(request, prepared)
 
-    result = await submitter.prepare_and_dispatch(
-        protocol_bundle.to_json_dict(),
-        dispatch,
-    )
+    if reviewed_bundle is None:
+        result = await submitter.prepare_and_dispatch(
+            protocol_bundle.to_json_dict(), dispatch,
+            **({"expected_protocol_fee_mojos": receipt_fee} if receipt_fee else {}),
+        )
+    else:
+        if (mode != 'REFUND_OWNER' or not submitter.funding_guard.locked()
+                or not 1 <= reviewed_bundle.fee_mojos <= submitter.policy.maximum_mojos
+                or len(reviewed_bundle.bundle.coin_spends) != len(protocol_bundle.coin_spends)+1
+                or not all(spend in reviewed_bundle.bundle.coin_spends for spend in protocol_bundle.coin_spends)):
+            raise ProtocolSubmissionError('Reviewed Stripe refund handoff differs from its protocol bundle')
+        dispatched = await dispatch(reviewed_bundle)
+        result = {**reviewed_bundle.to_json(), 'dispatchResult':dict(dispatched or {})}
     bound = store.voucher(terms_hash, serial).get("terminalExactExecution")
     if not isinstance(bound, dict):
         raise ProtocolSubmissionError(
@@ -114,6 +133,37 @@ async def prepare_and_dispatch_stripe_terminal(
             submission_attempted=True,
         )
     return bound, int(time.time())
+
+
+def _refund_receipt_fee(
+    bundle: SpendBundle, *, mode: str, voucher_action: int,
+    terms_hash: str, purchase_id: bytes32, artifact_hash: bytes32,
+) -> int:
+    """Authorize only the exact immutable Stripe refund receipt's one-mojo burn."""
+    if mode == "REDEEM":
+        return 0
+    from solslot_puzzles.voucher_presale_v3_driver import stripe_voucher_receipt_mod
+
+    matches = []
+    for spend in bundle.coin_spends:
+        puzzle = Program.from_bytes(bytes(spend.puzzle_reveal))
+        module, curried = puzzle.uncurry()
+        if module != stripe_voucher_receipt_mod():
+            continue
+        args = list(curried.as_iter())
+        solution = list(Program.from_bytes(bytes(spend.solution)).as_iter())
+        if (len(args) != 17 or len(solution) != 10
+                or args[0].as_atom() != _b32(terms_hash)
+                or args[6].as_atom() != artifact_hash
+                or args[7].as_atom() != purchase_id
+                or solution[0].as_int() != voucher_action
+                or spend.coin.amount != 1
+                or puzzle.get_tree_hash() != spend.coin.puzzle_hash):
+            raise ProtocolSubmissionError("Stripe refund receipt binding is invalid")
+        matches.append(spend.coin.name())
+    if len(matches) != 1 or any(c.parent_coin_info == matches[0] for c in bundle.additions()):
+        raise ProtocolSubmissionError("Stripe refund must burn exactly one pinned receipt")
+    return 1
 
 
 async def resume_stripe_terminal(
@@ -268,7 +318,11 @@ def _request_from_json(value: Any) -> ExactExecutionRequest:
             artifact_hash=_b32(value["artifactHash"]),
             claim_hash=_b32(value["claimHash"]),
             expected_outputs=outputs,
+            refund_continuation=(tuple(_b32(v) for v in value['refundContinuation'])
+                if 'refundContinuation' in value else None),
         )
+        if request.refund_continuation is not None and len(request.refund_continuation)!=3:
+            raise ValueError('Refund continuation binding must have three exact IDs')
     except (KeyError, TypeError, ValueError) as exc:
         raise ProtocolSubmissionError(
             "persisted Stripe voucher request is malformed"

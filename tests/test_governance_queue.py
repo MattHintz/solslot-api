@@ -968,12 +968,19 @@ def _coin_record(coin: Coin, *, confirmed: int, spent: int) -> dict:
 
 
 def _tracker_solution(dispatcher: int, params=None) -> dict:
+    from chia.wallet.puzzles.singleton_top_layer_v1_1 import puzzle_for_singleton
+    from solslot_puzzles.protocol_deployment import singleton_struct
+    from solslot_puzzles.sgt_driver import proposal_tracker_inner_puzzle, TEST_KOS_MINT_EXECUTE_PUBKEY
     if params is None:
         params = []
     solution = Program.to(
         [[], 1, [bytes32(b"\x51" * 32), bytes32(b"\x52" * 32), 1, dispatcher, params]]
     )
-    return {"solution": "0x" + bytes(solution).hex()}
+    seed = bytes32(b"\x51" * 32)
+    inner = proposal_tracker_inner_puzzle(singleton_struct(seed), seed, seed, seed, seed, seed,
+        singleton_struct(seed), 5000, 300, 1_000_000, 10_000, TEST_KOS_MINT_EXECUTE_PUBKEY)
+    return {"solution": "0x" + bytes(solution).hex(),
+        "puzzle_reveal": "0x" + bytes(puzzle_for_singleton(seed, inner)).hex()}
 
 
 class _TrackerProvider:

@@ -7,6 +7,7 @@ from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 
 from solslot_api.genesis_worker import _expected_outputs
+from solslot_puzzles.protocol_deployment import cat2_puzzle_hash_for_sgt
 
 
 def _surface(seed: int) -> SimpleNamespace:
@@ -25,7 +26,10 @@ def test_expected_outputs_include_property_registry_current_coin() -> None:
         funding=SimpleNamespace(sgt=bytes32(b"s" * 32)),
         protocol=SimpleNamespace(
             permanent_rules=SimpleNamespace(sgt_total_supply=1_000_000),
-            sgt_full_puzzle_hash=bytes32(b"t" * 32),
+            sgt_reserve_inner_puzzle_hash=bytes32(b"v" * 32),
+            sgt_full_puzzle_hash=cat2_puzzle_hash_for_sgt(
+                governance.launcher_id, bytes32(b"s" * 32), bytes32(b"v" * 32),
+            ),
             pool_launcher_id=pool.launcher_id,
             pool_full_puzzle_hash=pool.full_puzzle_hash,
             did_launcher_id=did.launcher_id,

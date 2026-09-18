@@ -9,9 +9,11 @@ from typing import Any, Mapping
 
 from chia.types.blockchain_format.coin import Coin
 from chia.types.blockchain_format.program import Program
+from chia.types.coin_spend import make_spend
 from chia.wallet.cat_wallet.cat_utils import CAT_MOD, get_innerpuzzle_from_puzzle
 from chia.wallet.lineage_proof import LineageProof
-from chia.wallet.puzzles.singleton_top_layer_v1_1 import lineage_proof_for_coinsol
+from chia.wallet.puzzles.singleton_top_layer_v1_1 import SINGLETON_MOD_HASH, lineage_proof_for_coinsol
+from chia.wallet.util.compute_additions import compute_additions
 from chia_rs import G2Element, SpendBundle
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
@@ -34,6 +36,10 @@ from solslot_puzzles.eip712_helpers import (
     genesis_challenge_for_network,
 )
 from solslot_puzzles.mint_publish_driver import build_tracker_propose_coin_spend
+from solslot_puzzles.genesis_ceremony_rc23 import build_sgt_genesis_issuance
+from solslot_puzzles.protocol_statutes_driver import (
+    build_governance_evidence_spend, make_inner_puzzle as make_statutes_inner,
+)
 from solslot_puzzles.protocol_deployment import singleton_struct
 from solslot_puzzles.sgt_driver import (
     admin_governance_proposal_message,
@@ -41,6 +47,9 @@ from solslot_puzzles.sgt_driver import (
     sgt_free_inner_mod,
     sgt_free_inner_puzzle,
     sgt_locked_inner_mod,
+    sgt_locked_inner_puzzle,
+    TRK_EXECUTE,
+    TRK_EXPIRE,
 )
 from solslot_puzzles.sgt_reserve_driver import (
     build_reserve_lock_coin_spend,
@@ -174,6 +183,50 @@ def _coin(record: Mapping[str, Any]) -> Coin | None:
         )
     except (TypeError, ValueError):
         return None
+
+
+def _idle_tracker_from_parent(
+    context: LiveSingletonContext, genesis_inner: Program, launcher: bytes32,
+) -> Program:
+    """Recover the idle policy retained by the last completed proposal."""
+    parent = context.parent_spend
+    if parent.coin.name() == launcher:
+        return genesis_inner
+    full = Program.from_bytes(bytes(parent.puzzle_reveal))
+    module, full_args = full.uncurry()
+    full_values = list(full_args.as_iter())
+    if (full.get_tree_hash() != parent.coin.puzzle_hash
+        or parent.coin.name() != context.coin.parent_coin_info
+        or module.get_tree_hash() != SINGLETON_MOD_HASH or len(full_values) != 2
+        or full_values[0] != singleton_struct(launcher)):
+        raise ValueError("governance parent is not the canonical tracker")
+    old_module, old_args = full_values[1].uncurry()
+    expected_module, expected_args = genesis_inner.uncurry()
+    values, expected = list(old_args.as_iter()), list(expected_args.as_iter())
+    mutable = {10, 11, 13, 15, 16, 17, 18}
+    if (old_module != expected_module or len(values) != len(expected)
+        or any(value != expected[index] for index, value in enumerate(values) if index not in mutable)):
+        raise ValueError("governance tracker immutable coordinates changed")
+    outer = list(Program.from_bytes(bytes(parent.solution)).as_iter())
+    inner = list(outer[2].as_iter()) if len(outer) == 3 else []
+    if len(inner) != 5 or inner[3].as_int() not in (TRK_EXECUTE, TRK_EXPIRE):
+        raise ValueError("governance tracker is not idle")
+    if context.coin not in compute_additions(parent):
+        raise ValueError("governance parent did not create the current tracker")
+    return old_module.curry(*values[:15], 0, 0, 0, 0)
+
+
+def _reserve_locked_parent(inner: Program, tracker: Program, owner: bytes32) -> bool:
+    module, curried = inner.uncurry()
+    args = list(curried.as_iter())
+    if module != sgt_locked_inner_mod() or len(args) != 6:
+        return False
+    try:
+        expected = sgt_locked_inner_puzzle(sgt_free_inner_mod().get_tree_hash(),
+            tracker, owner, bytes32(args[4].as_atom()), args[5].as_int())
+    except (ValueError, TypeError):
+        return False
+    return inner == expected
 
 
 def _action(
@@ -315,6 +368,21 @@ async def build_governance_publication(
     pool_launcher = _b32(launchers.get("pool"), "pool launcher")
     statutes_launcher = _b32(launchers.get("statutes"), "statutes launcher")
     admin_launcher = _b32(launchers.get("adminAuthority"), "authority launcher")
+    from .sols_swaps import _required_singleton_tip
+    from .sols_market import _statutes_snapshot, _artifact_permanent_rules
+
+    statutes_tip = await _required_singleton_tip(provider, _hex32(statutes_launcher), "protocol statutes")
+    statutes = await _statutes_snapshot(provider, statutes_tip, artifact)
+    statutes_inner = make_statutes_inner(
+        singleton_struct=singleton_struct(statutes_launcher),
+        governance_singleton_struct=singleton_struct(tracker_launcher),
+        permanent_rules=_artifact_permanent_rules(artifact), state=statutes.state,
+    )
+    statutes_context = await load_live_singleton_context(provider=provider, launcher_id=_hex32(statutes_launcher))
+    if _hex32(statutes_context.coin.name()) != statutes.live_coin_id:
+        raise ValueError("statutes changed during governance publication review")
+    _assert_full_puzzle_hash(context=statutes_context, launcher_id=statutes_launcher,
+        inner_puzzle=statutes_inner, label="protocol statutes")
     sgt_tail = _b32(
         artifact.get("sgtTailHash")
         or _mapping(plan.get("permanentRules"), "permanentRules").get(
@@ -349,6 +417,7 @@ async def build_governance_publication(
         provider=provider,
         launcher_id=_hex32(tracker_launcher),
     )
+    tracker_inner = _idle_tracker_from_parent(tracker_context, tracker_inner, tracker_launcher)
     _assert_full_puzzle_hash(
         context=tracker_context,
         launcher_id=tracker_launcher,
@@ -403,49 +472,65 @@ async def build_governance_publication(
     if len(candidates) != 1:
         raise ValueError("company SGT reserve must be one confirmed unspent coin")
     reserve_coin = candidates[0]
-    minimum_stake = int(parameters.get("minProposalStake"))
+    minimum_stake = statutes.parameters.min_proposal_stake
     if int(reserve_coin.amount) < minimum_stake:
         raise ValueError("company SGT reserve is below the minimum proposal stake")
     genesis_sgt_coin = _b32(
         artifact.get("sgtGenesisCoinId"),
         "SGT genesis coin",
     )
-    if reserve_coin.name() == genesis_sgt_coin:
-        reserve_lineage = LineageProof()
-    else:
-        parent_record = await provider.get_coin_record_by_name(
-            _hex32(reserve_coin.parent_coin_info)
+    parent_record = await provider.get_coin_record_by_name(
+        _hex32(reserve_coin.parent_coin_info)
+    )
+    parent_coin = _coin(parent_record) if isinstance(parent_record, Mapping) else None
+    height = int((parent_record or {}).get("spent_block_index") or 0)
+    if parent_coin is None or height <= 0:
+        raise ValueError("SGT reserve parent is unavailable")
+    parent_solution = await provider.get_puzzle_and_solution(
+        _hex32(parent_coin.name()),
+        height,
+    )
+    if not isinstance(parent_solution, Mapping):
+        raise ValueError("SGT reserve parent spend is unavailable")
+    parent_puzzle = Program.from_bytes(
+        bytes.fromhex(str(parent_solution["puzzle_reveal"]).removeprefix("0x"))
+    )
+    if parent_coin.name() != reserve_coin.parent_coin_info or parent_puzzle.get_tree_hash() != parent_coin.puzzle_hash:
+        raise ValueError("SGT reserve parent evidence does not match its coin")
+    parent_inner = get_innerpuzzle_from_puzzle(parent_puzzle)
+    parent_module, parent_args = parent_puzzle.uncurry()
+    cat_args = list(parent_args.as_iter())
+    if (parent_module != CAT_MOD or len(cat_args) != 3
+        or cat_args[1].as_atom() != bytes(sgt_tail)):
+        raise ValueError("SGT reserve parent has a different asset")
+    parent_solution_program = Program.from_bytes(
+        bytes.fromhex(str(parent_solution["solution"]).removeprefix("0x")))
+    if reserve_coin not in compute_additions(make_spend(parent_coin, parent_puzzle, parent_solution_program)):
+        raise ValueError("SGT reserve parent did not create the current reserve")
+    if (parent_inner != reserve_free_inner and not _reserve_locked_parent(
+        parent_inner, singleton_struct(tracker_launcher), reserve_inner.get_tree_hash())):
+        issuance = build_sgt_genesis_issuance(
+            genesis_coin_id=genesis_sgt_coin, governance_launcher_id=tracker_launcher,
+            reserve_inner_puzzle_hash=bytes32(reserve_inner.get_tree_hash()),
+            reserve_full_puzzle_hash=bytes32(reserve_full.get_tree_hash()),
+            total_supply=int(parameters.get("sgtTotalSupply")),
         )
-        parent_coin = _coin(parent_record) if isinstance(parent_record, Mapping) else None
-        height = int((parent_record or {}).get("spent_block_index") or 0)
-        if parent_coin is None or height <= 0:
-            raise ValueError("SGT reserve parent is unavailable")
-        parent_solution = await provider.get_puzzle_and_solution(
-            _hex32(parent_coin.name()),
-            height,
-        )
-        if not isinstance(parent_solution, Mapping):
-            raise ValueError("SGT reserve parent spend is unavailable")
-        parent_puzzle = Program.from_bytes(
-            bytes.fromhex(str(parent_solution["puzzle_reveal"]).removeprefix("0x"))
-        )
-        parent_inner = get_innerpuzzle_from_puzzle(parent_puzzle)
-        if bytes32(parent_inner.get_tree_hash()) != bytes32(
-            reserve_free_inner.get_tree_hash()
-        ):
+        if (parent_coin != issuance.eve_coin or reserve_coin != issuance.reserve_coin
+            or bytes(parent_puzzle) != bytes(issuance.eve_spend.puzzle_reveal)
+            or bytes.fromhex(str(parent_solution["solution"]).removeprefix("0x")) != bytes(issuance.eve_spend.solution)):
             raise ValueError("SGT reserve lineage changed owner")
-        reserve_lineage = LineageProof(
-            parent_name=parent_coin.parent_coin_info,
-            inner_puzzle_hash=bytes32(parent_inner.get_tree_hash()),
-            amount=parent_coin.amount,
-        )
+    reserve_lineage = LineageProof(
+        parent_name=parent_coin.parent_coin_info,
+        inner_puzzle_hash=bytes32(parent_inner.get_tree_hash()),
+        amount=parent_coin.amount,
+    )
 
     bill = Program.from_bytes(bytes.fromhex(record.bill_clvm_hex.removeprefix("0x")))
     proposal_hash = bytes32(bill.get_tree_hash())
     if _hex32(proposal_hash) != record.proposal_hash.lower():
         raise ValueError("queued proposal hash does not match its canonical bill")
     timestamp = int(time.time()) if now is None else now
-    proposed_deadline = timestamp + int(parameters.get("votingWindowSeconds"))
+    proposed_deadline = timestamp + statutes.parameters.voting_window_seconds
     if (
         record.publication_coadmin_slot is None
         or record.publication_voting_deadline is None
@@ -465,7 +550,7 @@ async def build_governance_publication(
     if timestamp >= deadline:
         raise ValueError("governance publication deadline has expired")
     requested_sgt = (
-        int(parameters.get("minProposalStake"))
+        statutes.parameters.min_proposal_stake
         if record.kind == "FUNDED_REDEMPTION"
         else int(record.bill.get("sgtAmount") or 0)
     )
@@ -565,8 +650,16 @@ async def build_governance_publication(
             voter_inner_puzzle_hash=bytes32(reserve_inner.get_tree_hash()),
             first_vote_amount=int(reserve_coin.amount),
             voting_deadline=deadline,
+            proposal_evidence=Program.to([authority_inner.get_tree_hash(),
+                statutes_inner.get_tree_hash(), list(statutes.parameters.as_tuple())]),
         )
         spends.append(tracker_spend)
+        statutes_evidence = build_governance_evidence_spend(
+            my_id=statutes_context.coin.name(), my_inner_puzzle_hash=statutes_inner.get_tree_hash(),
+            my_amount=int(statutes_context.coin.amount), parameters=statutes.parameters,
+        )
+        spends.append(_singleton_spend(context=statutes_context, inner_puzzle=statutes_inner,
+            inner_solution=statutes_evidence.inner_solution, amount=int(statutes_context.coin.amount)))
         spends.append(
             build_reserve_lock_coin_spend(
                 reserve_coin=reserve_coin,

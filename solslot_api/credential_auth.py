@@ -60,6 +60,7 @@ class OwnerChallengeResponse(BaseModel):
     vaultLauncherId: str
     action: CredentialAction
     payloadHash: str
+    nonce: str | None = None
     authType: Literal["evm", "chia_bls"]
     expiresAt: int
     typedData: dict[str, Any] | None = None
@@ -73,6 +74,7 @@ class VaultSessionResponse(BaseModel):
     network: str
     protocolVersion: Literal["solslot-v2"] = "solslot-v2"
     expiresAt: int
+    sessionFingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -135,7 +137,15 @@ def issue_vault_session(
         authType=verified_owner.auth_type,
         network=settings.network,
         expiresAt=expires_at,
+        sessionFingerprint=vault_session_fingerprint(claims["jti"]),
     )
+
+
+def vault_session_fingerprint(session_id: str) -> str | None:
+    """Non-authorizing identity for binding a browser review to its HTTP session."""
+    if not session_id:
+        return None
+    return "0x" + hashlib.sha256(json.dumps(session_id, separators=(",", ":")).encode()).hexdigest()
 
 
 def verify_vault_session(
@@ -392,6 +402,7 @@ def issue_owner_challenge(
         vaultLauncherId=vault,
         action=request.action,
         payloadHash=payload_hash,
+        nonce=challenge.nonce,
         authType=auth_type,
         expiresAt=challenge.expires_at,
         typedData=credential_typed_data(settings, challenge) if auth_type == "evm" else None,

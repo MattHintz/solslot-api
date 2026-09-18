@@ -1953,7 +1953,7 @@ def test_native_submission_rederives_every_persisted_chain_output() -> None:
 
 
 @pytest.mark.asyncio
-async def test_native_refund_waits_for_submission_and_atomic_confirmation(
+async def test_owner_refund_outputs_without_retained_signed_bytes_cannot_confirm(
     tmp_path: Path,
 ) -> None:
     now = int(time.time())
@@ -2156,19 +2156,15 @@ async def test_native_refund_waits_for_submission_and_atomic_confirmation(
     )
     reconciled = await worker.reconcile_once()
 
-    assert reconciled == [
-        {
-            "termsHash": str(current_terms["termsHash"]),
-            "serial": 0,
-            "status": "REFUNDED",
-        }
-    ]
+    assert len(reconciled)==1
+    assert reconciled[0]['status']=='REFUND_ERROR'
+    assert 'retained signed bytes' in reconciled[0]['detail']
     refunded = store.voucher(str(current_terms["termsHash"]), 0)
-    assert refunded["state"] == "REFUNDED"
-    assert refunded["refundConfirmedHeight"] == confirmed_height
+    assert refunded["state"] == "REFUNDING"
+    assert refunded["refundConfirmedHeight"] is None
     assert store.get(str(current_terms["termsHash"]))["chainState"][
         "refundedCount"
-    ] == 1
+    ] == 0
 
 
 def test_unbound_base_payment_and_changed_price_fail_closed() -> None:

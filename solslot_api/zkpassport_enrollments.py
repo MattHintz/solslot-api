@@ -1158,6 +1158,7 @@ def get_vault_session(
     vault_launcher_id: VaultLauncherPath,
     request: Request,
 ) -> VaultSessionResponse:
+    from .credential_auth import vault_session_fingerprint
     settings = _settings()
     key = _normalize_hex32(vault_launcher_id, "vaultLauncherId")
     session = verify_vault_session(settings, request, key, allow_recovery=True)
@@ -1167,6 +1168,7 @@ def get_vault_session(
         network=session.network,
         expiresAt=session.expires_at,
         scope=session.scope,
+        sessionFingerprint=vault_session_fingerprint(session.session_id),
     )
 
 

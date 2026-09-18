@@ -23,7 +23,7 @@ def _claims() -> AdminClaims:
 
 @pytest.mark.parametrize("authorization", [None, "0x" + "22" * 65])
 @pytest.mark.asyncio
-async def test_redemption_http_body_reaches_context_for_both_wallet_types(
+async def test_redemption_http_body_reaches_exact_review_for_both_wallet_types(
     authorization, monkeypatch, tmp_path,
 ) -> None:
     settings = Settings(
@@ -34,13 +34,16 @@ async def test_redemption_http_body_reaches_context_for_both_wallet_types(
     queue = GovernanceQueueStore(":memory:")
     observed = []
 
-    async def unavailable_chain_context(**kwargs):
-        observed.append(kwargs["owner_authorization"])
+    async def unavailable_review(*args):
+        body=args[3]
+        observed.append(body.vault_owner_authorization)
+        assert body.funding_reservation_hash=="0x"+"88"*32
         raise HTTPException(503, "Isolated chain fixture is unavailable")
 
     monkeypatch.setattr(funded_redemptions, "verify_vault_session", lambda *_: object())
     monkeypatch.setattr(funded_redemptions, "_find_redemption", lambda *_: (object(), object()))
-    monkeypatch.setattr(funded_redemptions, "_redemption_context", unavailable_chain_context)
+    from solslot_api import funded_redemption_review
+    monkeypatch.setattr(funded_redemption_review,"complete_review",unavailable_review)
     app = FastAPI()
     app.include_router(funded_redemptions.router)
     async def settings_override():
@@ -49,7 +52,7 @@ async def test_redemption_http_body_reaches_context_for_both_wallet_types(
         return queue
     app.dependency_overrides[get_settings] = settings_override
     app.dependency_overrides[funded_redemptions.get_governance_queue_store] = queue_override
-    body = {"operationHash": "0x" + "33" * 32}
+    body = {"operationHash": "0x" + "33" * 32,"fundingReservationHash":"0x"+"88"*32}
     if authorization is None:
         body["aggregatedSignature"] = "0x" + "44" * 96
     else:
