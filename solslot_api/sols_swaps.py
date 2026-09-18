@@ -1912,6 +1912,7 @@ async def _select_vault_sols_payment_coin(
     required_amount: int,
     required_coin_id: bytes32 | None = None,
 ) -> VaultSolsPaymentCoin | None:
+    from .cat_lineage import confirmed_cat_receipt_lineage
     inner = puzzle_for_vault_sols_inner(
         config=config,
         vault_launcher_id=vault_launcher_id,
@@ -1950,11 +1951,12 @@ async def _select_vault_sols_payment_coin(
                 _hex32(coin.name()),
                 "vault Sols payment coin",
             )
-            lineage = await _confirmed_cat_lineage(
+            lineage = await confirmed_cat_receipt_lineage(
                 provider=provider,
                 coin=confirmed,
                 expected_inner_hash=bytes32(inner.get_tree_hash()),
                 expected_tail_hash=config.permanent_rules.sols_tail_hash,
+                asset_label='Sols',
             )
         except (ValueError, SolsSwapOfferError):
             continue
