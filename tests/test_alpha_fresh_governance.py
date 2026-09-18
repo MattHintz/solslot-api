@@ -80,3 +80,20 @@ async def test_every_selected_genesis_singleton_uses_its_planned_full_puzzle():
         records = [await client.get_coin_record_by_name(bytes32.fromhex(value[2:])) for value in outputs]
         assert all(record and not record.spent for record in records)
         assert len({record.confirmed_block_index for record in records}) == 1
+        # The seeded Sols anchor must be discoverable by the production swap
+        # loader using the actual reserve reveal, not a hash-as-CLVM-atom.
+        from solslot_api.sols_swaps import _load_reserve_cat, _confirmed_coin_and_lineage
+        from solslot_puzzles.artifact_schema_v4 import build_public_artifact
+        from solslot_puzzles.sols_swap_v4_driver import _pool_lineage
+        from tests.test_alpha_governance_publisher import SimProvider
+        artifact = build_public_artifact(plan=world.plan,
+            spend_bundle_id=world.built.spend_bundle.name(),confirmed_block_index=int(sim.block_height))
+        provider = SimProvider(client)
+        reserve, lineage = await _load_reserve_cat(provider=provider,artifact=artifact,
+            config=p.pool_config,pool_state=p.pool_state,reserve_inner_puzzle=world.faucet.key.puzzle)
+        assert reserve.name() == p.sols_reserve_seed_coin_id and reserve.amount == 1
+        assert lineage.parent_name is None
+        pool = await live(client,p.pool_full_puzzle_hash)
+        confirmed, proof = await _confirmed_coin_and_lineage(provider,'0x'+pool.name().hex(),'fresh pool')
+        assert proof.inner_puzzle_hash is None
+        _pool_lineage(proof,confirmed,p.pool_launcher_id)
