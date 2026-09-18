@@ -28,7 +28,7 @@ import logging
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 from chia.types.blockchain_format.coin import Coin
 from chia_rs import AugSchemeMPL, SpendBundle
@@ -172,6 +172,97 @@ class PublishMintBundleRequest(BaseModel):
     spend_bundle: dict[str, Any]
     proposal_id: Optional[str] = Field(None, max_length=256)
     proposal_metadata: PublishProposalMetadata
+    stake_vault_launcher_id: Optional[str] = Field(None, pattern=r"^0x[0-9a-fA-F]{64}$")
+    publication_context_hash: Optional[str] = Field(None, pattern=r"^0x[0-9a-fA-F]{64}$")
+
+
+class MintStakeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    context_hash: str = Field(alias="contextHash", pattern=r"^0x[0-9a-fA-F]{64}$")
+    proposal_hash: str = Field(alias="proposalHash", pattern=r"^0x[0-9a-fA-F]{64}$")
+    vault_launcher_id: str = Field(alias="vaultLauncherId", pattern=r"^0x[0-9a-fA-F]{64}$")
+    stake_amount: str = Field(alias="stakeAmount", pattern=r"^[1-9][0-9]{0,19}$")
+    voting_deadline: int = Field(alias="votingDeadline", gt=0, lt=2**64)
+    operation_hash: str | None = Field(None, alias="operationHash", pattern=r"^0x[0-9a-fA-F]{64}$")
+    vault_owner_authorization: str | None = Field(None, alias="vaultOwnerAuthorization", pattern=r"^0x[0-9a-fA-F]{130}$")
+
+
+@router.post("/admin/mint/publication/context", dependencies=[Depends(require_mint_writes)])
+async def mint_publication_context(
+    request: Request,
+    _claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict:
+    from .genesis import get_genesis_store
+    from .mint_publication import load_mint_publication_context
+    import time
+    try:
+        context = await load_mint_publication_context(provider=request.app.state.coinset,
+            settings=settings, genesis_store=get_genesis_store(settings))
+        return context.to_wire(deadline=int(time.time()) + context.statutes.parameters.voting_window_seconds)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/admin/mint/publication/stake", dependencies=[Depends(require_mint_writes)])
+async def mint_publication_stake(
+    body: MintStakeRequest,
+    request: Request,
+    _claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict:
+    from .credential_auth import require_vault_record, verify_vault_session
+    from .evm_auth import recover_evm_signer
+    from .genesis import get_genesis_store
+    from .governance_publisher import _b32, _hex32
+    from .mint_publication import load_mint_publication_context
+    from .mint_stake import build_mint_stake
+    from .sols_swaps import _coin_spend_json
+    from solslot_puzzles.vault_driver import compact_signature_from_evm
+    import time
+    try:
+        verify_vault_session(settings, request, body.vault_launcher_id)
+        context = await load_mint_publication_context(provider=request.app.state.coinset,
+            settings=settings, genesis_store=get_genesis_store(settings))
+        if context.commitment != _b32(body.context_hash, 'mint context'):
+            raise ValueError('mint publication changed; prepare and review it again')
+        now = int(time.time())
+        if not now < body.voting_deadline <= now + context.statutes.parameters.voting_window_seconds:
+            raise ValueError('mint publication deadline is expired or exceeds the current voting window')
+        arguments = dict(context=context, provider=request.app.state.coinset, settings=settings,
+            vault_launcher_id=body.vault_launcher_id, stake_amount=int(body.stake_amount),
+            proposal_hash=_b32(body.proposal_hash, 'proposal hash'), deadline=body.voting_deadline)
+        stake = await build_mint_stake(**arguments)
+        if body.operation_hash is not None and _b32(body.operation_hash, 'stake operation') != stake.operation_hash:
+            raise ValueError('mint stake changed while it was being authorized')
+        if body.vault_owner_authorization is not None:
+            if stake.vault_auth_type != 'evm' or body.operation_hash is None:
+                raise ValueError('EVM mint stake requires its exact prepared operation')
+            owner = require_vault_record(body.vault_launcher_id)
+            recovered = recover_evm_signer(stake.vault_typed_data, body.vault_owner_authorization)
+            if not owner.owner_evm_address or recovered.address.lower() != owner.owner_evm_address.lower():
+                raise ValueError('mint stake signature does not belong to this vault owner')
+            signed = await build_mint_stake(**arguments,
+                signature_data=compact_signature_from_evm(body.vault_owner_authorization))
+            if signed.operation_hash != stake.operation_hash:
+                raise ValueError('mint stake changed while it was being authorized')
+            stake = signed
+        return {
+            'contextHash': _hex32(context.commitment), 'proposalHash': body.proposal_hash.lower(),
+            'operationHash': _hex32(stake.operation_hash), 'vaultLauncherId': _hex32(stake.vault_launcher_id),
+            'vaultCoinId': _hex32(stake.vault_coin_id), 'vaultAuthType': stake.vault_auth_type,
+            'vaultTypedData': stake.vault_typed_data, 'stakeAmount': str(stake.amount),
+            'votingDeadline': body.voting_deadline, 'sgtCoinId': _hex32(stake.sgt_coin_id),
+            'voterInnerPuzzleHash': _hex32(stake.owner_inner_hash),
+            'sgtCoin': {'parentCoinInfo': _hex32(stake.sgt_coin.parent_coin_info),
+                        'puzzleHash': _hex32(stake.sgt_coin.puzzle_hash), 'amount': str(stake.amount)},
+            'lockedInnerPuzzleHash': _hex32(stake.locked_inner_hash),
+            'availableSgtAmounts': [str(value) for value in stake.available_amounts],
+            'signingCoinSpends': [_coin_spend_json(spend) for spend in stake.bundle.coin_spends],
+            'evmOwnerAuthorized': stake.vault_auth_type == 'evm' and body.vault_owner_authorization is not None,
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 class ExecuteMintBundleRequest(BaseModel):
@@ -543,6 +634,7 @@ async def _publish_mint_bundle(
     settings: Settings,
     store: MintProposalStore,
     coinset: Optional[CoinsetClient],
+    request: Request | None = None,
 ) -> dict[str, Any]:
     if body.proposal_id is not None and body.proposal_id != proposal_id:
         raise HTTPException(status_code=400, detail="proposal_id does not match the route")
@@ -597,12 +689,14 @@ async def _publish_mint_bundle(
         raise HTTPException(status_code=403, detail="Only the original proposer may publish")
 
     bundle = _parse_spend_bundle(body.spend_bundle)
-    bundle_id = "0x" + bytes(bundle.name()).hex()
-    if proposal.state == "PROPOSED" and proposal.published_bundle_id == bundle_id:
+    owner_bundle_id = "0x" + bytes(bundle.name()).hex()
+    prior_context = (proposal.off_chain_metadata or {}).get('publish_context', {})
+    if proposal.state == "PROPOSED" and (proposal.published_bundle_id == owner_bundle_id
+        or prior_context.get('owner_bundle_id') == owner_bundle_id):
         return {
             "pushed": True,
             "status": "ALREADY_RECORDED",
-            "spend_bundle_id": bundle_id,
+            "spend_bundle_id": proposal.published_bundle_id,
             "proposal_id": proposal_id,
             "proposal": _to_response(proposal),
         }
@@ -614,13 +708,37 @@ async def _publish_mint_bundle(
 
     artifact = _load_mint_artifact(settings)
     try:
+        from .admin_operations import _mint_build
+        from .mint_publication import build_mint_authorization_spends
+        operation = getattr(request.state, 'admin_operation', None) if request is not None else None
+        if operation is None:
+            raise HTTPException(status_code=428, detail='Current owner-plus-one mint approvals are required')
+        reviewed = await _mint_build(operation, request, settings)
+        if reviewed is None or reviewed.owner_bundle != bundle:
+            raise ValueError('mint request differs from its exact approved wallet package')
+        signatures = {int(item['admin_index']): item for item in operation['chain_signatures']}
+        coadmin = next((slot for slot in (1, 2) if slot in signatures), None)
+        if 0 not in signatures or coadmin is None:
+            raise ValueError('mint needs the owner and one coadministrator chain approval')
+        authorization_spends = build_mint_authorization_spends(reviewed.context,
+            delegated=reviewed.delegated, actions=reviewed.actions, signatures=signatures,
+            coadmin_slot=coadmin)
+        bundle = SpendBundle([*bundle.coin_spends, *authorization_spends], bundle.aggregated_signature)
+        bundle_id = '0x' + bytes(bundle.name()).hex()
         canonical = validate_publish_bundle(
             bundle=bundle,
             metadata=body.proposal_metadata,
             proposal=proposal,
             artifact=artifact,
             authenticated_owner=claims.sub,
+            stake_vault_launcher_id=bytes32.from_hexstr(body.stake_vault_launcher_id),
+            authorization_spends=authorization_spends,
+            current_admin_pubkeys=tuple(bytes(identity.daily_compressed_pubkey) for identity in reviewed.context.identities),
         )
+        from .sols_swaps import _require_inputs_clear, _verify_aggregate_signature
+        from chia.wallet.wallet_spend_bundle import WalletSpendBundle
+        _verify_aggregate_signature(WalletSpendBundle(bundle.coin_spends, bundle.aggregated_signature), settings.network)
+        await _require_inputs_clear(coinset, tuple(spend.coin for spend in authorization_spends))
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -688,6 +806,7 @@ async def _publish_mint_bundle(
 
     persisted_metadata = dict(proposal.off_chain_metadata or {})
     persisted_metadata["publish_context"] = {
+        "owner_bundle_id": owner_bundle_id,
         "property_registry_puzzle_hash": "0x"
         + canonical.property_registry_puzzle_hash.hex(),
         "property_registry_coin_id": "0x" + canonical.property_registry_coin_id.hex(),
@@ -917,6 +1036,7 @@ async def _execute_mint_bundle(
 async def publish_mint_proposal(
     proposal_id: str,
     body: PublishMintBundleRequest,
+    request: Request,
     claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[MintProposalStore, Depends(get_mint_proposal_store)],
@@ -930,6 +1050,7 @@ async def publish_mint_proposal(
         settings=settings,
         store=store,
         coinset=coinset,
+        request=request,
     )
 
 
@@ -980,6 +1101,7 @@ async def execute_mint_proposal(
 )
 async def committee_propose_mint(
     body: PublishMintBundleRequest,
+    request: Request,
     claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[MintProposalStore, Depends(get_mint_proposal_store)],
@@ -995,6 +1117,7 @@ async def committee_propose_mint(
         settings=settings,
         store=store,
         coinset=coinset,
+        request=request,
     )
 
 
