@@ -28,7 +28,7 @@ from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import (
     MOD as _P2_DELEGATED_MOD,
     calculate_synthetic_secret_key,
 )
-from chia_rs import AugSchemeMPL, G1Element, PrivateKey
+from chia_rs import AugSchemeMPL, G1Element, G2Element, PrivateKey
 from chia_rs.sized_bytes import bytes32
 
 logger = logging.getLogger(__name__)
@@ -281,6 +281,37 @@ class Faucet:
         """
         self.require_spend_purpose(purpose)
         self.require_unreserved_coin(coin)
+        return self._delegated_signature(coin,conditions)
+
+    def sign_refund_fee_deadline(self, retained_bundle, protocol_signature, fee_coin_id, conditions, current_timestamp):
+        """Renew ONLY a previously signed refund sponsor deadline, keeping its hold.
+
+        No general reserved-coin signing bypass: the old aggregate proves this
+        key signed the exact prior sponsor, and every non-time condition stays.
+        The refund coordinator separately proves current inputs and effects.
+        """
+        from .stripe_refund_continuation import fee_deadline
+        from chia.types.coin_spend import make_spend
+        self.require_spend_purpose(None)
+        spends=[s for s in retained_bundle.coin_spends if '0x'+s.coin.name().hex()==fee_coin_id]
+        if len(retained_bundle.coin_spends)!=5 or len(spends)!=1:
+            raise FaucetSelectionRestricted('Retained refund sponsor is missing')
+        previous=spends[0]
+        if previous.coin.puzzle_hash!=self.address_puzzle_hash or bytes(previous.puzzle_reveal)!=bytes(self.key.puzzle):
+            raise FaucetSelectionRestricted('Retained refund sponsor key changed')
+        before,old_mask=fee_deadline(previous)
+        candidate=make_spend(previous.coin,self.key.puzzle,Program.to([0,Program.to((1,conditions)),0]))
+        after,new_mask=fee_deadline(candidate)
+        if (before is None or after is None or old_mask!=new_mask or type(current_timestamp) is not int
+                or not before<=current_timestamp<after<=current_timestamp+120):
+            raise FaucetSelectionRestricted('Refund sponsor may renew only its expired deadline')
+        previous_conditions=list(Program.from_bytes(bytes(previous.solution)).as_iter())[1].rest()
+        previous_signature=G2Element.from_bytes(self._delegated_signature(previous.coin,previous_conditions))
+        if AugSchemeMPL.aggregate([protocol_signature,previous_signature])!=retained_bundle.aggregated_signature:
+            raise FaucetSelectionRestricted('Retained refund sponsor authorization changed')
+        return self._delegated_signature(previous.coin,conditions)
+
+    def _delegated_signature(self,coin:Coin,conditions:Program)->bytes:
         delegated_puzzle = Program.to((1, conditions))  # (q . conditions)
         message = (
             bytes(delegated_puzzle.get_tree_hash())

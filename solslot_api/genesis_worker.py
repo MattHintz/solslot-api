@@ -251,16 +251,9 @@ def _funding_coins(values: Mapping[str, Mapping[str, Any]]) -> Any:
 def _expected_outputs(plan: Any) -> list[str]:
     from chia.types.blockchain_format.coin import Coin
     from chia_rs.sized_ints import uint64
+    from solslot_puzzles.genesis_ceremony_rc23 import build_rc23_sgt_issuance
 
-    outputs = [
-        _hex(
-            Coin(
-                plan.funding.sgt,
-                plan.protocol.sgt_full_puzzle_hash,
-                uint64(plan.protocol.permanent_rules.sgt_total_supply),
-            ).name()
-        )
-    ]
+    outputs = [_hex(build_rc23_sgt_issuance(plan).reserve_coin.name())]
     surfaces = [
         (
             plan.protocol.pool_launcher_id,

@@ -43,6 +43,13 @@ class VoucherWorkStore:
               terms_hash TEXT NOT NULL, serial INTEGER NOT NULL, kind TEXT NOT NULL,
               execution_json TEXT NOT NULL, confirmed INTEGER NOT NULL DEFAULT 0,
               PRIMARY KEY(terms_hash,serial,kind));
+            CREATE TABLE IF NOT EXISTS voucher_refund_settlements (
+              terms_hash TEXT NOT NULL, serial INTEGER NOT NULL, evidence_json TEXT NOT NULL,
+              PRIMARY KEY(terms_hash,serial));
+            CREATE TABLE IF NOT EXISTS voucher_refund_execution_history (
+              terms_hash TEXT NOT NULL, serial INTEGER NOT NULL, bundle_id TEXT NOT NULL,
+              execution_json TEXT NOT NULL, observation_json TEXT NOT NULL,
+              PRIMARY KEY(terms_hash,serial,bundle_id));
         """)
         for lane, predicate in LANES.items():
             table = "campaign_operations" if lane == "campaign" else "voucher_worker_executions" if lane == "retained" else "presale_series_v2" if lane == "phase" else "voucher_records_v2"
@@ -160,6 +167,123 @@ class VoucherWorkStore:
         if len(rows) > 1:
             raise ValueError('Voucher has conflicting unfinished executions')
         return json.loads(rows[0]['execution_json']) if rows else None
+
+    def native_refund_attempts(self, terms, serial):
+        active = self.retained_voucher_execution(terms,serial,'native_refund')
+        if active is None:
+            return []
+        previous = [json.loads(row[0]) for row in self._conn.execute(
+            'SELECT execution_json FROM voucher_refund_execution_history WHERE terms_hash=? AND serial=? ORDER BY rowid DESC',
+            (terms,serial))]
+        return [active,*[e for e in previous if e != active]]
+
+    def stripe_refund_attempts(self, terms, serial):
+        active=self.voucher(terms,serial).get('terminalExactExecution')
+        if active is None:return []
+        previous=[json.loads(row[0]) for row in self._conn.execute(
+            'SELECT execution_json FROM voucher_refund_execution_history WHERE terms_hash=? AND serial=? ORDER BY rowid DESC',
+            (terms,serial))]
+        return [active,*[e for e in previous if e!=active]]
+
+    def refund_settlement(self, terms, serial):
+        row=self._conn.execute('SELECT evidence_json FROM voucher_refund_settlements WHERE terms_hash=? AND serial=?',
+            (terms,serial)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def record_refund_settlement(self, terms, serial, execution, evidence):
+        """Retain actual primary-chain spends separately from signed attempts."""
+        from chia_rs import SpendBundle
+        from chia.types.coin_spend import CoinSpend
+        from .refund_continuation import same_refund_spends
+        stripe='prepared' in execution
+        bundle=SpendBundle.from_json_dict(execution['prepared']['spendBundle'] if stripe else execution['spendBundle'])
+        actual=[CoinSpend.from_json_dict(s) for s in evidence['observedCoinSpends']]
+        if (evidence['authorizationBundleId']!='0x'+bundle.name().hex()
+                or type(evidence['confirmedHeight']) is not int or evidence['confirmedHeight']<=0
+                or evidence['kind']!=('EXACT_RETAINED_SPENDS' if bundle.coin_spends==actual else 'EQUIVALENT_VAULT_TIMESTAMP')
+                or not same_refund_spends(bundle,actual)):
+            raise ValueError('Refund settlement differs from its retained authorization')
+        encoded=json.dumps(evidence,sort_keys=True,separators=(',',':'),allow_nan=False)
+        with self.txn() as cur:
+            active=(self.voucher(terms,serial).get('terminalExactExecution') if stripe
+                else self.retained_voucher_execution(terms,serial,'native_refund'))
+            if active!=execution:
+                raise ValueError('Refund settlement lost its active-attempt comparison')
+            previous=self.refund_settlement(terms,serial)
+            if previous:
+                # A later observation may have a newer peak. Preserve the first
+                # receipt if the actual settlement and authorization are equal.
+                if {k:v for k,v in previous.items() if k!='primaryAnchor'}!={k:v for k,v in evidence.items() if k!='primaryAnchor'}:
+                    raise ValueError('Refund settlement evidence is immutable')
+                return
+            cur.execute('INSERT INTO voucher_refund_settlements VALUES (?,?,?)',(terms,serial,encoded))
+
+    def advance_stripe_refund_attempt(self, terms, serial, previous, candidate, observation, *, confirmed=False):
+        from .stripe_refund_continuation import same_effects
+        encode=lambda v:json.dumps(v,sort_keys=True,separators=(',',':'),allow_nan=False)
+        old_id=previous['prepared']['spendBundleId'];new_id=candidate['prepared']['spendBundleId']
+        with self.txn() as cur:
+            if confirmed:
+                known=cur.execute('SELECT execution_json FROM voucher_refund_execution_history WHERE terms_hash=? AND serial=? AND bundle_id=?',
+                    (terms,serial,new_id)).fetchone()
+                if known is None or known[0]!=encode(candidate):raise ValueError('Confirmed Stripe refund is not retained')
+            else:same_effects(previous,candidate)
+            row=cur.execute('SELECT * FROM voucher_records_v2 WHERE terms_hash=? AND serial=?',(terms,serial)).fetchone()
+            if (row is None or row['payment_rail']!='STRIPE_USD' or row['state'] not in {'ESCROWED','REFUNDING'}
+                    or row['terminal_exact_execution_json']!=encode(previous) or row['refund_confirmed_height'] is not None
+                    or row['refund_bundle_id'] not in {None,old_id} or row['redemption_bundle_id'] is not None):
+                raise ValueError('Stripe refund continuation lost its active-attempt comparison')
+            for bundle_id,document in ((old_id,previous),(new_id,candidate)):
+                cur.execute('INSERT OR IGNORE INTO voucher_refund_execution_history VALUES (?,?,?,?,?)',
+                    (terms,serial,bundle_id,encode(document),encode(observation)))
+                stored=cur.execute('SELECT execution_json FROM voucher_refund_execution_history WHERE terms_hash=? AND serial=? AND bundle_id=?',
+                    (terms,serial,bundle_id)).fetchone()
+                if stored[0]!=encode(document):raise ValueError('Stripe refund history is immutable')
+            cur.execute('UPDATE voucher_records_v2 SET terminal_exact_execution_json=?,refund_bundle_id=? WHERE terms_hash=? AND serial=?',
+                (encode(candidate),new_id if row['refund_bundle_id'] else None,terms,serial))
+
+    def advance_native_refund_attempt(self, terms, serial, previous, candidate, observation, *, confirmed=False):
+        """CAS the active bytes; preserve all input/effect pins and both attempts."""
+        from copy import deepcopy
+        from chia_rs import SpendBundle
+        from .refund_continuation import retime_native_refund, vault_refund_timestamp
+        encode = lambda v: json.dumps(v,sort_keys=True,separators=(',',':'),allow_nan=False)
+        old = SpendBundle.from_json_dict(previous['spendBundle'])
+        new = SpendBundle.from_json_dict(candidate['spendBundle'])
+        old_id,new_id = '0x'+old.name().hex(),'0x'+new.name().hex()
+        if previous['kind'] != 'native_refund' or previous['bindings']['spend_bundle_id'] != old_id:
+            raise ValueError('Refund continuation prior binding changed')
+        expected = deepcopy(previous)
+        expected['spendBundle'] = new.to_json_dict(); expected['bindings']['spend_bundle_id'] = new_id
+        if expected != candidate:
+            raise ValueError('Refund continuation changed its immutable bindings')
+        with self.txn() as cur:
+            if confirmed:
+                known = cur.execute('SELECT execution_json FROM voucher_refund_execution_history WHERE terms_hash=? AND serial=? AND bundle_id=?',
+                    (terms,serial,new_id)).fetchone()
+                if known is None or known[0] != encode(candidate):
+                    raise ValueError('Confirmed refund is not a retained attempt')
+            else:
+                vault_id = previous['bindings']['vault_input_coin_id']
+                vault = next(s for s in new.coin_spends if '0x'+s.coin.name().hex() == vault_id)
+                if retime_native_refund(old,vault_id,vault_refund_timestamp(vault)) != new:
+                    raise ValueError('Refund continuation changed more than its timestamp')
+            row = cur.execute("SELECT execution_json,confirmed FROM voucher_worker_executions WHERE terms_hash=? AND serial=? AND kind='native_refund'",
+                (terms,serial)).fetchone()
+            voucher = cur.execute('SELECT state,refund_bundle_id FROM voucher_records_v2 WHERE terms_hash=? AND serial=?', (terms,serial)).fetchone()
+            if (row is None or row['execution_json'] != encode(previous) or row['confirmed']
+                    or voucher is None or voucher['state'] != 'REFUNDING' or voucher['refund_bundle_id'] != old_id):
+                raise ValueError('Refund continuation lost its active-attempt comparison')
+            for bundle_id,document in ((old_id,previous),(new_id,candidate)):
+                cur.execute('INSERT OR IGNORE INTO voucher_refund_execution_history VALUES (?,?,?,?,?)',
+                    (terms,serial,bundle_id,encode(document),encode(observation)))
+                stored = cur.execute('SELECT execution_json FROM voucher_refund_execution_history WHERE terms_hash=? AND serial=? AND bundle_id=?',
+                    (terms,serial,bundle_id)).fetchone()
+                if stored[0] != encode(document):
+                    raise ValueError('Refund attempt history is immutable')
+            cur.execute("UPDATE voucher_worker_executions SET execution_json=? WHERE terms_hash=? AND serial=? AND kind='native_refund'",
+                (encode(candidate),terms,serial))
+            cur.execute('UPDATE voucher_records_v2 SET refund_bundle_id=? WHERE terms_hash=? AND serial=?', (new_id,terms,serial))
 
     def retained_voucher_execution(self, terms: str, serial: int, kind: str) -> dict[str, Any] | None:
         """Original bytes remain available for independent terminal observation."""

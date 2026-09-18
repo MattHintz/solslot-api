@@ -82,7 +82,7 @@ from .faucet import Faucet
 from .governed_output_index import EvaluatedBundleOutputs
 from .kos_exact_execution import KeyOfSolomonExactExecutor
 from .payment_purchase_store import PaymentPurchaseStore
-from .protocol_submission import ProtocolBundleSubmitter
+from .protocol_submission import ProtocolBundleSubmitter, ProtocolSubmissionError
 from .presale_endpoints import (
     BaseVoucherRefundChainEvidence,
     PresaleStore,
@@ -347,6 +347,9 @@ class VoucherIssuanceWorker:
             confirmed = await self._confirm_stripe_refund_if_ready(
                 series, voucher
             )
+            if not confirmed and voucher.get('terminalExactExecution'):
+                status=await self._resume_stripe_terminal_execution(series,voucher)
+                confirmed=status=='STRIPE_REFUND_AUTHORIZED'
             result = {
                 "termsHash": str(series["termsHash"]),
                 "serial": int(voucher["serial"]),
@@ -604,6 +607,10 @@ class VoucherIssuanceWorker:
             self.presales.confirm_voucher_execution(series["termsHash"], voucher["serial"], kind)
             return final
         self._require_dispatch()
+        if kind == 'native_refund':
+            from .refund_continuation import renew_native_refund
+            execution = await renew_native_refund(self,series,voucher,execution)
+            bundle = SpendBundle.from_json_dict(execution['spendBundle'])
         result = await self.coinset.push_tx(bundle.to_json_dict())
         _require_push_accepted(result, "retained voucher " + kind)
         status = {"funding": "FUNDING_SUBMITTED", "issuance": "CONFIRMING", "native_refund": "REFUND_CONFIRMING",
@@ -954,11 +961,26 @@ class VoucherIssuanceWorker:
         series: dict[str, Any],
         voucher: dict[str, Any],
     ) -> bool:
+        attempts = self.presales.native_refund_attempts(str(series['termsHash']),int(voucher['serial']))
+        if attempts and attempts[0]['bindings'].get('vault_input_coin_id'):
+            from .refund_continuation import confirmed_refund_attempt
+            settled = await confirmed_refund_attempt(self.coinset,attempts,str(voucher['refundSeriesOutputCoinId']))
+            if settled is None:
+                return False
+            winner,height,evidence = settled
+            matched = next(e for e in attempts if e['bindings']['spend_bundle_id'] == winner)
+            if winner != voucher['refundBundleId']:
+                self.presales.advance_native_refund_attempt(str(series['termsHash']),int(voucher['serial']),attempts[0],matched,
+                    dict(confirmedHeight=height),confirmed=True)
+                voucher = self.presales.voucher(str(series['termsHash']),int(voucher['serial']))
+            self.presales.record_refund_settlement(str(series['termsHash']),int(voucher['serial']),matched,evidence)
         try:
             action = VoucherAction(int(voucher["refundAction"]))
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("native refund has no valid action binding") from exc
         automatic = action == VoucherAction.REFUND_EXPIRED
+        if not automatic and not attempts:
+            raise RuntimeError('Owner refund confirmation requires retained signed bytes')
         if action not in {
             VoucherAction.REFUND_PRESALE,
             VoucherAction.REFUND_EXPIRED,
@@ -1477,13 +1499,26 @@ class VoucherIssuanceWorker:
                 confirmed = False
             if confirmed:
                 return "STRIPE_DEED_DELIVERED"
+        elif await self._confirm_stripe_refund_if_ready(series,voucher_json):
+            return 'STRIPE_REFUND_AUTHORIZED'
         _submitter, exact_executor = self._stripe_execution_services()
-        execution, observed_at = await resume_stripe_terminal(
-            exact_executor=exact_executor,
-            execution=execution_json,
-            expected_purchase_id=purchase.purchase_id,
-            expected_artifact_hash=purchase.artifact_hash,
-        )
+        if execution_json['mode']=='REFUND_OWNER':
+            from .stripe_refund_continuation import renew_stripe_refund
+            execution_json=await renew_stripe_refund(self,series,voucher_json,execution_json)
+        async def resume(document):
+            return await resume_stripe_terminal(exact_executor=exact_executor,execution=document,
+                expected_purchase_id=purchase.purchase_id,expected_artifact_hash=purchase.artifact_hash)
+        try:
+            execution,observed_at=await resume(execution_json)
+        except ProtocolSubmissionError:
+            if 'refundContinuation' not in execution_json['request']:raise
+            # The prior HTTP response may have been lost before either side
+            # recorded acceptance. Re-establish retained predecessors in order;
+            # an expired push may fail after KoS has durably bound its bytes.
+            for prior in reversed(self.presales.stripe_refund_attempts(series['termsHash'],voucher_json['serial'])[1:]):
+                try:await resume(prior)
+                except ProtocolSubmissionError:pass
+            execution,observed_at=await resume(execution_json)
         self._record_stripe_terminal_submission(
             series,
             voucher_json,
@@ -2666,6 +2701,24 @@ class VoucherIssuanceWorker:
         series: dict[str, Any],
         voucher: dict[str, Any],
     ) -> bool:
+        attempts=self.presales.stripe_refund_attempts(str(series['termsHash']),int(voucher['serial']))
+        if not attempts:
+            raise RuntimeError('Stripe refund confirmation requires its exact fee-funded execution')
+        if attempts:
+            from .refund_continuation import confirmed_refund_attempt
+            documents=[dict(spendBundle=e['prepared']['spendBundle']) for e in attempts]
+            settled=await confirmed_refund_attempt(self.coinset,documents,str(attempts[0]['outputRoles']['series']))
+            if settled is None:return False
+            winner,height,evidence=settled
+            matched=next(e for e in attempts if e['prepared']['spendBundleId']==winner)
+            if matched!=attempts[0]:
+                self.presales.advance_stripe_refund_attempt(str(series['termsHash']),int(voucher['serial']),attempts[0],matched,
+                    dict(confirmedHeight=height),confirmed=True)
+            self.presales.record_refund_settlement(str(series['termsHash']),int(voucher['serial']),matched,evidence)
+            voucher=self.presales.voucher(str(series['termsHash']),int(voucher['serial']))
+            if not voucher.get('refundBundleId'):
+                self._record_stripe_terminal_submission(series,voucher,matched,int(time.time()))
+                voucher=self.presales.voucher(str(series['termsHash']),int(voucher['serial']))
         ids = {
             "terminal_voucher": str(voucher["terminalVoucherCoinId"] or ""),
             "series_output": str(voucher["refundSeriesOutputCoinId"] or ""),

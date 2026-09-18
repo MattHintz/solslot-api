@@ -14,9 +14,9 @@ concurrency:
 
 env:
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
-  # Exact merged protocol source from the Brick53 baseline manifest.
+  # Exact merged protocol source from the Brick55 coordinated candidate.
   # Deployment environment pins remain separately governed.
-  PROTOCOL_REF: cc72b176789780a867210b73ca44e5835d0071ff
+  PROTOCOL_REF: 158b03bf84f4b4bf1fc541dde671e671e6c0c526
 
 jobs:
   verify:

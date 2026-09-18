@@ -142,6 +142,9 @@ def test_evm_owner_challenge_is_payload_bound_and_single_use(tmp_path):
     assert recovered.vault_launcher_id == VAULT
     assert len(recovered.session_id) == 32
     assert 'session_id' not in public_session.model_dump()
+    from solslot_api.sols_swap_funding import digest
+    assert public_session.sessionFingerprint == digest(recovered.session_id)
+    assert recovered.session_id not in public_session.model_dump_json()
     with pytest.raises(HTTPException, match="does not match") as mismatch:
         verify_vault_session(settings, request, "0x" + "99" * 32)
     assert mismatch.value.status_code == 403
@@ -166,6 +169,8 @@ def test_bls_owner_challenge_verifies_without_an_evm_identity(tmp_path):
     )
     stored = get_credential_ledger(settings).get_owner_challenge(challenge.challengeId)
     assert stored is not None
+    assert challenge.nonce == stored.nonce
+    assert len(challenge.nonce) == 66
     signature = AugSchemeMPL.sign(owner_sk, credential_bls_signing_digest(settings, stored))
     verified = verify_owner_auth(
         settings,

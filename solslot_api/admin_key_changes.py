@@ -783,7 +783,7 @@ def _genesis_authority_from_artifact(
         raise ValueError("Signed Authority V3 genesis coordinates are incomplete")
     authority = build_genesis_admin_authority_v3(
         parent_coin_id=_bytes32_hex(
-            funding.get("adminAuthority"),
+            funding.get("admin_authority"),
             "Authority V3 funding coin",
         ),
         network="testnet11",

@@ -120,6 +120,7 @@ class CreateFundedRedemption(ApiModel):
 
 class CompleteRedemption(ApiModel):
     operation_hash: str = Field(alias="operationHash", min_length=66, max_length=66)
+    funding_reservation_hash: str | None = Field(default=None, alias="fundingReservationHash", pattern=r"^0x[0-9a-f]{64}$")
     aggregated_signature: str | None = Field(
         default=None, alias="aggregatedSignature", min_length=194, max_length=194
     )
@@ -142,6 +143,8 @@ class RedemptionContext:
     maker_offer: Offer
     acceptance: DirectRedemptionAcceptance
     vault_record: Any
+    artifact: Any
+    approved_vault: Any
 
 
 def _wusdc_amount(value: str) -> int:
@@ -664,6 +667,9 @@ async def list_vault_redemptions(
             vault_launcher_id.lower()
         )
     ]
+    from .funded_redemption_review import review_store, resume_execution
+    for operation in review_store(request, settings).list_executions(vault_launcher_id.lower()):
+        operations.append(await resume_execution(operation, request, settings))
     return {
         "offers": offers,
         "operations": operations,
@@ -684,59 +690,15 @@ async def prepare_redemption(
     require_alpha_writes(settings)
     require_operation_gate(settings, "purchases")
     verify_vault_session(settings, request, vault_launcher_id)
+    from .funded_redemption_review import prepare_review
     try:
-        record, allocation = _find_redemption(
-            queue, settlement_id, deed_launcher_id
-        )
-        context = await _redemption_context(
-            record=record,
-            allocation=allocation,
-            vault_launcher_id=vault_launcher_id,
-            request=request,
-            settings=settings,
-            build_acceptance=True,
-        )
+        return await prepare_review(vault_launcher_id, settlement_id, deed_launcher_id, request, settings, queue)
     except HTTPException:
         raise
-    except (ChiaProviderError, PublicArtifactError) as exc:
+    except (ChiaProviderError, PublicArtifactError, ProtocolSubmissionError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except (KeyError, TypeError, ValueError, SolsSwapOfferError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    acceptance = context.acceptance
-    typed = None
-    spends: list[dict[str, Any]] = []
-    if context.vault_record.auth_type == AUTH_TYPE_BLS:
-        spends = [_coin_spend_json(acceptance.vault_spend)]
-        auth_type = "chia_bls"
-    else:
-        typed = eip712_typed_data_for_redemption_accept(
-            acceptance.operation_hash, acceptance.vault_spend.coin.name()
-        )
-        auth_type = "evm"
-    return {
-        "schemaVersion": 1,
-        "operationHash": _hex32(acceptance.operation_hash),
-        "settlementId": _hex32(context.plan.settlement_id),
-        "deedLauncherId": _hex32(allocation.deed_launcher_id),
-        "vaultLauncherId": vault_launcher_id.lower(),
-        "paymentAssetId": _hex32(context.plan.payment_asset_id),
-        "paymentAmount": str(allocation.payment_amount),
-        "paymentSymbol": "wUSDC.b",
-        "fundingCoinId": _hex32(context.leaf_coin.name()),
-        "vaultAuthType": auth_type,
-        "signingCoinSpends": spends,
-        "vaultTypedData": typed,
-        "review": {
-            "network": settings.network,
-            "action": "Redeem SmartDeed",
-            "assetIn": "SmartDeed",
-            "assetOut": "wUSDC.b",
-            "amount": str(allocation.payment_amount),
-            "destination": _hex32(puzzle_for_p2_vault(_b32(vault_launcher_id, "vault launcher")).get_tree_hash()),
-            "permanentOffer": True,
-            "reversibleAfterSubmission": False,
-        },
-    }
 
 
 @router.post("/redemptions/vaults/{vault_launcher_id}/{settlement_id}/{deed_launcher_id}/complete")
@@ -753,117 +715,15 @@ async def complete_redemption(
     require_alpha_writes(settings)
     require_operation_gate(settings, "purchases")
     verify_vault_session(settings, request, vault_launcher_id)
-    stored = get_funded_redemption_store(settings.admin_db_path).get(
-        body.operation_hash.lower()
-    )
-    if stored is not None:
-        if (
-            stored.vault_launcher_id != vault_launcher_id.lower()
-            or stored.settlement_id != settlement_id.lower()
-            or stored.deed_launcher_id != deed_launcher_id.lower()
-        ):
-            raise HTTPException(status_code=409, detail="Redemption operation belongs to different terms.")
-        return await _refresh_operation(stored, request)
+    from .funded_redemption_review import complete_review
     try:
-        record, allocation = _find_redemption(
-            queue, settlement_id, deed_launcher_id
-        )
-        context = await _redemption_context(
-            record=record,
-            allocation=allocation,
-            vault_launcher_id=vault_launcher_id,
-            request=request,
-            settings=settings,
-            build_acceptance=True,
-            owner_authorization=body.vault_owner_authorization,
-        )
+        return await complete_review(vault_launcher_id, settlement_id, deed_launcher_id, body, request, settings, queue)
     except HTTPException:
         raise
-    except (ChiaProviderError, PublicArtifactError) as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (ChiaProviderError, PublicArtifactError, ProtocolSubmissionError) as exc:
+        raise HTTPException(status_code=503, detail="Redemption submission is unresolved; resume this exact operation. " + str(exc)) from exc
     except (KeyError, TypeError, ValueError, SolsSwapOfferError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if _hex32(context.acceptance.operation_hash) != body.operation_hash.lower():
-        raise HTTPException(status_code=409, detail="Redemption operation no longer matches chain state.")
-    try:
-        wallet_signature = G2Element()
-        if context.vault_record.auth_type == AUTH_TYPE_BLS:
-            if (
-                body.aggregated_signature is None
-                or body.vault_owner_authorization is not None
-            ):
-                raise ValueError("Chia vault signature is required.")
-            wallet_signature = G2Element.from_bytes(
-                _hex_bytes(
-                    body.aggregated_signature, 96, "aggregatedSignature"
-                )
-            )
-        else:
-            if body.aggregated_signature is not None:
-                raise ValueError("EVM vault cannot add a Chia signature.")
-            if body.vault_owner_authorization is None:
-                raise ValueError("EVM vault owner authorization is required.")
-        signed_taker = Offer(
-            context.acceptance.taker_offer.requested_payments,
-            WalletSpendBundle(
-                context.acceptance.taker_offer.coin_spends(), wallet_signature
-            ),
-            context.acceptance.taker_offer.driver_dict,
-        )
-        aggregate = aggregate_direct_redemption(
-            maker_offer=context.maker_offer,
-            acceptance=replace(
-                context.acceptance, taker_offer=signed_taker
-            ),
-        )
-        bundle = aggregate.to_valid_spend()
-        _verify_aggregate_signature(bundle, settings.network)
-        await _require_inputs_clear(
-            request.app.state.coinset, tuple(bundle.removals())
-        )
-        recipient_inner = puzzle_for_p2_vault(
-            _b32(vault_launcher_id, "vault launcher ID")
-        )
-        recipient_full = construct_cat_puzzle(
-            CAT_MOD, context.plan.payment_asset_id, recipient_inner
-        )
-        payment_outputs = [
-            coin
-            for coin in bundle.additions()
-            if coin.puzzle_hash == recipient_full.get_tree_hash()
-            and int(coin.amount) == allocation.payment_amount
-        ]
-    except (ChiaProviderError, PublicArtifactError) as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except (KeyError, TypeError, ValueError, SolsSwapOfferError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if len(payment_outputs) != 1:
-        raise HTTPException(status_code=409, detail="Exact wUSDC.b vault output is missing or ambiguous.")
-    submitter = getattr(request.app.state, "protocol_submitter", None)
-    if not isinstance(submitter, ProtocolBundleSubmitter):
-        raise HTTPException(status_code=503, detail="Protocol fee funding is unavailable.")
-    try:
-        submission = await submitter.submit(bundle.to_json_dict())
-    except ProtocolSubmissionError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    try:
-        stored = get_funded_redemption_store(settings.admin_db_path).record_submitted(
-            operation_hash=body.operation_hash.lower(),
-            settlement_id=settlement_id.lower(),
-            deed_launcher_id=deed_launcher_id.lower(),
-            vault_launcher_id=vault_launcher_id.lower(),
-            payment_amount=str(allocation.payment_amount),
-            funding_coin_id=_hex32(context.leaf_coin.name()),
-            expected_payment_coin_id=_hex32(payment_outputs[0].name()),
-            transaction_id=str(submission["spendBundleId"]),
-            fee_mojos=str(submission["feeMojos"]),
-            fee_target_seconds=int(submission["feeTargetSeconds"]),
-            submission_provider=str(submission["submissionProvider"]),
-            mempool_observed_at=str(submission["mempoolObservedAt"]),
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return _operation_view(stored)
 
 
 @router.get("/redemptions/{operation_hash}")
@@ -876,6 +736,13 @@ async def get_redemption_operation(
         normalized = _hex32(_b32(operation_hash, "operation hash"))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    from .funded_redemption_review import review_store, resume_execution
+    reviewed = review_store(request, settings)
+    if reviewed.execution(normalized) is not None or reviewed.expired_execution(normalized) is not None:
+        try:
+            return await resume_execution(normalized, request, settings)
+        except (ChiaProviderError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
     stored = get_funded_redemption_store(settings.admin_db_path).get(normalized)
     if stored is None:
         raise HTTPException(status_code=404, detail="Redemption operation was not found.")
@@ -887,17 +754,8 @@ async def _refresh_operation(
     stored: StoredFundedRedemption,
     request: Request,
 ) -> dict[str, Any]:
-    if stored.status != "CONFIRMED":
-        coin_record = await request.app.state.coinset.get_coin_record_by_name(
-            stored.expected_payment_coin_id
-        )
-        height = int((coin_record or {}).get("confirmed_block_index") or 0)
-        if height > 0:
-            stored = get_funded_redemption_store(
-                str(request.app.state.settings.admin_db_path)
-            ).mark_confirmed(
-                stored.operation_hash, height
-            )
+    # Historical rows lack a retained signed bundle. Preserve their recorded
+    # status; one unbound output lookup cannot upgrade them to confirmed.
     return _operation_view(stored)
 
 
@@ -958,6 +816,7 @@ async def _redemption_context(
     leaf_coin = _coin_from_record(leaf_record)
     if (
         leaf_coin is None
+        or _hex32(leaf_coin.name()) != leaf_id.lower()
         or int((leaf_record or {}).get("confirmed_block_index") or 0) <= 0
         or int((leaf_record or {}).get("spent_block_index") or 0) != 0
     ):
@@ -974,7 +833,12 @@ async def _redemption_context(
         _hex32(leaf_coin.parent_coin_info)
     )
     treasury_coin = _coin_from_record(treasury_record)
-    if treasury_coin is None:
+    expected_treasury = construct_cat_puzzle(CAT_MOD, asset_id, treasury_inner)
+    if (treasury_coin is None or treasury_coin.name() != leaf_coin.parent_coin_info
+            or treasury_coin.puzzle_hash != expected_treasury.get_tree_hash()
+            or type((treasury_record or {}).get("spent_block_index")) is not int
+            or treasury_record["spent_block_index"] != leaf_record["confirmed_block_index"]
+            or treasury_record.get("spent") is not True):
         raise ValueError("redemption treasury lineage is unavailable")
     leaf_lineage = LineageProof(
         treasury_coin.parent_coin_info,
@@ -1070,7 +934,7 @@ async def _redemption_context(
             }
         )
     )
-    return RedemptionContext(record, plan, allocation, leaf_coin, leaf_lineage, maker, acceptance, session.vault_record)
+    return RedemptionContext(record, plan, allocation, leaf_coin, leaf_lineage, maker, acceptance, session.vault_record, artifact, approved)
 
 
 async def _redemption_summary(

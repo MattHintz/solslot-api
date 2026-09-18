@@ -159,12 +159,14 @@ class ProtocolBundleSubmitter:
         ],
         *,
         selection_purpose: str | None = None,
+        expected_protocol_fee_mojos: int = 0,
     ) -> dict[str, Any]:
         """Fund, persist, and hand one exact bundle to its sole executor."""
 
         async with self._lock:
             prepared = await self._prepare_locked(
-                protocol_bundle_json, selection_purpose=selection_purpose
+                protocol_bundle_json, selection_purpose=selection_purpose,
+                expected_protocol_fee_mojos=expected_protocol_fee_mojos,
             )
             try:
                 dispatch_result = await dispatcher(prepared)
@@ -255,6 +257,7 @@ class ProtocolBundleSubmitter:
         *,
         selection_purpose: str | None = None,
         expected_backing_mojos: int = 0,
+        expected_protocol_fee_mojos: int = 0,
     ) -> PreparedProtocolBundle:
         if not self.policy.enabled:
             raise ProtocolSubmissionError("protocol fee funding is disabled")
@@ -277,7 +280,14 @@ class ProtocolBundleSubmitter:
             raise ProtocolSubmissionError("issuance backing exceeds configured cap or is invalid")
         if expected_backing_mojos and existing_fee != -expected_backing_mojos:
             raise ProtocolSubmissionError("bundle deficit does not match authorized issuance backing")
-        if not expected_backing_mojos and existing_fee != 0:
+        # Only the trusted Stripe terminal caller opts into its pinned one-mojo
+        # receipt burn. This is part of the total network fee, not an extra fee.
+        if (type(expected_protocol_fee_mojos) is not int
+                or expected_protocol_fee_mojos not in (0, 1)
+                or (expected_protocol_fee_mojos and expected_backing_mojos)
+                or expected_protocol_fee_mojos > self.policy.maximum_mojos):
+            raise ProtocolSubmissionError("authorized protocol receipt fee is invalid")
+        if not expected_backing_mojos and existing_fee != expected_protocol_fee_mojos:
             raise ProtocolSubmissionError(
                 "protocol spend bundle must not carry a separate user-funded fee"
             )
@@ -285,11 +295,12 @@ class ProtocolBundleSubmitter:
         # issuance as MintingCoin. Estimate only after attaching its backing.
         preliminary_fee = (self.policy.minimum_mojos if expected_backing_mojos
                            else await self._estimate_fee(protocol_bundle))
+        preliminary_fee = max(preliminary_fee, expected_protocol_fee_mojos)
         protocol_input_ids = {
             bytes(coin.name()) for coin in protocol_bundle.removals()
         }
         fee_coin = await self._select_fee_coin(
-            preliminary_fee + expected_backing_mojos,
+            preliminary_fee + expected_backing_mojos - expected_protocol_fee_mojos,
             excluded_coin_ids=protocol_input_ids,
             selection_purpose=selection_purpose,
         )
@@ -300,6 +311,7 @@ class ProtocolBundleSubmitter:
             selection_purpose=selection_purpose,
             backing_mojos=expected_backing_mojos,
             backing_conditions=self._backing_conditions(protocol_bundle) if expected_backing_mojos else (),
+            protocol_fee_mojos=expected_protocol_fee_mojos,
         )
         return PreparedProtocolBundle(
             bundle=final_bundle,
@@ -459,10 +471,12 @@ class ProtocolBundleSubmitter:
         selection_purpose: str | None,
         backing_mojos: int = 0,
         backing_conditions: tuple[Program, ...] = (),
+        protocol_fee_mojos: int = 0,
     ) -> tuple[SpendBundle, int, Coin]:
         fee = preliminary_fee
         for _ in range(3):
-            if fee + backing_mojos > int(fee_coin.amount):
+            sponsor_fee = fee - protocol_fee_mojos
+            if sponsor_fee + backing_mojos > int(fee_coin.amount):
                 if not backing_mojos:
                     raise ProtocolSubmissionError(
                         "selected protocol funding coin is smaller than backing plus the medium fee"
@@ -477,7 +491,7 @@ class ProtocolBundleSubmitter:
                     protocol_bundle,
                     self._fee_bundle(
                         fee_coin,
-                        fee,
+                        sponsor_fee,
                         selection_purpose=selection_purpose,
                         backing_mojos=backing_mojos,
                         backing_conditions=backing_conditions,

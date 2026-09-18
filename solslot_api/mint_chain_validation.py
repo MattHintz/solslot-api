@@ -523,8 +523,8 @@ def _parse_tracker_propose(coin_spend: Any) -> tuple[bytes32, Program, int, int]
     if len(inner) != 5 or inner[3].as_int() != 1:
         raise ValueError("governance singleton spend is not TRK_PROPOSE")
     params = list(inner[4].as_iter())
-    if len(params) != 5:
-        raise ValueError("TRK_PROPOSE parameters are malformed")
+    from solslot_puzzles.sgt_driver import tracker_propose_policy_from_spend
+    tracker_propose_policy_from_spend(_program(coin_spend.puzzle_reveal), params)
     return (
         bytes32(params[0].as_atom()),
         params[1],

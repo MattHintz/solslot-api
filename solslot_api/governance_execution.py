@@ -14,6 +14,7 @@ from chia.wallet.cat_wallet.cat_utils import (
     get_innerpuzzle_from_puzzle,
 )
 from chia.wallet.lineage_proof import LineageProof
+from chia.wallet.util.compute_additions import compute_additions
 from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
     lineage_proof_for_coinsol,
     puzzle_for_singleton,
@@ -36,11 +37,12 @@ from solslot_puzzles.sgt_driver import (
     sgt_free_inner_puzzle,
     sgt_locked_inner_mod,
     sgt_locked_inner_puzzle,
+    tracker_propose_policy_from_spend,
 )
 from solslot_puzzles.sgt_reserve_driver import (
     build_reserve_execute_spends,
+    build_reserve_allocation_spend,
     build_reserve_release_spend,
-    sgt_cat_puzzle,
     sgt_reserve_inner_puzzle,
 )
 from solslot_puzzles.funded_redemption_v1 import (
@@ -86,6 +88,7 @@ class AllocationChainState:
     vote_tally: int | None = None
     first_vote_amount: int | None = None
     voting_deadline: int | None = None
+    proposal_parameters: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -223,8 +226,13 @@ async def trace_allocation_proposal(
     if not isinstance(parent_solution, Mapping):
         raise ValueError("proposal tracker publication evidence is unavailable")
     dispatcher, params = _tracker_solution(parent_solution)
-    if dispatcher != TRK_PROPOSE or len(params) != 5:
+    if dispatcher != TRK_PROPOSE:
         raise ValueError("proposal tracker did not enter through PROPOSE")
+    proposal_parameters = tracker_propose_policy_from_spend(
+        _program(parent_solution.get("puzzle_reveal"), "tracker puzzle"), params,
+    )
+    if proposal_parameters is not None:
+        quorum_bps = proposal_parameters[1]
     if bytes32(params[0].as_atom()) != proposal_hash:
         raise ValueError("proposal tracker hash does not match the queue")
     if bytes32(params[1].get_tree_hash()) != bytes32(bill.get_tree_hash()):
@@ -255,6 +263,7 @@ async def trace_allocation_proposal(
                 vote_tally=vote_tally,
                 first_vote_amount=first_vote_amount,
                 voting_deadline=deadline,
+                proposal_parameters=proposal_parameters,
             )
         solution = await provider.get_puzzle_and_solution(
             _hex32(current_coin.name()), spent_height
@@ -270,6 +279,7 @@ async def trace_allocation_proposal(
                 vote_tally=vote_tally,
                 first_vote_amount=first_vote_amount,
                 voting_deadline=deadline,
+                proposal_parameters=proposal_parameters,
             )
         if dispatcher == TRK_EXPIRE:
             return AllocationChainState(
@@ -279,6 +289,7 @@ async def trace_allocation_proposal(
                 vote_tally=vote_tally,
                 first_vote_amount=first_vote_amount,
                 voting_deadline=deadline,
+                proposal_parameters=proposal_parameters,
             )
         if dispatcher != TRK_VOTE or len(params) != 2:
             raise ValueError("governance proposal used an unexpected transition")
@@ -375,10 +386,10 @@ async def build_allocation_execution(
         singleton_struct(pool_launcher),
         singleton_struct(admin_launcher),
         singleton_struct(statutes_launcher),
-        quorum_bps,
-        int(parameters.get("votingWindowSeconds")),
+        chain.proposal_parameters[1] if chain.proposal_parameters else quorum_bps,
+        chain.proposal_parameters[0] if chain.proposal_parameters else int(parameters.get("votingWindowSeconds")),
         total_supply,
-        int(parameters.get("minProposalStake")),
+        chain.proposal_parameters[2] if chain.proposal_parameters else int(parameters.get("minProposalStake")),
         bytes.fromhex(str(governance.get("mintExecuteCosignerPubkey")).removeprefix("0x")),
         proposal_hash,
         bill,
@@ -450,25 +461,44 @@ async def build_allocation_execution(
         proposal_hash,
         chain.voting_deadline,
     )
-    locked_full = sgt_cat_puzzle(
-        proposal_tracker_struct=tracker_struct,
-        sgt_tail_hash=sgt_tail,
-        owner_inner_puzzle=locked_inner,
-    )
+    locked_full = construct_cat_puzzle(CAT_MOD, sgt_tail, locked_inner)
     locked_records = await provider.get_coin_records_by_puzzle_hash(
-        _hex32(locked_full.get_tree_hash()), include_spent=False
+        _hex32(locked_full.get_tree_hash()), include_spent=True
     )
     locked_candidates = [
         candidate
         for item in locked_records
         if isinstance(item, Mapping)
-        and not int(item.get("spent_block_index") or 0)
         and (candidate := _coin(item)) is not None
         and int(candidate.amount) == chain.first_vote_amount
     ]
     if len(locked_candidates) != 1:
         raise ValueError("locked company SGT reserve is missing or ambiguous")
     locked_coin = locked_candidates[0]
+    locked_record = next(item for item in locked_records if _coin(item) == locked_coin)
+    released_coin = None
+    released_lineage = None
+    released_height = int(locked_record.get("spent_block_index") or 0)
+    if released_height:
+        released_payload = await provider.get_puzzle_and_solution(_hex32(locked_coin.name()), released_height)
+        if not isinstance(released_payload, Mapping):
+            raise ValueError("SGT deadline release evidence is unavailable")
+        release_puzzle = _program(released_payload.get("puzzle_reveal"), "SGT release puzzle")
+        if release_puzzle != locked_full:
+            raise ValueError("SGT release puzzle does not match the locked reserve")
+        release_spend = make_spend(locked_coin, release_puzzle,
+            _program(released_payload.get("solution"), "SGT release solution"))
+        free_inner = sgt_free_inner_puzzle(sgt_locked_inner_mod().get_tree_hash(), tracker_struct, reserve_inner_hash)
+        expected = Coin(locked_coin.name(), construct_cat_puzzle(CAT_MOD, sgt_tail, free_inner).get_tree_hash(), locked_coin.amount)
+        if expected not in compute_additions(release_spend):
+            raise ValueError("SGT release did not return the exact reserve")
+        returned = await provider.get_coin_record_by_name(_hex32(expected.name()))
+        if (not isinstance(returned, Mapping) or _coin(returned) != expected
+            or int(returned.get("spent_block_index") or 0)
+            or int(returned.get("confirmed_block_index") or 0) != released_height):
+            raise ValueError("returned SGT reserve is not confirmed and unspent")
+        released_coin = expected
+        released_lineage = LineageProof(locked_coin.parent_coin_info, locked_inner.get_tree_hash(), locked_coin.amount)
     reserve_parent_record = await provider.get_coin_record_by_name(
         _hex32(locked_coin.parent_coin_info)
     )
@@ -611,7 +641,7 @@ async def build_allocation_execution(
             plan=redemption_plan,
             deed_launcher_puzzle_hash=deed_launcher_hash,
         )
-        reserve_release = build_reserve_release_spend(
+        reserve_release = None if released_coin is not None else build_reserve_release_spend(
             locked_reserve_coin=locked_coin,
             locked_reserve_lineage_proof=locked_lineage,
             proposal_tracker_struct=tracker_struct,
@@ -622,7 +652,7 @@ async def build_allocation_execution(
             tracker_inner_puzzle_hash=bytes32(tracker_inner.get_tree_hash()),
         )
         bundle = SpendBundle(
-            [tracker_spend, reserve_release, *funded.spend_bundle.coin_spends],
+            [tracker_spend, *([reserve_release] if reserve_release else []), *funded.spend_bundle.coin_spends],
             G2Element(),
         )
         return AllocationExecutionBuild(
@@ -633,7 +663,17 @@ async def build_allocation_execution(
                 _hex32(coin.name()) for coin in funded.leaf_coins
             ),
         )
-    locked_spend, allocation_spend = build_reserve_execute_spends(
+    if released_coin is not None:
+        allocation_spend = build_reserve_allocation_spend(
+            reserve_coin=released_coin, reserve_lineage_proof=released_lineage,
+            proposal_tracker_struct=tracker_struct, admin_authority_struct=singleton_struct(admin_launcher),
+            sgt_tail_hash=sgt_tail,
+            wusdc_b_asset_id=_b32(_mapping(plan.get("trustedAssets"), "trustedAssets").get("wusdcBAssetId"), "trusted wUSDC.b asset ID"),
+            company_treasury_puzzle_hash=treasury, bill=bill,
+            tracker_inner_puzzle_hash=tracker_inner.get_tree_hash())
+        allocation_spends = [allocation_spend]
+    else:
+        allocation_spends = list(build_reserve_execute_spends(
         locked_reserve_coin=locked_coin,
         locked_reserve_lineage_proof=locked_lineage,
         proposal_tracker_struct=tracker_struct,
@@ -649,8 +689,9 @@ async def build_allocation_execution(
         bill=bill,
         voting_deadline=chain.voting_deadline,
         tracker_inner_puzzle_hash=bytes32(tracker_inner.get_tree_hash()),
-    )
-    bundle = SpendBundle([tracker_spend, locked_spend, allocation_spend], G2Element())
+        ))
+        allocation_spend = allocation_spends[-1]
+    bundle = SpendBundle([tracker_spend, *allocation_spends], G2Element())
     outputs = tuple(
         sorted(
             _hex32(coin.name())
@@ -747,10 +788,10 @@ async def build_allocation_vote(
         singleton_struct(pool_launcher),
         singleton_struct(admin_launcher),
         singleton_struct(statutes_launcher),
-        quorum_bps,
-        int(parameters.get("votingWindowSeconds")),
+        chain.proposal_parameters[1] if chain.proposal_parameters else quorum_bps,
+        chain.proposal_parameters[0] if chain.proposal_parameters else int(parameters.get("votingWindowSeconds")),
         total_supply,
-        int(parameters.get("minProposalStake")),
+        chain.proposal_parameters[2] if chain.proposal_parameters else int(parameters.get("minProposalStake")),
         bytes.fromhex(
             str(governance.get("mintExecuteCosignerPubkey")).removeprefix("0x")
         ),

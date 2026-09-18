@@ -1,6 +1,7 @@
 """Private fee holds and exact promotion before any provider broadcast."""
 from dataclasses import replace
 import json
+import hashlib
 import sqlite3
 from types import SimpleNamespace
 
@@ -34,7 +35,10 @@ async def test_hold_precedes_owner_completion_and_only_exact_funding_is_pushed(m
     again = await swaps.prepare_sols_swap(fixtures._hex32(fixtures.VAULT_LAUNCHER),
         swaps.PrepareSolsSwapRequest(direction=body.direction, deedLauncherId=body.deed_launcher_id), request, fixtures._settings())
     public = again.model_dump(by_alias=True)
-    assert public['fundingEvidence'] == {**review, 'reservationHash': held['reservationHash']}
+    assert public['fundingEvidence'] == {**review, 'reservationHash': held['reservationHash'],
+        'reservationReviewJson': funding.canonical(review)}
+    assert json.loads(public['fundingEvidence']['reservationReviewJson']) == review
+    assert '0x'+hashlib.sha256(public['fundingEvidence']['reservationReviewJson'].encode()).hexdigest() == held['reservationHash']
     assert held['fundingBundle']['aggregated_signature'].removeprefix('0x') not in json.dumps(public)
     assert 'fundingBundle' not in json.dumps(public)
     assert public['fundingEvidence']['fundingCoinSpend']['coin']['amount'].isdecimal()

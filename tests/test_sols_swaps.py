@@ -702,6 +702,12 @@ class FakeProtocolSubmitter(ProtocolBundleSubmitter):
 @pytest.fixture(autouse=True)
 def funding_runtime(monkeypatch):
     """Synthetic authenticated release context for swap integration fixtures."""
+    # These offer/funding tests replace the chain-state loaders. Real primary
+    # snapshot orchestration is exercised in test_chia_snapshot.py instead.
+    from solslot_api import sols_swaps
+    async def synthetic_prepare(*args):
+        return await sols_swaps._prepare_sols_swap(*args)
+    monkeypatch.setattr(sols_swaps, "_snapshot_prepare", synthetic_prepare)
     from solslot_api.sols_swap_funding import digest
     def binding(request, settings, context):
         return dict(vaultLauncherId=_hex32(context.vault_record.launcher_id),

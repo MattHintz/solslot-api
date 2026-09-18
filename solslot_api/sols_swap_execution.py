@@ -74,6 +74,10 @@ async def _primary_peak(node: Any) -> tuple[int, bytes32]:
 
 
 async def execution_confirmed(node: Any, bundle: SpendBundle, pool_output_id: str) -> bool:
+    return await execution_confirmation_height(node, bundle, pool_output_id) is not None
+
+
+async def execution_confirmation_height(node: Any, bundle: SpendBundle, pool_output_id: str) -> int | None:
     """Prove every retained spend at the pool successor's height on the primary.
 
     An output alone does not prove that the retained funding was consumed.
@@ -84,7 +88,7 @@ async def execution_confirmed(node: Any, bundle: SpendBundle, pool_output_id: st
     peak = await _primary_peak(node)
     raw = await node.get_coin_record_by_name_primary(pool_output_id)
     if raw is None:
-        return False
+        return None
     try:
         height, _ = _record_height(raw, output)
         if height > peak[0]:
@@ -93,20 +97,20 @@ async def execution_confirmed(node: Any, bundle: SpendBundle, pool_output_id: st
             coin_id = hx(expected.coin.name())
             record = await node.get_coin_record_by_name_primary(coin_id)
             if record is None:
-                return False
+                return None
             _, spent = _record_height(record, expected.coin)
             if not spent:
-                return False
+                return None
             actual = await node.get_puzzle_and_solution_primary(coin_id, spent)
             if actual is None:
-                return False
+                return None
             if spent != height or CoinSpend.from_json_dict(actual) != expected:
                 raise ValueError("reserved input was spent by a different transaction")
         # Both a changed output and a different branch retaining the same
         # output/height invalidate the multi-read proof.
         anchor = await node.get_coin_record_by_name_primary(pool_output_id)
         if anchor is None or _record_height(anchor, output)[0] != height:
-            return False
-        return await _primary_peak(node) == peak
+            return None
+        return height if await _primary_peak(node) == peak else None
     except (KeyError, TypeError, ValueError, RuntimeError) as exc:
         raise ValueError("Sols swap chain proof is inconsistent; retain funding for reconciliation") from exc

@@ -122,6 +122,18 @@ def test_owner_refund_and_phase_are_exclusive_and_lost_refund_push_recovers(camp
         with pytest.raises(ValueError, match='unfinished voucher work'):
             await competing_phase()
         w = worker(c)
+        # Exact refund confirmation uses the configured-primary interface.
+        from tests.test_chia_snapshot import provider
+        w.coinset = provider(c.node)
+        async def anchored_state():
+            return dict(success=True,blockchain_state=dict(sync=dict(synced=True,sync_mode=False),
+                peak=dict(height=200,header_hash=hx(200))))
+        monkeypatch.setattr(c.node,'get_blockchain_state',anchored_state)
+        original_solution=c.node.get_puzzle_and_solution
+        async def exact_solution(name,height):
+            value=await original_solution(name,height)
+            return dict(value,coin=c.node.records[name]['coin']) if value is not None else None
+        monkeypatch.setattr(c.node,'get_puzzle_and_solution',exact_solution)
         w.purchases = purchases
         outcome = await w.reconcile_once()
         assert outcome[0]['status'] == 'REFUND_CONFIRMING'
