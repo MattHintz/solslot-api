@@ -47,6 +47,8 @@ def _dependency_calls(route: APIRoute) -> set[Callable[..., object]]:
 def test_mint_admin_routes_are_jwt_gated() -> None:
     expected = {
         ("POST", "/admin/mint/propose"),
+        ("POST", "/admin/mint/publication/context"),
+        ("POST", "/admin/mint/publication/stake"),
         ("GET", "/admin/mint"),
         ("GET", "/admin/mint/{proposal_id}"),
         ("POST", "/admin/mint/{proposal_id}/cancel"),

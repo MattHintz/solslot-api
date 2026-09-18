@@ -20,6 +20,7 @@ from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
     SINGLETON_LAUNCHER_HASH,
     SINGLETON_MOD_HASH,
 )
+from chia.types.coin_spend import CoinSpend
 from chia.wallet.util.compute_additions import compute_additions
 from chia_rs import SpendBundle
 from chia_rs.sized_bytes import bytes32
@@ -71,8 +72,16 @@ def validate_publish_bundle(
     proposal: StoredMintProposal,
     artifact: dict[str, Any],
     authenticated_owner: str,
+    stake_vault_launcher_id: bytes32 | None = None,
+    authorization_spends: list[CoinSpend] | None = None,
+    owner_package: bool = False,
+    current_admin_pubkeys: tuple[bytes, ...] | None = None,
 ) -> CanonicalPublish:
-    """Validate and re-derive the four-spend proposal publication bundle."""
+    """Validate five wallet spends and the exact four current authority spends.
+
+The owner-package mode is only for review preparation. Submission uses all nine
+spends, including server-reconstructed owner-plus-one and statutes evidence.
+"""
     from solslot_puzzles import load_puzzle
     from solslot_puzzles.eip712_helpers import (
         compute_eip712_member_leaf_hash,
@@ -88,13 +97,31 @@ def validate_publish_bundle(
     from solslot_puzzles.protocol_deployment import (
         quorum_did_inner_puzzle,
         singleton_struct,
+        singleton_full_puzzle_hash,
     )
+    from chia.wallet.cat_wallet.cat_utils import CAT_MOD, construct_cat_puzzle
+    from solslot_puzzles.sgt_driver import (
+        sgt_free_inner_puzzle, sgt_free_inner_mod, sgt_locked_inner_mod, sgt_locked_inner_puzzle,
+    )
+    from solslot_puzzles.vault_driver import puzzle_for_p2_vault
 
-    if len(bundle.coin_spends) != 4:
-        raise ValueError(
-            "mint proposal publication must contain exactly four spends "
-            "(funding, proposal launcher, governance tracker, SGT lock)"
-        )
+    if stake_vault_launcher_id is None:
+        raise ValueError('mint publication requires an enrolled SGT stake vault')
+    expected_count = 5 if owner_package else 9
+    if len(bundle.coin_spends) != expected_count:
+        raise ValueError(f'mint publication requires exactly {expected_count} role-bound spends')
+    names = [bytes(spend.coin.name()) for spend in bundle.coin_spends]
+    if len(set(names)) != len(names):
+        raise ValueError('mint publication contains duplicate input coins')
+    authorizations = authorization_spends or []
+    if owner_package and authorizations:
+        raise ValueError('wallet review cannot contain administrator authority spends')
+    if not owner_package:
+        if len(authorizations) != 4 or len({bytes(spend.coin.name()) for spend in authorizations}) != 4:
+            raise ValueError('current owner-plus-one and statutes authorizations are required')
+        actual = {bytes(spend.coin.name()): spend for spend in bundle.coin_spends}
+        if any(actual.get(bytes(spend.coin.name())) != spend for spend in authorizations):
+            raise ValueError('mint authorization spends differ from the approved current package')
     _validate_reveals_match_coins(bundle)
 
     launchers = [
@@ -153,6 +180,7 @@ def validate_publish_bundle(
             genesis_challenge_for_network(str(artifact.get("network", "")))
         ),
         type_hash=eip712_type_hash(),
+        current_admin_pubkeys=current_admin_pubkeys,
     )
     if owner_member_hash != expected_owner_hash:
         raise ValueError("owner_member_hash does not belong to the authenticated administrator")
@@ -202,13 +230,16 @@ def validate_publish_bundle(
             else None
         ),
         primary_purchase=primary_purchase,
+        governance_tracker_version=2,
     )
 
     launcher_solution = list(_program(launcher_spend.solution).as_iter())
     if len(launcher_solution) < 2:
         raise ValueError("proposal launcher solution is malformed")
-    if bytes(launcher_solution[0].as_atom()) != bytes(artifacts.eve_inner_puzhash):
-        raise ValueError("proposal launcher does not create the re-derived eve inner")
+    expected_eve_full = singleton_full_puzzle_hash(
+        artifacts.proposal_singleton_launcher_id, artifacts.eve_inner_puzhash)
+    if bytes(launcher_solution[0].as_atom()) != bytes(expected_eve_full):
+        raise ValueError("proposal launcher does not create the re-derived full eve singleton")
     if launcher_solution[1].as_int() != 1:
         raise ValueError("proposal singleton amount must be one mojo")
 
@@ -248,15 +279,31 @@ def validate_publish_bundle(
         raise ValueError("governance tracker spend must create exactly one singleton child")
     tracker_child_id = bytes32(tracker_children[0].name())
 
-    used = {id(funding_spend), id(launcher_spend), id(tracker_spend)}
-    sgt_spends = [cs for cs in bundle.coin_spends if id(cs) not in used]
+    vault_spend = _single_spend_for_launcher(bundle, stake_vault_launcher_id)
+    used = {bytes(spend.coin.name()) for spend in
+        [funding_spend, launcher_spend, tracker_spend, vault_spend, *authorizations]}
+    if len(used) != 4 + len(authorizations):
+        raise ValueError('mint publication spend roles overlap')
+    sgt_spends = [cs for cs in bundle.coin_spends if bytes(cs.coin.name()) not in used]
     if len(sgt_spends) != 1:
         raise ValueError("publish bundle must contain exactly one SGT lock spend")
+    owner_inner_hash = puzzle_for_p2_vault(stake_vault_launcher_id).get_tree_hash()
+    tail = bytes32.from_hexstr(str(artifact['sgtTailHash']))
+    free_inner = sgt_free_inner_puzzle(sgt_locked_inner_mod().get_tree_hash(),
+        governance_struct, owner_inner_hash)
+    expected_sgt_puzzle = construct_cat_puzzle(CAT_MOD, tail, free_inner)
+    if _program(sgt_spends[0].puzzle_reveal) != expected_sgt_puzzle:
+        raise ValueError('mint stake is not canonical SGT owned by the selected vault')
+    if int(sgt_spends[0].coin.amount) != first_vote_amount:
+        raise ValueError('mint stake must lock one complete vault-held SGT coin')
+    locked_inner = sgt_locked_inner_puzzle(sgt_free_inner_mod().get_tree_hash(),
+        governance_struct, owner_inner_hash, proposal_hash, deadline)
+    expected_locked_hash = construct_cat_puzzle(CAT_MOD, tail, locked_inner).get_tree_hash()
     sgt_children = [
         coin for coin in compute_additions(sgt_spends[0])
-        if int(coin.amount) == first_vote_amount
+        if int(coin.amount) == first_vote_amount and coin.puzzle_hash == expected_locked_hash
     ]
-    if len(sgt_children) != 1:
+    if len(sgt_children) != 1 or len(compute_additions(sgt_spends[0])) != 1:
         raise ValueError("SGT spend does not create the first-vote locked coin")
     sgt_lock_coin_id = bytes32(sgt_children[0].name())
 
@@ -552,9 +599,13 @@ def _singleton_launcher_id(coin_spend: Any) -> bytes32 | None:
         values = list(args.as_iter())
         if len(values) != 2:
             return None
-        struct_values = list(values[0].as_iter())
-        launcher_pair = list(struct_values[1].as_iter())
-        return bytes32(launcher_pair[0].as_atom())
+        # SINGLETON_STRUCT is a dotted pair, not a proper CLVM list:
+        # (singleton_mod_hash . (launcher_id . launcher_puzzle_hash)).
+        struct = values[0]
+        if (struct.first().as_atom() != SINGLETON_MOD_HASH
+            or struct.rest().rest().as_atom() != SINGLETON_LAUNCHER_HASH):
+            return None
+        return bytes32(struct.rest().first().as_atom())
     except (IndexError, TypeError, ValueError):
         return None
 
@@ -566,11 +617,15 @@ def _admin_member_hash(
     compute_leaf: Any,
     prefix: bytes,
     type_hash: bytes32,
+    current_admin_pubkeys: tuple[bytes, ...] | None = None,
 ) -> bytes32:
     from eth_keys import keys
 
     admin = _artifact_mapping(artifact, "adminAuthority")
-    pubkeys = admin.get("compressedPubkeys")
+    # Production callers supply the chain-verified current identity keys,
+    # including completed rotations; historical readers retain genesis behavior.
+    pubkeys = ([key.hex() for key in current_admin_pubkeys]
+        if current_admin_pubkeys is not None else admin.get("compressedPubkeys"))
     if not isinstance(pubkeys, list):
         raise ValueError("signed artifact admin roster is malformed")
     owner = authenticated_owner.lower()

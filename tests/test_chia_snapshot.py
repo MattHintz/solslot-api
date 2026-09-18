@@ -159,15 +159,17 @@ async def test_no_broadcast_in_read_session():
         with pytest.raises(ChiaProviderError, match='broadcast'): await p.push_tx({})
 
 
-@pytest.mark.parametrize('reverse', [False, True])
-async def test_prepare_scope_covers_funding_but_excludes_ephemeral_inputs(monkeypatch, reverse):
+@pytest.mark.parametrize('reverse,consolidation', [(False,0),(True,0),(True,2),(True,32)])
+async def test_prepare_scope_covers_funding_but_excludes_ephemeral_inputs(monkeypatch, reverse, consolidation):
     p = provider(); coins = {}
     roles = ['sols_settlement', 'statutes', 'vault', 'pool'] + (
         ['held_deed', 'smart_deed', 'sols_reserve'] if reverse else ['sols_payment', 'deed_custody'])
+    roles = [f'reserve_consolidation_{i}' for i in range(consolidation)] + roles
+    ephemeral = {'sols_settlement', 'smart_deed'} | ({'sols_reserve'} if consolidation else set())
     def spend(role, index):
         coin = Coin(bytes32(bytes([index]) * 32), bytes32(b'b' * 32), 1)
         coins[role] = coin
-        if role not in {'sols_settlement', 'smart_deed'}:
+        if role not in ephemeral:
             p.primary.records['0x' + coin.name().hex()] = dict(coin=coin.to_json_dict(),
                 confirmed_block_index=10, spent_block_index=0, spent=False)
         return {'role': role, 'coin': dict(parentCoinInfo='0x' + coin.parent_coin_info.hex(),
@@ -185,7 +187,7 @@ async def test_prepare_scope_covers_funding_but_excludes_ephemeral_inputs(monkey
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(coinset=p)))
     prepared = await swaps._snapshot_prepare('vault', None, request, SimpleNamespace(network='testnet11'))
     receipt = prepared['current_state_evidence']
-    assert {r['role'] for r in receipt['inputs']} == set(roles + ['fee']) - {'sols_settlement', 'smart_deed'}
+    assert {r['role'] for r in receipt['inputs']} == set(roles + ['fee']) - ephemeral
     assert receipt['binding']['fundingReservationHash'] == 'funding'
     assert receipt['binding']['sessionFingerprint'] == 'session'
     assert not p.fallback.calls
@@ -259,3 +261,11 @@ async def test_completion_context_rechecks_primary_and_exits_before_broadcast(mo
     else:
         assert await swaps._load_observed_context(derive, kwargs) is context
     assert active_snapshot() is None and not p.fallback.calls
+
+
+async def test_persistent_input_limit_still_rejects_oversized_snapshot():
+    p = provider()
+    inputs = [('input', Coin(bytes32(bytes([i]) * 32), bytes32(b'b' * 32), 1)) for i in range(38)]
+    async with PrimaryReadSnapshot(p, 'testnet11') as snapshot:
+        with pytest.raises(ChiaProviderError, match='distinct persistent inputs'):
+            await snapshot.finish(inputs, binding())

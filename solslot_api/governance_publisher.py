@@ -237,6 +237,7 @@ def _action(
     delegated_puzzle_hash: bytes32,
     proposal_hash: bytes32,
     voting_deadline: int,
+    purpose: str = "SGT_ALLOCATION_PROPOSAL",
 ) -> GovernanceSigningAction:
     prefix = eip712_prefix_and_domain_separator(
         genesis_challenge_for_network("testnet11")
@@ -244,7 +245,7 @@ def _action(
     digest = eip712_hash_to_sign(prefix, coin_id, delegated_puzzle_hash)
     payload = {
         "schemaVersion": 1,
-        "purpose": "SGT_ALLOCATION_PROPOSAL",
+        "purpose": purpose,
         "proposalHash": _hex32(proposal_hash),
         "votingDeadline": voting_deadline,
         "signerSlot": slot,

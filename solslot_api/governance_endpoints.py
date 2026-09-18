@@ -1,6 +1,7 @@
 """Typed administrator queue for SGT sale and grant proposals."""
 from __future__ import annotations
 
+import hashlib
 import re
 import secrets
 import time
@@ -635,6 +636,64 @@ def create_proposal(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     _etag(response, value)
     return _public(value)
+
+
+class StarterGrantRecipients(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    vault_launcher_ids: list[str] = Field(alias='vaultLauncherIds', min_length=3, max_length=3)
+
+    @field_validator('vault_launcher_ids')
+    @classmethod
+    def distinct_vaults(cls, values: list[str]) -> list[str]:
+        normalized = ['0x' + _b32(value, 'administrator vault', nonzero=True).hex() for value in values]
+        if len(set(normalized)) != 3:
+            raise ValueError('select a different enrolled vault for each administrator')
+        return normalized
+
+
+@router.post('/admin/governance/sgt-starter-grants/preview')
+async def preview_starter_grants(
+    body: StarterGrantRecipients,
+    request: Request,
+    _: Annotated[AdminClaims, Depends(require_admin_jwt)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict:
+    """Prepare three ordinary grants; publication retains owner-plus-one authority."""
+    from .sols_market import _statutes_snapshot
+    from .sols_swaps import _required_singleton_tip
+
+    require_sgt_allocation_drafts(settings)
+    try:
+        artifact = load_signed_public_artifact(settings)
+        launchers = artifact['genesisPlan']['launcherIds']
+        provider = request.app.state.coinset
+        tip = await _required_singleton_tip(provider, launchers['statutes'], 'protocol statutes')
+        statutes = await _statutes_snapshot(provider, tip, artifact)
+        amount = statutes.parameters.min_proposal_stake
+        if amount <= 0:
+            raise ValueError('current minimum proposal stake is invalid')
+        proposals = []
+        for slot, vault_id in enumerate(body.vault_launcher_ids):
+            approved = require_current_approved_vault(settings, vault_id)
+            # These are explicitly selected recipients. The owner and coadmin
+            # review the slot-to-vault mapping before any on-chain allocation.
+            grant_id = hashlib.sha256(bytes(Program.to([
+                b'SOLSLOT_ADMIN_STARTER_V1', _b32(launchers['adminAuthority'], 'authority'),
+                slot, _b32(approved.launcher_id, 'recipient'), amount,
+            ]))).hexdigest()
+            proposal = CreateGovernanceProposal.model_validate({
+                'kind': 'SGT_GRANT', 'title': f'Administrator {slot + 1} starter SGT',
+                'sgtAmount': str(amount), 'recipientVaultLauncherId': approved.launcher_id,
+                'grantId': '0x' + grant_id,
+                'reasonHash': '0x' + hashlib.sha256(b'One minimum proposal stake for administrator participation').hexdigest(),
+            })
+            proposals.append(proposal.model_dump(by_alias=True, exclude_none=True))
+        return {'amountPerAdministrator': str(amount), 'totalAmount': str(amount * 3),
+            'statutesCoinId': statutes.live_coin_id,
+            'authorityRule': 'Owner administrator plus one of the other two administrators',
+            'proposals': proposals}
+    except (KeyError, TypeError, ValueError, PublicArtifactError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/admin/governance/sgt-allocation-options")

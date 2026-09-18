@@ -213,6 +213,12 @@ def test_http_dependency_rejects_jwt_only_and_consumes_owner_approval(
     client = TestClient(app)
 
     assert client.post("/admin/example", json={"value": 7}).status_code == 428
+    app.dependency_overrides[require_admin_jwt] = lambda: claims(COADMIN)
+    denied = client.post('/admin/example', json={'value': 7},
+        headers={'X-Solslot-Admin-Operation-Id': operation_id})
+    assert denied.status_code == 403
+    assert store.get(operation_id)['status'] == 'approved'
+    app.dependency_overrides[require_admin_jwt] = lambda: claims()
     authorized = client.post(
         "/admin/example",
         json={"value": 7},
@@ -275,7 +281,7 @@ def test_http_prepare_sign_and_execute_requires_owner_plus_one(
 
     @app.post(
         "/admin/example",
-        dependencies=[Depends(require_admin_operation("mint.publish"))],
+        dependencies=[Depends(require_admin_operation("mint.cancel"))],
     )
     async def protected() -> dict[str, bool]:
         return {"ok": True}
@@ -289,7 +295,7 @@ def test_http_prepare_sign_and_execute_requires_owner_plus_one(
     prepared = client.post(
         "/admin/auth/operations/prepare",
         json={
-            "operation": "mint.publish",
+            "operation": "mint.cancel",
             "revision": 0,
             "requestBinding": {
                 "method": "POST",
@@ -338,3 +344,60 @@ def test_http_prepare_sign_and_execute_requires_owner_plus_one(
         ).json()["count"]
         == 1
     )
+
+
+@pytest.mark.parametrize('coadmin_slot', [1, 2])
+def test_mint_requires_matching_http_and_chain_approvals(tmp_path, monkeypatch, coadmin_slot):
+    from types import SimpleNamespace
+    from solslot_api import admin_operations as operations
+    accounts = tuple(Account.from_key(bytes([index])*32) for index in (61, 62, 63))
+    roster = AdminRoster(launcher_id=bytes32(b'\x11'*32), compressed_pubkeys=tuple(
+        eth_keys.PrivateKey(bytes(account.key)).public_key.to_compressed_bytes() for account in accounts))
+    monkeypatch.setattr(operations, 'resolve_admin_roster', lambda _: roster)
+    class Action:
+        def __init__(self, slot):
+            self.action_id = '0x'+bytes([slot+10]).hex()*32
+            self.message_hash = '0x'+bytes([slot+20]).hex()*32
+            self.signer_public_key = '0x'+roster.compressed_pubkeys[slot].hex()
+        def to_wire(self, *, signed):
+            return {'actionId': self.action_id, 'signed': signed}
+    actions = [Action(slot) for slot in range(3)]
+    stale = [False]
+    async def build(value, request, settings):
+        if stale[0]: raise ValueError('mint publication package is stale')
+        return SimpleNamespace(actions=actions)
+    monkeypatch.setattr(operations, '_mint_build', build)
+    store = OperationStore(tmp_path/'admin.db')
+    settings = Settings(runtime_environment='test', admin_operation_approvals_enabled=True,
+        admin_db_path=str(tmp_path/'admin.db'), eip712_chain_id=11155111)
+    subject = [accounts[0].address.lower()]
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[require_admin_jwt] = lambda: claims(subject[0])
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_operation_store] = lambda: store
+    client = TestClient(app)
+    response = client.post('/admin/auth/operations/prepare', json={'operation': 'mint.publish', 'revision': 0,
+        'requestBinding': {'method': 'POST', 'path': '/admin/committee/propose', 'query': [], 'body': {'exact': 'wallet package'}}})
+    assert response.status_code == 201, response.text
+    operation = response.json()
+    operation_id = operation['operationId']
+    for slot in (0, coadmin_slot):
+        subject[0] = accounts[slot].address.lower()
+        http_sig = accounts[slot].sign_message(encode_typed_data(full_message=operation['typedData'])).signature
+        request_body = {'signature': '0x'+http_sig.hex()}
+        url = f'/admin/auth/operations/{operation_id}/sign'
+        assert client.post(url, json=request_body).status_code == 409
+        assert len(store.get(operation_id)['signatures']) == (0 if slot == 0 else 1)
+        sig = eth_keys.PrivateKey(bytes(accounts[slot].key)).sign_msg_hash(bytes.fromhex(actions[slot].message_hash[2:]))
+        request_body.update(chainActionId=actions[(slot+1)%3].action_id,
+            chainSignature='0x'+(sig.r.to_bytes(32,'big')+sig.s.to_bytes(32,'big')).hex())
+        assert client.post(url, json=request_body).status_code == 409
+        request_body['chainActionId'] = actions[slot].action_id
+        signed = client.post(url, json=request_body)
+        assert signed.status_code == 200, signed.text
+        assert signed.json()['status'] == ('pending' if slot == 0 else 'approved')
+    restored = OperationStore(tmp_path/'admin.db').get(operation_id)
+    assert len(restored['chain_signatures']) == len(restored['signatures']) == 2
+    stale[0] = True
+    assert client.get(f'/admin/auth/operations/{operation_id}').status_code == 409

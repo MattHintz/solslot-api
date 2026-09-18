@@ -185,6 +185,15 @@ class OperationStore:
                     FOREIGN KEY(operation_id) REFERENCES admin_operations(operation_id)
                         ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS admin_operation_chain_signatures (
+                    operation_id TEXT NOT NULL,
+                    admin_index INTEGER NOT NULL CHECK(admin_index BETWEEN 0 AND 2),
+                    action_id TEXT NOT NULL,
+                    signature TEXT NOT NULL,
+                    PRIMARY KEY(operation_id,admin_index),
+                    FOREIGN KEY(operation_id,admin_index)
+                        REFERENCES admin_operation_signatures(operation_id,admin_index)
+                );
                 """
             )
 
@@ -230,9 +239,14 @@ class OperationStore:
                 "FROM admin_operation_signatures WHERE operation_id=? ORDER BY admin_index",
                 (operation_id.lower(),),
             ).fetchall()
+            chain_signatures = connection.execute(
+                "SELECT admin_index,action_id,signature FROM admin_operation_chain_signatures "
+                "WHERE operation_id=? ORDER BY admin_index", (operation_id.lower(),),
+            ).fetchall()
         value = dict(row)
         value["request_binding"] = json.loads(value.pop("request_binding_json"))
         value["signatures"] = [dict(item) for item in signatures]
+        value["chain_signatures"] = [dict(item) for item in chain_signatures]
         slots = {int(item["admin_index"]) for item in signatures}
         value["status"] = (
             "consumed"
@@ -280,6 +294,8 @@ class OperationStore:
         compressed_pubkey: str,
         signature: str,
         now: int,
+        chain_action_id: str | None = None,
+        chain_signature: str | None = None,
     ) -> dict[str, Any]:
         with self._transaction() as connection:
             row = connection.execute(
@@ -307,6 +323,12 @@ class OperationStore:
                 )
             except sqlite3.IntegrityError as exc:
                 raise ValueError("admin slot already signed this operation") from exc
+            if (chain_action_id is None) != (chain_signature is None):
+                raise ValueError('chain signature requires its exact action identifier')
+            if chain_action_id is not None:
+                connection.execute(
+                    "INSERT INTO admin_operation_chain_signatures(operation_id,admin_index,action_id,signature) "
+                    "VALUES(?,?,?,?)", (operation_id.lower(), admin_index, chain_action_id, chain_signature))
             slots = {
                 int(item["admin_index"])
                 for item in connection.execute(
@@ -400,6 +422,32 @@ class PrepareOperationRequest(BaseModel):
 
 class SignOperationRequest(BaseModel):
     signature: str = Field(..., min_length=132, max_length=132)
+    chain_action_id: str | None = Field(None, alias="chainActionId", pattern=r"^0x[0-9a-fA-F]{64}$")
+    chain_signature: str | None = Field(None, alias="chainSignature", pattern=r"^0x(?:[0-9a-fA-F]{128}|[0-9a-fA-F]{130})$")
+
+
+async def _mint_build(value, request: Request, settings: Settings):
+    if value['operation'] != 'mint.publish':
+        return None
+    from .genesis import get_genesis_store
+    from .mint_publication import prepare_mint_authorization
+    provider = getattr(request.app.state, 'coinset', None)
+    if provider is None:
+        raise ValueError('Testnet11 Chia provider is unavailable')
+    return await prepare_mint_authorization(binding=value['request_binding'],
+        created_by=value['created_by'], provider=provider, settings=settings,
+        genesis_store=get_genesis_store(settings))
+
+
+def _with_mint_actions(public, build, value):
+    if build is None:
+        return public
+    signed = {item['action_id'] for item in value.get('chain_signatures', [])}
+    public['chainActions'] = [{**action.to_wire(signed=action.action_id in signed),
+        'summary': 'Approve this exact mint proposal, vault stake, deadline and current protocol inputs.',
+        'financialEffect': 'The chosen vault SGT is locked until the voting deadline. No deed is issued at publication.'}
+        for action in build.actions]
+    return public
 
 
 def _public_operation(
@@ -446,8 +494,9 @@ def _core_from_record(value: dict[str, Any]) -> AdminOperationCoreV1:
 
 
 @router.post("/prepare", status_code=201)
-def prepare_operation(
+async def prepare_operation(
     body: PrepareOperationRequest,
+    request: Request,
     claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[OperationStore, Depends(get_operation_store)],
@@ -473,8 +522,10 @@ def prepare_operation(
             nonce=bytes32(secrets.token_bytes(32)),
             expires_at=now + body.expires_in_seconds,
         )
+        build = await _mint_build({'operation': body.operation, 'request_binding': binding,
+            'created_by': claims.sub}, request, settings)
         value = store.create(core=core, binding=binding, created_by=claims.sub, now=now)
-        return _public_operation(value, core, chain_id=settings.eip712_chain_id)
+        return _with_mint_actions(_public_operation(value, core, chain_id=settings.eip712_chain_id), build, value)
     except (KeyError, TypeError, ValueError, sqlite3.IntegrityError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -503,27 +554,34 @@ def list_operations(
 
 
 @router.get("/{operation_id}")
-def get_operation(
+async def get_operation(
     operation_id: str,
+    request: Request,
     _claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[OperationStore, Depends(get_operation_store)],
 ) -> dict[str, Any]:
     try:
         value = store.get(operation_id)
-        return _public_operation(
+        public = _public_operation(
             value,
             _core_from_record(value),
             chain_id=settings.eip712_chain_id,
         )
-    except (KeyError, ValueError) as exc:
+        if value['status'] != 'consumed':
+            public = _with_mint_actions(public, await _mint_build(value, request, settings), value)
+        return public
+    except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.post("/{operation_id}/sign")
-def sign_operation(
+async def sign_operation(
     operation_id: str,
     body: SignOperationRequest,
+    request: Request,
     claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[OperationStore, Depends(get_operation_store)],
@@ -544,6 +602,19 @@ def sign_operation(
             admin_index = roster.compressed_pubkeys.index(recovered.compressed_pubkey)
         except ValueError as exc:
             raise ValueError("signature key is not in the active admin roster") from exc
+        build = await _mint_build(value, request, settings)
+        chain_signature = None
+        if build is not None:
+            from solslot_puzzles.eip712_helpers import normalize_eip712_member_signature
+            action = build.actions[admin_index]
+            if body.chain_action_id != action.action_id or body.chain_signature is None:
+                raise ValueError('mint approval requires this administrator\'s exact current chain action')
+            chain_signature = '0x' + normalize_eip712_member_signature(
+                signature=bytes.fromhex(body.chain_signature[2:]),
+                digest=_parse_hex32(action.message_hash, 'identity action hash'),
+                compressed_pubkey=bytes.fromhex(action.signer_public_key[2:])).hex()
+        elif body.chain_action_id is not None or body.chain_signature is not None:
+            raise ValueError('this HTTP operation does not accept a chain signature')
         value = store.add_signature(
             operation_id=operation_id,
             admin_index=admin_index,
@@ -551,8 +622,10 @@ def sign_operation(
             compressed_pubkey=recovered.compressed_pubkey_hex,
             signature=body.signature,
             now=int(time.time()),
+            chain_action_id=body.chain_action_id,
+            chain_signature=chain_signature,
         )
-        return _public_operation(value, core, chain_id=settings.eip712_chain_id)
+        return _with_mint_actions(_public_operation(value, core, chain_id=settings.eip712_chain_id), build, value)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -602,6 +675,8 @@ def require_admin_operation(expected_operation: str):
             )
             value = store.get(operation_id)
             core = _core_from_record(value)
+            if expected_operation == 'mint.publish' and claims.sub.lower() != value['created_by'].lower():
+                raise HTTPException(status_code=403, detail='Only the original proposer may publish')
             roster = resolve_admin_roster(settings)
             if core.authority_launcher_id != roster.launcher_id:
                 raise ValueError("admin operation is bound to a stale authority launcher")
@@ -624,6 +699,7 @@ def require_admin_operation(expected_operation: str):
                 caller=claims.sub,
                 now=int(time.time()),
             )
+            request.state.admin_operation = value
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:

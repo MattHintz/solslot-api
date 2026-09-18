@@ -73,6 +73,7 @@ from .credential_auth import require_vault_record
 from .funded_redemption_store import get_funded_redemption_store
 from .governance_queue import GovernanceQueueRecord
 from .sols_swaps import _confirmed_cat_lineage, _confirmed_coin_and_lineage
+from .sgt_lineage import confirmed_sgt_lineage
 from .vault_eligibility import ApprovedVault, require_current_approved_vault
 
 
@@ -853,7 +854,7 @@ async def build_allocation_vote(
     sgt_coin = matches[0]
     if await provider.get_mempool_items_by_coin_name(_hex32(sgt_coin.name())):
         raise ValueError("the selected SGT vote is already pending in the mempool")
-    sgt_lineage = await _confirmed_cat_lineage(
+    sgt_lineage = await confirmed_sgt_lineage(
         provider=provider,
         coin=sgt_coin,
         expected_inner_hash=bytes32(free_inner.get_tree_hash()),

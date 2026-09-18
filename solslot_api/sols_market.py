@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 from solslot_puzzles import load_puzzle
 from solslot_puzzles.mint_publish_driver import canonical_p2_pool_mod_hash
 from solslot_puzzles.pool_economics_v2 import deed_metadata_commitment
-from solslot_puzzles.pool_v4_driver import pool_v4_inner_mod_hash
+from solslot_puzzles.pool_v4_driver import pool_puzzle_version_for_hash
 from solslot_puzzles.protocol_statutes_driver import (
     protocol_statutes_inner_mod_hash,
 )
@@ -622,8 +622,7 @@ def _decode_pool_state(
     inner_args = list(inner_args_program.as_iter())
     if len(inner_args) != 13:
         raise ValueError("Pool V4 inner puzzle must have 13 arguments")
-    if inner_mod.get_tree_hash() != pool_v4_inner_mod_hash():
-        raise ValueError("pool inner module hash is not Pool V4")
+    pool_puzzle_version_for_hash(inner_mod.get_tree_hash())
 
     _, inner_solution = _solution_parts(
         str(puzzle_solution["solution"]), "pool"

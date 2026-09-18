@@ -9,7 +9,7 @@ protocol assembler are never advertised as executable.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 from time import time
 from typing import Annotated, Any, Literal, Mapping, Optional
@@ -42,6 +42,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from solslot_puzzles import load_puzzle
+from .sols_reserve import ReserveConsolidation, prepare_reserve_anchor
 from solslot_puzzles.pool_economics_v2 import deed_metadata_commitment
 from solslot_puzzles.pool_v4_driver import (
     PoolV4Config,
@@ -336,6 +337,7 @@ class ReverseSolsSwapContext:
     reserve_lineage: LineageProof
     reserve_inner_puzzle: Program
     receipt: Any
+    reserve_consolidation: tuple[ReserveConsolidation, ...] = ()
 
 
 @router.post(
@@ -361,6 +363,8 @@ async def _snapshot_prepare(vault_launcher_id, body, request, settings):
         result = await _prepare_sols_swap(vault_launcher_id, body, request, settings)
         evidence, funding = result.unsigned_protocol_evidence, result.funding_evidence
         ephemeral = {"sols_settlement", "smart_deed"}
+        if any(value["role"] == "reserve_consolidation_0" for value in evidence["coinSpends"]):
+            ephemeral.add("sols_reserve")
         inputs = []
         for value in [*evidence["coinSpends"], {"role": "fee", **funding["fundingCoinSpend"]}]:
             if value["role"] in ephemeral:
@@ -523,9 +527,7 @@ async def _prepare_deed_to_sols_swap(
             if context.vault_record.auth_type == AUTH_TYPE_BLS
             else None
         )
-        unsigned_evidence = prepare_unsigned_deed_to_sols_swap(
-            **_reverse_protocol_offer_arguments(context),
-        )
+        unsigned_evidence = _prepare_reverse_evidence(context)
         quote = context.receipt.deed_to_sols_quote
         if quote is None:
             raise SolsSwapOfferError("SmartDeed-to-Sols quote is unavailable.")
@@ -903,7 +905,7 @@ async def _complete_deed_to_sols_swap(
                 raise SolsSwapOfferError(
                     "EVM vault settlement is rebuilt from its signed receipt."
                 )
-            evidence = prepare_unsigned_deed_to_sols_swap(**_reverse_protocol_offer_arguments(context))
+            evidence = _prepare_reverse_evidence(context)
             funding = _completion_funding_identity(request, settings, context, evidence, body)
             signature_data = _vault_signature_data(context, body)
             protocol = _build_reverse_protocol_offer(
@@ -935,12 +937,7 @@ async def _complete_deed_to_sols_swap(
                     )
                 )
             )
-            reserve_signature = G2Element.from_bytes(
-                faucet.sign_delegated_spend(
-                    context.reserve_coin,
-                    protocol.reserve_signing_conditions,
-                )
-            )
+            reserve_signature = _sign_reverse_reserve(context, protocol, faucet)
             unsigned_spend = protocol.offer.to_valid_spend()
             valid_spend = WalletSpendBundle(
                 unsigned_spend.coin_spends,
@@ -1098,7 +1095,11 @@ async def _load_observed_context(derive, kwargs):
         if isinstance(context, SolsSwapContext):
             inputs.extend([("deed_custody", context.custody_coin), ("sols_payment", context.payment_coin)])
         else:
-            inputs.extend([("held_deed", context.deed.coin), ("sols_reserve", context.reserve_coin)])
+            inputs.append(("held_deed", context.deed.coin))
+            inputs.extend((f"sols_reserve_{index}",item.spend.coin)
+                for index,item in enumerate(context.reserve_consolidation))
+            if not context.reserve_consolidation:
+                inputs.append(("sols_reserve",context.reserve_coin))
         await snapshot.finish(inputs, {"quoteExpiresAt": context.receipt.quote_expires_at})
         return context
 
@@ -1444,6 +1445,8 @@ async def _derive_reverse_swap_context(
         config=config,
         vault_launcher_id=vault_record.launcher_id,
         deed_launcher_id=deed_launcher_id,
+        settings=settings,
+        artifact=artifact,
     )
     collections = [
         item
@@ -1509,7 +1512,7 @@ async def _derive_reverse_swap_context(
         ),
         uint64(1),
     )
-    reserve_coin, reserve_lineage = await _load_reserve_cat(
+    reserve_coin, reserve_lineage, reserve_consolidation = await prepare_reserve_anchor(
         provider=provider,
         artifact=artifact,
         config=config,
@@ -1551,6 +1554,7 @@ async def _derive_reverse_swap_context(
         vault_lineage=vault_lineage,
         deed=deed,
         reserve_coin=reserve_coin,
+        reserve_consolidation=reserve_consolidation,
         reserve_lineage=reserve_lineage,
         reserve_inner_puzzle=faucet.key.puzzle,
         receipt=receipt,
@@ -1604,18 +1608,43 @@ def _reverse_protocol_offer_arguments(context: ReverseSolsSwapContext) -> dict[s
 def _build_reverse_protocol_offer(
     context: ReverseSolsSwapContext, *, signature_data: bytes | None,
 ) -> Any:
-    return build_deed_to_sols_protocol_offer(
+    protocol = build_deed_to_sols_protocol_offer(
         **_reverse_protocol_offer_arguments(context), vault_signature_data=signature_data,
     )
+    if not context.reserve_consolidation:
+        return protocol
+    original=protocol.offer
+    bundle=WalletSpendBundle([*(item.spend for item in context.reserve_consolidation),
+        *original.coin_spends()],original.aggregated_signature())
+    return replace(protocol,offer=Offer(original.requested_payments,bundle,original.driver_dict))
+
+
+def _prepare_reverse_evidence(context: ReverseSolsSwapContext) -> UnsignedSolsSwapEvidence:
+    evidence=prepare_unsigned_deed_to_sols_swap(**_reverse_protocol_offer_arguments(context))
+    spends=tuple(item.spend for item in context.reserve_consolidation)
+    if not spends:
+        return evidence
+    return replace(evidence,coin_spends=(*spends,*evidence.coin_spends),
+        spend_roles=(*(f"reserve_consolidation_{index}" for index in range(len(spends))),*evidence.spend_roles))
+
+
+def _sign_reverse_reserve(context: ReverseSolsSwapContext, protocol, faucet) -> G2Element:
+    signatures=[G2Element.from_bytes(faucet.sign_delegated_spend(
+        context.reserve_coin,protocol.reserve_signing_conditions))]
+    signatures.extend(G2Element.from_bytes(faucet.sign_delegated_spend(
+        item.spend.coin,item.signing_conditions)) for item in context.reserve_consolidation)
+    return AugSchemeMPL.aggregate(signatures)
 
 
 def _initial_pool_config(
     artifact: Mapping[str, Any],
     tip: SingletonTip,
 ) -> PoolV4Config:
+    from solslot_puzzles.pool_v4_driver import pool_puzzle_version_for_hash
     hashes = artifact["puzzleHashes"]
     trusted = artifact["genesisPlan"]["trustedDestinations"]
     config = PoolV4Config(
+        pool_puzzle_version=pool_puzzle_version_for_hash(_b32(hashes["poolInnerModHash"], "poolInnerModHash")),
         pool_launcher_id=_b32(tip.launcher_id, "poolLauncherId"),
         statutes_inner_mod_hash=_b32(
             hashes["statutesInnerModHash"],
@@ -1669,6 +1698,8 @@ async def _load_vault_held_deed(
     config: PoolV4Config,
     vault_launcher_id: bytes32,
     deed_launcher_id: str,
+    settings: Settings | None = None,
+    artifact: Mapping[str, Any] | None = None,
 ) -> VaultHeldDeed:
     normalized = _hex32_text(deed_launcher_id, "deedLauncherId")
     tip = await _singleton_tip(provider, normalized)
@@ -1699,25 +1730,66 @@ async def _load_vault_held_deed(
             "SmartDeed immutable terms are unavailable from chain."
         )
     prior_full = _program(str(last_spend["puzzle_reveal"]))
-    uncurried = prior_full.uncurry()
-    if uncurried is None:
-        raise SolsSwapOfferError("SmartDeed singleton puzzle is malformed.")
-    full_mod, full_args_program = uncurried
-    full_args = list(full_args_program.as_iter())
-    if (
-        full_mod.get_tree_hash() != SINGLETON_MOD_HASH
-        or len(full_args) != 2
-        or bytes(full_args[0]) != bytes(deed_struct)
-    ):
-        raise SolsSwapOfferError(
-            "SmartDeed singleton identity does not match RC22."
-        )
-    smart_inner = full_args[1]
+    from .sols_market import _singleton_spend, MAX_SINGLETON_EVIDENCE_COST
+    cursor = len(tip.lineage) - 2
+    custody_commitment = None
+    remaining_cost = MAX_SINGLETON_EVIDENCE_COST
+    for leg in range(3):
+        full_mod, full_args_program = prior_full.uncurry()
+        full_args = list(full_args_program.as_iter())
+        if (full_mod.get_tree_hash() != SINGLETON_MOD_HASH or len(full_args) != 2
+            or bytes(full_args[0]) != bytes(deed_struct)):
+            raise SolsSwapOfferError("SmartDeed singleton identity does not match RC22.")
+        smart_inner = full_args[1]
+        inner_mod, inner_args = smart_inner.uncurry()
+        pool_custody = inner_mod.get_tree_hash() == config.p2_pool_v2_mod_hash
+        if leg == 0 and smart_inner.get_tree_hash() == OFFER_MOD_HASH:
+            # Native primary offers settle through one ephemeral OFFER_MOD
+            # singleton. Authenticate that exact preceding link before reading
+            # the inventory commitment; never search arbitrary old metadata.
+            if cursor < 1 or tip.lineage[cursor-1].spent_height != tip.lineage[cursor].spent_height:
+                raise SolsSwapOfferError("SmartDeed offer settlement is not atomic.")
+        elif pool_custody and custody_commitment is None and leg < 2:
+            # A pool withdrawal's previous immutable reveal is the deposit
+            # that created this exact custody coin, possibly in an older block.
+            values = list(inner_args.as_iter())
+            if (len(values) != 5 or values[0].as_atom() != bytes(config.p2_pool_v2_mod_hash)
+                or values[1].as_atom() != bytes(SINGLETON_MOD_HASH)
+                or values[2].as_atom() != bytes(config.pool_launcher_id)
+                or values[3].as_atom() != bytes(SINGLETON_LAUNCHER_HASH)
+                or len(values[4].as_atom()) != 32 or cursor < 1):
+                raise SolsSwapOfferError("SmartDeed custody does not match the governed pool.")
+            custody_commitment = bytes32(values[4].as_atom())
+        else:
+            break
+        preceding, consumed_cost = await _singleton_spend(provider,tip.lineage[cursor-1],tip.lineage[cursor],
+            max_cost=remaining_cost)
+        remaining_cost -= consumed_cost
+        cursor -= 1
+        prior_full = _program(str(preceding["puzzle_reveal"]))
     smart_uncurried = smart_inner.uncurry()
     if smart_uncurried is None:
         raise SolsSwapOfferError("SmartDeed immutable puzzle is malformed.")
     smart_mod, smart_args_program = smart_uncurried
     smart_args = list(smart_args_program.as_iter())
+    if custody_commitment is not None and smart_mod.get_tree_hash() != load_puzzle("smart_deed_inner_v2.clsp").get_tree_hash():
+        raise SolsSwapOfferError("Pool custody has no exact SmartDeed deposit predecessor.")
+    if smart_mod.get_tree_hash() == load_puzzle("mint_offer_delegate_v5.clsp").get_tree_hash():
+        # A primary purchase delivers directly from inventory into vault
+        # custody. Its confirmed parent commits to the SmartDeed inner hash,
+        # while the persisted mint record provides the immutable preimage.
+        from .deed_witness import primary_deed_inner
+        from .mint_endpoints import get_mint_proposal_store
+        if settings is None or artifact is None:
+            raise SolsSwapOfferError("Primary SmartDeed mint witness is unavailable.")
+        try:
+            record = get_mint_proposal_store(settings).get_by_deed_launcher_id(bytes(deed_id))
+            smart_inner = primary_deed_inner(record=record,deed_id=deed_id,deed_struct=deed_struct,
+                inventory_args=smart_args,config=config,artifact=artifact)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SolsSwapOfferError("Primary SmartDeed mint witness does not match chain.") from exc
+        smart_mod, smart_args_program = smart_inner.uncurry()
+        smart_args = list(smart_args_program.as_iter())
     if (
         smart_mod.get_tree_hash()
         != load_puzzle("smart_deed_inner_v2.clsp").get_tree_hash()
@@ -1741,6 +1813,8 @@ async def _load_vault_held_deed(
         collection_id,
         share_ppm,
     )
+    if custody_commitment is not None and custody_commitment != commitment:
+        raise SolsSwapOfferError("SmartDeed deposit does not match the pool custody commitment.")
     coin, lineage = await _confirmed_coin_and_lineage(
         provider,
         tip.live.coin_id,
@@ -1912,6 +1986,7 @@ async def _select_vault_sols_payment_coin(
     required_amount: int,
     required_coin_id: bytes32 | None = None,
 ) -> VaultSolsPaymentCoin | None:
+    from .cat_lineage import confirmed_cat_receipt_lineage
     inner = puzzle_for_vault_sols_inner(
         config=config,
         vault_launcher_id=vault_launcher_id,
@@ -1950,11 +2025,12 @@ async def _select_vault_sols_payment_coin(
                 _hex32(coin.name()),
                 "vault Sols payment coin",
             )
-            lineage = await _confirmed_cat_lineage(
+            lineage = await confirmed_cat_receipt_lineage(
                 provider=provider,
                 coin=confirmed,
                 expected_inner_hash=bytes32(inner.get_tree_hash()),
                 expected_tail_hash=config.permanent_rules.sols_tail_hash,
+                asset_label='Sols',
             )
         except (ValueError, SolsSwapOfferError):
             continue
@@ -2028,6 +2104,7 @@ def _pool_config(
     artifact: Mapping[str, Any],
     tip: SingletonTip,
 ) -> PoolV4Config:
+    from solslot_puzzles.pool_v4_driver import pool_puzzle_version_for_hash
     full = _program(str(pool_solution["puzzle_reveal"]))
     full_uncurried = full.uncurry()
     if full_uncurried is None:
@@ -2089,6 +2166,7 @@ def _pool_config(
             "Pool V4 deed launcher does not match signed genesis."
         )
     return PoolV4Config(
+        pool_puzzle_version=pool_puzzle_version_for_hash(_inner_mod.get_tree_hash()),
         pool_launcher_id=pool_launcher,
         statutes_inner_mod_hash=_node_b32(
             statutes_values[0],
