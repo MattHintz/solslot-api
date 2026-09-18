@@ -183,9 +183,17 @@ def current_launch_authority(
         if publication.get("schemaVersion") != 1 or not isinstance(publication.get("artifact"), Mapping):
             raise PublicArtifactError("reserved launch publication is invalid")
         artifact = verify_signed_public_artifact_payload(publication["artifact"])
+        from solslot_puzzles.enrollment_activation import enrollment_identity_chain_id
+        try:
+            identity_chain = enrollment_identity_chain_id(artifact,
+                environment=settings.runtime_environment + '-alpha')
+        except ValueError as exc:
+            raise PublicArtifactError('reserved launch identity binding changed') from exc
         if (artifact.get("artifactHash") != record.get("artifact_hash")
             or artifact.get("network") != settings.network
-            or artifact.get("evmChainId") != settings.zkpassport_evm_chain_id):
+            or identity_chain != settings.zkpassport_evm_chain_id
+            or (artifact.get('enrollmentActivation') is not None
+                and artifact.get('evmChainId') != settings.eip712_chain_id)):
             raise PublicArtifactError("reserved launch artifact binding changed")
         from .genesis import _expected_bootstrap_lock, _validate_bootstrap_lock
         lock = publication.get("bootstrapLock")

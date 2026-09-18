@@ -15,18 +15,19 @@ from solslot_puzzles.enrollment_activation import activation_context
 from solslot_api import enrollment_permit_signing as signer
 from tests.test_enrollment_permit_issuance import artifact,signature,SYNTHETIC_KEY
 
-def inputs():
-    active=artifact()['enrollmentActivation']
+def inputs(identity_chain=84532):
+    active=artifact(identity_chain)['enrollmentActivation']
     wire=EnrollmentPermit(bytes32(b'p'*32),activation_context(active).context_hash,bytes32(b'v'*32),
         bytes32(b'c'*32),2,bytes32(b'o'*32),bytes32(b'b'*32),1900000000,1900000900).to_wire()
     settings=SimpleNamespace(enrollment_permit_issuer_key_ref=active['issuerKeyRef'],
         enrollment_permit_identity_client_id=active['issuerIdentityClientId'],enrollment_permit_release_identity=active['releaseIdentity'],
-        runtime_environment='staging',network='testnet11',zkpassport_evm_chain_id=84532,alpha_writes_enabled=True)
+        runtime_environment='staging',network='testnet11',zkpassport_evm_chain_id=identity_chain,alpha_writes_enabled=True)
     return settings,active,wire
 
 @pytest.mark.parametrize('high_s',[False,True])
-def test_exact_versioned_key_vault_digest_and_issuer_recovery(monkeypatch,high_s):
-    settings,active,wire=inputs();requests=[];real_client=httpx.Client
+@pytest.mark.parametrize('identity_chain',[84532,8453])
+def test_exact_versioned_key_vault_digest_and_issuer_recovery(monkeypatch,high_s,identity_chain):
+    settings,active,wire=inputs(identity_chain);requests=[];real_client=httpx.Client
     def handle(request):
         requests.append(request)
         if request.method=='GET':
@@ -79,3 +80,21 @@ def test_signature_cannot_replay_another_permit_or_deployment():
     other=EnrollmentPermit.from_wire(wire)
     from dataclasses import replace
     with pytest.raises(ValueError):signer.verify_permit_signature(replace(other,permit_id=bytes32(b'x'*32)).to_wire(),active,sig)
+
+
+def test_sepolia_issuer_signature_cannot_authorize_base_identity():
+    _,sepolia,wire=inputs(84532)
+    signature_on_sepolia=signature(sepolia,wire)
+    _,base,base_wire=inputs(8453)
+    assert base_wire['contextHash'] != wire['contextHash']
+    with pytest.raises(ValueError):
+        signer.verify_permit_signature(base_wire,base,signature_on_sepolia)
+
+
+@pytest.mark.parametrize('identity_chain',[84532,8453])
+def test_mismatched_identity_rpc_chain_never_opens_issuer_transport(monkeypatch,identity_chain):
+    settings,active,wire=inputs(identity_chain)
+    settings.zkpassport_evm_chain_id=8453 if identity_chain==84532 else 84532
+    monkeypatch.setattr(signer.httpx,'Client',lambda **_:pytest.fail('unexpected issuer transport'))
+    with pytest.raises(signer.PermitIssuerUnavailable):
+        signer.sign_permit_with_key_vault(settings,active,wire)

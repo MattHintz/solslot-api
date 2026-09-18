@@ -13,11 +13,12 @@ from tests.test_public_artifact import _signed_artifact
 from solslot_api.validator_installation import validate_install_candidate
 
 
-def candidate(tmp_path):
+def candidate(tmp_path, identity_chain=84532):
     accounts=[Account.from_key(bytes(31)+bytes([i])) for i in (71,72,73)]
     original=_signed_artifact(accounts=accounts)
     plan=original['genesisPlan']
     active=json.loads((Path(__file__).parent/'fixtures/enrollment-activation.json').read_text())['enrollmentActivation']
+    active['evmChainId']=identity_chain
     active['deploymentId']=original['ceremony']['ceremonyId']
     active['emitter']=original['evmAddresses']['attestationEmitter']
     context=activation_context(active).context_hash
@@ -31,7 +32,7 @@ def candidate(tmp_path):
         signature='0x'+bytes(accounts[i].sign_message(typed).signature).hex()) for i in (0,2)]
     artifact=tmp_path/'candidate.json';artifact.write_text(json.dumps(a))
     release=tmp_path/'release.json';release.write_text(json.dumps({'schemaVersion':2,'protocolVersion':'solslot-v2','api_commit':a['sourceShas']['api'],'protocol_commit':a['sourceShas']['protocol']}))
-    config=dict(SIGNER_INDEX=0,DEPLOYMENT_ENVIRONMENT='staging-alpha',EVM_CHAIN_ID=84532,EVM_RPC_URL='https://rpc.invalid',
+    config=dict(SIGNER_INDEX=0,DEPLOYMENT_ENVIRONMENT='staging-alpha',EVM_CHAIN_ID=identity_chain,EVM_RPC_URL='https://rpc.invalid',
         ENROLLMENT_ACTIVATION=json.dumps(a['enrollmentActivation'],separators=(',',':')),BRIDGE_POLICY_HASH=a['bridgePolicy']['policyHash'],
         ROSTER_PUBKEYS=json.dumps(a['validatorSet']['pubkeys']),
         EVM_FORWARDER_ADDRESS=a['evmAddresses']['forwarder'],EVM_VERIFIER_ADAPTER_ADDRESS=a['evmAddresses']['verifierAdapter'],
@@ -41,8 +42,10 @@ def candidate(tmp_path):
     write();return a,artifact,release,config,env,write
 
 
-def test_signed_candidate_is_checked_without_reading_keys_or_installing(tmp_path):
-    a,artifact,release,config,env,_=candidate(tmp_path)
+@pytest.mark.parametrize("identity_chain", [84532, 8453])
+def test_signed_candidate_is_checked_without_reading_keys_or_installing(tmp_path, identity_chain):
+    a,artifact,release,config,env,_=candidate(tmp_path, identity_chain)
+    assert a["network"] == "testnet11" and a["evmChainId"] == 84532
     before={p:p.read_bytes() for p in (artifact,release,env)}
     assert validate_install_candidate(str(env),str(artifact),str(release))==a['artifactHash']
     assert {p:p.read_bytes() for p in before}==before

@@ -12,7 +12,7 @@ from solslot_puzzles.enrollment_permit import EnrollmentPermit
 from solslot_api import zkpassport_enrollments as enroll, zkpassport_relay as relay
 from solslot_api.enrollment_permit_runtime import (
     BINDING_ABI, PERMIT_ABI, PERMIT_SELECTOR, LEGACY_SELECTOR, PERMIT_EVENT_TOPIC,
-    PERMIT_EVENT_ABI, decode_enrollment, validate_record_permit, require_calldata_record,
+    PERMIT_EVENT_ABI, PROOF_PARAMS_ABI, decode_enrollment, validate_record_permit, require_calldata_record,
     verify_permit_event_pair, hx,
 )
 from solslot_api.validator_quorum import ValidatorClaim, PermitValidatorClaim, configured_bridge_policy_hash
@@ -27,8 +27,12 @@ def calldata(record, permit=None):
     values = (p.permit_id, p.context_hash, p.vault_launcher_id, p.current_vault_coin_id,
         p.owner_auth_type, p.owner_key_hash, p.bridge_coin_id, p.issued_at, p.expires_at)
     binding = (bytes.fromhex(record['vaultLauncherId'][2:]), bytes.fromhex(record['bridgeParentId'][2:]), 1)
+    # Canonical private age-18 request; the cryptographic proof is synthetic.
+    proof = encode([PROOF_PARAMS_ABI], [(bytes.fromhex('0000001400000000000000000000000000000000000000000000000000000000'),
+        (b'k'*32, b'proof', [bytes(32)]*9), bytes.fromhex('0100021200'),
+        (604800, 'staging.solslot.com', 'vault:'+record['vaultLauncherId'], False))])
     return PERMIT_SELECTOR + encode([BINDING_ABI, PERMIT_ABI, 'bytes', 'bytes'],
-        [binding, values, bytes.fromhex(record['permitIssuerSignature'][2:]), b'proof'])
+        [binding, values, bytes.fromhex(record['permitIssuerSignature'][2:]), proof])
 
 
 def test_exact_calldata_owner_issuer_and_deadline(setup, monkeypatch):
@@ -105,7 +109,7 @@ def test_legacy_claim_hash_and_selected_wire_version_are_distinct(setup):
 def signer_settings(s):
     a=s.a
     return dict(signer_index=0,seed_file='/unread-synthetic-only',evm_rpc_url='https://base.example.invalid',
-        evm_chain_id=84532,deployment_environment='staging-alpha',enrollment_activation=s.active,
+        evm_chain_id=s.active['evmChainId'],deployment_environment='staging-alpha',enrollment_activation=s.active,
         bridge_policy_hash=s.active['bridgePolicyHash'],roster_pubkeys=a['validatorSet']['pubkeys'],
         evm_forwarder_address=a['evmAddresses']['forwarder'],evm_verifier_adapter_address=a['evmAddresses']['verifierAdapter'],
         evm_attestation_emitter_address=a['evmAddresses']['attestationEmitter'])
@@ -114,13 +118,18 @@ def signer_settings(s):
 def test_signer_config_requires_complete_selected_context(setup):
     s=setup;values=signer_settings(s);checked=ValidatorSettings(**values)
     assert checked.enrollment_activation==s.active
-    for field,value in [('evm_chain_id',11155111),('deployment_environment','production-alpha'),
+    other_selected_chain=8453 if s.active['evmChainId']==84532 else 84532
+    for field,value in [('evm_chain_id',11155111),('evm_chain_id',other_selected_chain),('deployment_environment','production-alpha'),
         ('enrollment_activation',None),('bridge_policy_hash','0x'+'ab'*32),('evm_attestation_emitter_address','0x'+'cd'*20)]:
         with pytest.raises(ValidationError):ValidatorSettings(**{**values,field:value})
     s.settings.zkpassport_validator_urls=['https://v0.test','https://v1.test','https://v2.test']
     s.settings.zkpassport_validator_pubkeys=s.a['validatorSet']['pubkeys']
     s.settings.zkpassport_emitter_address=s.active['emitter']
     assert configured_bridge_policy_hash(s.settings,activation=s.active)==s.active['bridgePolicyHash']
+    from solslot_api.validator_quorum import ValidatorQuorumError
+    s.settings.zkpassport_evm_chain_id=other_selected_chain
+    with pytest.raises(ValidatorQuorumError):
+        configured_bridge_policy_hash(s.settings,activation=s.active)
 
 
 def canonical_case(s, monkeypatch, auth_type):
@@ -169,7 +178,7 @@ def canonical_case(s, monkeypatch, auth_type):
         verifier=s.a['evmAddresses']['verifierAdapter'],trustedDirectRelayer='0x'+'dd'*20).items()})
     functions.isTrustedForwarder=lambda _:SimpleNamespace(call=lambda:True)
     block=dict(hash=blockhash,number=20,timestamp=s.clock[0]+1)
-    rpc=SimpleNamespace(eth=SimpleNamespace(chain_id=84532,block_number=40,get_transaction_receipt=lambda _:receipt,
+    rpc=SimpleNamespace(eth=SimpleNamespace(chain_id=s.active['evmChainId'],block_number=40,get_transaction_receipt=lambda _:receipt,
         get_block=lambda _:block,get_code=lambda _:b'code',contract=lambda **_:SimpleNamespace(functions=functions)))
     class FakeWeb3(Web3):
         def __new__(cls,*args,**kwargs):return rpc
@@ -232,7 +241,7 @@ def test_private_validator_rejects_alternate_evidence(setup,monkeypatch,change):
         vs.verify_validator_claim(c.settings,claim,claim.canonical_hash())
 
 
-@pytest.mark.parametrize('change',[None,'chain','context','missing_activation','environment'])
+@pytest.mark.parametrize('change',[None,'chain','other_selected_chain','context','missing_activation','environment'])
 def test_preartifact_validator_health_binds_selected_release(setup,change):
     import asyncio, httpx
     from solslot_api.validator_quorum import probe_validator_health, ValidatorQuorumError
@@ -242,10 +251,13 @@ def test_preartifact_validator_health_binds_selected_release(setup,change):
         index=int(request.url.host[1]);activation=copy.deepcopy(s.active)
         if change=='context':activation['contextHash']='0x'+'ab'*32
         if change=='environment':activation['environment']='production-alpha'
+        observed_chain=s.active['evmChainId']
+        if change=='chain':observed_chain=11155111
+        if change=='other_selected_chain':observed_chain=8453 if observed_chain==84532 else 84532
         body=dict(status='healthy',signerIndex=index,validatorPubkey=s.a['validatorSet']['pubkeys'][index],
             apiCommit=s.a['sourceShas']['api'],protocolCommit=s.a['sourceShas']['protocol'],network='testnet11',
             bridgePolicyHash=s.active['bridgePolicyHash'],evmAddresses=s.a['evmAddresses'],
-            artifactReady=False,artifactHash=None,ledgerReady=True,evmChainId=11155111 if change=='chain' else 84532,
+            artifactReady=False,artifactHash=None,ledgerReady=True,evmChainId=observed_chain,
             enrollmentActivation=None if change=='missing_activation' else activation)
         return httpx.Response(200,json=body)
     async def probe():
@@ -259,13 +271,14 @@ def test_preartifact_validator_health_binds_selected_release(setup,change):
         with pytest.raises(ValidatorQuorumError):asyncio.run(probe())
 
 
-@pytest.mark.parametrize('chain',[11155111,84532])
-def test_validator_chain_environment_text_retains_legacy_compatibility(setup,monkeypatch,chain):
+@pytest.mark.parametrize('legacy',[False,True])
+def test_validator_chain_environment_text_retains_legacy_compatibility(setup,monkeypatch,legacy):
+    chain = 11155111 if legacy else setup.active["evmChainId"]
     s=setup;values=signer_settings(s);values.pop('evm_chain_id')
     if chain==11155111:values['enrollment_activation']=None
     monkeypatch.setenv('SOLSLOT_VALIDATOR_EVM_CHAIN_ID',str(chain))
     assert ValidatorSettings(**values).evm_chain_id==chain
-    for bad in ('8453','mainnet','true','84532.0'):
+    for bad in ('1','mainnet','true','84532.0','8453.0'):
         monkeypatch.setenv('SOLSLOT_VALIDATOR_EVM_CHAIN_ID',bad)
         with pytest.raises(ValidationError):ValidatorSettings(**values)
 

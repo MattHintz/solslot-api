@@ -684,10 +684,14 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
             "SOLSLOT_EIP712_CHAIN_ID does not match SOLSLOT_NETWORK: "
             f"{settings.network} requires {expected_evm_chain_id}."
         )
-    if settings.zkpassport_evm_chain_id != expected_evm_chain_id:
+    # The selected identity deployment can use zkPassport's Base mainnet
+    # verifier while ceremony signatures and payment rails remain on testnet.
+    # The signed enrollment activation independently pins the exact identity
+    # chain; complete issuer metadata is mandatory for either selected chain.
+    identity_chains = {8453, 84532} if all(permit_metadata) else {expected_evm_chain_id}
+    if settings.zkpassport_evm_chain_id not in identity_chains:
         raise RuntimeError(
-            "SOLSLOT_ZKPASSPORT_EVM_CHAIN_ID does not match SOLSLOT_NETWORK: "
-            f"{settings.network} requires {expected_evm_chain_id}."
+            "SOLSLOT_ZKPASSPORT_EVM_CHAIN_ID does not match the selected identity deployment."
         )
 
     insecure_origins: list[str] = []

@@ -180,12 +180,14 @@ def _decode_enrollment_calldata(data: bytes) -> tuple[str, str, int]:
 
 
 def _validate_relay_permit(settings, enrollment, session, data: bytes, *, live=False):
-    from .enrollment_permit_runtime import require_calldata_record
+    from .enrollment_permit_runtime import require_calldata_record, require_private_age_query
     selected = bool(settings.enrollment_permit_release_identity or enrollment.get("enrollmentPermit"))
     permit = _record_permit(settings, enrollment, owner_auth_type=session.vault_record.auth_type,
         owner_key=session.owner_key, now=int(time.time()) if live else None) if selected else None
     try:
         require_calldata_record(data, enrollment, permit)
+        if selected:
+            require_private_age_query(data, environment=settings.runtime_environment + '-alpha')
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return permit
@@ -208,19 +210,16 @@ def _require_relayer_account(settings: Settings):
 
 
 def _describe_revert(exc: BaseException) -> str:
-    text = str(exc)
-    selectors = []
-    for match in _REVERT_SELECTOR_RE.findall(text):
+    # Providers can echo the full request/calldata in their exception. Only
+    # fixed, known diagnostics may leave this boundary; never return raw text
+    # or unrecognized bytes from an identity verification request.
+    descriptions = []
+    for match in _REVERT_SELECTOR_RE.findall(str(exc)):
         selector = match.lower()
-        if selector not in selectors:
-            selectors.append(selector)
-    if not selectors:
-        return text
-    decoded = [
-        _KNOWN_REVERT_SELECTORS.get(selector, f"Unknown EVM revert selector {selector}.")
-        for selector in selectors
-    ]
-    return f"{'; '.join(decoded)} Raw error: {text}"
+        description = _KNOWN_REVERT_SELECTORS.get(selector)
+        if description and description not in descriptions:
+            descriptions.append(description)
+    return '; '.join(descriptions) if descriptions else 'Identity verification was rejected by the EVM verifier.'
 
 
 def _simulate_forwarded_inner_call(
@@ -269,7 +268,7 @@ def _verify_emitter_deployment(
         try:
             verify_selected_emitter(w3, artifact, expected_direct_relayer=expected_direct_relayer)
         except ValueError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+            raise HTTPException(status_code=503, detail='The selected identity emitter could not be verified against the signed release.') from exc
     expected_policy = str(settings.zkpassport_bridge_policy_hash or "").lower()
     if re.fullmatch(r"0x[0-9a-f]{64}", expected_policy) is None:
         raise HTTPException(
@@ -601,14 +600,14 @@ def relay(req: RelayRequest, request: Request) -> RelayResponse:
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"RPC deployment check failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail="RPC deployment check failed. Retry after the identity network is available.") from exc
     forwarder = w3.eth.contract(address=forwarder_addr, abi=_FORWARDER_ABI)
 
     # ── Free pre-checks: signature/nonce/deadline, then full inner simulation ──
     try:
         valid = forwarder.functions.verify(request_tuple).call()
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"RPC verify() failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail="RPC signature verification failed. Retry after the identity network is available.") from exc
     if not valid:
         raise HTTPException(status_code=400, detail="ForwardRequest signature/nonce/deadline is invalid.")
 
@@ -630,12 +629,12 @@ def relay(req: RelayRequest, request: Request) -> RelayResponse:
             ),
         ) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"RPC simulation failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail="RPC simulation failed. The proof was not submitted.") from exc
 
     try:
         forwarder_nonce = int(forwarder.functions.nonces(signer).call())
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"RPC nonce lookup failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail="RPC nonce lookup failed. The proof was not submitted.") from exc
     request_digest = "0x" + hashlib.sha256(
         json.dumps(auth_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -800,7 +799,7 @@ def relay_bls(req: BlsRelayRequest, request: Request) -> RelayResponse:
             detail=f"Emitter simulation reverted: {_describe_revert(exc)}",
         ) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"RPC simulation failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail="RPC simulation failed. The proof was not submitted.") from exc
     if estimated <= 0 or estimated > _MAX_INNER_GAS:
         raise HTTPException(
             status_code=400,

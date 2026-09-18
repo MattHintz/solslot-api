@@ -61,7 +61,7 @@ def sign_permit_with_key_vault(settings: Any, activation: Mapping[str,Any], wire
             or identity!=settings.enrollment_permit_identity_client_id
             or activation['releaseIdentity']!=settings.enrollment_permit_release_identity
             or activation['environment']!=settings.runtime_environment+'-alpha'
-            or settings.network!='testnet11' or settings.zkpassport_evm_chain_id!=84532
+            or settings.network!='testnet11' or settings.zkpassport_evm_chain_id!=activation['evmChainId']
             or not settings.alpha_writes_enabled):
         raise PermitIssuerUnavailable('Permit issuer is not configured for this approved deployment.')
     permit=EnrollmentPermit.from_wire(wire)

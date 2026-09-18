@@ -48,7 +48,7 @@ async def reserve_and_issue_permit(settings: Any, session: Any, artifact: dict[s
     if getattr(session,'scope','vault')!='vault':
         raise HTTPException(status_code=403,detail='Permit issuance requires full vault-owner authentication.')
     activation=activation_from_artifact(artifact,required=True,environment=settings.runtime_environment+'-alpha')
-    if (settings.network!='testnet11' or settings.zkpassport_evm_chain_id!=84532
+    if (settings.network!='testnet11' or settings.zkpassport_evm_chain_id!=activation['evmChainId']
             or settings.enrollment_permit_release_identity!=activation['releaseIdentity']
             or settings.enrollment_permit_issuer_key_ref!=activation['issuerKeyRef']
             or settings.enrollment_permit_identity_client_id!=activation['issuerIdentityClientId']):

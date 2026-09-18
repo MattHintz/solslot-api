@@ -31,10 +31,12 @@ def reseal(s):
     Path(s.settings.genesis_evm_deployment_path).write_text(json.dumps(s.deployment))
 
 
-@pytest.fixture
-def deployment_setup(tmp_path, monkeypatch):
+@pytest.fixture(params=[84532, 8453], ids=["base-sepolia", "base-mainnet-identity"])
+def deployment_setup(tmp_path, monkeypatch, request):
     artifact=json.loads((Path(__file__).parent/'fixtures/enrollment-activation.json').read_text())
     plan=artifact['genesisPlan'];active=plan['enrollmentActivation']
+    identity_chain=request.param
+    active['evmChainId']=identity_chain
     deployer='0x'+'dd'*20;start=7
     addresses={name:'0x'+Web3.keccak(rlp.encode([bytes.fromhex(deployer[2:]),start+i]))[-20:].hex()
         for i,name in enumerate(selected.EVM_CONTRACTS)}
@@ -48,7 +50,7 @@ def deployment_setup(tmp_path, monkeypatch):
     codes={name:('runtime-'+name).encode() for name in (*selected.EVM_CONTRACTS,'zkPassportRootVerifier')}
     txs={name:dict(hash='0x'+f'{i+1:02x}'*32,blockNumber=100+i,blockHash='0x'+f'{i+11:02x}'*32,
         nonce=start+i,initCodeHash='0x'+Web3.keccak(('init-'+name).encode()).hex()) for i,name in enumerate(selected.EVM_CONTRACTS)}
-    deployment=dict(schemaVersion=3,protocolVersion='solslot-v2',credentialPolicyVersion=2,network='baseSepolia',chainId=84532,
+    deployment=dict(schemaVersion=3,protocolVersion='solslot-v2',credentialPolicyVersion=2,network='base' if identity_chain==8453 else 'baseSepolia',chainId=identity_chain,
         sourceShas=copy.deepcopy(active['sourceShas']),deployer=deployer,startNonce=start,
         **{field:addresses[name] for name,field in selected.ADDRESS_FIELDS.items()},
         trustedDirectRelayerAddress='0x'+'aa'*20,bridgePolicyHash=active['bridgePolicyHash'],
@@ -70,14 +72,14 @@ def deployment_setup(tmp_path, monkeypatch):
     review=dict(schema='solslot.enrollment-deployment-review.v1',outcome='approved',activationHash='',deploymentArtifactHash='',
         releaseEvidenceSha256=digest(raw),manifestHash=manifest['manifestHash'],sourceShas=copy.deepcopy(active['sourceShas']),
         reviews=[dict(scope=scope,approved=True,reviewer='synthetic-'+scope,evidenceHash='0x'+'ab'*32) for scope in sorted(selected.REVIEW_SCOPES)])
-    settings=Settings(runtime_environment='staging',network='testnet11',eip712_chain_id=84532,zkpassport_evm_chain_id=84532,
+    settings=Settings(runtime_environment='staging',network='testnet11',eip712_chain_id=84532,zkpassport_evm_chain_id=identity_chain,
         zkpassport_evm_rpc_url='https://rpc.invalid',genesis_evm_deployment_path=str(tmp_path/'deployment.json'),
         enrollment_deployment_review_path=str(tmp_path/'review.json'),enrollment_deployment_review_sha256='',
         enrollment_permit_release_identity=active['releaseIdentity'],enrollment_permit_issuer_key_ref=active['issuerKeyRef'],
         enrollment_permit_identity_client_id=active['issuerIdentityClientId'],launch_release_tag=release_tag,
         launch_source_evidence_path=str(tmp_path/'release.json'),launch_source_evidence_sha256=digest(raw))
     class Eth:
-        chain_id=84532
+        chain_id=identity_chain
         block_number=120
         def get_block(self,n): return {'hash':self.blocks[n]}
         def get_transaction_receipt(self,h): return copy.deepcopy(self.receipts[h])
@@ -99,7 +101,7 @@ def deployment_setup(tmp_path, monkeypatch):
         h=item['hash'];eth.blocks[item['blockNumber']]=item['blockHash']
         eth.receipts[h]=dict(status=1,transactionHash=h,blockNumber=item['blockNumber'],blockHash=item['blockHash'],contractAddress=addresses[name])
         eth.transactions[h]=dict(hash=h,blockNumber=item['blockNumber'],blockHash=item['blockHash'],nonce=item['nonce'],
-            chainId=84532,value=0,to=None,input='0x'+('init-'+name).encode().hex(),**{'from':deployer})
+            chainId=identity_chain,value=0,to=None,input='0x'+('init-'+name).encode().hex(),**{'from':deployer})
     eth.codes={**{addresses[name]:codes[name] for name in addresses},selected.ROOT_VERIFIER:codes['zkPassportRootVerifier']}
     emitter=addresses['attestationEmitter'];adapter=addresses['verifierAdapter']
     eth.getters={(emitter,name):value for name,value in dict(bridgePolicyHash=active['bridgePolicyHash'],permitContextHash=active['contextHash'],
@@ -122,13 +124,28 @@ def verify(s): return verify_genesis_evm_deployment(s.settings,s.record,s.plan)
 
 def test_selected_deployment_requires_independent_pins_and_returns_bound_receipts(deployment_setup):
     s=deployment_setup;result=verify(s)
-    assert result['chainId']==84532 and result['checkedAtBlock']==120
+    assert result['chainId']==s.active['evmChainId'] and result['checkedAtBlock']==120
     assert result['enrollmentDeploymentReview']['receipt']==s.review
     for name,contract in result['contracts'].items():
         assert contract['transactionHash']==s.deployment['deploymentTransactions'][name]['hash']
         assert contract['bytecodeHash']==s.deployment['runtimeCodeHashes'][name]
     s.settings.enrollment_deployment_review_sha256=''
     with pytest.raises(GenesisEvmEvidenceError,match='operator pin'):verify(s)
+
+
+@pytest.mark.parametrize('changed',['rpc','runtime','deployment','transaction'])
+def test_identity_chain_cannot_be_replaced_by_the_other_base_network(deployment_setup,changed):
+    s=deployment_setup
+    other=8453 if s.active['evmChainId']==84532 else 84532
+    assert s.plan['network']=='testnet11' and s.plan['evmChainId']==84532
+    if changed=='rpc':s.eth.chain_id=other
+    elif changed=='runtime':s.settings.zkpassport_evm_chain_id=other
+    elif changed=='deployment':
+        s.deployment['chainId']=other
+        s.deployment['network']='base' if other==8453 else 'baseSepolia'
+        reseal(s)
+    else:next(iter(s.eth.transactions.values()))['chainId']=other
+    with pytest.raises(GenesisEvmEvidenceError):verify(s)
 
 
 @pytest.mark.parametrize('failure',['review_bytes','source_bytes','missing_review_pin','missing_source_pin','wrong_manifest','unapproved','duplicate_lane','missing_lane','activation','chain','null_activation','runtime_environment','coordinator_issuer','plan_input','plan_sources'])

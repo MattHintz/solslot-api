@@ -20,6 +20,9 @@ LEGACY_SELECTOR = bytes.fromhex("d33b3d83")
 PERMIT_SELECTOR = bytes(Web3.keccak(text=f"verifyAndEmitWithPermit({BINDING_ABI},{PERMIT_ABI},bytes,bytes)"))[:4]
 PERMIT_EVENT_TOPIC = bytes(Web3.keccak(text="EnrollmentPermitConsumed(bytes32,bytes32,bytes32,bytes32,bytes32,uint8,bytes32,uint64,uint64,bytes32)"))
 PERMIT_EVENT_ABI = ["bytes32", "bytes32", "uint8", "bytes32", "uint64", "uint64", "bytes32"]
+PROOF_PARAMS_ABI = "(bytes32,(bytes32,bytes,bytes32[]),bytes,(uint256,string,string,bool))"
+ACCEPTED_PROOF_VERSION = bytes.fromhex('0000001400000000000000000000000000000000000000000000000000000000')
+PRIVATE_AGE_QUERY = bytes.fromhex('0100021200')
 
 
 def hx(value: bytes) -> str:
@@ -33,6 +36,7 @@ class EnrollmentCalldata:
     amount: int
     permit: EnrollmentPermit | None
     issuer_signature: str | None
+    proof: bytes
 
 
 def decode_enrollment(data: bytes) -> EnrollmentCalldata:
@@ -59,7 +63,30 @@ def decode_enrollment(data: bytes) -> EnrollmentCalldata:
     if permit is not None and permit.vault_launcher_id != binding[0]:
         raise ValueError("permit vault differs from enrollment binding")
     return EnrollmentCalldata(hx(binding[0]), hx(binding[1]), binding[2], permit,
-        hx(values[2]) if selected else None)
+        hx(values[2]) if selected else None, values[-1])
+
+
+def require_private_age_query(data: bytes, *, environment: str) -> None:
+    """Reject disclosure-bearing proof requests before relay storage or RPC.
+
+    This is an admission/privacy check, not cryptographic proof verification.
+    The Base adapter and zkPassport root still independently verify the proof.
+    The version-pinned five bytes encode only AGE(min=18,max=0); additional
+    disclosures, bindings and predicates are outside Solslot's current query.
+    """
+    parsed = decode_enrollment(data)
+    domain = {'staging-alpha': 'staging.solslot.com', 'production-alpha': 'solslot.com'}.get(environment)
+    if domain is None or parsed.permit is None:
+        raise ValueError('private identity query requires a selected alpha enrollment')
+    try:
+        params = decode([PROOF_PARAMS_ABI], parsed.proof)[0]
+    except (DecodingError, ValueError) as exc:
+        raise ValueError('identity proof envelope is malformed') from exc
+    if encode([PROOF_PARAMS_ABI], [params]) != parsed.proof:
+        raise ValueError('identity proof envelope is not canonical')
+    if (params[0] != ACCEPTED_PROOF_VERSION or params[2] != PRIVATE_AGE_QUERY
+            or params[3] != (604800, domain, 'vault:' + parsed.vault, False)):
+        raise ValueError('identity proof must contain only the private age-18 query for this vault')
 
 
 def validate_record_permit(record: Mapping[str, Any], artifact: Mapping[str, Any], *,
