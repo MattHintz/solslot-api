@@ -230,6 +230,7 @@ spends, including server-reconstructed owner-plus-one and statutes evidence.
             else None
         ),
         primary_purchase=primary_purchase,
+        governance_tracker_version=2,
     )
 
     launcher_solution = list(_program(launcher_spend.solution).as_iter())

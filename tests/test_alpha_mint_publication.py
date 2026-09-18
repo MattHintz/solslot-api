@@ -72,13 +72,21 @@ async def grant_stake(world, sim, client, provider, owner, coadmin_slot, amount)
 @pytest.mark.asyncio
 @pytest.mark.parametrize('auth_type', [1, 3], ids=['bls', 'evm'])
 @pytest.mark.parametrize('coadmin_slot', [1, 2])
-async def test_fresh_grant_to_vault_then_owner_plus_one_mint(monkeypatch, tmp_path, auth_type, coadmin_slot):
+@pytest.mark.parametrize('inventory', [False, True], ids=['historical-deed', 'inventory-v2'])
+async def test_fresh_grant_to_vault_then_owner_plus_one_mint(monkeypatch, tmp_path, auth_type, coadmin_slot, inventory):
     async with SpendSim.managed(None, defaults=CONSTANTS) as sim:
         client = SimClient(sim)
         world = await fresh_genesis(sim, client)
         owner = await launch_and_enroll(world, sim, client, auth_type)
         artifact = build_public_artifact(plan=world.plan, spend_bundle_id=world.built.spend_bundle.name(),
             confirmed_block_index=int(sim.block_height), review_class=INTERNAL_ENGINEERING_TESTNET_REVIEW_CLASS)
+        if inventory:
+            artifact['inventoryActivation'] = dict(schema='solslot.inventory-activation.v1',
+                network='testnet11', environment='production-alpha',
+                deploymentId=artifact['ceremony']['ceremonyId'], inventoryVersion=2, adapterVersion=1,
+                sourceShas=artifact['sourceShas'], reviewEvidenceSha256='ab'*32,
+                availableModuleHash=HX(load_puzzle('mint_offer_inventory_available_v2.clsp').get_tree_hash()),
+                reservedModuleHash=HX(load_puzzle('mint_offer_delegate_v5.clsp').get_tree_hash()))
         async def evidence(_settings):
             return artifact, {}, None
         for module in (publisher, execution, mint):
@@ -105,9 +113,16 @@ async def test_fresh_grant_to_vault_then_owner_plus_one_mint(monkeypatch, tmp_pa
         parent = world.origins[1]
         governance_struct = singleton_struct(protocol.governance_launcher_id)
         did_struct = singleton_struct(protocol.did_launcher_id)
+        from solslot_puzzles.mint_publish_driver import PrimaryPurchaseMintConfig
+        from solslot_puzzles.stripe_settlement_v1_driver import PRIMARY_PURCHASE_PROVIDER_ID
+        treasury = B(91) if inventory else B(190)
+        purchase = PrimaryPurchaseMintConfig(network='testnet11', usd_amount_minor=101,
+            technology_fee_bps=100, protocol_treasury_puzhash=treasury,
+            validator_pubkeys=world.plan.validator_pubkeys, provider_id=PRIMARY_PURCHASE_PROVIDER_ID,
+            inventory_version=2) if inventory else None
         artifacts = build_mint_publish_artifacts(property_id_canon=canonicalise_property_id('SYNTHETIC-MINT'),
             collection_id_canon=canonicalise_property_id('SYNTHETIC-COLLECTION'), share_ppm=1_000_000,
-            par_value_mojos=1_000_000, asset_class=1, jurisdiction=b'US', royalty_puzhash=B(190), royalty_bps=100,
+            par_value_mojos=1_000_000, asset_class=1, jurisdiction=b'US', royalty_puzhash=treasury, royalty_bps=100,
             quorum_threshold=2, owner_member_hash=member_hash, gov_member_hash=B(0),
             deed_launcher_parent_coin_name=parent.name(), proposal_launcher_parent_coin_name=parent.name(),
             protocol_did_singleton_struct=did_struct, protocol_did_puzhash=protocol.did_full_puzzle_hash,
@@ -115,7 +130,9 @@ async def test_fresh_grant_to_vault_then_owner_plus_one_mint(monkeypatch, tmp_pa
             pool_singleton_launcher_id=protocol.pool_launcher_id, pool_singleton_launcher_puzzle_hash=SINGLETON_LAUNCHER_HASH,
             p2_pool_mod_hash=load_puzzle('p2_pool_v2.clsp').get_tree_hash(),
             p2_vault_mod_hash=load_puzzle('p2_vault.clsp').get_tree_hash(),
-            property_registry_puzzle_hash=world.plan.property_registry.full_puzzle_hash)
+            property_registry_puzzle_hash=world.plan.property_registry.full_puzzle_hash,
+            governance_tracker_version=2, primary_purchase=purchase,
+            metadata_root=B(195) if inventory else None, metadata_anchor_id=B(196) if inventory else None)
         eve = proposal_driver.make_inner_puzzle(owner_member_hash=member_hash, gov_member_hash=B(0),
             proposal_data_hash=artifacts.proposal_data_hash, governance_singleton_struct=governance_struct,
             governance_proposal_hash=artifacts.proposal_hash, deed_launcher_id=artifacts.deed_launcher_id,
@@ -162,16 +179,23 @@ async def test_fresh_grant_to_vault_then_owner_plus_one_mint(monkeypatch, tmp_pa
             asset_class_name='RWA-RE-RES', property_id_canon=HX(canonicalise_property_id('SYNTHETIC-MINT')),
             collection_id_canon=HX(canonicalise_property_id('SYNTHETIC-COLLECTION')), share_ppm=1_000_000,
             property_registry_coin_id=HX(registry.name()), property_registry_puzzle_hash=HX(registry.puzzle_hash),
-            par_value_mojos=1_000_000, asset_class=1, jurisdiction=HX(b'US'), royalty_puzhash=HX(B(190)),
+            par_value_mojos=1_000_000, asset_class=1, jurisdiction=HX(b'US'), royalty_puzhash=HX(treasury),
             royalty_bps=100, quorum_threshold=2, owner_member_hash=HX(member_hash), gov_member_hash=HX(B(0)),
-            voting_deadline=deadline)
+            voting_deadline=deadline,
+            **(dict(primary_purchase_usd_amount_minor=101, inventory_puzzle_version=2,
+                    metadata_root=HX(B(195)), metadata_anchor_id=HX(B(196))) if inventory else {}))
         draft = SimpleNamespace(property_id=metadata.property_id, collection_id=metadata.collection_id,
             share_ppm=metadata.share_ppm, par_value=metadata.par_value_mojos, asset_class=metadata.asset_class_name,
-            jurisdiction='US', royalty_puzhash=B(190), royalty_bps=100, quorum_required=2)
+            jurisdiction='US', royalty_puzhash=treasury, royalty_bps=100, quorum_required=2)
         validation = dict(metadata=metadata, proposal=draft, artifact=artifact,
             authenticated_owner=admin_key.to_checksum_address(), stake_vault_launcher_id=owner.launcher_id)
         reviewed = validate_publish_bundle(bundle=base, owner_package=True, **validation)
         assert reviewed.proposal_hash == artifacts.proposal_hash
+        if inventory:
+            assert len(list(artifacts.bill_op_program.as_iter())) == 4
+            with pytest.raises(ValueError, match='re-derived full eve'):
+                validate_publish_bundle(bundle=base, owner_package=True,
+                    **{**validation, 'metadata': metadata.model_copy(update={'metadata_root': HX(B(197))})})
         monkeypatch.setattr(mint_endpoints, 'require_mint_writes', lambda _: None)
         monkeypatch.setattr(mint_endpoints, 'get_mint_proposal_store', lambda _: SimpleNamespace(get=lambda _: None))
         # Collection sealing is covered by its owning endpoint tests. Here the
