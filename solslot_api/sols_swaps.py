@@ -9,7 +9,7 @@ protocol assembler are never advertised as executable.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 from time import time
 from typing import Annotated, Any, Literal, Mapping, Optional
@@ -42,6 +42,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from solslot_puzzles import load_puzzle
+from .sols_reserve import ReserveConsolidation, prepare_reserve_anchor
 from solslot_puzzles.pool_economics_v2 import deed_metadata_commitment
 from solslot_puzzles.pool_v4_driver import (
     PoolV4Config,
@@ -336,6 +337,7 @@ class ReverseSolsSwapContext:
     reserve_lineage: LineageProof
     reserve_inner_puzzle: Program
     receipt: Any
+    reserve_consolidation: tuple[ReserveConsolidation, ...] = ()
 
 
 @router.post(
@@ -523,9 +525,7 @@ async def _prepare_deed_to_sols_swap(
             if context.vault_record.auth_type == AUTH_TYPE_BLS
             else None
         )
-        unsigned_evidence = prepare_unsigned_deed_to_sols_swap(
-            **_reverse_protocol_offer_arguments(context),
-        )
+        unsigned_evidence = _prepare_reverse_evidence(context)
         quote = context.receipt.deed_to_sols_quote
         if quote is None:
             raise SolsSwapOfferError("SmartDeed-to-Sols quote is unavailable.")
@@ -903,7 +903,7 @@ async def _complete_deed_to_sols_swap(
                 raise SolsSwapOfferError(
                     "EVM vault settlement is rebuilt from its signed receipt."
                 )
-            evidence = prepare_unsigned_deed_to_sols_swap(**_reverse_protocol_offer_arguments(context))
+            evidence = _prepare_reverse_evidence(context)
             funding = _completion_funding_identity(request, settings, context, evidence, body)
             signature_data = _vault_signature_data(context, body)
             protocol = _build_reverse_protocol_offer(
@@ -935,12 +935,7 @@ async def _complete_deed_to_sols_swap(
                     )
                 )
             )
-            reserve_signature = G2Element.from_bytes(
-                faucet.sign_delegated_spend(
-                    context.reserve_coin,
-                    protocol.reserve_signing_conditions,
-                )
-            )
+            reserve_signature = _sign_reverse_reserve(context, protocol, faucet)
             unsigned_spend = protocol.offer.to_valid_spend()
             valid_spend = WalletSpendBundle(
                 unsigned_spend.coin_spends,
@@ -1098,7 +1093,11 @@ async def _load_observed_context(derive, kwargs):
         if isinstance(context, SolsSwapContext):
             inputs.extend([("deed_custody", context.custody_coin), ("sols_payment", context.payment_coin)])
         else:
-            inputs.extend([("held_deed", context.deed.coin), ("sols_reserve", context.reserve_coin)])
+            inputs.append(("held_deed", context.deed.coin))
+            inputs.extend((f"sols_reserve_{index}",item.spend.coin)
+                for index,item in enumerate(context.reserve_consolidation))
+            if not context.reserve_consolidation:
+                inputs.append(("sols_reserve",context.reserve_coin))
         await snapshot.finish(inputs, {"quoteExpiresAt": context.receipt.quote_expires_at})
         return context
 
@@ -1511,7 +1510,7 @@ async def _derive_reverse_swap_context(
         ),
         uint64(1),
     )
-    reserve_coin, reserve_lineage = await _load_reserve_cat(
+    reserve_coin, reserve_lineage, reserve_consolidation = await prepare_reserve_anchor(
         provider=provider,
         artifact=artifact,
         config=config,
@@ -1553,6 +1552,7 @@ async def _derive_reverse_swap_context(
         vault_lineage=vault_lineage,
         deed=deed,
         reserve_coin=reserve_coin,
+        reserve_consolidation=reserve_consolidation,
         reserve_lineage=reserve_lineage,
         reserve_inner_puzzle=faucet.key.puzzle,
         receipt=receipt,
@@ -1606,18 +1606,43 @@ def _reverse_protocol_offer_arguments(context: ReverseSolsSwapContext) -> dict[s
 def _build_reverse_protocol_offer(
     context: ReverseSolsSwapContext, *, signature_data: bytes | None,
 ) -> Any:
-    return build_deed_to_sols_protocol_offer(
+    protocol = build_deed_to_sols_protocol_offer(
         **_reverse_protocol_offer_arguments(context), vault_signature_data=signature_data,
     )
+    if not context.reserve_consolidation:
+        return protocol
+    original=protocol.offer
+    bundle=WalletSpendBundle([*(item.spend for item in context.reserve_consolidation),
+        *original.coin_spends()],original.aggregated_signature())
+    return replace(protocol,offer=Offer(original.requested_payments,bundle,original.driver_dict))
+
+
+def _prepare_reverse_evidence(context: ReverseSolsSwapContext) -> UnsignedSolsSwapEvidence:
+    evidence=prepare_unsigned_deed_to_sols_swap(**_reverse_protocol_offer_arguments(context))
+    spends=tuple(item.spend for item in context.reserve_consolidation)
+    if not spends:
+        return evidence
+    return replace(evidence,coin_spends=(*spends,*evidence.coin_spends),
+        spend_roles=(*(f"reserve_consolidation_{index}" for index in range(len(spends))),*evidence.spend_roles))
+
+
+def _sign_reverse_reserve(context: ReverseSolsSwapContext, protocol, faucet) -> G2Element:
+    signatures=[G2Element.from_bytes(faucet.sign_delegated_spend(
+        context.reserve_coin,protocol.reserve_signing_conditions))]
+    signatures.extend(G2Element.from_bytes(faucet.sign_delegated_spend(
+        item.spend.coin,item.signing_conditions)) for item in context.reserve_consolidation)
+    return AugSchemeMPL.aggregate(signatures)
 
 
 def _initial_pool_config(
     artifact: Mapping[str, Any],
     tip: SingletonTip,
 ) -> PoolV4Config:
+    from solslot_puzzles.pool_v4_driver import pool_puzzle_version_for_hash
     hashes = artifact["puzzleHashes"]
     trusted = artifact["genesisPlan"]["trustedDestinations"]
     config = PoolV4Config(
+        pool_puzzle_version=pool_puzzle_version_for_hash(_b32(hashes["poolInnerModHash"], "poolInnerModHash")),
         pool_launcher_id=_b32(tip.launcher_id, "poolLauncherId"),
         statutes_inner_mod_hash=_b32(
             hashes["statutesInnerModHash"],
@@ -2077,6 +2102,7 @@ def _pool_config(
     artifact: Mapping[str, Any],
     tip: SingletonTip,
 ) -> PoolV4Config:
+    from solslot_puzzles.pool_v4_driver import pool_puzzle_version_for_hash
     full = _program(str(pool_solution["puzzle_reveal"]))
     full_uncurried = full.uncurry()
     if full_uncurried is None:
@@ -2138,6 +2164,7 @@ def _pool_config(
             "Pool V4 deed launcher does not match signed genesis."
         )
     return PoolV4Config(
+        pool_puzzle_version=pool_puzzle_version_for_hash(_inner_mod.get_tree_hash()),
         pool_launcher_id=pool_launcher,
         statutes_inner_mod_hash=_node_b32(
             statutes_values[0],
