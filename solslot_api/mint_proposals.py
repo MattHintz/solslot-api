@@ -566,6 +566,19 @@ class MintProposalStore:
             raise ProposalNotFound(proposal_id)
         return rec
 
+    def get_by_deed_launcher_id(self, deed_launcher_id: bytes) -> Optional[StoredMintProposal]:
+        """Return an unambiguous immutable-term witness for a minted launcher."""
+        if len(deed_launcher_id) != 32:
+            raise ValueError("deed launcher must be 32 bytes")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM mint_proposals WHERE deed_launcher_id = ? LIMIT 2",
+                (deed_launcher_id,),
+            ).fetchall()
+        if len(rows) > 1:
+            raise ValueError("ambiguous mint records for deed launcher")
+        return _row_to_record(rows[0]) if rows else None
+
     def get_by_property_id(self, property_id: str) -> Optional[StoredMintProposal]:
         """Return the *active* (non-terminal) proposal for ``property_id``.
 

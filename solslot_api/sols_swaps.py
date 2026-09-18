@@ -1444,6 +1444,8 @@ async def _derive_reverse_swap_context(
         config=config,
         vault_launcher_id=vault_record.launcher_id,
         deed_launcher_id=deed_launcher_id,
+        settings=settings,
+        artifact=artifact,
     )
     collections = [
         item
@@ -1669,6 +1671,8 @@ async def _load_vault_held_deed(
     config: PoolV4Config,
     vault_launcher_id: bytes32,
     deed_launcher_id: str,
+    settings: Settings | None = None,
+    artifact: Mapping[str, Any] | None = None,
 ) -> VaultHeldDeed:
     normalized = _hex32_text(deed_launcher_id, "deedLauncherId")
     tip = await _singleton_tip(provider, normalized)
@@ -1699,25 +1703,46 @@ async def _load_vault_held_deed(
             "SmartDeed immutable terms are unavailable from chain."
         )
     prior_full = _program(str(last_spend["puzzle_reveal"]))
-    uncurried = prior_full.uncurry()
-    if uncurried is None:
-        raise SolsSwapOfferError("SmartDeed singleton puzzle is malformed.")
-    full_mod, full_args_program = uncurried
-    full_args = list(full_args_program.as_iter())
-    if (
-        full_mod.get_tree_hash() != SINGLETON_MOD_HASH
-        or len(full_args) != 2
-        or bytes(full_args[0]) != bytes(deed_struct)
-    ):
-        raise SolsSwapOfferError(
-            "SmartDeed singleton identity does not match RC22."
-        )
-    smart_inner = full_args[1]
+    for leg in range(2):
+        full_mod, full_args_program = prior_full.uncurry()
+        full_args = list(full_args_program.as_iter())
+        if (full_mod.get_tree_hash() != SINGLETON_MOD_HASH or len(full_args) != 2
+            or bytes(full_args[0]) != bytes(deed_struct)):
+            raise SolsSwapOfferError("SmartDeed singleton identity does not match RC22.")
+        smart_inner = full_args[1]
+        if leg == 0 and smart_inner.get_tree_hash() == OFFER_MOD_HASH:
+            # Native primary offers settle through one ephemeral OFFER_MOD
+            # singleton. Authenticate that exact preceding link before reading
+            # the inventory commitment; never search arbitrary old metadata.
+            from .sols_market import _singleton_spend, MAX_SINGLETON_EVIDENCE_COST
+            if len(tip.lineage) < 3 or tip.lineage[-3].spent_height != tip.lineage[-2].spent_height:
+                raise SolsSwapOfferError("SmartDeed offer settlement is not atomic.")
+            preceding, _ = await _singleton_spend(provider,tip.lineage[-3],tip.lineage[-2],
+                max_cost=MAX_SINGLETON_EVIDENCE_COST)
+            prior_full = _program(str(preceding["puzzle_reveal"]))
+            continue
+        break
     smart_uncurried = smart_inner.uncurry()
     if smart_uncurried is None:
         raise SolsSwapOfferError("SmartDeed immutable puzzle is malformed.")
     smart_mod, smart_args_program = smart_uncurried
     smart_args = list(smart_args_program.as_iter())
+    if smart_mod.get_tree_hash() == load_puzzle("mint_offer_delegate_v5.clsp").get_tree_hash():
+        # A primary purchase delivers directly from inventory into vault
+        # custody. Its confirmed parent commits to the SmartDeed inner hash,
+        # while the persisted mint record provides the immutable preimage.
+        from .deed_witness import primary_deed_inner
+        from .mint_endpoints import get_mint_proposal_store
+        if settings is None or artifact is None:
+            raise SolsSwapOfferError("Primary SmartDeed mint witness is unavailable.")
+        try:
+            record = get_mint_proposal_store(settings).get_by_deed_launcher_id(bytes(deed_id))
+            smart_inner = primary_deed_inner(record=record,deed_id=deed_id,deed_struct=deed_struct,
+                inventory_args=smart_args,config=config,artifact=artifact)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SolsSwapOfferError("Primary SmartDeed mint witness does not match chain.") from exc
+        smart_mod, smart_args_program = smart_inner.uncurry()
+        smart_args = list(smart_args_program.as_iter())
     if (
         smart_mod.get_tree_hash()
         != load_puzzle("smart_deed_inner_v2.clsp").get_tree_hash()

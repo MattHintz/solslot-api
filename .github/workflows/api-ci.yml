@@ -16,7 +16,7 @@ env:
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
   # Exact merged protocol source from the Brick56 inventory correction.
   # Deployment environment pins remain separately governed.
-  PROTOCOL_REF: aacb89962fca5b55de158e1f0d1794e83df35b4d
+  PROTOCOL_REF: 3d1ffd2f8f6663b12634cc3122babeef5e42b003
 
 jobs:
   verify:
