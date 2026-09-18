@@ -119,3 +119,46 @@ async def test_primary_loader_resolves_only_confirmed_commitment(monkeypatch,off
         earlier.spent_height=7
         with pytest.raises(SolsSwapOfferError,match='atomic'):
             await sols_swaps._load_vault_held_deed(**parameters)
+
+
+@pytest.mark.asyncio
+async def test_pool_withdrawal_recovers_terms_from_exact_deposit_predecessor(monkeypatch):
+    from chia.types.blockchain_format.coin import Coin
+    from chia.wallet.lineage_proof import LineageProof
+    from chia.wallet.puzzles.singleton_top_layer_v1_1 import SINGLETON_MOD, SINGLETON_MOD_HASH
+    from chia.wallet.trading.offer import OFFER_MOD
+    from solslot_puzzles.vault_driver import puzzle_for_p2_vault
+    from solslot_puzzles.pool_economics_v2 import deed_metadata_commitment
+    from solslot_puzzles.sols_swap_v4_driver import SolsSwapOfferError
+    from solslot_api import sols_swaps, sols_market
+    args,expected=case();config=args['config'];config.deed_launcher_puzzle_hash=SINGLETON_LAUNCHER_HASH
+    vault=bytes32(b'v'*32);record=args['record']
+    commitment=deed_metadata_commitment(args['deed_id'],record.par_value,1,
+        canonicalise_property_id(record.property_id),canonicalise_property_id(record.collection_id),record.share_ppm)
+    custody_args=[config.p2_pool_v2_mod_hash,SINGLETON_MOD_HASH,config.pool_launcher_id,SINGLETON_LAUNCHER_HASH,commitment]
+    held=SINGLETON_MOD.curry(args['deed_struct'],puzzle_for_p2_vault(vault))
+    coin=Coin(bytes32(b'r'*32),held.get_tree_hash(),1)
+    live=SimpleNamespace(puzzle_hash='0x'+coin.puzzle_hash.hex(),coin_id='0x'+coin.name().hex())
+    deposit=SimpleNamespace(spent_height=7);custody=SimpleNamespace(spent_height=8);offer=SimpleNamespace(spent_height=8)
+    tip=SimpleNamespace(live=live,lineage=(deposit,custody,offer,live))
+    def reveal(inner):return {'puzzle_reveal':bytes(SINGLETON_MOD.curry(args['deed_struct'],inner)).hex()}
+    async def load_tip(*_):return tip
+    async def latest(*_):return reveal(OFFER_MOD)
+    async def preceding(provider,parent,child,**kwargs):
+        if parent is custody and child is offer:
+            return reveal(load_puzzle('p2_pool_v2.clsp').curry(*custody_args)),1
+        assert parent is deposit and child is custody
+        return reveal(expected),1
+    async def confirmed(*_):return coin,LineageProof(bytes32(b'x'*32),bytes32(b'y'*32),1)
+    monkeypatch.setattr(sols_swaps,'_singleton_tip',load_tip)
+    monkeypatch.setattr(sols_swaps,'_latest_solution',latest)
+    monkeypatch.setattr(sols_market,'_singleton_spend',preceding)
+    monkeypatch.setattr(sols_swaps,'_confirmed_coin_and_lineage',confirmed)
+    parameters=dict(provider=None,config=config,vault_launcher_id=vault,deed_launcher_id='0x'+args['deed_id'].hex())
+    assert (await sols_swaps._load_vault_held_deed(**parameters)).smart_deed_inner==expected
+    custody_args[4]=bytes32(b'x'*32)
+    with pytest.raises(SolsSwapOfferError,match='commitment'):
+        await sols_swaps._load_vault_held_deed(**parameters)
+    custody_args[4]=commitment;custody_args[2]=bytes32(b'x'*32)
+    with pytest.raises(SolsSwapOfferError,match='pool'):
+        await sols_swaps._load_vault_held_deed(**parameters)

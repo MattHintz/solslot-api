@@ -1703,30 +1703,50 @@ async def _load_vault_held_deed(
             "SmartDeed immutable terms are unavailable from chain."
         )
     prior_full = _program(str(last_spend["puzzle_reveal"]))
-    for leg in range(2):
+    from .sols_market import _singleton_spend, MAX_SINGLETON_EVIDENCE_COST
+    cursor = len(tip.lineage) - 2
+    custody_commitment = None
+    remaining_cost = MAX_SINGLETON_EVIDENCE_COST
+    for leg in range(3):
         full_mod, full_args_program = prior_full.uncurry()
         full_args = list(full_args_program.as_iter())
         if (full_mod.get_tree_hash() != SINGLETON_MOD_HASH or len(full_args) != 2
             or bytes(full_args[0]) != bytes(deed_struct)):
             raise SolsSwapOfferError("SmartDeed singleton identity does not match RC22.")
         smart_inner = full_args[1]
+        inner_mod, inner_args = smart_inner.uncurry()
+        pool_custody = inner_mod.get_tree_hash() == config.p2_pool_v2_mod_hash
         if leg == 0 and smart_inner.get_tree_hash() == OFFER_MOD_HASH:
             # Native primary offers settle through one ephemeral OFFER_MOD
             # singleton. Authenticate that exact preceding link before reading
             # the inventory commitment; never search arbitrary old metadata.
-            from .sols_market import _singleton_spend, MAX_SINGLETON_EVIDENCE_COST
-            if len(tip.lineage) < 3 or tip.lineage[-3].spent_height != tip.lineage[-2].spent_height:
+            if cursor < 1 or tip.lineage[cursor-1].spent_height != tip.lineage[cursor].spent_height:
                 raise SolsSwapOfferError("SmartDeed offer settlement is not atomic.")
-            preceding, _ = await _singleton_spend(provider,tip.lineage[-3],tip.lineage[-2],
-                max_cost=MAX_SINGLETON_EVIDENCE_COST)
-            prior_full = _program(str(preceding["puzzle_reveal"]))
-            continue
-        break
+        elif pool_custody and custody_commitment is None and leg < 2:
+            # A pool withdrawal's previous immutable reveal is the deposit
+            # that created this exact custody coin, possibly in an older block.
+            values = list(inner_args.as_iter())
+            if (len(values) != 5 or values[0].as_atom() != bytes(config.p2_pool_v2_mod_hash)
+                or values[1].as_atom() != bytes(SINGLETON_MOD_HASH)
+                or values[2].as_atom() != bytes(config.pool_launcher_id)
+                or values[3].as_atom() != bytes(SINGLETON_LAUNCHER_HASH)
+                or len(values[4].as_atom()) != 32 or cursor < 1):
+                raise SolsSwapOfferError("SmartDeed custody does not match the governed pool.")
+            custody_commitment = bytes32(values[4].as_atom())
+        else:
+            break
+        preceding, consumed_cost = await _singleton_spend(provider,tip.lineage[cursor-1],tip.lineage[cursor],
+            max_cost=remaining_cost)
+        remaining_cost -= consumed_cost
+        cursor -= 1
+        prior_full = _program(str(preceding["puzzle_reveal"]))
     smart_uncurried = smart_inner.uncurry()
     if smart_uncurried is None:
         raise SolsSwapOfferError("SmartDeed immutable puzzle is malformed.")
     smart_mod, smart_args_program = smart_uncurried
     smart_args = list(smart_args_program.as_iter())
+    if custody_commitment is not None and smart_mod.get_tree_hash() != load_puzzle("smart_deed_inner_v2.clsp").get_tree_hash():
+        raise SolsSwapOfferError("Pool custody has no exact SmartDeed deposit predecessor.")
     if smart_mod.get_tree_hash() == load_puzzle("mint_offer_delegate_v5.clsp").get_tree_hash():
         # A primary purchase delivers directly from inventory into vault
         # custody. Its confirmed parent commits to the SmartDeed inner hash,
@@ -1766,6 +1786,8 @@ async def _load_vault_held_deed(
         collection_id,
         share_ppm,
     )
+    if custody_commitment is not None and custody_commitment != commitment:
+        raise SolsSwapOfferError("SmartDeed deposit does not match the pool custody commitment.")
     coin, lineage = await _confirmed_coin_and_lineage(
         provider,
         tip.live.coin_id,
