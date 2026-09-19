@@ -12,6 +12,7 @@ from solslot_puzzles.enrollment_permit import EnrollmentPermit,permit_owner_from
 from .credential_auth import require_alpha_writes
 from .credential_ledger import LedgerConflict,LedgerRateLimited,get_credential_ledger
 from .enrollment_permit_signing import sign_permit_with_key_vault
+from .enrollment_permit_remote import sign_permit_with_remote
 
 
 def _require_unspent(settings: Any, coin: Any) -> None:
@@ -114,7 +115,15 @@ async def reserve_and_issue_permit(settings: Any, session: Any, artifact: dict[s
     except (LedgerConflict,ValueError) as exc:raise HTTPException(status_code=409,detail=str(exc)) from exc
     if attempt is None:return ledger.get_enrollment(vault)
     try:
-        signature=await asyncio.to_thread(signer or sign_permit_with_key_vault,settings,activation,wire)
+        if signer is not None:
+            signature = await asyncio.to_thread(signer, settings, activation, wire)
+        elif settings.enrollment_permit_signer_mode == 'remote':
+            signature = await asyncio.to_thread(sign_permit_with_remote, settings, activation, wire,
+                artifact_hash=artifact['artifactHash'])
+        elif settings.enrollment_permit_signer_mode == 'key_vault':
+            signature = await asyncio.to_thread(sign_permit_with_key_vault, settings, activation, wire)
+        else:
+            raise ValueError('Unsupported permit signer mode.')
     except Exception:
         ledger.finish_permit_issuance(vault,binding,attempt,failure='unavailable')
         raise HTTPException(status_code=503,detail='Permit signing is interrupted. The original reservation and deadline are preserved; retry its status.') from None

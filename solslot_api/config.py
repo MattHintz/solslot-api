@@ -94,6 +94,12 @@ def validate_secret_env_file_permissions(env_file: Path | None = None) -> None:
 def validate_server_hardening_at_startup(settings: "Settings") -> None:
     """Reject unsafe staging/production HTTP posture before serving traffic."""
 
+    from .enrollment_permit_remote import validate_remote_signer_config
+    try:
+        validate_remote_signer_config(settings)
+    except (OSError, ValueError):
+        raise RuntimeError("Enrollment permit signer transport is not configured securely.") from None
+
     hosted = settings.runtime_environment in {"staging", "production"}
     if hosted and len(settings.protocol_artifact_api_token or "") < 32:
         raise RuntimeError(
@@ -991,6 +997,11 @@ class Settings(BaseSettings):
     enrollment_permit_release_identity: str = ""
     enrollment_permit_issuer_key_ref: str = ""
     enrollment_permit_identity_client_id: str = ""
+    enrollment_permit_signer_mode: Literal["key_vault", "remote"] = "key_vault"
+    enrollment_permit_remote_url: str = ""
+    enrollment_permit_remote_ca_file: str = ""
+    enrollment_permit_remote_cert_file: str = ""
+    enrollment_permit_remote_key_file: str = ""
     bootstrap_manifest_path: str = "./state/bootstrap_manifest_v2.json"
     genesis_db_path: str = "./state/genesis_ceremony_v2.db"
     genesis_output_dir: str = "./state/genesis_ceremonies"
