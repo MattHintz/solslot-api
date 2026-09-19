@@ -285,7 +285,6 @@ def load_validator_artifact(
         raise ValidatorEvidenceError("signed artifact runtime bindings are incomplete")
     checks = (
         (artifact.get("network"), settings.network, "network"),
-        (artifact.get("evmChainId"), settings.evm_chain_id, "EVM chain"),
         (source_shas.get("api"), release.apiCommit, "API commit"),
         (source_shas.get("protocol"), release.protocolCommit, "protocol commit"),
         (bridge.get("policyHash"), settings.bridge_policy_hash, "bridge policy"),
@@ -328,6 +327,9 @@ def load_validator_artifact(
         raise ValidatorEvidenceError(str(exc)) from exc
     if activation != settings.enrollment_activation:
         raise ValidatorEvidenceError("signed enrollment activation differs from signer configuration")
+    identity_chain = activation['evmChainId'] if activation is not None else artifact.get('evmChainId')
+    if identity_chain != settings.evm_chain_id:
+        raise ValidatorEvidenceError("signed artifact identity chain does not match signer config")
     return artifact, release
 
 

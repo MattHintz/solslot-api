@@ -585,7 +585,7 @@ def _selected_template(settings: Settings, template: Mapping[str, Any], digest: 
             ceremony_id=active["deploymentId"], emitter=body.evm_addresses["attestationEmitter"],
             validator_pubkeys=[exact_hex(k, 48, "validator") for k in body.validator_pubkeys],
             environment=settings.runtime_environment + "-alpha")
-        if (settings.network != "testnet11" or settings.zkpassport_evm_chain_id != 84532
+        if (settings.network != "testnet11" or settings.zkpassport_evm_chain_id != active["evmChainId"]
                 or settings.eip712_chain_id != 84532
                 or active["releaseIdentity"] != settings.enrollment_permit_release_identity
                 or active["issuerKeyRef"] != settings.enrollment_permit_issuer_key_ref

@@ -1,4 +1,4 @@
-"""Reviewed Base Sepolia deployment verification; never deployment authorization.
+"""Reviewed Base identity deployment verification; never deployment authorization.
 
 The operator pins a separate review receipt and the existing nine-component
 release evidence. A deployment JSON's self hash cannot supply either pin.
@@ -89,7 +89,7 @@ def _read(path_value: str, label: str, pin: str | None = None) -> tuple[dict[str
 
 def _activation(settings: Settings, record: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[str, Any]:
     try:
-        if (settings.network != 'testnet11' or settings.zkpassport_evm_chain_id != 84532
+        if (settings.network != 'testnet11'
                 or settings.eip712_chain_id != 84532 or plan['evmChainId'] != 84532
                 or type(plan['evmChainId']) is not int or plan['network'] != 'testnet11'
                 or record['draft']['evmChainId'] != 84532
@@ -103,7 +103,8 @@ def _activation(settings: Settings, record: Mapping[str, Any], plan: Mapping[str
             emitter=plan['evmAddresses']['attestationEmitter'],
             validator_pubkeys=[exact_hex(key, 48, 'validator') for key in plan['validatorSet']['pubkeys']],
             environment=settings.runtime_environment+'-alpha')
-        if (active != record['plan_input']['enrollmentActivation']
+        if (settings.zkpassport_evm_chain_id != active['evmChainId']
+                or active != record['plan_input']['enrollmentActivation']
                 or active['bridgePolicyHash'] != plan['puzzleHashes']['bridgePolicy']
                 or active['releaseIdentity'] != settings.enrollment_permit_release_identity
                 or active['issuerKeyRef'] != settings.enrollment_permit_issuer_key_ref
@@ -171,6 +172,8 @@ def _call(web3: Any, address: str, name: str, output: str, peak: int, args=(), i
 
 def verify_permit_deployment(settings: Settings, record: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[str, Any]:
     active = _activation(settings, record, plan)
+    identity_chain = active['evmChainId']
+    identity_network = {8453: 'base', 84532: 'baseSepolia'}[identity_chain]
     deployment, _ = _read(settings.genesis_evm_deployment_path, 'permit deployment')
     fields = {'schemaVersion','protocolVersion','credentialPolicyVersion','network','chainId',
         'sourceShas','deployer','startNonce','forwarderAddress','verifierAdapterAddress',
@@ -183,7 +186,7 @@ def verify_permit_deployment(settings: Settings, record: Mapping[str, Any], plan
     if deployment['artifactHash'] != _canonical_hash({k:v for k,v in deployment.items() if k!='artifactHash'}):
         raise GenesisEvmEvidenceError('permit deployment hash is not canonical')
     expected = {'schemaVersion':3,'protocolVersion':'solslot-v2','credentialPolicyVersion':2,
-        'network':'baseSepolia','chainId':84532,'sourceShas':active['sourceShas'],
+        'network':identity_network,'chainId':identity_chain,'sourceShas':active['sourceShas'],
         'bridgePolicyHash':active['bridgePolicyHash'],'permitIssuer':active['issuer'],
         'permitContextHash':active['contextHash'],'deploymentId':active['deploymentId'],
         'releaseIdentity':active['releaseIdentity'],'zkPassportRootVerifierAddress':ROOT_VERIFIER,
@@ -205,8 +208,8 @@ def verify_permit_deployment(settings: Settings, record: Mapping[str, Any], plan
     web3 = Web3(Web3.HTTPProvider(settings.zkpassport_evm_rpc_url, request_kwargs={'timeout':15}))
     contracts = {}
     try:
-        if not web3.is_connected() or web3.eth.chain_id != 84532:
-            raise GenesisEvmEvidenceError('selected RPC must be Base Sepolia')
+        if not web3.is_connected() or web3.eth.chain_id != identity_chain:
+            raise GenesisEvmEvidenceError('selected RPC must match the reviewed Base identity chain')
         peak = _integer(web3.eth.block_number, 'RPC peak', 1)
         peak_hash = _rpc_hash(web3.eth.get_block(peak)['hash'], 'peak hash')
         for offset, name in enumerate(EVM_CONTRACTS):
@@ -230,7 +233,7 @@ def verify_permit_deployment(settings: Settings, record: Mapping[str, Any], plan
                     or _rpc_hash(tx['hash'],'transaction identity')!=tx_hash
                     or tx['blockNumber']!=height or _rpc_hash(tx['blockHash'],'transaction block')!=block_hash
                     or str(tx['from']).lower()!=deployer or tx['to'] is not None
-                    or tx['nonce']!=tx_nonce or tx['chainId']!=84532 or tx['value']!=0):
+                    or tx['nonce']!=tx_nonce or tx['chainId']!=identity_chain or tx['value']!=0):
                 raise GenesisEvmEvidenceError(f'{name} canonical deployment transaction differs')
             init = tx['input']
             init_bytes = bytes.fromhex(init[2:]) if isinstance(init,str) and init.startswith('0x') else bytes(init)
@@ -271,11 +274,11 @@ def verify_permit_deployment(settings: Settings, record: Mapping[str, Any], plan
             raise GenesisEvmEvidenceError('emitter does not trust the reviewed forwarder')
         # A second canonical peak lookup detects an RPC reorganization during the read.
         if _rpc_hash(web3.eth.get_block(peak)['hash'],'final peak hash')!=peak_hash:
-            raise GenesisEvmEvidenceError('Base Sepolia reorganized during deployment verification')
+            raise GenesisEvmEvidenceError('Base identity chain reorganized during deployment verification')
     except GenesisEvmEvidenceError:
         raise
     except Exception as exc:
         raise GenesisEvmEvidenceError('could not verify selected canonical deployment state') from exc
     return dict(manifestArtifactHash=deployment['artifactHash'],checkedAtBlock=peak,checkedAtBlockHash=peak_hash,
-        chainId=84532,contracts=contracts,zkPassportRootVerifier=dict(address=ROOT_VERIFIER,
+        chainId=identity_chain,contracts=contracts,zkPassportRootVerifier=dict(address=ROOT_VERIFIER,
         bytecodeHash=codes['zkPassportRootVerifier']),enrollmentDeploymentReview=review)

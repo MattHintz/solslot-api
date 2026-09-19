@@ -66,11 +66,11 @@ class ValidatorSettings(BaseSettings):
     @classmethod
     def _enrollment_chain(cls, value: Any) -> int:
         # BaseSettings receives numeric environment values as text.
-        if isinstance(value, str) and value in ("11155111", "84532"):
+        if isinstance(value, str) and value in ("11155111", "84532", "8453"):
             return int(value)
-        if type(value) is int and value in (11155111, 84532):
+        if type(value) is int and value in (11155111, 84532, 8453):
             return value
-        raise ValueError("enrollment chain must be Ethereum Sepolia or selected Base Sepolia")
+        raise ValueError("enrollment chain must be Ethereum Sepolia or an explicitly selected Base deployment")
 
     @field_validator("bridge_policy_hash")
     @classmethod
@@ -106,12 +106,12 @@ class ValidatorSettings(BaseSettings):
     def _permit_deployment(self) -> "ValidatorSettings":
         if self.enrollment_activation is None:
             if self.evm_chain_id != 11155111:
-                raise ValueError("Base Sepolia enrollment requires complete activation evidence")
+                raise ValueError("Base enrollment requires complete activation evidence")
             return self
         from solslot_puzzles.enrollment_activation import validate_enrollment_activation
         value = self.enrollment_activation
-        if self.evm_chain_id != 84532 or self.deployment_environment is None:
-            raise ValueError("permit signer requires an explicit alpha environment and Base Sepolia")
+        if self.evm_chain_id not in (84532, 8453) or self.deployment_environment is None:
+            raise ValueError("permit signer requires an explicit alpha environment and Base deployment")
         try:
             checked = validate_enrollment_activation(value, source_shas=value["sourceShas"],
                 ceremony_id=value["deploymentId"], emitter=self.evm_attestation_emitter_address,
@@ -119,8 +119,8 @@ class ValidatorSettings(BaseSettings):
                 environment=self.deployment_environment)
         except (KeyError, TypeError) as exc:
             raise ValueError("permit signer activation evidence is incomplete") from exc
-        if checked["bridgePolicyHash"] != self.bridge_policy_hash:
-            raise ValueError("permit signer bridge policy does not reconstruct")
+        if checked["bridgePolicyHash"] != self.bridge_policy_hash or checked["evmChainId"] != self.evm_chain_id:
+            raise ValueError("permit signer bridge policy or identity chain differs from activation")
         self.enrollment_activation = checked
         return self
 

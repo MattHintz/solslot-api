@@ -94,6 +94,12 @@ def validate_secret_env_file_permissions(env_file: Path | None = None) -> None:
 def validate_server_hardening_at_startup(settings: "Settings") -> None:
     """Reject unsafe staging/production HTTP posture before serving traffic."""
 
+    from .enrollment_permit_remote import validate_remote_signer_config
+    try:
+        validate_remote_signer_config(settings)
+    except (OSError, ValueError):
+        raise RuntimeError("Enrollment permit signer transport is not configured securely.") from None
+
     hosted = settings.runtime_environment in {"staging", "production"}
     if hosted and len(settings.protocol_artifact_api_token or "") < 32:
         raise RuntimeError(
@@ -684,10 +690,14 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
             "SOLSLOT_EIP712_CHAIN_ID does not match SOLSLOT_NETWORK: "
             f"{settings.network} requires {expected_evm_chain_id}."
         )
-    if settings.zkpassport_evm_chain_id != expected_evm_chain_id:
+    # The selected identity deployment can use zkPassport's Base mainnet
+    # verifier while ceremony signatures and payment rails remain on testnet.
+    # The signed enrollment activation independently pins the exact identity
+    # chain; complete issuer metadata is mandatory for either selected chain.
+    identity_chains = {8453, 84532} if all(permit_metadata) else {expected_evm_chain_id}
+    if settings.zkpassport_evm_chain_id not in identity_chains:
         raise RuntimeError(
-            "SOLSLOT_ZKPASSPORT_EVM_CHAIN_ID does not match SOLSLOT_NETWORK: "
-            f"{settings.network} requires {expected_evm_chain_id}."
+            "SOLSLOT_ZKPASSPORT_EVM_CHAIN_ID does not match the selected identity deployment."
         )
 
     insecure_origins: list[str] = []
@@ -987,6 +997,11 @@ class Settings(BaseSettings):
     enrollment_permit_release_identity: str = ""
     enrollment_permit_issuer_key_ref: str = ""
     enrollment_permit_identity_client_id: str = ""
+    enrollment_permit_signer_mode: Literal["key_vault", "remote"] = "key_vault"
+    enrollment_permit_remote_url: str = ""
+    enrollment_permit_remote_ca_file: str = ""
+    enrollment_permit_remote_cert_file: str = ""
+    enrollment_permit_remote_key_file: str = ""
     bootstrap_manifest_path: str = "./state/bootstrap_manifest_v2.json"
     genesis_db_path: str = "./state/genesis_ceremony_v2.db"
     genesis_output_dir: str = "./state/genesis_ceremonies"
