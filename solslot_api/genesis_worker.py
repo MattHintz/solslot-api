@@ -342,7 +342,7 @@ def execute(payload: Mapping[str, Any]) -> dict[str, Any]:
         return {
             "protocolVersion": "solslot-v2-rc23",
             "adminAuthorityInnerModHash": _hex(
-                admin_authority_v3_inner_mod_hash()
+                admin_authority_v3_inner_mod_hash(4)
             ),
         }
     if operation == "roster":

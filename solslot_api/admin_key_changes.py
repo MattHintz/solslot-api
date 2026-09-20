@@ -42,6 +42,7 @@ from solslot_puzzles.admin_authority_v3_driver import (
     GenesisAdminAuthorityV3,
     IdentityVaultGenesis,
     IdentityVaultTransition,
+    authority_puzzle_version_for_hash,
     build_admin_identity_vault,
     build_authority_prepare_mips_spend,
     build_cancel_solution,
@@ -738,6 +739,12 @@ def _authority_inner_from_snapshot(
     snapshot: AdminAuthorityV3Snapshot,
 ) -> Program:
     return make_inner_puzzle(
+        authority_puzzle_version=authority_puzzle_version_for_hash(
+            _bytes32_hex(
+                snapshot.evidence.get("authorityInnerModHash"),
+                "authority inner module hash",
+            )
+        ),
         authority_launcher_id=_bytes32_hex(
             snapshot.launcher_id,
             "authority launcher id",
@@ -782,6 +789,7 @@ def _genesis_authority_from_artifact(
     ) or len(identities) != 3:
         raise ValueError("Signed Authority V3 genesis coordinates are incomplete")
     authority = build_genesis_admin_authority_v3(
+        authority_puzzle_version=plan.get("authorityPuzzleVersion", 3),
         parent_coin_id=_bytes32_hex(
             funding.get("admin_authority"),
             "Authority V3 funding coin",
@@ -989,6 +997,7 @@ async def _chia_recovery_build(
             authority_version=snapshot.authority_version - 1,
         )
         prior_authority_inner = make_inner_puzzle(
+            authority_puzzle_version=authority.authority_puzzle_version,
             authority_launcher_id=authority.authority_launcher_id,
             operational_root_hash=authority.operational_root_hash,
             lost_recovery_root_hashes=authority.lost_recovery_root_hashes,
@@ -4585,14 +4594,9 @@ async def _observe_chia_case(
     latest_spend = str(snapshot.evidence.get("latestSpend") or "")
 
     if snapshot.pending:
-        expected_chia_kind = (
-            "ROUTINE"
-            if intent.kind == "RECOVERY_KIT"
-            else intent.kind
-        )
         if (
             snapshot.pending_intent_hash != case["intentHash"]
-            or snapshot.pending_kind != expected_chia_kind
+            or snapshot.pending_kind != intent.kind
             or snapshot.pending_slot != intent.slot
         ):
             raise ValueError(
@@ -4600,11 +4604,7 @@ async def _observe_chia_case(
             )
         receipt_record = {
             "schemaVersion": 1,
-            "event": (
-                "PREPARE_ROUTINE"
-                if intent.kind in {"ROUTINE", "RECOVERY_KIT"}
-                else "PREPARE_LOST"
-            ),
+            "event": latest_spend,
             "network": "testnet11",
             "intentHash": case["intentHash"],
             "authorityCoinId": snapshot.current_coin_id,

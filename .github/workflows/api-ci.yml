@@ -14,9 +14,9 @@ concurrency:
 
 env:
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
-  # Exact coordinated protocol source for the Base identity candidate.
+  # Exact protocol source for the Authority V4 announcement guard.
   # Deployment environment pins remain separately governed.
-  PROTOCOL_REF: 7b7fbebb842ce367dcffc771a384912942107e8e
+  PROTOCOL_REF: c7d4bb47787b4ccd3b645500bc3f6b71aa467791
 
 jobs:
   verify:
