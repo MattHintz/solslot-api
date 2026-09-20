@@ -4594,14 +4594,9 @@ async def _observe_chia_case(
     latest_spend = str(snapshot.evidence.get("latestSpend") or "")
 
     if snapshot.pending:
-        expected_chia_kind = (
-            "ROUTINE"
-            if intent.kind == "RECOVERY_KIT"
-            else intent.kind
-        )
         if (
             snapshot.pending_intent_hash != case["intentHash"]
-            or snapshot.pending_kind != expected_chia_kind
+            or snapshot.pending_kind != intent.kind
             or snapshot.pending_slot != intent.slot
         ):
             raise ValueError(
@@ -4609,11 +4604,7 @@ async def _observe_chia_case(
             )
         receipt_record = {
             "schemaVersion": 1,
-            "event": (
-                "PREPARE_ROUTINE"
-                if intent.kind in {"ROUTINE", "RECOVERY_KIT"}
-                else "PREPARE_LOST"
-            ),
+            "event": latest_spend,
             "network": "testnet11",
             "intentHash": case["intentHash"],
             "authorityCoinId": snapshot.current_coin_id,

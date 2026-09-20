@@ -338,10 +338,11 @@ def _state_after_solution(
         current_custodies = list(
             parsed.state.current_identity_custody_hashes
         )
-        if spend_tag == SPEND_COMPLETE:
-            current_custodies[parsed.state.pending_slot] = (
-                parsed.state.pending_replacement_custody_hash
-            )
+        current_custodies[parsed.state.pending_slot] = (
+            parsed.state.pending_replacement_custody_hash
+            if spend_tag == SPEND_COMPLETE
+            else parsed.state.pending_original_custody_hash
+        )
         state = AdminAuthorityV3State(
             current_identity_custody_hashes=tuple(current_custodies),  # type: ignore[arg-type]
             authority_version=new_version,
