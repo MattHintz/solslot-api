@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from chia._tests.util.spend_sim import SimClient, SpendSim
@@ -17,6 +19,7 @@ from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 from eth_keys import keys
 
+from solslot_api import admin_key_changes
 from solslot_api.admin_authority_v3 import (
     AdminAuthorityV3Snapshot,
     AdminIdentityVaultV1,
@@ -38,6 +41,7 @@ from solslot_puzzles.admin_authority_v3_driver import (
     AUTHORITY_LAUNCHER_AMOUNT,
     PENDING_LOST,
     PENDING_ROUTINE,
+    admin_authority_v3_inner_mod_hash,
     build_genesis_admin_authority_v3,
     build_identity_vault_transition,
 )
@@ -153,7 +157,11 @@ def _snapshot(authority, authority_coin, identity_coins):
             )
             for slot, identity in enumerate(authority.identity_vaults)
         ),
-        evidence={},
+        evidence={
+            "authorityInnerModHash": "0x" + admin_authority_v3_inner_mod_hash(
+                authority.authority_puzzle_version
+            ).hex(),
+        },
     )
 
 
@@ -291,9 +299,12 @@ def _pending_build(
     ("kind", "pending_kind"),
     (("ROUTINE", PENDING_ROUTINE), ("LOST", PENDING_LOST)),
 )
+@pytest.mark.parametrize("authority_puzzle_version", (3, 4))
 async def test_api_packages_execute_against_authority_v3_consensus(
     kind: str,
     pending_kind: int,
+    authority_puzzle_version: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     daily_private_keys = tuple(
         keys.PrivateKey(bytes([value]) * 32)
@@ -321,6 +332,7 @@ async def test_api_packages_execute_against_authority_v3_consensus(
         )
         parent = records[0].coin
         authority = build_genesis_admin_authority_v3(
+            authority_puzzle_version=authority_puzzle_version,
             parent_coin_id=bytes32(parent.name()),
             network="testnet11",
             daily_compressed_pubkeys=tuple(
@@ -498,6 +510,45 @@ async def test_api_packages_execute_against_authority_v3_consensus(
         await sim.farm_block()
 
         pending = _pending_build(build, bundle)
+        # Reconstruct the pending transition through the coordinator's recovery
+        # builder; signatures and consensus checks below use that reconstruction.
+        monkeypatch.setattr(
+            admin_key_changes, "_verified_evidence_context",
+            AsyncMock(return_value=({}, {}, None)),
+        )
+        monkeypatch.setattr(
+            admin_key_changes, "_validate_intent_bindings", lambda **_: None,
+        )
+        monkeypatch.setattr(
+            admin_key_changes, "_genesis_authority_from_artifact", lambda _: authority,
+        )
+        monkeypatch.setattr(
+            admin_key_changes, "_current_identity_vaults",
+            lambda **_: authority.identity_vaults,
+        )
+        monkeypatch.setattr(
+            admin_key_changes, "build_admin_authority_v3_snapshot",
+            AsyncMock(return_value=pending.snapshot),
+        )
+        contexts = {
+            "0x" + context.launcher_id.hex(): context
+            for context in (pending.authority_context, *pending.identity_contexts)
+        }
+        monkeypatch.setattr(
+            admin_key_changes, "load_live_singleton_context",
+            AsyncMock(side_effect=lambda **kwargs: contexts[kwargs["launcher_id"]]),
+        )
+        pending = await admin_key_changes._chia_recovery_build(
+            case={**case, "state": "PENDING"},
+            phase="CANCEL" if kind == "ROUTINE" else "COMPLETE",
+            coadmin_slot=build.coadmin_slot,
+            request=SimpleNamespace(
+                app=SimpleNamespace(state=SimpleNamespace(coinset=client))
+            ),
+            settings=None,
+            store=store,
+        )
+        assert pending.transition == transition
         if kind == "ROUTINE":
             cancel_bundle, cancel_actions = _signed_cancel_bundle(
                 build=pending,

@@ -425,6 +425,7 @@ async def build_admin_authority_v3_snapshot(
                 )
                 latest_spend_tag = spend_tag
                 next_inner = make_inner_puzzle(
+                    authority_puzzle_version=parsed.authority_puzzle_version,
                     authority_launcher_id=parsed.authority_launcher_id,
                     operational_root_hash=parsed.operational_root_hash,
                     lost_recovery_root_hashes=(

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
+from unittest.mock import AsyncMock
 
 import pytest
 from chia.types.blockchain_format.coin import Coin
 from chia.types.blockchain_format.program import Program
-from chia.wallet.puzzles.singleton_top_layer_v1_1 import SINGLETON_LAUNCHER_HASH
+from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
+    SINGLETON_LAUNCHER_HASH,
+    puzzle_for_singleton,
+)
 from chia_rs import AugSchemeMPL
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
@@ -15,15 +20,22 @@ from solslot_api.admin_authority_v3 import (
     _state_after_solution,
     build_admin_authority_v3_snapshot,
 )
+from solslot_api.admin_key_changes import (
+    _authority_inner_from_snapshot,
+    _genesis_authority_from_artifact,
+)
 from solslot_puzzles.admin_authority_v3_driver import (
     AUTHORITY_LAUNCHER_AMOUNT,
     PENDING_RECOVERY_KIT,
     SPEND_COMPLETE,
+    SPEND_OPERATIONAL,
     SPEND_PREPARE_KIT,
+    admin_authority_v3_inner_mod_hash,
     build_complete_solution,
     build_genesis_admin_authority_v3,
     build_identity_vault_transition,
     build_prepare_solution,
+    make_inner_puzzle,
 )
 
 
@@ -39,8 +51,9 @@ RECOVERY_KEYS = tuple(
 )
 
 
-def _artifact() -> tuple[dict, object]:
+def _artifact(*, authority_puzzle_version: int = 3) -> tuple[dict, object]:
     authority = build_genesis_admin_authority_v3(
+        authority_puzzle_version=authority_puzzle_version,
         parent_coin_id=PARENT_ID,
         network="testnet11",
         daily_compressed_pubkeys=DAILY_KEYS,
@@ -49,16 +62,20 @@ def _artifact() -> tuple[dict, object]:
     )
     artifact = {
         "network": "testnet11",
+        "genesisPlan": {
+            "fundingCoinIds": {"admin_authority": "0x" + PARENT_ID.hex()},
+            **(
+                {"authorityPuzzleVersion": authority_puzzle_version}
+                if authority_puzzle_version != 3 else {}
+            ),
+        },
         "launcherIds": {
             "adminAuthority": "0x" + authority.authority_launcher_id.hex(),
         },
         "puzzleHashes": {
             "adminAuthorityInnerMod": (
                 "0x"
-                + __import__(
-                    "solslot_puzzles.admin_authority_v3_driver",
-                    fromlist=["admin_authority_v3_inner_mod_hash"],
-                ).admin_authority_v3_inner_mod_hash().hex()
+                + admin_authority_v3_inner_mod_hash(authority_puzzle_version).hex()
             ),
             "adminAuthorityFull": "0x" + authority.full_puzzle_hash.hex(),
         },
@@ -192,8 +209,11 @@ async def test_artifact_snapshot_is_honest_before_chain_launch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_genesis_lineage_verifies_all_four_singletons() -> None:
-    artifact, authority = _artifact()
+@pytest.mark.parametrize("authority_puzzle_version", (3, 4))
+async def test_genesis_lineage_verifies_all_four_singletons(
+    authority_puzzle_version: int,
+) -> None:
+    artifact, authority = _artifact(authority_puzzle_version=authority_puzzle_version)
     snapshot = await build_admin_authority_v3_snapshot(
         artifact=artifact,
         provider=_GenesisProvider(authority),  # type: ignore[arg-type]
@@ -202,6 +222,13 @@ async def test_genesis_lineage_verifies_all_four_singletons() -> None:
     assert snapshot.current_coin_id is not None
     assert snapshot.evidence["lineageDepth"] == 1
     assert all(identity.live_coin_id for identity in snapshot.identities)
+    assert _authority_inner_from_snapshot(snapshot) == authority.inner_puzzle
+    assert _genesis_authority_from_artifact(artifact) == authority
+
+    for module_hash in (None, "0x" + "ff" * 32):
+        unsupported = replace(snapshot, evidence={"authorityInnerModHash": module_hash})
+        with pytest.raises(ValueError):
+            _authority_inner_from_snapshot(unsupported)
 
 
 @pytest.mark.asyncio
@@ -220,6 +247,48 @@ async def test_chain_puzzle_mismatch_fails_closed() -> None:
             artifact=deepcopy(artifact),
             provider=provider,  # type: ignore[arg-type]
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authority_puzzle_version", (3, 4))
+async def test_lineage_replay_preserves_authority_module(
+    authority_puzzle_version: int,
+) -> None:
+    artifact, authority = _artifact(authority_puzzle_version=authority_puzzle_version)
+    provider = _GenesisProvider(authority)
+    coin = Coin(authority.authority_launcher_id, authority.full_puzzle_hash, uint64(1))
+    # The reader interprets confirmed spend fields. Package tests separately
+    # submit signed bundles to the simulator for consensus validation.
+    solution = _outer_solution(Program.to([SPEND_OPERATIONAL, 1, 2, None]))
+    parsed, state, _tag = _state_after_solution(authority.inner_puzzle, solution)
+    next_inner = make_inner_puzzle(
+        authority_puzzle_version=authority_puzzle_version,
+        authority_launcher_id=parsed.authority_launcher_id,
+        operational_root_hash=parsed.operational_root_hash,
+        lost_recovery_root_hashes=parsed.lost_recovery_root_hashes,
+        identity_launcher_ids=parsed.identity_launcher_ids,
+        source_manifest_hash=parsed.source_manifest_hash,
+        state=state,
+    )
+    next_full = puzzle_for_singleton(authority.authority_launcher_id, next_inner)
+    child = Coin(bytes32(coin.name()), bytes32(next_full.get_tree_hash()), uint64(1))
+    provider.records["0x" + coin.name().hex()]["spent_block_index"] = 102
+    provider.records["0x" + child.name().hex()] = _record(child, confirmed=102)
+    provider.get_puzzle_and_solution = AsyncMock(return_value={
+        "puzzle_reveal": bytes(puzzle_for_singleton(
+            authority.authority_launcher_id, authority.inner_puzzle
+        )).hex(),
+        "solution": bytes(solution).hex(),
+    })
+
+    snapshot = await build_admin_authority_v3_snapshot(
+        artifact=artifact,
+        provider=provider,  # type: ignore[arg-type]
+    )
+    assert snapshot.chain_verified and not snapshot.pending
+    assert snapshot.authority_version == 2
+    assert snapshot.evidence["lineageDepth"] == 2
+    assert _authority_inner_from_snapshot(snapshot) == next_inner
 
 
 def _outer_solution(inner_solution: Program) -> Program:

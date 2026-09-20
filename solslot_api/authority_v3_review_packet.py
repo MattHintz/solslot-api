@@ -43,6 +43,7 @@ TRUST_BOUNDARIES = {
         "repositories": ["protocol", "api"],
         "sourcePaths": [
             "solslot_puzzles/admin_authority_v3_inner.clsp",
+            "solslot_puzzles/admin_authority_v4_inner.clsp",
             "solslot_puzzles/admin_authority_action_v1.clsp",
             "solslot_puzzles/admin_identity_action_v1.clsp",
             "solslot_puzzles/admin_identity_prepare_announcement_v1.clsp",
@@ -57,11 +58,13 @@ TRUST_BOUNDARIES = {
             "replacement, network, manifest, nonce, and expiry are bound",
             "pending recovery freezes unrelated privileged operations",
             "cancel and completion can only reach the committed state",
+            "only validated Authority transitions emit reserved state announcements",
         ],
         "verificationCommands": [
             {
                 "repository": "protocol",
-                "command": "pytest -q tests/test_admin_authority_v3.py",
+                "command": "pytest -q tests/test_admin_authority_v3.py "
+                "tests/test_admin_authority_v4.py",
             },
             {
                 "repository": "api",
@@ -76,6 +79,7 @@ TRUST_BOUNDARIES = {
         "sourcePaths": [
             "solslot_puzzles/recovery_dependencies.py",
             "solslot_puzzles/admin_authority_v3_inner.clsp",
+            "solslot_puzzles/admin_authority_v4_inner.clsp",
             "solslot_puzzles/admin_authority_v3_driver.py",
             "tests/test_recovery_dependencies.py",
         ],
