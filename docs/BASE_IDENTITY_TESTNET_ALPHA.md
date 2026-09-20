@@ -1,5 +1,8 @@
 # Base identity verification with Testnet11 assets
 
+This document describes the historical v1 profile. The explicit v2 operations
+profile is documented in [Base mainnet operations preparation](BASE_MAINNET_OPERATIONS.md).
+
 This candidate separates identity verification from operational signatures and settlement. It does not activate a deployment or change the reviewed RC27.41 evidence.
 
 | Purpose | Selected network |

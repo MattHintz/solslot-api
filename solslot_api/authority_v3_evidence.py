@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .config import Settings
+from .authority_network import authority_chain_id, validate_authority_network
 
 
 MAX_EVIDENCE_BYTES = 128 * 1024
@@ -59,13 +60,14 @@ def load_governance_evidence(settings: Settings) -> dict[str, Any]:
         != "solslot-alpha-authority-v3-governance-deployment"
         or evidence.get("authorityRule")
         != "slot0_and_one_of_slot1_slot2"
-        or evidence.get("network") != "baseSepolia"
-        or evidence.get("chainId") != AUTHORITY_EVM_CHAIN_ID
         or evidence.get("artifactHash") != _canonical_hash(evidence)
     ):
         raise ValueError(
             "Authority V3 EVM deployment evidence is unsupported"
         )
+    validate_authority_network(
+        evidence, 8453 if settings.eip712_chain_id == 8453 else AUTHORITY_EVM_CHAIN_ID,
+    )
     recovery = evidence.get("recovery")
     safes = evidence.get("safes")
     chia = evidence.get("chiaAuthority")
@@ -99,6 +101,7 @@ def validate_governance_roster(
     kits: list[Mapping[str, Any]],
     evidence: Mapping[str, Any],
 ) -> None:
+    validate_authority_network(evidence, authority_chain_id(record.get("draft") or {}))
     if [int(item["slot"]) for item in kits] != [0, 1, 2]:
         raise ValueError("all three recovery drills are required")
     invitations = sorted(

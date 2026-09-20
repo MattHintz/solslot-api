@@ -21,7 +21,7 @@ CEREMONY_ID = "0x" + "11" * 32
 DAILY_WALLET = "0x" + "22" * 20
 
 
-def _app(tmp_path) -> tuple[FastAPI, GenesisStore]:
+def _app(tmp_path, operations_chain=84532) -> tuple[FastAPI, GenesisStore]:
     settings = Settings(
         _env_file=None,
         runtime_environment="test",
@@ -30,7 +30,12 @@ def _app(tmp_path) -> tuple[FastAPI, GenesisStore]:
         genesis_db_path=str(tmp_path / "genesis.db"),
     )
     store = GenesisStore(settings.genesis_db_path)
-    store.create_draft(CEREMONY_ID, {"network": "testnet11"})
+    draft = {"network": "testnet11"}
+    if operations_chain == 8453:
+        draft.update(evmChainId=8453, enrollmentActivation={
+            "schema": "solslot.enrollment-activation.v2", "evmChainId": 8453,
+        })
+    store.create_draft(CEREMONY_ID, draft)
     app = FastAPI()
     app.include_router(router)
 
@@ -56,10 +61,11 @@ def _app(tmp_path) -> tuple[FastAPI, GenesisStore]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operations_chain", [84532, 8453])
 async def test_dual_key_drill_enrolls_public_recovery_evidence(
-    tmp_path,
+    tmp_path, operations_chain,
 ) -> None:
-    app, store = _app(tmp_path)
+    app, store = _app(tmp_path, operations_chain)
     guardian = Account.create()
     recovery_sk = AugSchemeMPL.key_gen(b"recovery drill seed" * 2)
     async with httpx.AsyncClient(
@@ -75,6 +81,7 @@ async def test_dual_key_drill_enrolls_public_recovery_evidence(
         )
         assert prepared.status_code == 200, prepared.text
         challenge = prepared.json()
+        assert challenge["evmTypedData"]["domain"]["chainId"] == operations_chain
         evm_signature = guardian.sign_message(
             encode_typed_data(full_message=challenge["evmTypedData"])
         ).signature

@@ -233,7 +233,14 @@ def test_permit_network_posture_requires_explicit_complete_metadata_and_matching
         enrollment_permit_identity_client_id=active['issuerIdentityClientId'])
     validate_server_hardening_at_startup(_staging(**values))
     validate_server_hardening_at_startup(_staging())
-    for change in [dict(eip712_chain_id=8453),dict(zkpassport_evm_chain_id=1),dict(eip712_chain_id=11155111),dict(enrollment_permit_identity_client_id=''),dict(network='mainnet')]:
+    invalid_changes = [dict(eip712_chain_id=1), dict(zkpassport_evm_chain_id=1),
+        dict(eip712_chain_id=11155111), dict(enrollment_permit_identity_client_id=''), dict(network='mainnet')]
+    if identity_chain == 8453:
+        # Posture allows explicit v2; authenticated activation still fixes the domain.
+        validate_server_hardening_at_startup(_staging(**{**values, 'eip712_chain_id': 8453}))
+    else:
+        invalid_changes.append(dict(eip712_chain_id=8453))
+    for change in invalid_changes:
         with pytest.raises(RuntimeError):validate_server_hardening_at_startup(_staging(**{**values,**change}))
     with pytest.raises(RuntimeError):validate_server_hardening_at_startup(_staging(eip712_chain_id=84532,zkpassport_evm_chain_id=84532))
 
@@ -252,3 +259,10 @@ def test_unsigned_legacy_artifact_cannot_acquire_permit_runtime_configuration(se
     from solslot_api.public_artifact import _verify_runtime_bindings,PublicArtifactError
     old=json.loads((Path(__file__).parent/'fixtures/enrollment-activation-legacy.json').read_text())
     with pytest.raises(PublicArtifactError,match='requires signed enrollment activation'):_verify_runtime_bindings(setup.settings,old)
+
+
+def test_v1_activation_cannot_acquire_mainnet_operations_by_runtime_configuration(setup):
+    from solslot_api.public_artifact import _verify_runtime_bindings, PublicArtifactError
+    setup.settings.eip712_chain_id = 8453
+    with pytest.raises(PublicArtifactError, match='ceremony signing chain'):
+        _verify_runtime_bindings(setup.settings, setup.a)

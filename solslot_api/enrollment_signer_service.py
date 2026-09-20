@@ -1,6 +1,8 @@
 """Stateless permit-only authority; local signed evidence selects every key input."""
 from __future__ import annotations
 
+from solslot_puzzles.enrollment_networks import enrollment_operational_chain_id
+
 import time
 from typing import Any, Mapping
 from solslot_puzzles.enrollment_activation import activation_from_artifact
@@ -22,7 +24,7 @@ def load_issuer_artifact(settings: EnrollmentSignerSettings) -> tuple[dict[str, 
         if (release is None or artifact['artifactHash'] != settings.expected_artifact_hash
                 or artifact['sourceShas']['api'] != release.apiCommit
                 or artifact['sourceShas']['protocol'] != release.protocolCommit
-                or artifact['network'] != settings.network or artifact['evmChainId'] != 84532
+                or artifact['network'] != settings.network or artifact['evmChainId'] != enrollment_operational_chain_id(activation)
                 or activation['evmChainId'] != settings.zkpassport_evm_chain_id
                 or activation['releaseIdentity'] != settings.enrollment_permit_release_identity
                 or activation['issuerKeyRef'] != settings.enrollment_permit_issuer_key_ref

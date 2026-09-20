@@ -789,8 +789,9 @@ def build_review_receipt(
         governance_evidence.get("schemaVersion") != 3
         or governance_evidence.get("kind")
         != "solslot-alpha-authority-v3-governance-deployment"
-        or governance_evidence.get("network") != "baseSepolia"
-        or governance_evidence.get("chainId") != 84_532
+        or (governance_evidence.get("network"), governance_evidence.get("chainId"))
+        not in (("baseSepolia", 84_532), ("baseMainnet", 8453))
+        or type(governance_evidence.get("chainId")) is not int
         or governance_evidence.get("artifactHash")
         != canonical_hash(governance_evidence)
     ):

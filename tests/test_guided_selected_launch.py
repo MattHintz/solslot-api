@@ -107,3 +107,42 @@ async def test_guided_build_checks_selected_deployment_before_plan_builder(guide
     else:
         assert (await launch.build_guided_plan(g.settings,store,session))['ceremonyId']==g.active['deploymentId']
         assert built[0].enrollment_activation==g.active
+
+
+@pytest.mark.parametrize('deployment_setup', [8453], indirect=True)
+def test_mainnet_operations_onboarding_requires_no_preexisting_sgt_vault(guided, deployment_setup):
+    from tests.test_genesis_permit_evm import reseal
+    g, s = guided, deployment_setup
+    s.active['schema'] = 'solslot.enrollment-activation.v2'
+    s.plan['evmChainId'] = 8453
+    s.record['draft']['evmChainId'] = 8453
+    s.settings.eip712_chain_id = 8453
+    reseal(s)
+    g.settings.eip712_chain_id = 8453
+    g.settings.enrollment_deployment_review_sha256 = s.settings.enrollment_deployment_review_sha256
+    g.template['enrollmentActivation'] = copy.deepcopy(s.active)
+    g.file.write_text(json.dumps(g.template))
+    claimed = claim(g)
+    assert claimed.status_code == 200, claimed.text
+    token = claimed.json()['ownerEnrollmentToken']
+    record = g.store.get(claimed.json()['ceremonyId'])
+    assert record['draft']['evmChainId'] == 8453
+    assert record['draft']['network'] == 'testnet11'
+    owner = Account.create()
+    prepared = g.client.post('/admin/launch/invitations/prepare',
+        json=dict(token=token, wallet=owner.address))
+    assert prepared.status_code == 200, prepared.text
+    data = prepared.json()
+    assert data['typedData']['domain']['chainId'] == 8453
+    assert data['ceremonyBinding']['evmChainId'] == 8453
+    crossed = copy.deepcopy(data['typedData'])
+    crossed['domain']['chainId'] = 84532
+    rejected = g.client.post('/admin/launch/invitations/accept',
+        json=dict(token=token, wallet=owner.address, signature=_sign(owner, crossed)))
+    assert rejected.status_code == 403
+    accepted = g.client.post('/admin/launch/invitations/accept',
+        json=dict(token=token, wallet=owner.address, signature=_sign(owner, data['typedData'])))
+    assert accepted.status_code == 200, accepted.text
+    resumed = g.client.post('/admin/launch/auth/challenge', json=dict(wallet=owner.address))
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()['typedData']['domain']['chainId'] == 8453

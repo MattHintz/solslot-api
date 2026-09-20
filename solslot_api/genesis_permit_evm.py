@@ -8,6 +8,8 @@ separate gates. No live keys are needed by this reader.
 """
 from __future__ import annotations
 
+from solslot_puzzles.enrollment_networks import enrollment_operational_chain_id
+
 import hashlib
 import json
 import re
@@ -90,9 +92,9 @@ def _read(path_value: str, label: str, pin: str | None = None) -> tuple[dict[str
 def _activation(settings: Settings, record: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[str, Any]:
     try:
         if (settings.network != 'testnet11'
-                or settings.eip712_chain_id != 84532 or plan['evmChainId'] != 84532
+                or settings.eip712_chain_id != enrollment_operational_chain_id(plan.get('enrollmentActivation')) or plan['evmChainId'] != settings.eip712_chain_id
                 or type(plan['evmChainId']) is not int or plan['network'] != 'testnet11'
-                or record['draft']['evmChainId'] != 84532
+                or record['draft']['evmChainId'] != settings.eip712_chain_id
                 or type(record['draft']['evmChainId']) is not int
                 or plan['sourceShas'] != record['draft']['sourceShas']
                 or plan['ceremonyId'] != record['ceremony_id']

@@ -677,21 +677,24 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
     # source and a circular trust dependency.
 
     expected_evm_chain_id = 1 if settings.network == "mainnet" else 11155111
+    expected_evm_chain_ids = {expected_evm_chain_id}
     permit_metadata = (settings.enrollment_permit_release_identity,
         settings.enrollment_permit_issuer_key_ref, settings.enrollment_permit_identity_client_id)
     if any(permit_metadata):
         if settings.network != "testnet11" or not all(permit_metadata):
             raise RuntimeError("Enrollment permit issuer metadata requires complete isolated Testnet configuration.")
         expected_evm_chain_id = 84532
+        expected_evm_chain_ids = {84532, 8453} if settings.zkpassport_evm_chain_id == 8453 else {84532}
     # This is a posture precheck, not activation authority. Every trust-critical
     # call still verifies the full signed artifact and exact issuer/release pins.
-    if settings.eip712_chain_id != expected_evm_chain_id:
+    if settings.eip712_chain_id not in expected_evm_chain_ids:
         raise RuntimeError(
             "SOLSLOT_EIP712_CHAIN_ID does not match SOLSLOT_NETWORK: "
-            f"{settings.network} requires {expected_evm_chain_id}."
+            f"{settings.network} requires one of {sorted(expected_evm_chain_ids)}."
         )
     # The selected identity deployment can use zkPassport's Base mainnet
-    # verifier while ceremony signatures and payment rails remain on testnet.
+    # verifier. V1 keeps ceremony signatures on Base Sepolia; V2 selects
+    # Base mainnet operations. The authenticated activation fixes that choice.
     # The signed enrollment activation independently pins the exact identity
     # chain; complete issuer metadata is mandatory for either selected chain.
     identity_chains = {8453, 84532} if all(permit_metadata) else {expected_evm_chain_id}

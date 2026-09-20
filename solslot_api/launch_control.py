@@ -8,6 +8,8 @@ the underlying signed evidence remains downloadable for technical review.
 
 from __future__ import annotations
 
+from solslot_puzzles.enrollment_networks import enrollment_operational_chain_id
+
 import asyncio
 import hashlib
 import json
@@ -586,13 +588,13 @@ def _selected_template(settings: Settings, template: Mapping[str, Any], digest: 
             validator_pubkeys=[exact_hex(k, 48, "validator") for k in body.validator_pubkeys],
             environment=settings.runtime_environment + "-alpha")
         if (settings.network != "testnet11" or settings.zkpassport_evm_chain_id != active["evmChainId"]
-                or settings.eip712_chain_id != 84532
+                or settings.eip712_chain_id != enrollment_operational_chain_id(active)
                 or active["releaseIdentity"] != settings.enrollment_permit_release_identity
                 or active["issuerKeyRef"] != settings.enrollment_permit_issuer_key_ref
                 or active["issuerIdentityClientId"] != settings.enrollment_permit_identity_client_id
                 or active["reviewEvidenceSha256"] != settings.enrollment_deployment_review_sha256):
             raise ValueError("selected launch differs from coordinator pins")
-        binding = {"evmChainId": 84532, "enrollmentActivation": active,
+        binding = {"evmChainId": enrollment_operational_chain_id(active), "enrollmentActivation": active,
             "launchPlanTemplateSha256": digest}
         if record is not None and (record["ceremony_id"] != active["deploymentId"]
                 or any(record["draft"].get(k) != v for k,v in binding.items())
@@ -618,7 +620,7 @@ def _claim_selection(settings: Settings) -> dict[str, Any] | None:
 
 def _ceremony_chain(record: Mapping[str, Any]) -> int:
     chain = record["draft"].get("evmChainId", 11155111)
-    if type(chain) is not int or chain not in (11155111, 84532):
+    if type(chain) is not int or chain not in (11155111, 84532, 8453):
         raise GenesisConflict("unsupported ceremony signing chain")
     return chain
 
@@ -2750,7 +2752,7 @@ async def build_guided_plan(
         if selection:
             from .genesis_permit_evm import verify_permit_deployment
             active = selection["enrollmentActivation"]
-            projection = {"network": "testnet11", "evmChainId": 84532, "sourceShas": record["draft"]["sourceShas"],
+            projection = {"network": "testnet11", "evmChainId": selection["evmChainId"], "sourceShas": record["draft"]["sourceShas"],
                 "ceremonyId": record["ceremony_id"], "enrollmentActivation": active,
                 "validatorSet": {"threshold": 2, "pubkeys": template["validatorPubkeys"]},
                 "evmAddresses": template["evmAddresses"], "puzzleHashes": {"bridgePolicy": active["bridgePolicyHash"]}}
