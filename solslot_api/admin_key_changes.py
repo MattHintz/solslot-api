@@ -42,6 +42,7 @@ from solslot_puzzles.admin_authority_v3_driver import (
     GenesisAdminAuthorityV3,
     IdentityVaultGenesis,
     IdentityVaultTransition,
+    authority_puzzle_version_for_hash,
     build_admin_identity_vault,
     build_authority_prepare_mips_spend,
     build_cancel_solution,
@@ -80,6 +81,11 @@ from .admin_security import (
     SecurityActor,
     _hex_value,
     require_security_actor,
+)
+from .authority_network import (
+    authority_chain_id,
+    authority_network_name,
+    validate_authority_network,
 )
 from .admin_roster import (
     artifact_admins,
@@ -214,7 +220,7 @@ class AdminKeyChangeIntentV1(ApiModel):
         "testnet11",
         alias="chiaNetwork",
     )
-    evm_chain_id: Literal[84532] = Field(
+    evm_chain_id: Literal[84532, 8453] = Field(
         AUTHORITY_EVM_CHAIN_ID,
         alias="evmChainId",
     )
@@ -738,6 +744,12 @@ def _authority_inner_from_snapshot(
     snapshot: AdminAuthorityV3Snapshot,
 ) -> Program:
     return make_inner_puzzle(
+        authority_puzzle_version=authority_puzzle_version_for_hash(
+            _bytes32_hex(
+                snapshot.evidence.get("authorityInnerModHash"),
+                "authority inner module hash",
+            )
+        ),
         authority_launcher_id=_bytes32_hex(
             snapshot.launcher_id,
             "authority launcher id",
@@ -782,6 +794,7 @@ def _genesis_authority_from_artifact(
     ) or len(identities) != 3:
         raise ValueError("Signed Authority V3 genesis coordinates are incomplete")
     authority = build_genesis_admin_authority_v3(
+        authority_puzzle_version=plan.get("authorityPuzzleVersion", 3),
         parent_coin_id=_bytes32_hex(
             funding.get("admin_authority"),
             "Authority V3 funding coin",
@@ -989,6 +1002,7 @@ async def _chia_recovery_build(
             authority_version=snapshot.authority_version - 1,
         )
         prior_authority_inner = make_inner_puzzle(
+            authority_puzzle_version=authority.authority_puzzle_version,
             authority_launcher_id=authority.authority_launcher_id,
             operational_root_hash=authority.operational_root_hash,
             lost_recovery_root_hashes=authority.lost_recovery_root_hashes,
@@ -1187,7 +1201,9 @@ def prepare_key_change_calldata(intent: AdminKeyChangeIntentV1) -> str:
 def lost_key_authorization_typed_data(
     intent_hash: str,
     coordinator: str,
+    chain_id: int = AUTHORITY_EVM_CHAIN_ID,
 ) -> dict[str, Any]:
+    authority_network_name(chain_id)
     normalized_hash = _hex_value(intent_hash, 64, "intentHash")
     verifying_contract = normalize_evm_address(
         coordinator,
@@ -1208,7 +1224,7 @@ def lost_key_authorization_typed_data(
         "primaryType": LOST_KEY_AUTHORIZATION_PRIMARY_TYPE,
         "domain": {
             **LOST_KEY_AUTHORIZATION_DOMAIN,
-            "chainId": AUTHORITY_EVM_CHAIN_ID,
+            "chainId": chain_id,
             "verifyingContract": verifying_contract,
         },
         "message": {"intentHash": normalized_hash},
@@ -1251,6 +1267,7 @@ def verify_lost_guardian_authorization(
     typed_data = lost_key_authorization_typed_data(
         hash_admin_key_change_intent(intent),
         coordinator,
+        chain_id=intent.evm_chain_id,
     )
     recovered = recover_evm_signer(typed_data, guardian_signature)
     expected = normalize_evm_address(
@@ -1268,7 +1285,9 @@ def recovery_guardian_action_typed_data(
     intent_hash: str,
     coordinator: str,
     action: Literal["ACCEPT", "VETO"],
+    chain_id: int = AUTHORITY_EVM_CHAIN_ID,
 ) -> dict[str, Any]:
+    authority_network_name(chain_id)
     normalized_hash = _hex_value(intent_hash, 64, "intentHash")
     verifying_contract = normalize_evm_address(
         coordinator,
@@ -1290,7 +1309,7 @@ def recovery_guardian_action_typed_data(
         "primaryType": primary_type,
         "domain": {
             **LOST_KEY_AUTHORIZATION_DOMAIN,
-            "chainId": AUTHORITY_EVM_CHAIN_ID,
+            "chainId": chain_id,
             "verifyingContract": verifying_contract,
         },
         "message": {"intentHash": normalized_hash},
@@ -1312,6 +1331,7 @@ def verify_recovery_guardian_action_authorization(
         hash_admin_key_change_intent(intent),
         coordinator,
         action,
+        chain_id=intent.evm_chain_id,
     )
     recovered = recover_evm_signer(typed_data, guardian_signature)
     expected = normalize_evm_address(
@@ -1514,6 +1534,8 @@ async def _verified_evidence_context(
 ) -> tuple[dict[str, Any], dict[str, Any], str]:
     artifact = load_signed_public_artifact(settings)
     evidence = load_governance_evidence(settings)
+    expected_chain = authority_chain_id(artifact)
+    validate_authority_network(evidence, expected_chain)
     authority = artifact["adminAuthority"]
     chia = evidence["chiaAuthority"]
     if (
@@ -1538,7 +1560,7 @@ async def _verified_evidence_context(
     if "0x" + keccak(bytes.fromhex(str(code)[2:])).hex() != expected_code_hash:
         raise ValueError("Authority V3 recovery runtime code hash changed")
     chain_id = int(str(await _rpc(settings, "eth_chainId", [])), 16)
-    if chain_id != AUTHORITY_EVM_CHAIN_ID:
+    if chain_id != expected_chain:
         raise ValueError("Authority V3 RPC is on the wrong EVM network")
     return artifact, evidence, coordinator
 
@@ -1582,6 +1604,7 @@ def _build_intent(
     new_recovery_guardian: str | None = None,
     new_recovery_bls_key: str | None = None,
 ) -> AdminKeyChangeIntentV1:
+    validate_authority_network(evidence, authority_chain_id(artifact))
     administrators = administrators or artifact_admins(artifact)
     old_evm, old_chia = administrators[slot]
     safes = evidence["safes"]
@@ -1660,6 +1683,7 @@ def _build_intent(
         else ROUTINE_DELAY_SECONDS
     )
     return AdminKeyChangeIntentV1(
+        evmChainId=evidence["chainId"],
         slot=slot,
         kind=kind,
         oldDailyEvmKey=old_evm,
@@ -1698,7 +1722,7 @@ def _prepared_response(
         intentHash=intent_hash,
         coordinator=coordinator,
         prepareTransaction={
-            "chainId": AUTHORITY_EVM_CHAIN_ID,
+            "chainId": intent.evm_chain_id,
             "to": coordinator,
             "value": "0x0",
             "data": prepare_key_change_calldata(intent),
@@ -1741,6 +1765,7 @@ def _prepared_response(
             lost_key_authorization_typed_data(
                 intent_hash,
                 coordinator,
+                chain_id=intent.evm_chain_id,
             )
             if intent.kind == "LOST"
             else None
@@ -2300,6 +2325,7 @@ def _case_actions(
                     str(case["intentHash"]),
                     coordinator,
                     "ACCEPT",
+                    chain_id=intent.evm_chain_id,
                 ),
                 authorization_action="ACCEPT",
             )
@@ -2329,6 +2355,7 @@ def _case_actions(
                 str(case["intentHash"]),
                 coordinator,
                 "VETO",
+                chain_id=intent.evm_chain_id,
             ),
             authorization_action="VETO",
         )
@@ -2522,10 +2549,12 @@ def _contract_owner_signature(owner: str, nested_signature: bytes) -> bytes:
 def _safe_transaction_typed_data(
     safe: str,
     transaction: Mapping[str, Any],
+    chain_id: int = AUTHORITY_EVM_CHAIN_ID,
 ) -> dict[str, Any]:
+    authority_network_name(chain_id)
     return {
         "domain": {
-            "chainId": AUTHORITY_EVM_CHAIN_ID,
+            "chainId": chain_id,
             "verifyingContract": safe,
         },
         "types": {"SafeTx": SAFE_TRANSACTION_FIELDS},
@@ -2551,10 +2580,12 @@ def _safe_transaction_typed_data(
 def _safe_message_typed_data(
     identity_safe: str,
     transaction_data: str,
+    chain_id: int = AUTHORITY_EVM_CHAIN_ID,
 ) -> dict[str, Any]:
+    authority_network_name(chain_id)
     return {
         "domain": {
-            "chainId": AUTHORITY_EVM_CHAIN_ID,
+            "chainId": chain_id,
             "verifyingContract": identity_safe,
         },
         "types": {"SafeMessage": [{"name": "message", "type": "bytes"}]},
@@ -2570,6 +2601,7 @@ async def _safe_transaction_context(
     to: str,
     data: str,
     nonce_override: int | None = None,
+    chain_id: int = AUTHORITY_EVM_CHAIN_ID,
 ) -> dict[str, Any]:
     safe = normalize_evm_address(safe, "execution Safe")
     to = normalize_evm_address(to, "Safe transaction target")
@@ -2610,7 +2642,7 @@ async def _safe_transaction_context(
         "nonce": nonce,
     }
     local_data = _safe_typed_data_preimage(
-        _safe_transaction_typed_data(safe, transaction)
+        _safe_transaction_typed_data(safe, transaction, chain_id)
     )
     local_hash = "0x" + keccak(local_data).hex()
     argument_types = [
@@ -2681,6 +2713,7 @@ async def _safe_transaction_context(
         raise ValueError("Safe transaction data differs from the local EIP-712 action")
     return {
         "safe": safe,
+        "chainId": chain_id,
         "nonce": nonce,
         "transaction": transaction,
         "transactionHash": local_hash,
@@ -2694,7 +2727,7 @@ def _safe_exec_transaction(
 ) -> dict[str, Any]:
     transaction = context["transaction"]
     return {
-        "chainId": AUTHORITY_EVM_CHAIN_ID,
+        "chainId": context["chainId"],
         "to": context["safe"],
         "value": "0x0",
         "data": _function_data(
@@ -2925,6 +2958,7 @@ async def _build_evm_safe_action_package(
         to=action["to"],
         data=action["data"],
         nonce_override=approved_safe_nonce,
+        chain_id=intent.evm_chain_id,
     )
     administrators = _current_administrators(artifact, store)
     descriptors = []
@@ -2939,11 +2973,13 @@ async def _build_evm_safe_action_package(
             _safe_message_typed_data(
                 topology["identities"][slot],
                 context["transactionData"],
+                chain_id=intent.evm_chain_id,
             )
             if signature_kind == "SAFE_MESSAGE"
             else _safe_transaction_typed_data(
                 execution_safe,
                 context["transaction"],
+                chain_id=intent.evm_chain_id,
             )
         )
         message_hash = _safe_typed_data_digest(typed_data)
@@ -2970,8 +3006,8 @@ async def _build_evm_safe_action_package(
         "caseId": case["caseId"],
         "actionId": body.action_id,
         "intentHash": case["intentHash"],
-        "network": "baseSepolia",
-        "chainId": AUTHORITY_EVM_CHAIN_ID,
+        "network": authority_network_name(intent.evm_chain_id),
+        "chainId": intent.evm_chain_id,
         "executionSafe": execution_safe,
         "safeNonce": context["nonce"],
         "coadminSlot": selected_coadmin,
@@ -3122,7 +3158,7 @@ async def _record_pending_evm_action(
     if transaction.get("chainId") is not None and _rpc_integer(
         transaction.get("chainId"),
         "Base Sepolia transaction chain",
-    ) != AUTHORITY_EVM_CHAIN_ID:
+    ) != intent.evm_chain_id:
         raise ValueError("administrator action was submitted on the wrong EVM network")
 
     if action["execution"] == "SAFE":
@@ -4585,14 +4621,9 @@ async def _observe_chia_case(
     latest_spend = str(snapshot.evidence.get("latestSpend") or "")
 
     if snapshot.pending:
-        expected_chia_kind = (
-            "ROUTINE"
-            if intent.kind == "RECOVERY_KIT"
-            else intent.kind
-        )
         if (
             snapshot.pending_intent_hash != case["intentHash"]
-            or snapshot.pending_kind != expected_chia_kind
+            or snapshot.pending_kind != intent.kind
             or snapshot.pending_slot != intent.slot
         ):
             raise ValueError(
@@ -4600,11 +4631,7 @@ async def _observe_chia_case(
             )
         receipt_record = {
             "schemaVersion": 1,
-            "event": (
-                "PREPARE_ROUTINE"
-                if intent.kind in {"ROUTINE", "RECOVERY_KIT"}
-                else "PREPARE_LOST"
-            ),
+            "event": latest_spend,
             "network": "testnet11",
             "intentHash": case["intentHash"],
             "authorityCoinId": snapshot.current_coin_id,
@@ -4839,7 +4866,7 @@ async def authorize_lost_key_change(
             intentHash=intent_hash,
             guardianSigner=signer,
             relayTransaction={
-                "chainId": AUTHORITY_EVM_CHAIN_ID,
+                "chainId": body.intent.evm_chain_id,
                 "to": coordinator,
                 "value": "0x0",
                 "data": prepare_lost_key_with_signature_calldata(
@@ -4954,7 +4981,7 @@ async def authorize_recovery_guardian_action(
             action=body.action,
             guardianSigner=signer,
             relayTransaction={
-                "chainId": AUTHORITY_EVM_CHAIN_ID,
+                "chainId": intent.evm_chain_id,
                 "to": coordinator,
                 "value": "0x0",
                 "data": recovery_guardian_action_with_signature_calldata(

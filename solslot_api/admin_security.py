@@ -21,6 +21,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .admin_auth import require_admin_jwt
+from .authority_network import authority_chain_id, authority_network_name
 from .admin_roster import (
     artifact_ceremony_id,
     current_artifact_admins,
@@ -218,12 +219,15 @@ def _drill_payload(
     revision: int,
     nonce: str,
     expires_at: int,
+    evm_chain_id: int = AUTHORITY_EVM_CHAIN_ID,
 ) -> dict[str, Any]:
+    authority_network_name(evm_chain_id)
     commitment = "0x" + keccak(
         bytes.fromhex(recovery_bls_pubkey[2:])
     ).hex()
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2 if evm_chain_id == 8453 else 1,
+        **({"evmChainId": evm_chain_id} if evm_chain_id == 8453 else {}),
         "purpose": "Solslot administrator recovery drill",
         "ceremonyId": actor.ceremony_id,
         "slot": actor.authority_slot,
@@ -239,7 +243,16 @@ def _drill_payload(
     }
 
 
+def _drill_chain(payload: Mapping[str, Any]) -> int:
+    if payload.get("schemaVersion") == 1 and "evmChainId" not in payload:
+        return AUTHORITY_EVM_CHAIN_ID
+    if payload.get("schemaVersion") == 2 and type(payload.get("evmChainId")) is int and payload["evmChainId"] == 8453:
+        return 8453
+    raise ValueError("unsupported recovery drill network profile")
+
+
 def _drill_typed_data(payload: Mapping[str, Any]) -> dict[str, Any]:
+    chain = _drill_chain(payload)
     return {
         "types": {
             "EIP712Domain": [
@@ -261,8 +274,8 @@ def _drill_typed_data(payload: Mapping[str, Any]) -> dict[str, Any]:
         "primaryType": "SolslotAdminRecoveryDrill",
         "domain": {
             "name": "Solslot Admin Recovery",
-            "version": "1",
-            "chainId": AUTHORITY_EVM_CHAIN_ID,
+            "version": str(payload["schemaVersion"]),
+            "chainId": chain,
         },
         "message": {
             key: payload[key]
@@ -281,6 +294,7 @@ def _drill_typed_data(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _drill_bls_digest(payload: Mapping[str, Any]) -> bytes:
+    chain = _drill_chain(payload)
     def atom_hash(value: bytes) -> bytes:
         return hashlib.sha256(b"\x01" + value).digest()
 
@@ -296,7 +310,8 @@ def _drill_bls_digest(payload: Mapping[str, Any]) -> bytes:
     message = proper_list_hash(
         [
             b"SolslotAdminRecoveryDrill",
-            int_to_bytes(1),
+            int_to_bytes(payload["schemaVersion"]),
+            *([int_to_bytes(chain)] if payload["schemaVersion"] == 2 else []),
             bytes.fromhex(str(payload["ceremonyId"])[2:]),
             int_to_bytes(int(payload["slot"])),
             bytes.fromhex(str(payload["recoveryBlsCommitment"])[2:]),
@@ -439,7 +454,7 @@ async def prepare_recovery_drill(
             "evmGuardian",
         )
         _assert_recovery_identity_is_unique(store, actor, guardian)
-        store.get(actor.ceremony_id)
+        record = store.get(actor.ceremony_id)
         existing = next(
             (
                 item
@@ -474,6 +489,7 @@ async def prepare_recovery_drill(
             revision=revision,
             nonce=nonce,
             expires_at=expires_at,
+            evm_chain_id=authority_chain_id(record["draft"]),
         )
         challenge_hash = _canonical_hash(payload)
         store.create_recovery_drill(

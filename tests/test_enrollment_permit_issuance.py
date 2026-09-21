@@ -22,18 +22,34 @@ from solslot_api.credential_ledger import CredentialLedger,LedgerConflict,Ledger
 
 SYNTHETIC_KEY=bytes(31)+b'\x01'
 
-def artifact():
-    return json.loads((Path(__file__).parent/'fixtures/enrollment-activation.json').read_text())
+def artifact(identity_chain=84532):
+    value = json.loads((Path(__file__).parent/'fixtures/enrollment-activation.json').read_text())
+    if identity_chain != 84532:
+        from solslot_puzzles.enrollment_permit_driver import make_permit_bridge_puzzle
+        active = value['enrollmentActivation']
+        active['evmChainId'] = identity_chain
+        context = activation_context(active).context_hash
+        active['contextHash'] = '0x' + context.hex()
+        active['bridgePolicyHash'] = '0x' + make_permit_bridge_puzzle(
+            [bytes.fromhex(k[2:]) for k in value['validatorSet']['pubkeys']], context).get_tree_hash().hex()
+        value['genesisPlan']['enrollmentActivation'] = copy.deepcopy(active)
+        value['genesisPlan']['puzzleHashes']['bridgePolicy'] = active['bridgePolicyHash']
+        value['bridgePolicy']['policyHash'] = active['bridgePolicyHash']
+        value['puzzleHashes']['bridgePolicy'] = active['bridgePolicyHash']
+        value['bridgePolicy']['bridgeCoinIds'] = [
+            '0x' + Coin(bytes32.from_hexstr(parent), bytes32.from_hexstr(active['bridgePolicyHash']), uint64(1)).name().hex()
+            for parent in value['bridgePolicy']['parentCoinIds']]
+    return value
 
 def signature(activation,wire,key=SYNTHETIC_KEY):
     msg=encode_typed_data(full_message=permit_signing_typed_data(EnrollmentPermit.from_wire(wire),activation_context(activation)))
     return '0x'+Account.sign_message(msg,key).signature.hex()
 
-@pytest.fixture
-def setup(monkeypatch,tmp_path):
-    a=artifact();active=a['enrollmentActivation'];policy=BridgeCoinPolicy.from_artifact(a)
+@pytest.fixture(params=[84532, 8453], ids=["base-sepolia", "base-mainnet-identity"])
+def setup(monkeypatch,tmp_path,request):
+    a=artifact(request.param);active=a['enrollmentActivation'];policy=BridgeCoinPolicy.from_artifact(a)
     settings=Settings(runtime_environment='staging',network='testnet11',alpha_writes_enabled=True,
-        zkpassport_evm_chain_id=84532,zkpassport_ledger_db_path=str(tmp_path/'ledger.db'),
+        zkpassport_evm_chain_id=request.param,eip712_chain_id=84532,zkpassport_ledger_db_path=str(tmp_path/'ledger.db'),
         enrollment_permit_release_identity=active['releaseIdentity'],enrollment_permit_issuer_key_ref=active['issuerKeyRef'],
         enrollment_permit_identity_client_id=active['issuerIdentityClientId'])
     from chia.wallet.puzzles.singleton_top_layer_v1_1 import SINGLETON_LAUNCHER_HASH
@@ -207,16 +223,24 @@ def test_nonlauncher_parent_never_reaches_issuer(setup):
     with pytest.raises(HTTPException):s.issue()
     assert not s.calls and s.ledger.get_enrollment(s.vault) is None
 
-def test_permit_network_posture_requires_explicit_complete_metadata_and_matching_wallet_chain():
+@pytest.mark.parametrize("identity_chain", [84532, 8453])
+def test_permit_network_posture_requires_explicit_complete_metadata_and_matching_wallet_chain(identity_chain):
     from tests.test_server_hardening import _staging
     from solslot_api.config import validate_server_hardening_at_startup
     active=artifact()['enrollmentActivation']
-    values=dict(eip712_chain_id=84532,zkpassport_evm_chain_id=84532,
+    values=dict(eip712_chain_id=84532,zkpassport_evm_chain_id=identity_chain,
         enrollment_permit_release_identity=active['releaseIdentity'],enrollment_permit_issuer_key_ref=active['issuerKeyRef'],
         enrollment_permit_identity_client_id=active['issuerIdentityClientId'])
     validate_server_hardening_at_startup(_staging(**values))
     validate_server_hardening_at_startup(_staging())
-    for change in [dict(eip712_chain_id=11155111),dict(enrollment_permit_identity_client_id=''),dict(network='mainnet')]:
+    invalid_changes = [dict(eip712_chain_id=1), dict(zkpassport_evm_chain_id=1),
+        dict(eip712_chain_id=11155111), dict(enrollment_permit_identity_client_id=''), dict(network='mainnet')]
+    if identity_chain == 8453:
+        # Posture allows explicit v2; authenticated activation still fixes the domain.
+        validate_server_hardening_at_startup(_staging(**{**values, 'eip712_chain_id': 8453}))
+    else:
+        invalid_changes.append(dict(eip712_chain_id=8453))
+    for change in invalid_changes:
         with pytest.raises(RuntimeError):validate_server_hardening_at_startup(_staging(**{**values,**change}))
     with pytest.raises(RuntimeError):validate_server_hardening_at_startup(_staging(eip712_chain_id=84532,zkpassport_evm_chain_id=84532))
 
@@ -235,3 +259,10 @@ def test_unsigned_legacy_artifact_cannot_acquire_permit_runtime_configuration(se
     from solslot_api.public_artifact import _verify_runtime_bindings,PublicArtifactError
     old=json.loads((Path(__file__).parent/'fixtures/enrollment-activation-legacy.json').read_text())
     with pytest.raises(PublicArtifactError,match='requires signed enrollment activation'):_verify_runtime_bindings(setup.settings,old)
+
+
+def test_v1_activation_cannot_acquire_mainnet_operations_by_runtime_configuration(setup):
+    from solslot_api.public_artifact import _verify_runtime_bindings, PublicArtifactError
+    setup.settings.eip712_chain_id = 8453
+    with pytest.raises(PublicArtifactError, match='ceremony signing chain'):
+        _verify_runtime_bindings(setup.settings, setup.a)

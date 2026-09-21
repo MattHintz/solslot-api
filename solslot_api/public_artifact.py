@@ -137,8 +137,11 @@ def _verify_runtime_bindings(settings: Settings, payload: Mapping[str, Any]) -> 
         raise PublicArtifactError('enrollment permit runtime does not match the reviewed release and issuer metadata')
     if payload.get("network") != settings.network:
         raise PublicArtifactError("public artifact network does not match this API")
-    if payload.get("evmChainId") != settings.zkpassport_evm_chain_id:
-        raise PublicArtifactError("public artifact EVM chain does not match this API")
+    identity_chain = selected['evmChainId'] if selected is not None else payload.get("evmChainId")
+    if identity_chain != settings.zkpassport_evm_chain_id:
+        raise PublicArtifactError("public artifact identity chain does not match this API")
+    if selected is not None and payload.get("evmChainId") != settings.eip712_chain_id:
+        raise PublicArtifactError("public artifact ceremony signing chain does not match this API")
 
     launchers = payload.get("launcherIds")
     bridge = payload.get("bridgePolicy")

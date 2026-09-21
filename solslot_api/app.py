@@ -194,6 +194,7 @@ def _warm_chia_puzzle_templates() -> None:
     )
     for mod in (
         admin_authority_v3_inner_mod(),
+        admin_authority_v3_inner_mod(4),
         mint_proposal_inner_v2_mod(),
         property_registry_inner_mod(),
         protocol_config_inner_mod(),

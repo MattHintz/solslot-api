@@ -71,7 +71,7 @@ class ApiModel(BaseModel):
 
 
 class DraftRequest(ApiModel):
-    evm_chain_id: Literal[11155111,84532] = Field(11155111,alias="evmChainId")
+    evm_chain_id: Literal[11155111,84532,8453] = Field(11155111,alias="evmChainId")
     source_shas: dict[str, str] = Field(alias="sourceShas")
     review_class: Literal[
         "independent-release-review", "internal-engineering-testnet"

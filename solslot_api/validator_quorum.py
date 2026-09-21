@@ -1128,7 +1128,7 @@ def configured_bridge_policy_hash(settings: Settings, *, activation: dict[str, A
             checked = validate_enrollment_activation(activation, source_shas=activation["sourceShas"],
                 ceremony_id=activation["deploymentId"], emitter=settings.zkpassport_emitter_address.lower(),
                 validator_pubkeys=pubkeys, environment=settings.runtime_environment + "-alpha")
-            if (settings.zkpassport_evm_chain_id != 84532
+            if (settings.zkpassport_evm_chain_id != checked["evmChainId"]
                     or settings.enrollment_permit_release_identity != checked["releaseIdentity"]
                     or settings.enrollment_permit_issuer_key_ref != checked["issuerKeyRef"]
                     or settings.enrollment_permit_identity_client_id != checked["issuerIdentityClientId"]):
@@ -1205,7 +1205,7 @@ async def probe_validator_health(
         parsed = ValidatorHealthResponse.model_validate(response.json())
         expected_pubkey = "0x" + pubkeys[index].hex()
         if (parsed.enrollmentActivation != expected_enrollment_activation
-                or parsed.evmChainId != (84532 if expected_enrollment_activation is not None else 11155111)):
+                or parsed.evmChainId != (expected_enrollment_activation["evmChainId"] if expected_enrollment_activation is not None else 11155111)):
             raise ValidatorQuorumError(f"validator signer {index} enrollment deployment does not match ceremony")
         checks = (
             (parsed.status, "healthy", "status"),
