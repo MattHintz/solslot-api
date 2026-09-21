@@ -372,7 +372,8 @@ jobs:
                 echo "Refusing to replace the active release directory $release_dir." >&2
                 exit 1
               fi
-              rm -rf "$release_dir"
+              echo "Incomplete release retained under preservation hold: $release_dir" >&2
+              exit 1
             fi
 
             if [ ! -f "$release_dir/.release-ready" ]; then
@@ -666,10 +667,8 @@ jobs:
             fi
             touch "$release_dir/.release-local-verified"
 
-            find "$release_root/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
-              | sort -rn \
-              | awk 'NR>5 {print $2}' \
-              | xargs -r rm -rf
+            # Prior releases are preserved for evidence and rollback.
+            # Cleanup requires separate authorization under the retention hold.
 
       - name: Verify public production API
         run: |

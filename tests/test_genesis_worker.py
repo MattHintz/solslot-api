@@ -6,8 +6,16 @@ from chia.types.blockchain_format.coin import Coin
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 
-from solslot_api.genesis_worker import _expected_outputs
+from solslot_api.genesis_worker import _expected_outputs, execute
+from solslot_puzzles.admin_authority_v3_driver import admin_authority_v3_inner_mod_hash
 from solslot_puzzles.protocol_deployment import cat2_puzzle_hash_for_sgt
+
+
+def test_authority_review_inventory_selects_v4() -> None:
+    inventory = execute({"operation": "authorityV3Inventory"})
+    assert inventory["adminAuthorityInnerModHash"] == (
+        "0x" + admin_authority_v3_inner_mod_hash(4).hex()
+    )
 
 
 def _surface(seed: int) -> SimpleNamespace:

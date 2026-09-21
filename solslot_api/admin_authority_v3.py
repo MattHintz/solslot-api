@@ -338,10 +338,11 @@ def _state_after_solution(
         current_custodies = list(
             parsed.state.current_identity_custody_hashes
         )
-        if spend_tag == SPEND_COMPLETE:
-            current_custodies[parsed.state.pending_slot] = (
-                parsed.state.pending_replacement_custody_hash
-            )
+        current_custodies[parsed.state.pending_slot] = (
+            parsed.state.pending_replacement_custody_hash
+            if spend_tag == SPEND_COMPLETE
+            else parsed.state.pending_original_custody_hash
+        )
         state = AdminAuthorityV3State(
             current_identity_custody_hashes=tuple(current_custodies),  # type: ignore[arg-type]
             authority_version=new_version,
@@ -425,6 +426,7 @@ async def build_admin_authority_v3_snapshot(
                 )
                 latest_spend_tag = spend_tag
                 next_inner = make_inner_puzzle(
+                    authority_puzzle_version=parsed.authority_puzzle_version,
                     authority_launcher_id=parsed.authority_launcher_id,
                     operational_root_hash=parsed.operational_root_hash,
                     lost_recovery_root_hashes=(
