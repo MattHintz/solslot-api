@@ -1021,7 +1021,8 @@ class Settings(BaseSettings):
     bootstrap_cookie_secure: bool = True
     launch_session_secret: str = ""
     launch_session_ttl_seconds: int = Field(900, ge=300, le=3600)
-    launch_cookie_path: str = "/protocol-api/admin/launch"
+    # Recovery setup uses /admin/security before on-chain admins exist.
+    launch_cookie_path: str = "/protocol-api/admin"
     # The guided browser never chooses the ceremony review class. Official
     # Testnet11 releases use an independent review; an explicitly configured
     # internal engineering run remains available only as a disposable operator

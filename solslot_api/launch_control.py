@@ -320,6 +320,7 @@ def _issue_session(
 def _set_session_cookie(
     response: Response, settings: Settings, token: str, expires_at: int
 ) -> None:
+    _clear_legacy_session_cookie(response, settings)
     response.set_cookie(
         LAUNCH_COOKIE_NAME,
         token,
@@ -329,6 +330,18 @@ def _set_session_cookie(
         samesite="strict",
         path=settings.launch_cookie_path,
     )
+
+
+def _clear_legacy_session_cookie(response: Response, settings: Settings) -> None:
+    legacy_path = "/protocol-api/admin/launch"
+    if settings.launch_cookie_path != legacy_path:
+        response.delete_cookie(
+            LAUNCH_COOKIE_NAME,
+            path=legacy_path,
+            secure=settings.bootstrap_cookie_secure,
+            httponly=True,
+            samesite="strict",
+        )
 
 
 def _decode_session(token: str, settings: Settings) -> LaunchSession:
@@ -1971,6 +1984,7 @@ async def launch_logout(
     response: Response,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict[str, bool]:
+    _clear_legacy_session_cookie(response, settings)
     response.delete_cookie(LAUNCH_COOKIE_NAME, path=settings.launch_cookie_path)
     return {"authenticated": False}
 
@@ -1978,10 +1992,16 @@ async def launch_logout(
 @router.get("/workspace")
 async def launch_workspace(
     request: Request,
+    response: Response,
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[GenesisStore, Depends(get_genesis_store)],
     session: Annotated[LaunchSession, Depends(require_launch_session)],
 ) -> dict[str, Any]:
+    # Upgrade a validated existing session without a new signature or enrollment.
+    # Preserve its original expiry; visiting the workspace cannot extend access.
+    _set_session_cookie(
+        response, settings, request.cookies[LAUNCH_COOKIE_NAME], session.expires_at
+    )
     record = store.get(session.ceremony_id)
     readiness = await _readiness(request, settings, store, record)
     action_approvals: dict[str, Any] = {}
