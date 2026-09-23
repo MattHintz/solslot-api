@@ -44,6 +44,7 @@ from .authority_v3_review import (
     load_authority_v3_review,
 )
 from .config import Settings, get_settings
+from .disposable_genesis import is_disposable, require_scope, require_allowed_gate
 from .evm_auth import normalize_evm_address, recover_evm_signer
 from .genesis import (
     INDEPENDENT_REVIEW_CLASS,
@@ -1053,12 +1054,14 @@ def _task_for(record: Mapping[str, Any], readiness: list[dict[str, Any]]) -> dic
             "assignedRole": "owner" if enrolled == 0 else "administrator",
             "action": "enrollment",
         }
+    if state in {"roster_open", "roster_frozen"}:
+        readiness = [item for item in readiness if item["id"] not in {"authorityV3Evm", "authorityV3Review"}]
     blocked = next(
         (
             item
             for item in readiness
             if item["status"] == "Blocked"
-            and (item.get("blocksCeremony", True) or ceremony_complete)
+            and (item.get("blocksCeremony", True) or (ceremony_complete and not is_disposable(record)))
         ),
         None,
     )
@@ -1074,7 +1077,7 @@ def _task_for(record: Mapping[str, Any], readiness: list[dict[str, Any]]) -> dic
             item
             for item in readiness
             if item["status"] in {"Needs action", "Waiting"}
-            and (item.get("blocksCeremony", True) or ceremony_complete)
+            and (item.get("blocksCeremony", True) or (ceremony_complete and not is_disposable(record)))
         ),
         None,
     )
@@ -1358,110 +1361,125 @@ async def _readiness(
         }
     )
 
-    authority_evidence: dict[str, Any] | None = None
     try:
-        authority_evidence = load_governance_evidence(settings)
-        validate_governance_roster(
-            record,
-            recovery_kits,
-            authority_evidence,
-        )
-        items.append(
-            {
-                "id": "authorityV3Evm",
-                "title": "Protected administrator authority",
-                "status": "Healthy",
-                "impact": (
-                    "The three identity Safes, owner-plus-one root, "
-                    "recovery coordinator, guards, and delays match the "
-                    "administrator recovery roster."
-                ),
-                "assignedRole": "system",
-                "evidence": {
-                    "artifactHash": authority_evidence[
-                        "artifactHash"
-                    ],
-                    "authorityRule": "Owner plus either coadministrator",
-                    "identitySafes": 3,
-                    "routineDelaySeconds": 86_400,
-                    "lostKeyDelaySeconds": 604_800,
-                },
-            }
-        )
-    except (GenesisStoreError, KeyError, TypeError, ValueError) as exc:
-        items.append(
-            {
-                "id": "authorityV3Evm",
-                "title": "Finish administrator protection",
-                "status": "Blocked",
-                "impact": (
-                    "The protected Safe hierarchy and recovery roster are "
-                    "not installed as one matching Authority V3 release."
-                ),
-                "assignedRole": "technical-coadmin",
-                "action": "installAuthorityV3",
-                "evidence": {"technicalReason": str(exc)},
-            }
-        )
+        disposable = require_scope(settings, record)
+    except ValueError as exc:
+        disposable = False
+        items.append({"id": "disposableScope", "title": "Disposable scope mismatch",
+                      "status": "Blocked", "impact": str(exc), "assignedRole": "technical-coadmin"})
+    if disposable:
+        for name, title in (("authorityV3Evm", "EVM recovery setup deferred"),
+                            ("authorityV3Review", "Independent recovery review deferred")):
+            items.append({"id": name, "title": title, "status": "Waiting",
+                          "impact": "Deferred for this disposable vault/identity test. Replace this genesis before bridge or sales testing.",
+                          "assignedRole": "technical-coadmin", "blocksCeremony": False,
+                          "deferredForDisposable": True, "action": None,
+                          "evidence": {"auditStatus": "unaudited", "replaceBeforeBridgeTesting": True}})
+    else:
+        authority_evidence: dict[str, Any] | None = None
+        try:
+            authority_evidence = load_governance_evidence(settings)
+            validate_governance_roster(
+                record,
+                recovery_kits,
+                authority_evidence,
+            )
+            items.append(
+                {
+                    "id": "authorityV3Evm",
+                    "title": "Protected administrator authority",
+                    "status": "Healthy",
+                    "impact": (
+                        "The three identity Safes, owner-plus-one root, "
+                        "recovery coordinator, guards, and delays match the "
+                        "administrator recovery roster."
+                    ),
+                    "assignedRole": "system",
+                    "evidence": {
+                        "artifactHash": authority_evidence[
+                            "artifactHash"
+                        ],
+                        "authorityRule": "Owner plus either coadministrator",
+                        "identitySafes": 3,
+                        "routineDelaySeconds": 86_400,
+                        "lostKeyDelaySeconds": 604_800,
+                    },
+                }
+            )
+        except (GenesisStoreError, KeyError, TypeError, ValueError) as exc:
+            items.append(
+                {
+                    "id": "authorityV3Evm",
+                    "title": "Finish administrator protection",
+                    "status": "Blocked",
+                    "impact": (
+                        "The protected Safe hierarchy and recovery roster are "
+                        "not installed as one matching Authority V3 release."
+                    ),
+                    "assignedRole": "technical-coadmin",
+                    "action": "installAuthorityV3",
+                    "evidence": {"technicalReason": str(exc)},
+                }
+            )
 
-    try:
-        if release is None:
-            raise AuthorityV3ReviewError(
-                "reviewed release evidence is unavailable"
+        try:
+            if release is None:
+                raise AuthorityV3ReviewError(
+                    "reviewed release evidence is unavailable"
+                )
+            if authority_evidence is None:
+                raise AuthorityV3ReviewError(
+                    "Authority V3 EVM evidence is unavailable"
+                )
+            inventory = await _run_worker(
+                {"operation": "authorityV3Inventory"}
             )
-        if authority_evidence is None:
-            raise AuthorityV3ReviewError(
-                "Authority V3 EVM evidence is unavailable"
+            review = load_authority_v3_review(
+                settings,
+                source_shas=release["sourceShas"],
+                authority_inner_mod_hash=str(
+                    inventory["adminAuthorityInnerModHash"]
+                ),
+                governance_evidence_hash=str(
+                    authority_evidence["artifactHash"]
+                ),
             )
-        inventory = await _run_worker(
-            {"operation": "authorityV3Inventory"}
-        )
-        review = load_authority_v3_review(
-            settings,
-            source_shas=release["sourceShas"],
-            authority_inner_mod_hash=str(
-                inventory["adminAuthorityInnerModHash"]
-            ),
-            governance_evidence_hash=str(
-                authority_evidence["artifactHash"]
-            ),
-        )
-        items.append(
-            {
-                "id": "authorityV3Review",
-                "title": "Independent recovery review",
-                "status": "Healthy",
-                "impact": (
-                    "An independent reviewer approved the Chialisp "
-                    "wrapper, MIPS composition, Safe recovery module, "
-                    "and authority guards for this exact release."
-                ),
-                "assignedRole": "system",
-                "evidence": review,
-            }
-        )
-    except (
-        AuthorityV3ReviewError,
-        GenesisStoreError,
-        KeyError,
-        TypeError,
-        ValueError,
-    ) as exc:
-        items.append(
-            {
-                "id": "authorityV3Review",
-                "title": "Independent recovery review required",
-                "status": "Blocked",
-                "impact": (
-                    "A focused independent review of all four recovery "
-                    "trust boundaries must approve this exact release "
-                    "before launch."
-                ),
-                "assignedRole": "technical-coadmin",
-                "action": "installAuthorityReview",
-                "evidence": {"technicalReason": str(exc)},
-            }
-        )
+            items.append(
+                {
+                    "id": "authorityV3Review",
+                    "title": "Independent recovery review",
+                    "status": "Healthy",
+                    "impact": (
+                        "An independent reviewer approved the Chialisp "
+                        "wrapper, MIPS composition, Safe recovery module, "
+                        "and authority guards for this exact release."
+                    ),
+                    "assignedRole": "system",
+                    "evidence": review,
+                }
+            )
+        except (
+            AuthorityV3ReviewError,
+            GenesisStoreError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            items.append(
+                {
+                    "id": "authorityV3Review",
+                    "title": "Independent recovery review required",
+                    "status": "Blocked",
+                    "impact": (
+                        "A focused independent review of all four recovery "
+                        "trust boundaries must approve this exact release "
+                        "before launch."
+                    ),
+                    "assignedRole": "technical-coadmin",
+                    "action": "installAuthorityReview",
+                    "evidence": {"technicalReason": str(exc)},
+                }
+            )
 
     validator_pubkeys: list[bytes] = []
     for value in settings.zkpassport_validator_pubkeys:
@@ -1719,6 +1737,8 @@ def _public_ceremony(record: Mapping[str, Any], store: GenesisStore) -> dict[str
         "state": record["state"],
         "network": record["network"],
         "evmChainId": _ceremony_chain(record),
+        "launchProfile": record["draft"].get("launchProfile"),
+        "reviewClass": record["draft"].get("reviewClass"),
         "enrollmentCommitments": _selected_commitments(record),
         "createdAt": record["created_at"],
         "updatedAt": record["updated_at"],
@@ -2356,6 +2376,10 @@ async def propose_gate(
     session: Annotated[LaunchSession, Depends(require_launch_session)],
 ) -> dict[str, Any]:
     _require_wallet_session(session)
+    try:
+        require_allowed_gate(settings, store.get(session.ceremony_id), body.gate)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if body.gate == "xchVouchers":
         from .voucher_rail_policy import xch_voucher_control
         control = xch_voucher_control(settings)
@@ -2798,10 +2822,10 @@ async def guided_prepare_plan_signature(
     prepared["ceremonyBinding"] = _ceremony_binding(record)
     prepared["decisionReceipt"] = {
         "enrollmentCommitments": _selected_commitments(record),
-        "title": "Approve the fixed Testnet11 launch plan",
+        "title": "Approve the disposable vault/identity test plan" if is_disposable(record) else "Approve the fixed Testnet11 launch plan",
         "network": "Testnet11",
         "financialEffect": "No payment is made by this signature.",
-        "customerImpact": "Approves the exact protocol coordinates and administrator roster.",
+        "customerImpact": ("Disposable and unaudited: vault registration and identity tests only. Sales and bridge stay closed. Replace this genesis before bridge testing." if is_disposable(record) else "Approves the exact protocol coordinates and administrator roster."),
         "reversibility": "Expires with the plan and cannot authorize another plan.",
         "expiresAt": record["plan_expires_at"],
         "requiredApprovers": "Owner plus either coadministrator",

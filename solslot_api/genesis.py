@@ -24,6 +24,7 @@ from .admin import require_admin_token
 from .chia_provider import ChiaProviderError
 from .coinset_client import CoinsetClient
 from .config import Settings, get_settings
+from .disposable_genesis import (is_disposable, require_scope, scope_receipt, receipt_bytes, receipt_summary)
 from .evm_auth import normalize_evm_address, recover_evm_signer
 from .genesis_store import (
     GenesisConflict,
@@ -561,12 +562,13 @@ def _materialize_broadcast_evidence(
         Path(settings.genesis_output_dir)
         / str(record["ceremony_id"]).removeprefix("0x")
     )
+    review_filename = "disposable_scope.json" if is_disposable(record) else "authority_v3_review.json"
     allowed = {
         "plan.json",
         "spend_bundle.json",
         "fee_receipt.json",
         "audit_approval.json",
-        "authority_v3_review.json",
+        review_filename,
         "validator_health.json",
     }
     chain_confirmation = reservation.get("chainConfirmation")
@@ -588,7 +590,7 @@ def _materialize_broadcast_evidence(
             _pretty_json_bytes(evidence["auditApproval"]),
             0o644,
         ),
-        "authority_v3_review.json": (review_receipt, 0o444),
+        review_filename: (review_receipt, 0o444),
         "validator_health.json": (
             _pretty_json_bytes(evidence["validatorHealth"]),
             0o644,
@@ -784,7 +786,7 @@ def _commit_finalization(
             "spend_bundle.json",
             "fee_receipt.json",
             "audit_approval.json",
-            "authority_v3_review.json",
+            "disposable_scope.json" if is_disposable(record) else "authority_v3_review.json",
             "validator_health.json",
             "chain_confirmation.json",
         }
@@ -998,6 +1000,7 @@ async def create_plan(
 ) -> dict[str, Any]:
     try:
         current = store.get(ceremony_id.lower())
+        require_scope(settings, current)
         expires_at = int(time.time()) + settings.genesis_plan_ttl_seconds
         input_payload = body.model_dump(by_alias=True)
         if input_payload.get("enrollmentActivation") is None:
@@ -1347,6 +1350,11 @@ def _selected_genesis(record: Mapping[str, Any]) -> bool:
 
 
 async def _authority_preflight(settings: Settings, record: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        if require_scope(settings, record):
+            return receipt_summary(scope_receipt(settings, record))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GenesisConflict(f"Disposable genesis scope failed: {exc}") from exc
     from .authority_v3_evidence import (
         load_governance_evidence,
         validate_governance_roster,
@@ -1553,6 +1561,10 @@ async def _broadcast_ceremony(
     gate_authorization: dict[str, Any] | None,
 ) -> dict[str, Any]:
     record = store.get(ceremony_id.lower())
+    try:
+        require_scope(settings, record)
+    except ValueError as exc:
+        raise GenesisConflict(str(exc)) from exc
     if record.get("state") == "broadcast":
         reservation = record.get("broadcast")
         if not isinstance(reservation, Mapping):
@@ -1576,6 +1588,7 @@ async def _broadcast_ceremony(
             )
 
         def authorize_exact_replay() -> None:
+            require_scope(settings, store.get(ceremony_id.lower()))
             _require_fresh_finalization_targets(settings)
             store.authorize_broadcast_reconciliation(
                 ceremony_id.lower(),
@@ -1621,13 +1634,17 @@ async def _broadcast_ceremony(
     )
 
     try:
-        review_receipt = read_authority_v3_review_receipt(
-            settings,
-            expected_file_sha256=str(
-                approval["authorityV3Review"]["fileSha256"]
-            ),
-        )
-    except (AuthorityV3ReviewError, KeyError, TypeError) as exc:
+        if require_scope(settings, record):
+            scope = scope_receipt(settings, record)
+            if receipt_summary(scope) != approval["authorityV3Review"]:
+                raise ValueError("disposable scope changed before reservation")
+            review_receipt = receipt_bytes(scope)
+        else:
+            review_receipt = read_authority_v3_review_receipt(
+                settings,
+                expected_file_sha256=str(approval["authorityV3Review"]["fileSha256"]),
+            )
+    except (AuthorityV3ReviewError, KeyError, TypeError, ValueError) as exc:
         raise GenesisConflict(
             f"Authority V3 review archive failed: {exc}"
         ) from exc
@@ -1650,6 +1667,7 @@ async def _broadcast_ceremony(
 
     def reserve_prepared(prepared: PreparedProtocolBundle) -> None:
         nonlocal reserved_spend_bundle_id
+        require_scope(settings, store.get(ceremony_id.lower()))
         _require_empty_evidence_output(output)
         _require_fresh_finalization_targets(settings)
         prepared_json = prepared.to_json()
