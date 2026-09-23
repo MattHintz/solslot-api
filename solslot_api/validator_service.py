@@ -564,6 +564,7 @@ def _coordinator_settings(
         zkpassport_validator_pubkeys=list(settings.roster_pubkeys),
         zkpassport_bridge_policy_hash=settings.bridge_policy_hash,
         zkpassport_forwarder_address=settings.evm_forwarder_address,
+        zkpassport_verifier_adapter_address=settings.evm_verifier_adapter_address,
         zkpassport_emitter_address=settings.evm_attestation_emitter_address,
         pool_launcher_id=str(artifact["launcherIds"]["pool"]),
     )
