@@ -570,3 +570,46 @@ def test_browser_proxy_accepts_height_alias_and_rejects_unbounded_bundles() -> N
             client.post("/chia/push_tx", json={"spend_bundle": oversized}).status_code
             == 422
         )
+
+
+@pytest.mark.asyncio
+async def test_bounded_retry_is_exact_and_journaled_after_unspent_check(tmp_path):
+    import sqlite3
+    from tests.test_protocol_submission import protocol_bundle
+    bundle=protocol_bundle().to_json_dict()
+    coin=SpendBundle.from_json_dict(bundle).removals()[0]
+    coin_id='0x'+coin.name().hex();bundle_id='0x'+SpendBundle.from_json_dict(bundle).name().hex()
+    class RetryRpc(FakeRpc):
+        sends=0
+        async def push_tx(self,value):
+            self.calls.append(('push_tx',value));self.sends+=1
+            if self.sends==1:raise TimeoutError('synthetic timeout')
+            self.mempool[coin_id]=[{'spend_bundle_name':bundle_id}]
+            return {'success':True,'status':'SUCCESS'}
+    rpc=RetryRpc(read_result={'coin':coin.to_json_dict(),'confirmed_block_index':10,'spent_block_index':0})
+    journal=tmp_path/'submissions.sqlite3'
+    provider=ChiaProvider(rpc,FakeRpc(),config(submission_retry_count=2,submission_journal_path=str(journal)))
+    result=await provider.push_tx_confirmed_in_primary_mempool(bundle,required_coin_id=coin_id,
+        required_spend_bundle_id=bundle_id,timeout_seconds=0,poll_seconds=.01)
+    assert result['status']=='MEMPOOL'
+    assert [v for op,v in rpc.calls if op=='push_tx']==[bundle,bundle]
+    assert ('get_coin_record_by_name',coin_id) in rpc.calls
+    db=sqlite3.connect(journal)
+    assert db.execute('select event from protocol_submission_events order by id').fetchall()==[('dispatching',),('uncertain',),('dispatching',),('accepted',)]
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_fee_rejection_records_reason_without_repeated_identical_push(tmp_path):
+    import sqlite3
+    from tests.test_protocol_submission import protocol_bundle
+    bundle=protocol_bundle().to_json_dict();coin_id=_input_coin_ids(bundle)[0]
+    rpc=FakeRpc(push_result={'success':False,'status':'FAILED','error':'INVALID_FEE_TOO_CLOSE_TO_ZERO'})
+    journal=tmp_path/'errors.sqlite3'
+    provider=ChiaProvider(rpc,FakeRpc(),config(submission_retry_count=2,submission_journal_path=str(journal)))
+    with pytest.raises(ChiaProviderError,match='INVALID_FEE_TOO_CLOSE_TO_ZERO'):
+        await provider.push_tx_confirmed_in_primary_mempool(bundle,required_coin_id=coin_id,timeout_seconds=0,poll_seconds=.01)
+    assert len([c for c in rpc.calls if c[0]=='push_tx'])==1
+    db=sqlite3.connect(journal)
+    assert db.execute("select error_code from protocol_submission_events where event='rejected'").fetchone()[0]=='INVALID_FEE_TOO_CLOSE_TO_ZERO'
+    db.close()

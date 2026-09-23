@@ -1907,6 +1907,9 @@ class SolsMarketReader:
 
     async def vault_sols_balance(self, vault_launcher_id: str) -> int:
         """Return Sols held by the canonical Pool V4 vault custody puzzle."""
+        # Local import avoids the market/swap reader dependency cycle.
+        from .sols_swaps import _initial_pool_config, _pool_config
+
         artifact = load_signed_public_artifact(self.settings)
         pool_tip = await _singleton_tip(
             self.provider,

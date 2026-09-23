@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import hashlib
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
@@ -19,6 +20,7 @@ from .faucet import Faucet
 
 CREATE_COIN = 51
 RESERVE_FEE = 52
+logger = logging.getLogger(__name__)
 
 
 class ProtocolSubmissionError(RuntimeError):
@@ -44,6 +46,7 @@ class ProtocolFeePolicy:
     maximum_backing_mojos: int = 0
     mempool_timeout_seconds: float = 20.0
     mempool_poll_seconds: float = 0.5
+    estimate_buffer_bps: int = 10_000
 
 
 @dataclass(frozen=True)
@@ -160,6 +163,8 @@ class ProtocolBundleSubmitter:
         *,
         selection_purpose: str | None = None,
         expected_protocol_fee_mojos: int = 0,
+        bind_protocol: bool = False,
+        sponsor_deadline: int | None = None,
     ) -> dict[str, Any]:
         """Fund, persist, and hand one exact bundle to its sole executor."""
 
@@ -167,6 +172,8 @@ class ProtocolBundleSubmitter:
             prepared = await self._prepare_locked(
                 protocol_bundle_json, selection_purpose=selection_purpose,
                 expected_protocol_fee_mojos=expected_protocol_fee_mojos,
+                bind_protocol=bind_protocol,
+                sponsor_deadline=sponsor_deadline,
             )
             try:
                 dispatch_result = await dispatcher(prepared)
@@ -258,6 +265,8 @@ class ProtocolBundleSubmitter:
         selection_purpose: str | None = None,
         expected_backing_mojos: int = 0,
         expected_protocol_fee_mojos: int = 0,
+        bind_protocol: bool = False,
+        sponsor_deadline: int | None = None,
     ) -> PreparedProtocolBundle:
         if not self.policy.enabled:
             raise ProtocolSubmissionError("protocol fee funding is disabled")
@@ -304,13 +313,18 @@ class ProtocolBundleSubmitter:
             excluded_coin_ids=protocol_input_ids,
             selection_purpose=selection_purpose,
         )
+        binding_conditions = self._backing_conditions(protocol_bundle) if expected_backing_mojos or bind_protocol else ()
+        if sponsor_deadline is not None:
+            if not bind_protocol or type(sponsor_deadline) is not int or sponsor_deadline <= 0:
+                raise ProtocolSubmissionError("fee sponsor deadline requires a bound protocol")
+            binding_conditions += (Program.to([ConditionOpcode.ASSERT_BEFORE_SECONDS_ABSOLUTE, sponsor_deadline]),)
         final_bundle, fee, fee_coin = await self._converge_fee(
             protocol_bundle,
             fee_coin,
             preliminary_fee,
             selection_purpose=selection_purpose,
             backing_mojos=expected_backing_mojos,
-            backing_conditions=self._backing_conditions(protocol_bundle) if expected_backing_mojos else (),
+            backing_conditions=binding_conditions,
             protocol_fee_mojos=expected_protocol_fee_mojos,
         )
         return PreparedProtocolBundle(
@@ -369,7 +383,13 @@ class ProtocolBundleSubmitter:
         estimate = raw_estimate
         if estimate < 0:
             raise ProtocolSubmissionError("local node returned a negative fee estimate")
-        fee = max(estimate, self.policy.minimum_mojos)
+        if not 10_000 <= self.policy.estimate_buffer_bps <= 30_000:
+            raise ProtocolSubmissionError("fee estimate buffer is outside its approved bound")
+        fee = max((estimate * self.policy.estimate_buffer_bps + 9_999) // 10_000,
+                  self.policy.minimum_mojos)
+        logger.info("protocol_fee_quote bundle_id=%s target_seconds=%d estimate_mojos=%d buffer_bps=%d fee_mojos=%d cap_mojos=%d",
+            "0x" + bundle.name().hex(), self.policy.target_seconds, estimate,
+            self.policy.estimate_buffer_bps, fee, self.policy.maximum_mojos)
         if fee > self.policy.maximum_mojos:
             raise ProtocolSubmissionError(
                 f"medium fee {fee} exceeds configured cap "
@@ -477,12 +497,8 @@ class ProtocolBundleSubmitter:
         for _ in range(3):
             sponsor_fee = fee - protocol_fee_mojos
             if sponsor_fee + backing_mojos > int(fee_coin.amount):
-                if not backing_mojos:
-                    raise ProtocolSubmissionError(
-                        "selected protocol funding coin is smaller than backing plus the medium fee"
-                    )
                 fee_coin = await self._select_fee_coin(
-                    fee + backing_mojos,
+                    sponsor_fee + backing_mojos,
                     excluded_coin_ids={bytes(c.name()) for c in protocol_bundle.removals()},
                     selection_purpose=selection_purpose,
                 )

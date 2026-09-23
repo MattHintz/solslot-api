@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 import pytest
@@ -123,7 +124,8 @@ def _artifact(pool_launcher: bytes32, claim: ValidatorClaim) -> dict:
     }
 
 
-def test_evm_owner_signature_reconstructs_current_unstamped_vault(monkeypatch) -> None:
+@pytest.mark.parametrize("worker_thread", [False, True])
+def test_evm_owner_signature_reconstructs_current_unstamped_vault(monkeypatch, worker_thread) -> None:
     settings = _settings()
     launcher = bytes32(b"l" * 32)
     pool_launcher = bytes32(b"p" * 32)
@@ -169,7 +171,11 @@ def test_evm_owner_signature_reconstructs_current_unstamped_vault(monkeypatch) -
         lambda *_args, **_kwargs: _coin_record(coin),
     )
 
-    _verify_vault_and_owner(settings, _artifact(pool_launcher, claim), claim)
+    if worker_thread:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(_verify_vault_and_owner, settings, _artifact(pool_launcher, claim), claim).result()
+    else:
+        _verify_vault_and_owner(settings, _artifact(pool_launcher, claim), claim)
 
 
 def test_evm_authorization_for_another_owner_cannot_reconstruct_vault(monkeypatch) -> None:
@@ -213,11 +219,13 @@ def test_evm_authorization_for_another_owner_cannot_reconstruct_vault(monkeypatc
         lambda *_args, **_kwargs: _coin_record(coin),
     )
 
-    with pytest.raises(ValidatorEvidenceError, match="does not reconstruct"):
-        _verify_vault_and_owner(settings, _artifact(pool_launcher, claim), claim)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with pytest.raises(ValidatorEvidenceError, match="does not reconstruct"):
+            pool.submit(_verify_vault_and_owner, settings, _artifact(pool_launcher, claim), claim).result()
 
 
-def test_bls_owner_signature_reconstructs_current_unstamped_vault(monkeypatch) -> None:
+@pytest.mark.parametrize("worker_thread", [False, True])
+def test_bls_owner_signature_reconstructs_current_unstamped_vault(monkeypatch, worker_thread) -> None:
     settings = _settings()
     launcher = bytes32(b"l" * 32)
     pool_launcher = bytes32(b"p" * 32)
@@ -255,7 +263,11 @@ def test_bls_owner_signature_reconstructs_current_unstamped_vault(monkeypatch) -
         lambda *_args, **_kwargs: _coin_record(coin),
     )
 
-    _verify_vault_and_owner(settings, _artifact(pool_launcher, claim), claim)
+    if worker_thread:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(_verify_vault_and_owner, settings, _artifact(pool_launcher, claim), claim).result()
+    else:
+        _verify_vault_and_owner(settings, _artifact(pool_launcher, claim), claim)
 
 
 def test_owner_check_rejects_stale_action_before_coin_lookup(monkeypatch) -> None:
@@ -455,3 +467,27 @@ def test_signer_rejects_wrong_claim_hash_artifact_and_emitter(monkeypatch) -> No
     wrong_emitter = claim.model_copy(update={"emitter_address": "0x" + "ff" * 20})
     with pytest.raises(ValidatorEvidenceError, match="signed attestation emitter"):
         verify_validator_claim(settings, wrong_emitter, wrong_emitter.canonical_hash())
+
+
+def test_receipt_adapter_preserves_all_signed_evm_bindings(monkeypatch, tmp_path) -> None:
+    from solslot_api.validator_service import _coordinator_settings
+    from solslot_api.public_artifact import _verify_runtime_bindings, PublicArtifactError
+
+    settings = _settings().model_copy(update={"release_metadata_path": str(tmp_path / "absent.json")})
+    artifact = {
+        "network": "testnet11", "evmChainId": settings.evm_chain_id,
+        "launcherIds": {"pool": "0x" + "11" * 32},
+        "bridgePolicy": {"policyHash": settings.bridge_policy_hash, "policyVersion": 2},
+        "validatorSet": {"threshold": 2, "pubkeys": settings.roster_pubkeys},
+        "evmAddresses": {"forwarder": settings.evm_forwarder_address,
+            "verifierAdapter": settings.evm_verifier_adapter_address,
+            "attestationEmitter": settings.evm_attestation_emitter_address},
+    }
+    # The adapter must pass the signer config explicitly, even if a conflicting
+    # coordinator-style environment variable is inherited by the process.
+    monkeypatch.setenv("SOLSLOT_ZKPASSPORT_VERIFIER_ADAPTER_ADDRESS", "0x" + "ff" * 20)
+    adapted = _coordinator_settings(settings, artifact)
+    _verify_runtime_bindings(adapted, artifact)
+    for field in ("zkpassport_forwarder_address", "zkpassport_verifier_adapter_address", "zkpassport_emitter_address"):
+        with pytest.raises(PublicArtifactError, match="does not match signed artifact"):
+            _verify_runtime_bindings(adapted.model_copy(update={field: "0x" + "ee" * 20}), artifact)

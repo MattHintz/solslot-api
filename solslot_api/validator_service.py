@@ -172,6 +172,7 @@ from .validator_quorum import (
     base_settlement_evidence_hash,
 )
 from .validator_settings import ValidatorSettings
+from .vault_puzzle_hash import puzzle_hash_for_vault_full
 from .zkpassport_enrollments import _fetch_verified_evm_attestation
 from .bridge_coin_policy import BridgeCoinPolicy
 
@@ -509,7 +510,7 @@ def _verify_vault_and_owner(
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValidatorEvidenceError("artifact vault trust coordinates are invalid") from exc
-    expected_puzzle = puzzle_for_vault_full(
+    expected_puzzle_hash = puzzle_hash_for_vault_full(
         launcher,
         owner_pubkey,
         claim.owner_auth_type,
@@ -518,7 +519,7 @@ def _verify_vault_and_owner(
         identity_attest_root=DEFAULT_IDENTITY_ATTEST_ROOT,
         zkpassport_bridge_policy_hash=bridge_policy_hash,
     )
-    if coin.puzzle_hash != bytes32(expected_puzzle.get_tree_hash()):
+    if coin.puzzle_hash != expected_puzzle_hash:
         raise ValidatorEvidenceError(
             "owner authorization does not reconstruct the current unstamped vault coin"
         )
@@ -564,6 +565,7 @@ def _coordinator_settings(
         zkpassport_validator_pubkeys=list(settings.roster_pubkeys),
         zkpassport_bridge_policy_hash=settings.bridge_policy_hash,
         zkpassport_forwarder_address=settings.evm_forwarder_address,
+        zkpassport_verifier_adapter_address=settings.evm_verifier_adapter_address,
         zkpassport_emitter_address=settings.evm_attestation_emitter_address,
         pool_launcher_id=str(artifact["launcherIds"]["pool"]),
     )
