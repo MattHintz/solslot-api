@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 import pytest
@@ -123,7 +124,8 @@ def _artifact(pool_launcher: bytes32, claim: ValidatorClaim) -> dict:
     }
 
 
-def test_evm_owner_signature_reconstructs_current_unstamped_vault(monkeypatch) -> None:
+@pytest.mark.parametrize("worker_thread", [False, True])
+def test_evm_owner_signature_reconstructs_current_unstamped_vault(monkeypatch, worker_thread) -> None:
     settings = _settings()
     launcher = bytes32(b"l" * 32)
     pool_launcher = bytes32(b"p" * 32)
@@ -169,7 +171,11 @@ def test_evm_owner_signature_reconstructs_current_unstamped_vault(monkeypatch) -
         lambda *_args, **_kwargs: _coin_record(coin),
     )
 
-    _verify_vault_and_owner(settings, _artifact(pool_launcher, claim), claim)
+    if worker_thread:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(_verify_vault_and_owner, settings, _artifact(pool_launcher, claim), claim).result()
+    else:
+        _verify_vault_and_owner(settings, _artifact(pool_launcher, claim), claim)
 
 
 def test_evm_authorization_for_another_owner_cannot_reconstruct_vault(monkeypatch) -> None:
@@ -213,11 +219,13 @@ def test_evm_authorization_for_another_owner_cannot_reconstruct_vault(monkeypatc
         lambda *_args, **_kwargs: _coin_record(coin),
     )
 
-    with pytest.raises(ValidatorEvidenceError, match="does not reconstruct"):
-        _verify_vault_and_owner(settings, _artifact(pool_launcher, claim), claim)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with pytest.raises(ValidatorEvidenceError, match="does not reconstruct"):
+            pool.submit(_verify_vault_and_owner, settings, _artifact(pool_launcher, claim), claim).result()
 
 
-def test_bls_owner_signature_reconstructs_current_unstamped_vault(monkeypatch) -> None:
+@pytest.mark.parametrize("worker_thread", [False, True])
+def test_bls_owner_signature_reconstructs_current_unstamped_vault(monkeypatch, worker_thread) -> None:
     settings = _settings()
     launcher = bytes32(b"l" * 32)
     pool_launcher = bytes32(b"p" * 32)
@@ -255,7 +263,11 @@ def test_bls_owner_signature_reconstructs_current_unstamped_vault(monkeypatch) -
         lambda *_args, **_kwargs: _coin_record(coin),
     )
 
-    _verify_vault_and_owner(settings, _artifact(pool_launcher, claim), claim)
+    if worker_thread:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(_verify_vault_and_owner, settings, _artifact(pool_launcher, claim), claim).result()
+    else:
+        _verify_vault_and_owner(settings, _artifact(pool_launcher, claim), claim)
 
 
 def test_owner_check_rejects_stale_action_before_coin_lookup(monkeypatch) -> None:
