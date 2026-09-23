@@ -94,6 +94,11 @@ def validate_secret_env_file_permissions(env_file: Path | None = None) -> None:
 def validate_server_hardening_at_startup(settings: "Settings") -> None:
     """Reject unsafe staging/production HTTP posture before serving traffic."""
 
+    from .disposable_genesis import validate_configuration
+    try:
+        validate_configuration(settings)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
     from .enrollment_permit_remote import validate_remote_signer_config
     try:
         validate_remote_signer_config(settings)
@@ -1030,6 +1035,9 @@ class Settings(BaseSettings):
     launch_genesis_review_class: Literal[
         "independent-release-review", "internal-engineering-testnet"
     ] = "independent-release-review"
+    # Explicit opt-in for one disposable vault/identity ceremony. Never permits
+    # payment, sale, SGT allocation or bridge activation; replace before that work.
+    disposable_genesis_ceremony_id: Optional[str] = None
     launch_release_tag: str = "solslot-v2-alpha-rc27.36-20260824"
     launch_owner_claim_token: Optional[str] = None
     launch_source_evidence_path: Optional[str] = (

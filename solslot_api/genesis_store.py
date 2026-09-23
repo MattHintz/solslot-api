@@ -1058,6 +1058,50 @@ class GenesisStore:
             )
         return self.get(ceremony_id)
 
+    def adopt_disposable_release(
+        self, settings: Settings, ceremony_id: str, *,
+        expected_draft: dict[str, Any], release: dict[str, Any],
+        action_envelope_id: str,
+    ) -> dict[str, Any]:
+        """Operator-only pre-plan migration; preserve the original draft in audit.
+
+        There is deliberately no HTTP route. Enrollments, recovery proofs and
+        funding stay intact. Once a plan ever exists, this migration is forbidden.
+        """
+        from .disposable_genesis import PROFILE, REVIEW_CLASS, require_scope
+        from .genesis import DraftRequest
+        sources = DraftRequest(sourceShas=release["sourceShas"]).source_shas
+        replacement = {**expected_draft, "sourceShas": sources,
+                       "releaseTag": release["releaseTag"],
+                       "releaseEvidenceHash": release["fileSha256"],
+                       "reviewClass": REVIEW_CLASS, "launchProfile": PROFILE}
+        require_scope(settings, {"ceremony_id": ceremony_id, "draft": replacement})
+        if not action_envelope_id:
+            raise GenesisConflict("disposable adoption requires its authorization reference")
+        timestamp = int(time.time())
+        with self._transaction() as connection:
+            row = self._require_ceremony(connection, ceremony_id)
+            self._require_state(row, "roster_frozen")
+            if (json.loads(row["draft_json"]) != expected_draft
+                or any(row[key] is not None for key in ("plan_json", "plan_input_json", "plan_hash", "spend_bundle_id", "broadcast_json", "artifact_json"))
+                or connection.execute("SELECT 1 FROM audit_events WHERE ceremony_id=? AND event_type IN ('plan_created','disposable_release_adopted')", (ceremony_id,)).fetchone()):
+                raise GenesisConflict("disposable release adoption is allowed exactly once before any plan")
+            kits = connection.execute(
+                "SELECT slot,revision,drill_verified_at,offline_copy_confirmed,second_device_confirmed "
+                "FROM admin_recovery_kits WHERE ceremony_id=? ORDER BY slot", (ceremony_id,)
+            ).fetchall()
+            if ([kit["slot"] for kit in kits] != list(ADMIN_SLOTS)
+                or any(not (kit["revision"] >= 1 and kit["drill_verified_at"] and
+                            kit["offline_copy_confirmed"] and kit["second_device_confirmed"]) for kit in kits)):
+                raise GenesisConflict("all three recovery drills remain required")
+            connection.execute("UPDATE ceremonies SET draft_json=?,updated_at=? WHERE ceremony_id=?",
+                               (canonical_json(replacement), timestamp, ceremony_id))
+            self._event(connection, ceremony_id, "disposable_release_adopted", {
+                "actionEnvelopeId": action_envelope_id, "previousDraft": expected_draft,
+                "adoptedDraft": replacement, "replaceBeforeBridgeTesting": True,
+            }, timestamp)
+        return self.get(ceremony_id)
+
     def set_plan(
         self,
         ceremony_id: str,
@@ -2570,6 +2614,11 @@ class GenesisStore:
         Signature expiry limits activation, not the separately approved gate
         duration. Old unsigned rows have no activation proof and fail closed.
         """
+        from .disposable_genesis import require_allowed_gate
+        try:
+            require_allowed_gate(settings, self.get(ceremony_id), gate_name)
+        except ValueError as exc:
+            raise GenesisConflict(str(exc)) from exc
         timestamp = int(time.time()) if now is None else now
         with self._transaction() as connection:
             gate = self.gates(ceremony_id, now=timestamp).get(gate_name)
