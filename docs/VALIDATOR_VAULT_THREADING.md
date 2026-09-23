@@ -24,3 +24,13 @@ systemd working directory. A health response alone does not prove readiness:
 exercise the saved claim through the full non-signing verification path on a
 worker, recording any in-memory timestamp refresh as rehearsal only. Never
 replace a frozen claim or sign it through this diagnostic.
+
+Deployment must also run `scripts/activate_identity_validator_import_path_20260923.py`.
+The source archive has root-only group ownership, so the runtime copy must be
+readable by the existing validator service group. A working-directory change
+alone can silently leave Python using the old installed package. The activation
+script pins Uvicorn's app directory and a startup entrypoint that checks the
+resolved module paths and file hashes before serving requests. Follow with a
+live mTLS request using a deliberately different test owner: it must reach vault
+reconstruction and return409 rather than raising a thread-affinity panic. The
+negative test must return no validator signature.

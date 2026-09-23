@@ -32,10 +32,14 @@ assert not entry.exists() or entry.read_text()==code
 if not entry.exists():entry.write_text(code)
 value=subprocess.check_output(['systemctl','show','solslot-validator','-p','ExecStart','--value'],text=True)
 args=shlex.split(value.split('argv[]=',1)[1].split(' ; ignore_errors=',1)[0])
-assert args[0]=='/opt/solslot/validator/current/.venv/bin/uvicorn'
-assert args[1] in ('solslot_api.validator_app:app','solslot_runtime_entrypoint:app')
+if args[0]=='/opt/solslot/validator/current/.venv/bin/uvicorn':
+ app_index=1
+else:
+ assert args[:3]==['/opt/solslot/validator/current/.venv/bin/python','-m','uvicorn']
+ app_index=3
+assert args[app_index] in ('solslot_api.validator_app:app','solslot_runtime_entrypoint:app')
 assert args[args.index('--ssl-cert-reqs')+1]=='2'
-args[1]='solslot_runtime_entrypoint:app'
+args[app_index]='solslot_runtime_entrypoint:app'
 if '--app-dir' in args:
  assert args[args.index('--app-dir')+1]==str(root)
 else:args.extend(['--app-dir',str(root)])
