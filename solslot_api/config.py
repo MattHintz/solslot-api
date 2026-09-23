@@ -884,6 +884,7 @@ class Settings(BaseSettings):
     # Explicit per-bundle XCH budget for fresh Sols issuance, separate from fees.
     protocol_issuance_backing_max_mojos: int = Field(default=0, ge=0)
     protocol_medium_fee_target_seconds: int = Field(300, ge=60, le=1800)
+    protocol_fee_estimate_buffer_bps: int = Field(12_500, ge=10_000, le=30_000)
     protocol_minimum_fee_mojos: int = Field(1, ge=0)
     protocol_maximum_fee_mojos: int = Field(10_000_000, ge=1)
     protocol_mempool_timeout_seconds: float = Field(20.0, ge=2.0, le=120.0)

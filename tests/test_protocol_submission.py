@@ -155,6 +155,41 @@ def test_ceremony_faucet_exclusivity_blocks_every_other_selection_purpose() -> N
 
 
 @pytest.mark.asyncio
+async def test_complete_bundle_quote_reselects_a_larger_fee_coin() -> None:
+    faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
+    small = Coin(b32(4), faucet.address_puzzle_hash, uint64(5))
+    large = Coin(b32(5), faucet.address_puzzle_hash, uint64(100))
+
+    class GrowingProvider(FakeProvider):
+        async def get_coin_records_by_puzzle_hash(self, *args, **kwargs):
+            return [coin_record(small), coin_record(large)]
+
+    provider = GrowingProvider(fee_coin=small, base_fee=4, aggregate_fee=7)
+    receipt = await submitter(provider, faucet).submit(protocol_bundle().to_json_dict())
+    assert receipt["feeCoinId"] == "0x" + large.name().hex()
+    assert receipt["feeMojos"] == "7"
+
+
+@pytest.mark.asyncio
+async def test_vault_launch_uses_complete_bundle_fee_and_retains_funded_id(monkeypatch):
+    from types import SimpleNamespace
+    from solslot_api import app as app_module
+
+    faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
+    coin = Coin(b32(4), faucet.address_puzzle_hash, uint64(100))
+    provider = FakeProvider(fee_coin=coin, base_fee=4, aggregate_fee=7)
+    monkeypatch.setattr(app_module.app.state, "protocol_submitter", submitter(provider, faucet), raising=False)
+    original = protocol_bundle()
+    launched = SimpleNamespace(spend_bundle=original)
+    accepted, status = await app_module._push_vault_launch(provider, launched,
+        Settings(protocol_fee_funding_enabled=True))
+    assert accepted and status == "MEMPOOL"
+    assert launched.spend_bundle.name() != original.name()
+    assert launched.spend_bundle.coin_spends[0] == original.coin_spends[0]
+    assert provider.submitted == launched.spend_bundle.to_json_dict()
+
+
+@pytest.mark.asyncio
 async def test_medium_fee_is_added_from_till_without_changing_protocol_outputs() -> None:
     faucet = Faucet.from_seed_hex("01" * 32, "testnet11")
     fee_coin = Coin(b32(4), faucet.address_puzzle_hash, uint64(100))

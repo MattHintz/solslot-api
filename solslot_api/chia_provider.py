@@ -38,6 +38,8 @@ class ChiaProviderConfig:
     primary_ca_cert_path: str | None = None
     primary_client_cert_path: str | None = None
     primary_client_key_path: str | None = None
+    submission_journal_path: str | None = None
+    submission_retry_count: int = 0
 
 
 def _utc_now() -> str:
@@ -408,6 +410,26 @@ class ChiaProvider:
             ),
         )
 
+    async def _logged_push(self, client, bundle, provider):
+        from .submission_errors import record_submission, error_code
+        from chia_rs import SpendBundle
+        try:
+            bundle_id = "0x" + SpendBundle.from_json_dict(bundle).name().hex()
+        except Exception:
+            bundle_id = "invalid-bundle"
+        def log(event, code=None):
+            record_submission(self.config.submission_journal_path, network=self.config.network,
+                bundle_id=bundle_id, provider=provider, event=event, code=code, bundle=bundle)
+        log("dispatching")
+        try:
+            result = await client.push_tx(bundle)
+        except Exception as exc:
+            log("uncertain", error_code(exc))
+            raise
+        accepted = bool(result.get("success")) or str(result.get("status", "")).upper() in {"SUCCESS","PENDING"}
+        log("accepted" if accepted else "rejected", None if accepted else error_code("rejected protocol bundle: " + str(result)))
+        return result
+
     async def push_tx(self, spend_bundle_json: dict[str, Any]) -> dict[str, Any]:
         from .chia_snapshot import active_snapshot
         if active_snapshot() is not None:
@@ -415,7 +437,7 @@ class ChiaProvider:
         if await self._primary_available():
             assert self.primary is not None
             try:
-                result = await self.primary.push_tx(spend_bundle_json)
+                result = await self._logged_push(self.primary, spend_bundle_json, "primary")
                 self._last_primary_success_at = _utc_now()
                 return result
             except Exception as primary_error:
@@ -427,7 +449,7 @@ class ChiaProvider:
                         "already_submitted": True,
                     }
         try:
-            return await self.fallback.push_tx(spend_bundle_json)
+            return await self._logged_push(self.fallback, spend_bundle_json, "fallback")
         except Exception as fallback_error:
             raise ChiaProviderError(
                 "Chia push_tx failed through primary and fallback: "
@@ -477,7 +499,7 @@ class ChiaProvider:
         push_result: dict[str, Any] | None = None
         push_error: Exception | None = None
         try:
-            push_result = await self.primary.push_tx(spend_bundle_json)
+            push_result = await self._logged_push(self.primary, spend_bundle_json, "primary")
             self._last_primary_success_at = _utc_now()
         except Exception as exc:
             push_error = exc
@@ -492,6 +514,8 @@ class ChiaProvider:
                 )
 
         deadline = self._monotonic() + timeout_seconds
+        retry_limit = min(2, max(0, self.config.submission_retry_count))
+        retries_left = retry_limit
         while True:
             try:
                 items = await self.primary.get_mempool_items_by_coin_name(
@@ -517,6 +541,18 @@ class ChiaProvider:
             except Exception as exc:
                 push_error = push_error or exc
             if self._monotonic() >= deadline:
+                if retries_left and await self._primary_inputs_clear(spend_bundle_json):
+                    retries_left -= 1
+                    await asyncio.sleep(2 ** (retry_limit - retries_left - 1))
+                    try:
+                        push_result = await self._logged_push(self.primary, spend_bundle_json, "primary-retry")
+                    except Exception as exc:
+                        push_error = exc
+                    else:
+                        if not push_result.get("success") and str(push_result.get("status", "")).upper() not in {"SUCCESS", "PENDING"}:
+                            raise ChiaProviderError(f"local Chia node rejected protocol bundle: {push_result}")
+                    deadline = self._monotonic() + timeout_seconds
+                    continue
                 detail = (
                     f" after ambiguous push ({push_error})" if push_error else ""
                 )
@@ -525,6 +561,26 @@ class ChiaProvider:
                     f"{detail}"
                 )
             await asyncio.sleep(poll_seconds)
+
+    async def _primary_inputs_clear(self, bundle):
+        if self.primary is None:
+            return False
+        try:
+            from chia_rs import SpendBundle
+            parsed = SpendBundle.from_json_dict(bundle)
+            ephemeral = {coin.name() for coin in parsed.additions()}
+            for coin in parsed.removals():
+                if coin.name() in ephemeral:
+                    continue
+                coin_id = "0x" + coin.name().hex()
+                record = await self.primary.get_coin_record_by_name(coin_id)
+                if (not record or Coin.from_json_dict(record["coin"]) != coin
+                        or not record.get("confirmed_block_index") or record.get("spent_block_index")
+                        or await self.primary.get_mempool_items_by_coin_name(coin_id)):
+                    return False
+            return True
+        except Exception:
+            return False
 
     async def _spend_observed(self, spend_bundle_json: dict[str, Any]) -> bool:
         try:

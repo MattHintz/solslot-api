@@ -304,6 +304,8 @@ async def lifespan(app: FastAPI):
             primary_ca_cert_path=settings.chia_primary_ca_cert_path,
             primary_client_cert_path=settings.chia_primary_client_cert_path,
             primary_client_key_path=settings.chia_primary_client_key_path,
+            submission_journal_path=str(Path(settings.zkpassport_ledger_db_path).parent / "protocol-submissions.sqlite3"),
+            submission_retry_count=2,
         )
     )
     await app.state.coinset.start()
@@ -346,6 +348,10 @@ async def lifespan(app: FastAPI):
         )
 
     app.state.protocol_submitter = None
+    from .stamp_funding import StampFundingStore, bind_store as bind_stamp_funding
+    app.state.stamp_funding_store = StampFundingStore(str(settings.zkpassport_ledger_db_path) + '.stamp-funding.sqlite3')
+    if app.state.faucet is not None:
+        app.state.faucet.add_coin_reservation_source(app.state.stamp_funding_store.reserved_coin_ids)
     # Existing reservations still protect the faucet if fee funding was
     # switched off after a restart. Register before starting any worker.
     app.state.sols_swap_store = _load_swap_store_for_runtime(settings, app.state.faucet)
@@ -378,6 +384,7 @@ async def lifespan(app: FastAPI):
             policy=ProtocolFeePolicy(
                 enabled=True,
                 target_seconds=settings.protocol_medium_fee_target_seconds,
+                estimate_buffer_bps=settings.protocol_fee_estimate_buffer_bps,
                 minimum_mojos=settings.protocol_minimum_fee_mojos,
                 maximum_mojos=settings.protocol_maximum_fee_mojos,
                 maximum_funding_coin_mojos=settings.faucet_max_spend_mojos,
@@ -390,6 +397,7 @@ async def lifespan(app: FastAPI):
     stripe_delivery_store = None
     presale_store = None
     if app.state.protocol_submitter is not None:
+        bind_stamp_funding(app.state.protocol_submitter, app.state.stamp_funding_store)
         from .stripe_delivery_store import get_stripe_delivery_store
 
         if genesis_store is None:
@@ -578,6 +586,7 @@ async def lifespan(app: FastAPI):
         if app.state.faucet_worker is not None:
             await app.state.faucet_worker.stop()
         await app.state.coinset.close()
+        app.state.stamp_funding_store.db.close()
         # Lifespan services may retain thread-affine chia_rs Program/LazyNode
         # values. Release every owned reference on this event-loop thread so a
         # later TestClient or server restart cannot finalize it on another one.
@@ -1147,7 +1156,7 @@ async def register_evm_vault(
     # POP-CANON-004 fix: hard-fail on push_tx rejection so the frontend
     # cannot silently believe a vault was registered when the spend was
     # never accepted into the mempool.
-    accepted, push_status = await _push_or_fail(coinset, launched.spend_bundle)
+    accepted, push_status = await _push_vault_launch(coinset, launched, settings)
     if not accepted:
         raise HTTPException(
             status_code=502,
@@ -1270,7 +1279,7 @@ async def register_chia_vault(
     )
 
     # POP-CANON-004 fix: hard-fail on push_tx rejection.
-    accepted, push_status = await _push_or_fail(coinset, launched.spend_bundle)
+    accepted, push_status = await _push_vault_launch(coinset, launched, settings)
     if not accepted:
         raise HTTPException(
             status_code=502,
@@ -1458,6 +1467,25 @@ def _client_ip(request: Request, settings: Settings) -> str:
     an explicitly configured Cloudflare source range.
     """
     return trusted_client_ip(request.scope, settings)
+
+
+async def _push_vault_launch(coinset, launched, settings):
+    """Vault creation uses the same complete-bundle fee policy as protocol writes."""
+    if not settings.protocol_fee_funding_enabled:
+        if settings.runtime_environment == 'production':
+            raise HTTPException(status_code=503, detail='Vault network fee funding is unavailable.')
+        return await _push_or_fail(coinset, launched.spend_bundle)
+    from .protocol_submission import ProtocolSubmissionError
+    submitter = getattr(app.state, 'protocol_submitter', None)
+    if not isinstance(submitter, ProtocolBundleSubmitter):
+        raise HTTPException(status_code=503, detail='Vault network fee funding is unavailable.')
+    def retain_funded(prepared):
+        launched.spend_bundle = prepared.bundle
+    try:
+        await submitter.submit(launched.spend_bundle.to_json_dict(), before_push=retain_funded)
+    except ProtocolSubmissionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return True, 'MEMPOOL'
 
 
 async def _push_or_fail(

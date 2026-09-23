@@ -29,7 +29,7 @@ from web3 import Web3
 
 from .config import Settings
 from .bridge_coin_policy import BridgeCoinPolicy
-from .chia_provider import ChiaProvider
+from .chia_provider import ChiaProvider, ChiaProviderError
 from .credential_auth import (
     OwnerAuth,
     OwnerChallengeRequest,
@@ -1671,7 +1671,11 @@ async def _push_chia_stamp_and_mark_pending(
     key: str,
     spend_bundle: SpendBundle,
     expected_vault_coin: Coin,
+    fee_submitter=None,
+    fee_store=None,
 ) -> SubmitChiaStampResponse:
+    if settings.runtime_environment == 'production' and not settings.protocol_fee_funding_enabled:
+        raise HTTPException(status_code=503, detail='Identity stamp fee funding is unavailable; no transaction was sent.')
     spend_bundle_id = _hex32(spend_bundle.name())
     expected_vault_coin_id = _hex32(expected_vault_coin.name())
     ledger = get_credential_ledger(settings)
@@ -1683,9 +1687,25 @@ async def _push_chia_stamp_and_mark_pending(
         ))
         if pending.receipt is None or pending.receipt.chiaVaultCoinId != expected_vault_coin_id:
             raise LedgerConflict("Stamp successor differs from retained authorization.")
-        ledger.record_stamp_dispatch(key, spend_bundle_id, "unknown")
+        if not settings.protocol_fee_funding_enabled:
+            ledger.record_stamp_dispatch(key, spend_bundle_id, "unknown")
     except (ValueError, LedgerConflict) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if settings.protocol_fee_funding_enabled:
+        from .stamp_funding import submit_funded_stamp
+        from .protocol_submission import ProtocolSubmissionError
+        try:
+            if fee_store is None:
+                raise ProtocolSubmissionError('Identity stamp funding journal is unavailable')
+            funded = await submit_funded_stamp(submitter=fee_submitter, store=fee_store,
+                ledger=ledger, key=key, original=spend_bundle, expected_coin=expected_vault_coin)
+        except (ProtocolSubmissionError, ChiaProviderError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        updated = pending.model_dump(mode='json')
+        updated['receipt']['chiaSpendBundleId'] = funded['spendBundleId']
+        pending = EnrollmentRecord.model_validate(ledger.update_enrollment(updated, expected_statuses=['stamp_pending']))
+        return SubmitChiaStampResponse(enrollment=pending,
+            spendBundleId=funded['spendBundleId'], expectedVaultCoinId=expected_vault_coin_id)
     try:
         push_result = await coinset.push_tx(spend_bundle.to_json_dict())
     except Exception as exc:  # noqa: BLE001
@@ -1794,12 +1814,13 @@ async def submit_evm_chia_stamp(
     if record.status == "stamp_pending" and record.receipt:
         if record.receipt.chiaSpendBundleId and record.receipt.chiaVaultCoinId:
             if attempt and attempt["bundle_hex"]:
-                if abs(int(time.time()) - retained_claim["current_timestamp"]) > 90:
+                if not settings.protocol_fee_funding_enabled and abs(int(time.time()) - retained_claim["current_timestamp"]) > 90:
                     raise HTTPException(status_code=409,
                         detail="The retained stamp submission window has passed. Check its existing receipt; authorization will not be renewed.")
                 # Exact bytes protect against replacement, not against a reorg
                 # or a changed release. Revalidate their original authorization
-                # without collecting another quorum or refreshing the clock.
+                # without collecting another quorum. Testnet sponsorship may
+                # continue only the unsigned clock in a separately saved child.
                 event = _fetch_verified_evm_attestation(settings,
                     transaction_hash=record.receipt.evmTxHash, expected_vault_launcher_id=key)
                 vault_coin = _find_initial_vault_coin(settings, key)
@@ -1816,6 +1837,8 @@ async def submit_evm_chia_stamp(
                         detail="The retained stamp no longer matches its original owner, EVM event or release. Reconcile the existing receipt.")
                 return await _push_chia_stamp_and_mark_pending(settings,
                     coinset=request.app.state.coinset, key=key,
+                    fee_submitter=getattr(request.app.state, 'protocol_submitter', None),
+                    fee_store=getattr(request.app.state, 'stamp_funding_store', None),
                     spend_bundle=SpendBundle.from_bytes(bytes.fromhex(attempt["bundle_hex"])),
                     expected_vault_coin=Coin.from_json_dict(json.loads(attempt["expected_coin_json"])))
             return SubmitChiaStampResponse(
@@ -1917,6 +1940,8 @@ async def submit_evm_chia_stamp(
         return await _push_chia_stamp_and_mark_pending(
             settings,
             coinset=request.app.state.coinset,
+            fee_submitter=getattr(request.app.state, 'protocol_submitter', None),
+            fee_store=getattr(request.app.state, 'stamp_funding_store', None),
             key=key,
             spend_bundle=spend_bundle,
             expected_vault_coin=expected_vault_coin,
@@ -2110,6 +2135,8 @@ async def submit_evm_chia_stamp(
     return await _push_chia_stamp_and_mark_pending(
         settings,
         coinset=request.app.state.coinset,
+        fee_submitter=getattr(request.app.state, 'protocol_submitter', None),
+        fee_store=getattr(request.app.state, 'stamp_funding_store', None),
         key=key,
         spend_bundle=spend_bundle,
         expected_vault_coin=expected_vault_coin,
