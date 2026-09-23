@@ -46,6 +46,7 @@ from .credential_ledger import LedgerConflict, LedgerRateLimited, get_credential
 from .evm_auth import recover_evm_signer
 from .faucet import AGG_SIG_ME_DATA
 from .state import VaultRecord, get_registry
+from .vault_puzzle_hash import puzzle_hash_for_vault_full
 from .validator_quorum import (
     ValidatorClaim,
     PermitValidatorClaim,
@@ -893,10 +894,9 @@ def _expected_stamped_vault_puzzle_hash(
     try:
         from solslot_puzzles.vault_driver import (
             one_leaf_merkle_root,
-            puzzle_for_vault_full,
         )
 
-        expected = puzzle_for_vault_full(
+        expected = puzzle_hash_for_vault_full(
             bytes32.fromhex(vault_launcher_id.removeprefix("0x")),
             bytes(record.owner_pubkey),
             int(record.auth_type),
@@ -912,7 +912,7 @@ def _expected_stamped_vault_puzzle_hash(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Vault registry cannot reconstruct the stamped vault puzzle: {exc}",
         ) from exc
-    return "0x" + expected.get_tree_hash().hex()
+    return "0x" + expected.hex()
 
 
 def _sync_chia_stamp(settings: Settings, key: str) -> EnrollmentRecord:

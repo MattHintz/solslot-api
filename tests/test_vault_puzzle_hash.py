@@ -36,3 +36,21 @@ def test_worker_hash_matches_full_protocol_puzzle_for_all_state_fields(auth_type
 def test_invalid_owner_encoding_still_rejected(auth_type, owner):
     with pytest.raises(ValueError):
         puzzle_hash_for_vault_full(bytes32.zeros, owner, auth_type, bytes32.zeros, bytes32.zeros)
+
+
+def test_enrollment_receipt_hash_survives_asgi_worker_boundary(monkeypatch):
+    from types import SimpleNamespace
+    from solslot_api import zkpassport_enrollments as enrollment
+    from solslot_puzzles.vault_driver import one_leaf_merkle_root
+    owner=b'\x02'+bytes(range(32))
+    launcher,pool,identity,bridge=[bytes32(bytes([n])*32) for n in range(1,5)]
+    record=SimpleNamespace(owner_pubkey=owner,auth_type=3)
+    monkeypatch.setattr(enrollment,'get_registry',lambda:SimpleNamespace(get=lambda _:record))
+    monkeypatch.setattr(enrollment,'_active_pool_launcher_id',lambda _:'0x'+pool.hex())
+    monkeypatch.setattr(enrollment,'_active_bridge_policy_hash',lambda _:'0x'+bridge.hex())
+    expected=puzzle_for_vault_full(launcher,owner,3,one_leaf_merkle_root(owner),pool,
+        identity_attest_root=identity,zkpassport_bridge_policy_hash=bridge).get_tree_hash()
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        actual=workers.submit(enrollment._expected_stamped_vault_puzzle_hash,None,
+            vault_launcher_id='0x'+launcher.hex(),identity_attest_root='0x'+identity.hex()).result()
+    assert actual=='0x'+expected.hex()
