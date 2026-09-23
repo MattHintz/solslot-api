@@ -92,6 +92,18 @@ def test_real_signed_stamp_fee_funding_and_immutable_recovery(monkeypatch,tmp_pa
             original=original,expected_coin=expected)
         assert again==doc
         assert store.db.execute('select count(*) from stamp_submissions').fetchone()[0]==1
+        from solslot_api.stamp_recovery_worker import recover_saved_stamp
+        funded_settings=settings.model_copy(update={'protocol_fee_funding_enabled':True})
+        with monkeypatch.context() as patch:
+            patch.setattr(enroll,'_push_chia_stamp_and_mark_pending',original_push)
+            recovered=await recover_saved_stamp(funded_settings,submitter,store,kwargs['key'],
+                ledger.get_enrollment(kwargs['key']),frozen)
+            assert recovered.spendBundleId==doc['spendBundleId']
+            changed=dict(frozen)
+            changed['claim_hash']='0x'+'ff'*32
+            with pytest.raises(ValueError,match='canonical proof'):
+                await recover_saved_stamp(funded_settings,submitter,store,kwargs['key'],
+                    ledger.get_enrollment(kwargs['key']),changed)
         store.db.close();observed.append(True)
         return result
     monkeypatch.setattr(enroll,'_push_chia_stamp_and_mark_pending',intercept)

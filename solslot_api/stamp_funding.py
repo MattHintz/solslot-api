@@ -108,6 +108,10 @@ class StampFundingStore:
             row = self.db.execute('SELECT * FROM stamp_submissions WHERE vault=? ORDER BY id DESC LIMIT 1', (vault,)).fetchone()
         return dict(row) if row else None
 
+    def attempt_count(self, vault):
+        with self.lock:
+            return self.db.execute('SELECT COUNT(*) FROM stamp_submissions WHERE vault=?', (vault,)).fetchone()[0]
+
     def reserve(self, vault, original_id, document, expected_previous):
         encoded = json.dumps(document, sort_keys=True, separators=(',', ':'))
         with self.lock:

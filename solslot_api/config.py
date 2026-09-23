@@ -881,6 +881,7 @@ class Settings(BaseSettings):
     # Server-funded protocol submissions use the local node's native fee
     # estimator. The existing faucet wallet acts as a bounded fee till.
     protocol_fee_funding_enabled: bool = False
+    stamp_fee_recovery_enabled: bool = False
     # Explicit per-bundle XCH budget for fresh Sols issuance, separate from fees.
     protocol_issuance_backing_max_mojos: int = Field(default=0, ge=0)
     protocol_medium_fee_target_seconds: int = Field(300, ge=60, le=1800)

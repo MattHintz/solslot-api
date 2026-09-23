@@ -574,9 +574,21 @@ async def lifespan(app: FastAPI):
             "Faucet consolidation is suppressed while genesis owns the faucet."
         )
 
+    app.state.stamp_fee_recovery_worker = None
+    if settings.stamp_fee_recovery_enabled:
+        if settings.network != 'testnet11' or app.state.protocol_submitter is None or genesis_faucet_exclusive:
+            raise RuntimeError('Stamp fee recovery requires the funded post-genesis Testnet11 runtime')
+        from .stamp_recovery_worker import StampRecoveryWorker
+        app.state.stamp_fee_recovery_worker = StampRecoveryWorker(settings,
+            app.state.protocol_submitter, app.state.stamp_funding_store)
+        await app.state.stamp_fee_recovery_worker.start()
+
     try:
         yield
     finally:
+        if app.state.stamp_fee_recovery_worker is not None:
+            await app.state.stamp_fee_recovery_worker.stop()
+        app.state.stamp_fee_recovery_worker = None
         if app.state.checkout_lifecycle_worker is not None:
             await app.state.checkout_lifecycle_worker.stop()
         if app.state.stripe_delivery_worker is not None:
