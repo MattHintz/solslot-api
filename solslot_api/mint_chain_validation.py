@@ -333,10 +333,13 @@ def primary_purchase_mint_config(values: dict, artifact: dict):
     primary_purchase = None
     puzzle_hashes = _artifact_mapping(artifact, "puzzleHashes")
     if "primary_purchase_usd_amount_minor" in values:
-        if values.get("inventory_puzzle_version", 1) != 2:
+        version = values.get("inventory_puzzle_version", 1)
+        if type(version) is not int or version not in (2, 3):
             raise ValueError("new purchase publication requires governed inventory V2")
         from solslot_puzzles.inventory_activation import validate_inventory_activation
-        validate_inventory_activation(artifact, required=True)
+        activation = validate_inventory_activation(artifact, required=True)
+        if version != activation['inventoryVersion']:
+            raise ValueError("inventory version differs from the signed activation")
         if values["royalty_bps"] != 100:
             raise ValueError("inventory V2 alpha technology fee must be 100 basis points")
         validator_set = _artifact_mapping(artifact, "validatorSet")
@@ -358,7 +361,7 @@ def primary_purchase_mint_config(values: dict, artifact: dict):
         primary_purchase = PrimaryPurchaseMintConfig(
             network=str(artifact.get("network", "")),
             usd_amount_minor=int(values["primary_purchase_usd_amount_minor"]),
-            inventory_version=2,
+            inventory_version=version,
             technology_fee_bps=100,
             protocol_treasury_puzhash=_artifact_bytes32(
                 puzzle_hashes,

@@ -1054,14 +1054,24 @@ def _task_for(record: Mapping[str, Any], readiness: list[dict[str, Any]]) -> dic
             "assignedRole": "owner" if enrolled == 0 else "administrator",
             "action": "enrollment",
         }
-    if state in {"roster_open", "roster_frozen"}:
-        readiness = [item for item in readiness if item["id"] not in {"authorityV3Evm", "authorityV3Review"}]
+    # These records bind deterministic plan coordinates. Requiring them before
+    # the plan exists creates a circular deployment dependency. This changes
+    # task ordering only: readiness and final preflight remain fail-closed.
+    plan_pending = state in {"roster_open", "roster_frozen"}
+    plan_dependencies = {"authorityV3Evm", "authorityV3Review"}
+
+    def relevant(item: Mapping[str, Any]) -> bool:
+        return (
+            (item.get("blocksCeremony", True) or (ceremony_complete and not is_disposable(record)))
+            and not (plan_pending and item.get("id") in plan_dependencies)
+        )
+
     blocked = next(
         (
             item
             for item in readiness
             if item["status"] == "Blocked"
-            and (item.get("blocksCeremony", True) or (ceremony_complete and not is_disposable(record)))
+            and relevant(item)
         ),
         None,
     )
@@ -1077,7 +1087,7 @@ def _task_for(record: Mapping[str, Any], readiness: list[dict[str, Any]]) -> dic
             item
             for item in readiness
             if item["status"] in {"Needs action", "Waiting"}
-            and (item.get("blocksCeremony", True) or (ceremony_complete and not is_disposable(record)))
+            and relevant(item)
         ),
         None,
     )
@@ -2820,12 +2830,18 @@ async def guided_prepare_plan_signature(
     )
     record = store.get(session.ceremony_id)
     prepared["ceremonyBinding"] = _ceremony_binding(record)
+    payment_chain = (record.get("plan") or {}).get("paymentChainId")
+    payment_label = {8453: "Base mainnet", 84532: "Base Sepolia"}.get(payment_chain)
+    identity_label = {11155111: "Ethereum Sepolia", 8453: "Base mainnet", 84532: "Base Sepolia"}[_ceremony_chain(record)]
     prepared["decisionReceipt"] = {
         "enrollmentCommitments": _selected_commitments(record),
         "title": "Approve the disposable vault/identity test plan" if is_disposable(record) else "Approve the fixed Testnet11 launch plan",
-        "network": "Testnet11",
+        "network": (
+            f"Chia Testnet11; identity {identity_label}; payment authority {payment_label}"
+            if payment_label else "Testnet11"
+        ),
         "financialEffect": "No payment is made by this signature.",
-        "customerImpact": ("Disposable and unaudited: vault registration and identity tests only. Sales and bridge stay closed. Replace this genesis before bridge testing." if is_disposable(record) else "Approves the exact protocol coordinates and administrator roster."),
+        "customerImpact": ("Disposable and unaudited: vault registration and identity tests only. Sales and bridge stay closed. Replace this genesis before bridge testing." if is_disposable(record) else "Approves the exact protocol coordinates and administrator roster. Payment and bridge activation are separate steps."),
         "reversibility": "Expires with the plan and cannot authorize another plan.",
         "expiresAt": record["plan_expires_at"],
         "requiredApprovers": "Owner plus either coadministrator",

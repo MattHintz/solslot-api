@@ -964,12 +964,12 @@ def _reseal_evidence(path, mutate):
         (
             "omnichain-samuel-evidence.json",
             lambda value: value["baseSepolia"].update(chainId=8453),
-            "Samuel evidence mismatches",
+            "Samuel coordinates contain a mismatched payment chain",
         ),
         (
             "omnichain-samuel-evidence.json",
             lambda value: value.update(schemaVersion=1),
-            "Samuel evidence mismatches",
+            "Samuel coordinates do not match the selected payment chain",
         ),
         (
             "omnichain-samuel-evidence.json",

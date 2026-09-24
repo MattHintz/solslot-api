@@ -40,6 +40,18 @@ class Provider(SimProvider):
         status, error = await self.client.push_tx(SpendBundle.from_json_dict(raw))
         return {'success': status is MempoolInclusionStatus.SUCCESS, 'status': str(status), 'error': str(error)}
 
+    async def get_fee_estimate(self, *, target_times, **kwargs):
+        return {'target_times': target_times, 'estimates': [7]}
+
+    async def push_tx_confirmed_in_primary_mempool(self, raw, *, required_coin_id, required_spend_bundle_id, **kwargs):
+        bundle = SpendBundle.from_json_dict(raw)
+        assert HX(bundle.name()) == required_spend_bundle_id
+        assert required_coin_id in {HX(c.name()) for c in bundle.removals()}
+        result = await self.push_tx(raw)
+        assert result['success'], result
+        assert await self.client.get_mempool_item_by_tx_id(bundle.name())
+        return {'status': 'MEMPOOL', 'provider': 'local-simulator', 'observed_at': 'synthetic', 'ambiguous_push': False}
+
 
 async def grant_stake(world, sim, client, provider, owner, coadmin_slot, amount):
     bill = bill_sgt_grant(grant_id=B(180), sgt_amount=amount,
@@ -239,17 +251,37 @@ async def test_fresh_grant_to_vault_then_owner_plus_one_mint(monkeypatch, tmp_pa
         monkeypatch.setattr(admin_operations, '_mint_build', rebuild)
         operation = {'chain_signatures': [dict(admin_index=slot, **signed) for slot, signed in signatures.items()]}
         request = SimpleNamespace(state=SimpleNamespace(admin_operation=operation))
+        funded = inventory and auth_type == 1 and coadmin_slot == 1
+        funding_store = None
+        if funded:
+            from solslot_api.protocol_submission import ProtocolBundleSubmitter, ProtocolFeePolicy
+            from solslot_api.protocol_funding_store import ProtocolFundingStore
+            funding_store = ProtocolFundingStore(str(tmp_path/'mint-funding.sqlite3'))
+            sponsor = ProtocolBundleSubmitter(provider=provider, faucet=world.faucet, funding_store=funding_store,
+                policy=ProtocolFeePolicy(enabled=True, minimum_mojos=7, maximum_mojos=100,
+                    maximum_funding_coin_mojos=2**64-1))
+            settings.protocol_fee_funding_enabled = True
+            request.app = SimpleNamespace(state=SimpleNamespace(protocol_submitter=sponsor))
         store = MintProposalStore(str(tmp_path/'mint.db'))
         claims = AdminClaims(sub=admin_key.to_checksum_address(), auth_type='evm', iat=1, exp=2_000_000_000)
         publish_args = dict(proposal_id='synthetic-mint', body=mint_endpoints.PublishMintBundleRequest.model_validate(binding['body']),
             claims=claims, settings=settings, store=store, coinset=provider, request=request)
         published = await mint_endpoints._publish_mint_bundle(**publish_args)
         assert published['pushed'] is True
-        assert published['spend_bundle_id'] == HX(bundle.name())
+        if funded:
+            import json
+            saved = json.loads(funding_store.db.execute('SELECT document FROM funded_protocol_bundles').fetchone()[0])
+            assert published['spend_bundle_id'] == saved['spendBundleId'] != HX(bundle.name())
+            assert saved['feeMojos'] == '7'
+            assert len(saved['spendBundle']['coin_spends']) == len(bundle.coin_spends) + 1
+        else:
+            assert published['spend_bundle_id'] == HX(bundle.name())
         await sim.farm_block()
         assert (await client.get_coin_record_by_name(launch.eve_coin.name())).coin == launch.eve_coin
         assert store.get('synthetic-mint').state == 'PROPOSED'
         assert (await mint_endpoints._publish_mint_bundle(**publish_args))['status'] == 'ALREADY_RECORDED'
         store.close()
+        if funding_store:
+            funding_store.close()
         with pytest.raises(ValueError):
             await mint.load_mint_publication_context(provider=Provider(SimClient(sim)), settings=None, genesis_store=None)

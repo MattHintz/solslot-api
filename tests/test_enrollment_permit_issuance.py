@@ -78,6 +78,8 @@ def setup(monkeypatch,tmp_path,request):
         calls.append(copy.deepcopy(wire));return signature(activation,wire)
     def issue(**kw):
         return asyncio.run(service.reserve_and_issue_permit(settings,kw.pop('session',session),a,policy,signer=kw.pop('signer',signer),**kw))
+    from solslot_api import zkpassport_relay
+    monkeypatch.setattr(zkpassport_relay, '_active_genesis_artifact', lambda _: a)
     return SimpleNamespace(a=a,active=active,policy=policy,settings=settings,session=session,vault=vault,
         coin=coin,bridge=bridge,records=records,clock=clock,calls=calls,issue=issue,signer=signer,
         ledger=get_credential_ledger(settings))

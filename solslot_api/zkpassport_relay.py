@@ -186,7 +186,15 @@ def _validate_relay_permit(settings, enrollment, session, data: bytes, *, live=F
         owner_key=session.owner_key, now=int(time.time()) if live else None) if selected else None
     try:
         require_calldata_record(data, enrollment, permit)
-        if selected:
+        from solslot_puzzles.eligibility_policy import identity_policy_from_artifact
+        artifact = _active_genesis_artifact(settings)
+        requires_sanctions = identity_policy_from_artifact(artifact) is not None
+        if requires_sanctions != (settings.zkpassport_eligibility_policy == 'age-sanctions-v1'):
+            raise ValueError('Identity runtime policy differs from the signed genesis')
+        if requires_sanctions:
+            from .enrollment_permit_runtime import require_private_eligibility_query
+            require_private_eligibility_query(data, artifact)
+        elif selected:
             require_private_age_query(data, environment=settings.runtime_environment + '-alpha')
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

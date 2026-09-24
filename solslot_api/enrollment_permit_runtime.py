@@ -89,6 +89,24 @@ def require_private_age_query(data: bytes, *, environment: str) -> None:
         raise ValueError('identity proof must contain only the private age-18 query for this vault')
 
 
+def require_private_eligibility_query(data: bytes, artifact: Mapping[str, Any]) -> None:
+    from solslot_puzzles.eligibility_policy import identity_policy_from_artifact, require_eligibility_inputs
+    if identity_policy_from_artifact(artifact) is None:
+        raise ValueError('age-plus-sanctions policy is not selected by the signed genesis')
+    parsed = decode_enrollment(data)
+    if parsed.permit is not None:
+        raise ValueError('this eligibility release requires its Sepolia emitter')
+    try:
+        params = decode([PROOF_PARAMS_ABI], parsed.proof)[0]
+    except (DecodingError, ValueError) as exc:
+        raise ValueError('identity proof envelope is malformed') from exc
+    if (encode([PROOF_PARAMS_ABI], [params]) != parsed.proof
+            or params[0] != ACCEPTED_PROOF_VERSION
+            or params[3] != (604800, 'solslot.com', 'vault:' + parsed.vault, False)):
+        raise ValueError('identity proof domain, scope or real-document policy differs')
+    require_eligibility_inputs(params[2])
+
+
 def validate_record_permit(record: Mapping[str, Any], artifact: Mapping[str, Any], *,
         owner_auth_type: int | None = None, owner_key: str | None = None,
         current_vault_coin_id: str | None = None, now: int | None = None) -> EnrollmentPermit | None:

@@ -79,6 +79,7 @@ class ProtocolBundleSubmitter:
         provider: ChiaProvider,
         faucet: Faucet,
         policy: ProtocolFeePolicy,
+        funding_store=None,
     ) -> None:
         self.provider = provider
         self.faucet = faucet
@@ -87,6 +88,10 @@ class ProtocolBundleSubmitter:
         self._fee_coin_reservation_sources: list[
             Callable[[], Iterable[str | bytes]]
         ] = []
+        self.funding_store = funding_store
+        if funding_store is not None:
+            self.add_fee_coin_reservation_source(funding_store.reserved_coin_ids)
+            self.faucet.add_coin_reservation_source(funding_store.reserved_coin_ids)
 
     @property
     def funding_guard(self) -> asyncio.Lock:
@@ -119,31 +124,69 @@ class ProtocolBundleSubmitter:
         # Production keeps one worker for faucet-backed writes. Holding this
         # lock until mempool observation prevents reuse of an unconfirmed coin.
         async with self._lock:
-            prepared = await self._prepare_locked(
-                protocol_bundle_json, selection_purpose=selection_purpose,
-                expected_backing_mojos=expected_backing_mojos
-            )
+            try:
+                original = SpendBundle.from_json_dict(protocol_bundle_json)
+            except Exception as exc:
+                raise ProtocolSubmissionError("protocol spend bundle is malformed") from exc
+            original_id = "0x" + original.name().hex()
+            context = {"feeTill": self.faucet.address_hex,
+                       "purpose": selection_purpose, "backingMojos": expected_backing_mojos}
+            store = self.funding_store
+            try:
+                saved = store.lookup(self.faucet.network, original_id, context) if store else None
+                if saved:
+                    if not self.policy.enabled:
+                        raise ProtocolSubmissionError("protocol fee funding is disabled")
+                    prepared = PreparedProtocolBundle(
+                        SpendBundle.from_json_dict(saved["spendBundle"]), int(saved["feeMojos"]),
+                        saved["feeCoinId"], int(saved["backingMojos"]))
+                    if not 0 <= prepared.fee_mojos <= self.policy.maximum_mojos:
+                        raise ProtocolSubmissionError("saved protocol fee is outside policy")
+                    if not 0 <= prepared.backing_mojos <= self.policy.maximum_backing_mojos:
+                        raise ProtocolSubmissionError("saved issuance backing is outside policy")
+                else:
+                    prepared = await self._prepare_locked(
+                        protocol_bundle_json, selection_purpose=selection_purpose,
+                        expected_backing_mojos=expected_backing_mojos
+                    )
+                    if store:
+                        store.reserve(self.faucet.network, original_id, context, prepared.to_json())
+            except ProtocolSubmissionError:
+                raise
+            except Exception as exc:
+                raise ProtocolSubmissionError("durable protocol funding could not be reconciled; saved transactions are retained") from exc
             if before_push is not None:
                 callback_result = before_push(prepared)
                 if inspect.isawaitable(callback_result):
                     await callback_result
             try:
-                mempool = await self.provider.push_tx_confirmed_in_primary_mempool(
-                    prepared.bundle.to_json_dict(),
-                    required_coin_id=prepared.fee_coin_id,
-                    required_spend_bundle_id=prepared.spend_bundle_id,
-                    timeout_seconds=self.policy.mempool_timeout_seconds,
-                    poll_seconds=self.policy.mempool_poll_seconds,
-                )
+                # On retry observe the exact original spends before any RPC
+                # write. A spent coin alone is never proof of confirmation.
+                mempool = await self.provider.observe_exact_protocol_bundle(prepared.bundle.to_json_dict()) if saved else None
+                if store:
+                    store.event(self.faucet.network, original_id, "observed" if mempool else "dispatching")
+                if mempool is None:
+                    mempool = await self.provider.push_tx_confirmed_in_primary_mempool(
+                        prepared.bundle.to_json_dict(),
+                        required_coin_id=prepared.fee_coin_id,
+                        required_spend_bundle_id=prepared.spend_bundle_id,
+                        timeout_seconds=self.policy.mempool_timeout_seconds,
+                        poll_seconds=self.policy.mempool_poll_seconds,
+                    )
+                if store:
+                    store.event(self.faucet.network, original_id, mempool.get("status", "MEMPOOL").lower())
             except ChiaProviderError as exc:
+                if store:
+                    from .submission_errors import error_code
+                    store.event(self.faucet.network, original_id, "reconciliation_required", error_code(exc))
                 raise ProtocolSubmissionError(
-                    str(exc),
+                    (f"Saved protocol transaction requires reconciliation ({error_code(exc)})" if store else str(exc)),
                     submission_attempted=True,
                 ) from exc
 
         return {
             "schemaVersion": 1,
-            "status": "MEMPOOL",
+            "status": mempool.get("status", "MEMPOOL"),
             "network": self.faucet.network,
             **prepared.to_json(),
             "feeTargetSeconds": self.policy.target_seconds,
@@ -151,6 +194,7 @@ class ProtocolBundleSubmitter:
             "submissionProvider": mempool["provider"],
             "mempoolObservedAt": mempool["observed_at"],
             "ambiguousPushRecovered": bool(mempool["ambiguous_push"]),
+            **({"confirmedHeight": mempool["confirmed_height"]} if "confirmed_height" in mempool else {}),
         }
 
     async def prepare_and_dispatch(
@@ -313,7 +357,14 @@ class ProtocolBundleSubmitter:
             excluded_coin_ids=protocol_input_ids,
             selection_purpose=selection_purpose,
         )
-        binding_conditions = self._backing_conditions(protocol_bundle) if expected_backing_mojos or bind_protocol else ()
+        # A fee subsidy must never be extractable as a standalone spend. Even
+        # ordinary transfers require every reviewed input in the same bundle.
+        # Issuance and explicitly bound executions additionally require an
+        # announcement commitment, as before.
+        binding_conditions = self._backing_conditions(
+            protocol_bundle,
+            require_announcements=bool(expected_backing_mojos or bind_protocol),
+        )
         if sponsor_deadline is not None:
             if not bind_protocol or type(sponsor_deadline) is not int or sponsor_deadline <= 0:
                 raise ProtocolSubmissionError("fee sponsor deadline requires a bound protocol")
@@ -335,7 +386,7 @@ class ProtocolBundleSubmitter:
         )
 
     @staticmethod
-    def _backing_conditions(bundle: SpendBundle) -> tuple[Program, ...]:
+    def _backing_conditions(bundle: SpendBundle, *, require_announcements: bool = True) -> tuple[Program, ...]:
         """Tie the subsidy to every protocol input and its emitted commitments."""
         conditions = []
         announcements = 0
@@ -353,7 +404,7 @@ class ProtocolBundleSubmitter:
                     announcements += 1
                     digest = hashlib.sha256(bytes(origin) + condition.vars[0]).digest()
                     conditions.append(Program.to([assertion, digest]))
-        if not announcements:
+        if require_announcements and not announcements:
             raise ProtocolSubmissionError("issuance backing requires protocol announcement commitments")
         return tuple(conditions)
 

@@ -15,6 +15,11 @@ def record_submission(path, *, network, bundle_id, provider, event, code=None, b
     logging.getLogger(__name__).info('protocol_submission network=%s bundle_id=%s provider=%s event=%s error_code=%s',
         network,bundle_id,provider,event,code)
     if not path:return
+    from pathlib import Path
+    Path(path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd=os.open(path,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+    os.fchmod(fd,0o600)
+    os.close(fd)
     db=sqlite3.connect(path,timeout=10)
     try:
         os.chmod(path,0o600)

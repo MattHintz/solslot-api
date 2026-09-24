@@ -556,3 +556,24 @@ async def test_issuance_backing_is_exact_bounded_and_separate_from_reserved_fee(
     with pytest.raises(ValueError, match="Assert.*Failed"):
         chia_rs.validate_clvm_and_signature(detached,11_000_000_000,constants,chia_rs.MEMPOOL_MODE)
     chia_rs.validate_clvm_and_signature(final,11_000_000_000,constants,chia_rs.MEMPOOL_MODE)
+
+
+@pytest.mark.asyncio
+async def test_ordinary_fee_sponsor_cannot_be_detached_from_the_transfer():
+    from chia.consensus.default_constants import DEFAULT_CONSTANTS
+    import chia_rs
+    faucet = Faucet.from_seed_hex('01' * 32, 'testnet11')
+    provider = FakeProvider(fee_coin=Coin(b32(198), faucet.address_puzzle_hash, uint64(100)))
+    # A valid ordinary transfer need not create any announcement.
+    puzzle = Program.to((1, [[51, b32(199), 10]]))
+    original = SpendBundle([make_spend(
+        Coin(b32(197), puzzle.get_tree_hash(), uint64(10)), puzzle, Program.to(0)
+    )], G2Element())
+    await submitter(provider, faucet).submit(original.to_json_dict())
+    final = SpendBundle.from_json_dict(provider.submitted)
+    constants = DEFAULT_CONSTANTS.replace(
+        AGG_SIG_ME_ADDITIONAL_DATA=bytes32(AGG_SIG_ME_DATA['testnet11']))
+    chia_rs.validate_clvm_and_signature(final, 11_000_000_000, constants, chia_rs.MEMPOOL_MODE)
+    detached = SpendBundle([final.coin_spends[-1]], final.aggregated_signature)
+    with pytest.raises(ValueError, match='AssertConcurrentSpendFailed'):
+        chia_rs.validate_clvm_and_signature(detached, 11_000_000_000, constants, chia_rs.MEMPOOL_MODE)

@@ -14,6 +14,7 @@ from typing import Any, Mapping
 from eth_utils import keccak, to_checksum_address
 
 from .safe_owner_roster import address_from_compressed_pubkey
+from .authority_network import authority_chain_id
 
 
 _CEREMONY_ID = re.compile(r"^0x[0-9a-fA-F]{64}$")
@@ -190,6 +191,10 @@ def export_authority_v3_roster(
         )
 
     plan = _mapping(ceremony["plan"], "genesis ceremony plan")
+    try:
+        selected_chain = authority_chain_id(plan)
+    except ValueError as exc:
+        raise AuthorityV3RosterError(str(exc)) from exc
     if (
         str(plan.get("ceremonyId") or "").lower()
         != str(ceremony["ceremony_id"]).lower()
@@ -386,6 +391,12 @@ def export_authority_v3_roster(
         "identityLauncherIds": identity_launcher_ids,
         "administrators": administrators,
     }
+    if "paymentChainId" in plan or selected_chain != 84532:
+        evidence.update(
+            schemaVersion=3,
+            paymentChainId=selected_chain,
+            evmChainId=plan.get("evmChainId", 11155111),
+        )
     return {**evidence, "artifactHash": _canonical_hash(evidence)}
 
 

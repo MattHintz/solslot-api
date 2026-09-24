@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .config import Settings
-from .authority_network import authority_chain_id, validate_authority_network
+from .authority_network import authority_chain_id, ceremony_authority_document, validate_authority_network
 
 
 MAX_EVIDENCE_BYTES = 128 * 1024
@@ -66,7 +66,7 @@ def load_governance_evidence(settings: Settings) -> dict[str, Any]:
             "Authority V3 EVM deployment evidence is unsupported"
         )
     validate_authority_network(
-        evidence, 8453 if settings.eip712_chain_id == 8453 else AUTHORITY_EVM_CHAIN_ID,
+        evidence, 8453 if settings.eip712_chain_id == 8453 else settings.payment_omnichain_chain_id,
     )
     recovery = evidence.get("recovery")
     safes = evidence.get("safes")
@@ -101,7 +101,7 @@ def validate_governance_roster(
     kits: list[Mapping[str, Any]],
     evidence: Mapping[str, Any],
 ) -> None:
-    validate_authority_network(evidence, authority_chain_id(record.get("draft") or {}))
+    validate_authority_network(evidence, authority_chain_id(ceremony_authority_document(record)))
     if [int(item["slot"]) for item in kits] != [0, 1, 2]:
         raise ValueError("all three recovery drills are required")
     invitations = sorted(

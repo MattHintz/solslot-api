@@ -6,7 +6,8 @@ from solslot_api import mint_endpoints
 from tests.test_mint_publish_validation import _metadata
 
 
-def test_api_mint_terms_match_reservation_provider_fee_and_signed_activation():
+@pytest.mark.parametrize('version', [2, 3])
+def test_api_mint_terms_match_reservation_provider_fee_and_signed_activation(version):
     from solslot_api.mint_chain_validation import primary_purchase_mint_config
     from solslot_api.mint_publish_validation import metadata_bytes
     from solslot_puzzles import load_puzzle
@@ -22,16 +23,26 @@ def test_api_mint_terms_match_reservation_provider_fee_and_signed_activation():
         inventoryVersion=2, adapterVersion=1, reviewEvidenceSha256="ab"*32,
         availableModuleHash="0x"+load_puzzle("mint_offer_inventory_available_v2.clsp").get_tree_hash().hex(),
         reservedModuleHash="0x"+load_puzzle("mint_offer_delegate_v5.clsp").get_tree_hash().hex())
+    if version == 3:
+        from solslot_puzzles.alpha_payment_profile import alpha_payment_profile
+        artifact.update(evmChainId=11155111, paymentChainId=8453, genesisPlan={'paymentChainId':8453})
+        artifact['inventoryActivation'].update(schema='solslot.inventory-activation.v2', inventoryVersion=3,
+            adapterVersion=2, paymentProfile=alpha_payment_profile(),
+            availableModuleHash='0x'+load_puzzle('mint_offer_inventory_available_v3.clsp').get_tree_hash().hex(),
+            reservedModuleHash='0x'+load_puzzle('mint_offer_delegate_v6.clsp').get_tree_hash().hex())
+    values['inventory_puzzle_version'] = version
     config = primary_purchase_mint_config(values, artifact)
     assert config.usd_amount_minor == 101 and config.technology_fee_bps == 100
-    assert config.provider_id == PRIMARY_PURCHASE_PROVIDER_ID and config.inventory_version == 2
+    assert config.provider_id == PRIMARY_PURCHASE_PROVIDER_ID and config.inventory_version == version
+    with pytest.raises(ValueError, match='differs from the signed activation'):
+        primary_purchase_mint_config({**values, 'inventory_puzzle_version':5-version}, artifact)
     with pytest.raises(ValueError, match="governed inventory V2"):
         primary_purchase_mint_config({**values, "inventory_puzzle_version": 1}, artifact)
     with pytest.raises(ValueError, match="100 basis points"):
         primary_purchase_mint_config({**values, "royalty_bps": 200}, artifact)
 
 
-@pytest.mark.parametrize("version,wire,accepted", [(1, 103, True), (2, 101, True), (2, 103, False), (1, 101, False)])
+@pytest.mark.parametrize("version,wire,accepted", [(1, 103, True), (2, 101, True), (2, 103, False), (1, 101, False), (3, 101, True), (3, 103, False)])
 def test_sealed_allocation_preserves_old_wire_and_charges_v2_fee_once(monkeypatch, version, wire, accepted):
     metadata = _metadata(primary_purchase_usd_amount_minor=wire, inventory_puzzle_version=version,
         metadata_root="0x"+"77"*32, metadata_anchor_id="0x"+"88"*32)

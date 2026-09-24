@@ -83,6 +83,14 @@ def verify_genesis_evm_deployment(
     unsigned = {key: value for key, value in deployment.items() if key != "artifactHash"}
     if supplied_hash != _canonical_hash(unsigned):
         raise GenesisEvmEvidenceError("deployment artifactHash is not canonical")
+    from solslot_puzzles.eligibility_policy import validate_identity_policy
+    identity_policy = validate_identity_policy(plan.get("identityPolicy"), evm_chain_id=plan.get("evmChainId", 11155111))
+    if (deployment.get("identityPolicy") != identity_policy
+            or (identity_policy is not None and (
+                settings.zkpassport_eligibility_policy != "age-sanctions-v1"
+                or deployment.get("zkPassportDomain") != "solslot.com"
+                or deployment.get("zkPassportDevMode") is not False))):
+        raise GenesisEvmEvidenceError("identity deployment policy differs from the signed plan")
     if (
         deployment.get("schemaVersion") != 2
         or deployment.get("protocolVersion") != "solslot-v2"
@@ -211,6 +219,21 @@ def verify_genesis_evm_deployment(
         "zkPassportRootVerifier runtime bytecode hash",
     ):
         raise GenesisEvmEvidenceError("zkPassport root verifier bytecode hash changed")
+
+    if identity_policy is not None:
+        try:
+            adapter = web3.eth.contract(address=Web3.to_checksum_address(addresses["verifierAdapter"]), abi=[
+                {"type":"function","name":name,"inputs":[],"outputs":[{"type":kind}],"stateMutability":"view"}
+                for name,kind in (("ELIGIBILITY_POLICY_ID","bytes32"),("domain","string"),("devMode","bool"),("SANCTIONS_STRICT","bool"))
+            ])
+            expected_id = bytes(Web3.keccak(text="solslot:age18:sanctions:all:standard:real:solslot.com:v1"))
+            if (bytes(adapter.functions.ELIGIBILITY_POLICY_ID().call()) != expected_id
+                    or adapter.functions.domain().call() != "solslot.com"
+                    or adapter.functions.devMode().call() is not False
+                    or adapter.functions.SANCTIONS_STRICT().call() is not False):
+                raise ValueError("policy mismatch")
+        except Exception as exc:
+            raise GenesisEvmEvidenceError("live verifier does not enforce the reviewed eligibility policy") from exc
 
     return {
         "manifestArtifactHash": supplied_hash,

@@ -100,7 +100,7 @@ def _fixture(tmp_path):
     return settings, record, plan, deployment, code
 
 
-def _install_fake_web3(monkeypatch, deployment, code, *, peak=120):
+def _install_fake_web3(monkeypatch, deployment, code, *, peak=120, adapter_values=None):
     receipts = {
         item["hash"].lower(): {
             "status": 1,
@@ -128,6 +128,14 @@ def _install_fake_web3(monkeypatch, deployment, code, *, peak=120):
         def get_code(address):
             assert RealWeb3.is_checksum_address(address)
             return code[str(address).lower()]
+
+        @staticmethod
+        def contract(**_kwargs):
+            from types import SimpleNamespace
+            class Functions:
+                def __getattr__(self, name):
+                    return lambda: SimpleNamespace(call=lambda: adapter_values[name])
+            return SimpleNamespace(functions=Functions())
 
     class FakeWeb3:
         HTTPProvider = staticmethod(lambda *_args, **_kwargs: object())
@@ -189,3 +197,32 @@ def test_live_evm_deployment_verification_rejects_source_or_manifest_drift(
         json.dump(deployment, stream)
     with pytest.raises(GenesisEvmEvidenceError, match="artifactHash"):
         verify_genesis_evm_deployment(settings, record, plan)
+
+
+@pytest.mark.parametrize("drift", [None, "domain", "devMode", "ELIGIBILITY_POLICY_ID", "SANCTIONS_STRICT", "config", "manifest"])
+def test_fresh_eligibility_genesis_checks_live_policy(tmp_path, monkeypatch, drift):
+    from solslot_puzzles.eligibility_policy import ELIGIBILITY_POLICY
+    settings, record, plan, deployment, code = _fixture(tmp_path)
+    settings.zkpassport_eligibility_policy = "age-sanctions-v1"
+    plan["identityPolicy"] = ELIGIBILITY_POLICY
+    deployment.update(identityPolicy=ELIGIBILITY_POLICY, zkPassportDomain="solslot.com", zkPassportDevMode=False)
+    values = {
+        "domain": "solslot.com", "devMode": False, "SANCTIONS_STRICT": False,
+        "ELIGIBILITY_POLICY_ID": bytes(RealWeb3.keccak(text="solslot:age18:sanctions:all:standard:real:solslot.com:v1")),
+    }
+    if drift == "config":
+        settings.zkpassport_eligibility_policy = "age-only"
+    elif drift == "manifest":
+        deployment.pop("identityPolicy")
+    elif drift is not None:
+        values[drift] = {"domain": "staging.solslot.com", "devMode": True,
+                         "SANCTIONS_STRICT": True, "ELIGIBILITY_POLICY_ID": bytes(32)}[drift]
+    deployment["artifactHash"] = _canonical_hash({k:v for k,v in deployment.items() if k != "artifactHash"})
+    with open(settings.genesis_evm_deployment_path, "w", encoding="ascii") as stream:
+        json.dump(deployment, stream)
+    _install_fake_web3(monkeypatch, deployment, code, adapter_values=values)
+    if drift:
+        with pytest.raises(GenesisEvmEvidenceError, match="policy"):
+            verify_genesis_evm_deployment(settings, record, plan)
+    else:
+        assert verify_genesis_evm_deployment(settings, record, plan)["manifestArtifactHash"] == deployment["artifactHash"]

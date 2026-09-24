@@ -35,7 +35,7 @@ class PublishProposalMetadata(BaseModel):
     )
 
     inventory_puzzle_version: int = Field(
-        1, ge=1, le=2, strict=True,
+        1, ge=1, le=3, strict=True,
         description="Governed inventory module version; omitted historical metadata remains V1",
     )
 

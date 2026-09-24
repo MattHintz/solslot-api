@@ -348,6 +348,10 @@ async def lifespan(app: FastAPI):
         )
 
     app.state.protocol_submitter = None
+    from .protocol_funding_store import ProtocolFundingStore
+    app.state.protocol_funding_store = ProtocolFundingStore(str(settings.zkpassport_ledger_db_path) + '.protocol-funding.sqlite3')
+    if app.state.faucet is not None:
+        app.state.faucet.add_coin_reservation_source(app.state.protocol_funding_store.reserved_coin_ids)
     from .stamp_funding import StampFundingStore, bind_store as bind_stamp_funding
     app.state.stamp_funding_store = StampFundingStore(str(settings.zkpassport_ledger_db_path) + '.stamp-funding.sqlite3')
     if app.state.faucet is not None:
@@ -381,6 +385,7 @@ async def lifespan(app: FastAPI):
         app.state.protocol_submitter = ProtocolBundleSubmitter(
             provider=app.state.coinset,
             faucet=app.state.faucet,
+            funding_store=app.state.protocol_funding_store,
             policy=ProtocolFeePolicy(
                 enabled=True,
                 target_seconds=settings.protocol_medium_fee_target_seconds,
@@ -599,6 +604,7 @@ async def lifespan(app: FastAPI):
             await app.state.faucet_worker.stop()
         await app.state.coinset.close()
         app.state.stamp_funding_store.db.close()
+        app.state.protocol_funding_store.close()
         # Lifespan services may retain thread-affine chia_rs Program/LazyNode
         # values. Release every owned reference on this event-loop thread so a
         # later TestClient or server restart cannot finalize it on another one.

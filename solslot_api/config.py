@@ -435,7 +435,7 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
     if settings.payment_omnichain_ownership_activation_enabled:
         if settings.network != "testnet11":
             raise RuntimeError(
-                "Base Sepolia ownership activation is restricted to the Testnet11 alpha."
+                "Base ownership activation is restricted to the Testnet11 alpha."
             )
         if (
             not settings.payment_omnichain_rpc_url
@@ -454,7 +454,7 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
             load_authority_operation(settings)
         except OwnershipActivationError as exc:
             raise RuntimeError(
-                "Base Sepolia ownership activation requires the exact reviewed "
+                "Base ownership activation requires the exact reviewed "
                 f"Safe operation package: {exc}"
             ) from exc
 
@@ -1190,6 +1190,7 @@ class Settings(BaseSettings):
     # ceremony; retired JSON enrollment stores are never imported.
     zkpassport_ledger_db_path: str = "./state/zkpassport_v2.db"
     zkpassport_policy_version: int = Field(2, ge=2)
+    zkpassport_eligibility_policy: Literal["age-only", "age-sanctions-v1"] = "age-only"
     zkpassport_owner_challenge_ttl_seconds: int = Field(300, ge=30, le=900)
 
     # ── zkPassport gasless relayer (ERC-2771 meta-transactions) ────────
@@ -1249,11 +1250,23 @@ class Settings(BaseSettings):
     payment_kos_executor_mtls_key_path: Optional[str] = None
     # External CCIP/Warp escrow is separately deployed from the ceremony EVM
     # bridge. Token allowlisting alone must never activate this rail.
+    # Payment signatures have their own domain; identity enrollment is unchanged.
+    payment_omnichain_chain_id: Literal[8453, 84532] = 84532
     payment_omnichain_enabled: bool = False
     payment_omnichain_ingest_token: Optional[str] = None
     payment_omnichain_rpc_url: Optional[str] = None
     payment_omnichain_preflight_evidence_path: Optional[str] = None
     payment_omnichain_evidence_path: Optional[str] = None
+    payment_omnichain_test_asset_evidence_path: Optional[str] = None
+
+    @field_validator("payment_omnichain_chain_id", mode="before")
+    @classmethod
+    def parse_payment_network_environment(cls, value):
+        # Pydantic Literal[int] does not coerce environment variable strings.
+        # Accept only the two canonical decimal encodings, never bools/floats.
+        if isinstance(value, str) and value in ("8453", "84532"):
+            return int(value)
+        return value
     payment_omnichain_activation_evidence_path: Optional[str] = None
     payment_omnichain_governance_evidence_path: Optional[str] = None
     payment_omnichain_samuel_evidence_path: Optional[str] = None

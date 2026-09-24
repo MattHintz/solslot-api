@@ -10,6 +10,15 @@ from chia.consensus.condition_tools import conditions_dict_for_solution
 from chia.types.blockchain_format.program import INFINITE_COST
 from solslot_api import zkpassport_enrollments as enroll
 from solslot_api.stamp_funding import continue_stamp, stamp_timestamp, StampFundingStore, submit_funded_stamp
+
+
+def test_fresh_install_can_create_private_funding_journal(tmp_path):
+    path = tmp_path / 'fresh' / 'state' / 'stamp.sqlite3'
+    store = StampFundingStore(path)
+    assert store.latest('new-vault') is None
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+    store.db.close()
 from solslot_api.credential_ledger import get_credential_ledger
 from solslot_api.faucet import Faucet
 from solslot_api.protocol_submission import ProtocolBundleSubmitter, ProtocolFeePolicy, ProtocolSubmissionError

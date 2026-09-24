@@ -1,4 +1,4 @@
-"""Administrator signing surface for the sealed Base Sepolia ownership handoff.
+"""Administrator signing surface for the sealed Base ownership handoff.
 
 The two stored approvals are the actual nested Safe ``SafeMessage`` signatures.
 There is no second Solslot-specific approval envelope and the API never holds a
@@ -38,7 +38,7 @@ from .timelock_operation import (
 
 
 MAX_OPERATION_BYTES = 128 * 1024
-BASE_SEPOLIA_CHAIN_ID = 84532
+PAYMENT_NETWORKS = {8453: "baseMainnet", 84532: "baseSepolia"}
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 REQUIRED_ROLES = ("owner_identity", "coadmin")
 _HASH_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
@@ -511,6 +511,7 @@ def _validate_approval(
     *,
     chain_id: int,
     transaction_data: str,
+    schema_version: int = 1,
 ) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise OwnershipActivationError("Safe approval descriptor must be an object")
@@ -518,12 +519,22 @@ def _validate_approval(
     if role not in REQUIRED_ROLES:
         raise OwnershipActivationError("Safe approval role is unsupported")
     safe = _require_address(value.get("safe"), f"{role}.safe")
+    parent = value.get("parentSafe")
+    if schema_version == 2 and role == "coadmin":
+        parent = _require_address(parent, "coadmin.parentSafe")
+        if parent.lower() in (safe.lower(), ZERO_ADDRESS):
+            raise OwnershipActivationError("coadministrator parent Safe is invalid")
+        transaction_data = _safe_message_data(chain_id, parent, transaction_data)
+    elif parent is not None:
+        raise OwnershipActivationError("unexpected parent Safe in approval")
     allowed_raw = value.get("allowedSigners")
     if not isinstance(allowed_raw, list) or not allowed_raw:
         raise OwnershipActivationError(f"{role}.allowedSigners must not be empty")
     allowed = [_require_address(item, f"{role}.allowedSigners") for item in allowed_raw]
     if len({item.lower() for item in allowed}) != len(allowed):
         raise OwnershipActivationError(f"{role}.allowedSigners contains duplicates")
+    if schema_version == 2 and len(allowed) != 1:
+        raise OwnershipActivationError("each Authority V3 identity has exactly one daily signer")
     typed_data = value.get("typedData")
     if not isinstance(typed_data, Mapping) or set(typed_data) != {
         "domain",
@@ -551,7 +562,42 @@ def _validate_approval(
         "allowedSigners": allowed,
         "messageHash": message_hash,
         "typedData": dict(typed_data),
+        **({"parentSafe": parent} if parent else {}),
     }
+
+
+def _safe_message_data(chain_id: int, safe: str, message: str) -> str:
+    """Safe CompatibilityFallbackHandler's encodeMessageDataForSafe bytes."""
+    encoded = encode_typed_data(full_message={
+        "domain": {"chainId": chain_id, "verifyingContract": safe},
+        "types": {"SafeMessage": [{"name": "message", "type": "bytes"}]},
+        "primaryType": "SafeMessage", "message": {"message": message},
+    })
+    return "0x" + (b"\x19" + encoded.version + encoded.header + encoded.body).hex()
+
+
+def _validate_v3_approval_topology(settings: Settings, package: Mapping[str, Any], approvals: list[dict[str, Any]]) -> None:
+    from .authority_v3_evidence import load_governance_evidence
+
+    try:
+        governance = load_governance_evidence(settings)
+        identities = governance["safes"]["identities"]
+        owner = next(a for a in approvals if a["role"] == "owner_identity")
+        coadmin = next(a for a in approvals if a["role"] == "coadmin")
+        selected = next(s for s in identities[1:] if s["address"].lower() == coadmin["safe"].lower())
+        if (
+            governance["artifactHash"] != package["governanceArtifactHash"]
+            or governance["safes"]["root"]["address"].lower() != package["rootSafe"].lower()
+            or governance["timelock"]["address"].lower() != package["timelock"].lower()
+            or owner["safe"].lower() != identities[0]["address"].lower()
+            or owner.get("parentSafe") is not None
+            or coadmin["parentSafe"].lower() != governance["safes"]["coadmin"]["address"].lower()
+            or [x.lower() for x in owner["allowedSigners"]] != [x.lower() for x in identities[0]["owners"]]
+            or [x.lower() for x in coadmin["allowedSigners"]] != [x.lower() for x in selected["owners"]]
+        ):
+            raise ValueError("mismatch")
+    except (ValueError, KeyError, TypeError, StopIteration, AttributeError) as exc:
+        raise OwnershipActivationError("Authority V3 approvals differ from the sealed governance topology") from exc
 
 
 def load_authority_operation(
@@ -590,10 +636,11 @@ def load_authority_operation(
         raise OwnershipActivationError("ownership activation package hash mismatches")
     package["artifactHash"] = declared_hash
     if (
-        package.get("schemaVersion") != 1
+        package.get("schemaVersion") not in (1, 2)
         or package.get("kind") != "solslot-safe-authority-operation"
-        or package.get("network") != "baseSepolia"
-        or package.get("chainId") != BASE_SEPOLIA_CHAIN_ID
+        or package.get("network") != PAYMENT_NETWORKS[settings.payment_omnichain_chain_id]
+        or type(package.get("chainId")) is not int
+        or package.get("chainId") != settings.payment_omnichain_chain_id
         or package.get("phase") != phase
         or not isinstance(package.get("sourceSha"), str)
         or not _SHA_RE.fullmatch(package["sourceSha"])
@@ -687,16 +734,19 @@ def load_authority_operation(
     approvals = [
         _validate_approval(
             value,
-            chain_id=BASE_SEPOLIA_CHAIN_ID,
+            chain_id=package["chainId"],
             transaction_data=transaction_data,
+            schema_version=package["schemaVersion"],
         )
         for value in approvals_raw
     ]
     if {value["role"] for value in approvals} != set(REQUIRED_ROLES):
         raise OwnershipActivationError("owner identity and coadmin approvals are required")
-    child_safes = [value["safe"].lower() for value in approvals]
+    child_safes = [value.get("parentSafe", value["safe"]).lower() for value in approvals]
     if len(set(child_safes)) != 2:
         raise OwnershipActivationError("nested Safe approval domains must be unique")
+    if package["schemaVersion"] == 2:
+        _validate_v3_approval_topology(settings, package, approvals)
     authority = dict(authority)
     authority["transaction"] = validated_transaction
     authority["transactionData"] = transaction_data
@@ -731,8 +781,15 @@ def _transaction_arguments(package: Mapping[str, Any]) -> list[Any]:
 def _web3(settings: Settings) -> Web3:
     rpc_url = settings.payment_omnichain_rpc_url
     if not rpc_url or not rpc_url.startswith("https://"):
-        raise OwnershipActivationError("Base Sepolia HTTPS RPC is not configured")
-    return Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 20.0}))
+        raise OwnershipActivationError("Payment-chain HTTPS RPC is not configured")
+    w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 20.0}))
+    try:
+        chain_id = w3.eth.chain_id
+    except Exception as exc:
+        raise OwnershipActivationError("Payment RPC chain could not be verified") from exc
+    if chain_id != settings.payment_omnichain_chain_id:
+        raise OwnershipActivationError("Payment RPC is on the wrong EVM network")
+    return w3
 
 
 def _chain_state(settings: Settings, package: Mapping[str, Any]) -> ChainState:
@@ -758,7 +815,7 @@ def _chain_state(settings: Settings, package: Mapping[str, Any]) -> ChainState:
         latest_block = int(w3.eth.block_number)
     except Exception as exc:  # noqa: BLE001
         raise OwnershipActivationError(
-            "Base Sepolia Safe/timelock state could not be independently verified"
+            "Payment-chain Safe/timelock state could not be independently verified"
         ) from exc
     live_hash_hex = Web3.to_hex(live_hash).lower()
     should_validate_package = (
@@ -880,8 +937,9 @@ def _validate_derived_execute_package(
     approvals = [
         _validate_approval(
             value,
-            chain_id=BASE_SEPOLIA_CHAIN_ID,
+            chain_id=package["chainId"],
             transaction_data=transaction_data,
+            schema_version=package["schemaVersion"],
         )
         for value in approvals_raw
     ]
@@ -896,6 +954,7 @@ def _validate_derived_execute_package(
         if (
             expected is None
             or approval["safe"].lower() != expected["safe"].lower()
+            or approval.get("parentSafe", "").lower() != expected.get("parentSafe", "").lower()
             or [value.lower() for value in approval["allowedSigners"]]
             != [value.lower() for value in expected["allowedSigners"]]
         ):
@@ -979,18 +1038,20 @@ def _build_derived_execute_package(
     for descriptor in schedule_package["authorityOperation"]["approvals"]:
         typed_data = {
             "domain": {
-                "chainId": BASE_SEPOLIA_CHAIN_ID,
+                "chainId": schedule_package["chainId"],
                 "verifyingContract": descriptor["safe"],
             },
             "types": {"SafeMessage": [{"name": "message", "type": "bytes"}]},
             "primaryType": "SafeMessage",
-            "message": {"message": transaction_data},
+            "message": {"message": _safe_message_data(schedule_package["chainId"], descriptor["parentSafe"], transaction_data)
+                        if descriptor.get("parentSafe") else transaction_data},
         }
         approvals.append(
             {
                 "role": descriptor["role"],
                 "safe": descriptor["safe"],
                 "allowedSigners": list(descriptor["allowedSigners"]),
+                **({"parentSafe": descriptor["parentSafe"]} if descriptor.get("parentSafe") else {}),
                 "messageHash": _typed_data_digest(typed_data),
                 "typedData": typed_data,
             }
@@ -1096,12 +1157,15 @@ def _encode_contract_signatures(
     for role in REQUIRED_ROLES:
         if role not in approvals:
             raise ValueError(f"{role} administrator signature is missing")
-        entries.append(
-            (
-                descriptors[role]["safe"],
-                _normalize_signature(str(approvals[role]["signature"])),
-            )
-        )
+        descriptor = descriptors[role]
+        signature = _normalize_signature(str(approvals[role]["signature"]))
+        if descriptor.get("parentSafe"):
+            signature = _encode_signature_entries([(descriptor["safe"], signature)])
+        entries.append((descriptor.get("parentSafe", descriptor["safe"]), signature))
+    return _encode_signature_entries(entries)
+
+
+def _encode_signature_entries(entries: list[tuple[str, bytes]]) -> bytes:
     entries.sort(key=lambda item: int(item[0], 16))
     static_size = 65 * len(entries)
     dynamic_offset = static_size
@@ -1158,7 +1222,7 @@ def _build_exec_transaction(
         ],
     )
     return {
-        "chainId": str(BASE_SEPOLIA_CHAIN_ID),
+        "chainId": str(package["chainId"]),
         "to": package["rootSafe"],
         "value": "0x0",
         "data": "0x" + (selector + arguments).hex(),
@@ -1179,7 +1243,7 @@ def _verify_broadcast(
         transaction = w3.eth.get_transaction(transaction_hash)
     except Exception as exc:  # noqa: BLE001
         raise OwnershipActivationError(
-            "ownership broadcast is not yet available from Base Sepolia"
+            "ownership broadcast is not yet available from the payment chain"
         ) from exc
     input_data = transaction.get("input") or transaction.get("data") or "0x"
     input_hex = (

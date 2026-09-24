@@ -562,6 +562,78 @@ class ChiaProvider:
                 )
             await asyncio.sleep(poll_seconds)
 
+    async def observe_exact_protocol_bundle(self, bundle_json):
+        """Reconcile saved spends on one synced primary before a resend.
+
+        This is a full-node observation, not an SPV proof. Require every spend,
+        including ephemeral inputs, to have its original puzzle and solution in
+        the same block. A conflicting spend or changing tip fails closed.
+        """
+        from chia_rs import SpendBundle, CoinSpend
+        bundle = SpendBundle.from_json_dict(bundle_json)
+        if not bundle.coin_spends or self.primary is None or not await self._primary_available():
+            raise ChiaProviderError("saved protocol submission requires the local Chia full node")
+        node = self.primary
+        async def peak():
+            info = await node.get_network_info()
+            state = await node.get_blockchain_state()
+            chain = state["blockchain_state"]
+            value = chain["peak"]
+            if (info.get("network_name") != self.config.network or info.get("success") is not True
+                    or state.get("success") is not True or chain["sync"].get("synced") is not True
+                    or chain["sync"].get("sync_mode", False) is not False
+                    or type(value.get("height")) is not int or value["height"] <= 0):
+                raise ChiaProviderError("saved protocol observation requires a synced primary on the exact network")
+            return value["height"], _normalize_coin_id(value["header_hash"])
+        try:
+            initial_peak = await peak()
+            bundle_id = "0x" + bundle.name().hex()
+            ephemeral = {coin.name() for coin in bundle.additions()}
+            persistent = [s for s in bundle.coin_spends if s.coin.name() not in ephemeral]
+            if not persistent:
+                raise ChiaProviderError("saved protocol bundle has no persistent inputs")
+            records = {}
+            pending = False
+            for spend in persistent:
+                coin_id = "0x" + spend.coin.name().hex()
+                items = await node.get_mempool_items_by_coin_name(coin_id)
+                if any(not _mempool_item_matches_bundle(item, bundle_id) for item in items):
+                    raise ChiaProviderError("saved protocol input has a conflicting pending transaction")
+                pending = pending or bool(items)
+                record = await node.get_coin_record_by_name(coin_id)
+                if (not record or Coin.from_json_dict(record["coin"]) != spend.coin
+                        or type(record.get("confirmed_block_index")) is not int
+                        or not 0 < record["confirmed_block_index"] <= initial_peak[0]
+                        or type(record.get("spent_block_index")) is not int
+                        or not 0 <= record["spent_block_index"] <= initial_peak[0]):
+                    raise ChiaProviderError("saved protocol input is missing or inconsistent")
+                records[coin_id] = record
+            heights = {r["spent_block_index"] for r in records.values()}
+            confirmed_height = None
+            if heights != {0}:
+                if 0 in heights or len(heights) != 1 or pending:
+                    raise ChiaProviderError("saved protocol inputs have inconsistent settlement")
+                confirmed_height = next(iter(heights))
+                for spend in bundle.coin_spends:
+                    coin_id = "0x" + spend.coin.name().hex()
+                    record = records.get(coin_id) or await node.get_coin_record_by_name(coin_id)
+                    actual = await node.get_puzzle_and_solution(coin_id, confirmed_height)
+                    if (not record or Coin.from_json_dict(record["coin"]) != spend.coin
+                            or record.get("spent_block_index") != confirmed_height
+                            or not actual or CoinSpend.from_json_dict(actual) != spend):
+                        raise ChiaProviderError("confirmed spend differs from saved protocol authorization")
+            if self.primary is not node or await peak() != initial_peak:
+                raise ChiaProviderError("chain changed during saved protocol observation; retry status")
+            if not pending and confirmed_height is None:
+                return None
+            return {"status": "CONFIRMED" if confirmed_height else "MEMPOOL",
+                    "provider": "local-full-node", "observed_at": _utc_now(), "ambiguous_push": True,
+                    **({"confirmed_height": confirmed_height} if confirmed_height else {})}
+        except ChiaProviderError:
+            raise
+        except Exception as exc:
+            raise ChiaProviderError("saved protocol observation is unavailable; original transaction retained") from exc
+
     async def _primary_inputs_clear(self, bundle):
         if self.primary is None:
             return False

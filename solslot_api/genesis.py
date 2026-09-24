@@ -141,7 +141,9 @@ class ProtocolParameters(ApiModel):
 class PlanRequest(ApiModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
+    payment_chain_id: Literal[8453, 84532] | None = Field(default=None, alias="paymentChainId")
     enrollment_activation: dict[str, Any] | None = Field(default=None, alias="enrollmentActivation")
+    identity_policy: dict[str, Any] | None = Field(default=None, alias="identityPolicy")
     evm_addresses: dict[str, str] = Field(alias="evmAddresses")
     funding_coin_ids: FundingCoinIds = Field(alias="fundingCoinIds")
     faucet_puzzle_hash: str = Field(alias="faucetPuzzleHash")
@@ -1003,6 +1005,12 @@ async def create_plan(
         require_scope(settings, current)
         expires_at = int(time.time()) + settings.genesis_plan_ttl_seconds
         input_payload = body.model_dump(by_alias=True)
+        if body.identity_policy is None:
+            input_payload.pop("identityPolicy", None)
+        if body.payment_chain_id is None:
+            input_payload.pop("paymentChainId", None)
+        elif body.payment_chain_id != settings.payment_omnichain_chain_id:
+            raise ValueError("plan payment chain differs from the configured payment network")
         if input_payload.get("enrollmentActivation") is None:
             input_payload.pop("enrollmentActivation", None)
         elif input_payload["enrollmentActivation"].get("environment") != settings.runtime_environment + "-alpha":

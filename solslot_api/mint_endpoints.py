@@ -114,6 +114,25 @@ async def _get_coinset_dep(request: Request) -> Optional[CoinsetClient]:
     return getattr(request.app.state, "coinset", None)
 
 
+async def _submit_validated_mint(bundle, *, request, settings, coinset):
+    """Only called after complete owner/quorum/KoS semantic validation.
+
+    The public committee-vote forwarder must never use this sponsor: its
+    structural checks alone do not authorize spending the protocol fee till.
+    """
+    if not getattr(settings, "protocol_fee_funding_enabled", False):
+        return await coinset.push_tx(bundle.to_json_dict()), "0x" + bundle.name().hex()
+    from .protocol_submission import ProtocolBundleSubmitter, ProtocolSubmissionError
+    submitter = getattr(getattr(getattr(request, "app", None), "state", None), "protocol_submitter", None)
+    if not isinstance(submitter, ProtocolBundleSubmitter) or submitter.funding_store is None:
+        raise HTTPException(status_code=503, detail="Durable MINT fee funding is unavailable; nothing was submitted.")
+    try:
+        result = await submitter.submit(bundle.to_json_dict(), selection_purpose="mint")
+    except ProtocolSubmissionError as exc:
+        raise HTTPException(status_code=503, detail="MINT submission needs reconciliation. Its saved transaction is retained.") from exc
+    return {"success": True, "status": result["status"]}, result["spendBundleId"]
+
+
 # ── Wire schemas ────────────────────────────────────────────────────────────
 def _strip0x(s: str) -> str:
     return s[2:] if s.startswith("0x") else s
@@ -581,7 +600,7 @@ def _validate_collection_publish_context(
     fee_bps = int(offering.get("royaltyBps") or 0)
     technology_fee = (base_usd_amount * fee_bps + 9_999) // 10_000
     expected_usd_amount = base_usd_amount + technology_fee
-    if metadata.inventory_puzzle_version == 2:
+    if metadata.inventory_puzzle_version in (2, 3):
         # Explicit V2 carries the base price. Protocol CLVM adds the agreed fee
         # exactly once. Historical version-1 wire semantics remain unchanged.
         expected_usd_amount = base_usd_amount
@@ -787,7 +806,9 @@ async def _publish_mint_bundle(
     )
 
     try:
-        push_result = await coinset.push_tx(bundle.to_json_dict())
+        push_result, bundle_id = await _submit_validated_mint(bundle, request=request, settings=settings, coinset=coinset)
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Coinset publish failed for mint %s", proposal_id)
         raise HTTPException(status_code=502, detail=f"Coinset publish failed: {exc}") from exc
@@ -911,6 +932,7 @@ async def _execute_mint_bundle(
     settings: Settings,
     store: MintProposalStore,
     coinset: Optional[CoinsetClient],
+    request: Request | None = None,
 ) -> dict[str, Any]:
     if body.proposal_id is not None and body.proposal_id != proposal_id:
         raise HTTPException(status_code=400, detail="proposal_id does not match the route")
@@ -967,7 +989,9 @@ async def _execute_mint_bundle(
     bundle_id = "0x" + bytes(bundle.name()).hex()
 
     try:
-        push_result = await coinset.push_tx(bundle.to_json_dict())
+        push_result, bundle_id = await _submit_validated_mint(bundle, request=request, settings=settings, coinset=coinset)
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Coinset execute failed for mint %s", proposal_id)
         raise HTTPException(status_code=502, detail=f"Coinset execute failed: {exc}") from exc
@@ -1065,6 +1089,7 @@ async def publish_mint_proposal(
 async def execute_mint_proposal(
     proposal_id: str,
     body: ExecuteMintBundleRequest,
+    request: Request,
     claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[MintProposalStore, Depends(get_mint_proposal_store)],
@@ -1078,6 +1103,7 @@ async def execute_mint_proposal(
         settings=settings,
         store=store,
         coinset=coinset,
+        request=request,
     )
 
 
@@ -1131,6 +1157,7 @@ async def committee_propose_mint(
 )
 async def committee_execute_mint(
     body: ExecuteMintBundleRequest,
+    request: Request,
     claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[MintProposalStore, Depends(get_mint_proposal_store)],
@@ -1146,6 +1173,7 @@ async def committee_execute_mint(
         settings=settings,
         store=store,
         coinset=coinset,
+        request=request,
     )
 
 

@@ -101,9 +101,10 @@ def test_metadata_bytes_rejects_non_bytes32_field() -> None:
 def test_inventory_version_metadata_is_explicit_and_historical_default_is_preserved():
     assert metadata_bytes(_metadata())["inventory_puzzle_version"] == 1
     assert metadata_bytes(_metadata(inventory_puzzle_version=2))["inventory_puzzle_version"] == 2
+    assert metadata_bytes(_metadata(inventory_puzzle_version=3))["inventory_puzzle_version"] == 3
 
 
-@pytest.mark.parametrize("value", [0, 3, True, "2", 2.0, None])
+@pytest.mark.parametrize("value", [0, 4, True, "2", 2.0, None])
 def test_inventory_version_metadata_rejects_unknown_or_coerced_values(value):
     with pytest.raises(ValueError):
         _metadata(inventory_puzzle_version=value)

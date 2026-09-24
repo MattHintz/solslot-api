@@ -21,7 +21,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .admin_auth import require_admin_jwt
-from .authority_network import authority_chain_id, authority_network_name
+from .authority_network import authority_chain_id, authority_network_name, ceremony_authority_document
 from .admin_roster import (
     artifact_ceremony_id,
     current_artifact_admins,
@@ -489,7 +489,7 @@ async def prepare_recovery_drill(
             revision=revision,
             nonce=nonce,
             expires_at=expires_at,
-            evm_chain_id=authority_chain_id(record["draft"]),
+            evm_chain_id=authority_chain_id(ceremony_authority_document(record)),
         )
         challenge_hash = _canonical_hash(payload)
         store.create_recovery_drill(

@@ -14,6 +14,7 @@ import threading
 import os
 import time
 from dataclasses import replace
+from pathlib import Path
 
 from chia.consensus.condition_tools import conditions_dict_for_solution
 from chia.types.blockchain_format.program import Program, INFINITE_COST
@@ -88,6 +89,8 @@ class StampFundingStore:
     def __init__(self, path):
         self.path = str(path)
         self.lock = threading.RLock()
+        if self.path != ":memory:":
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.db = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
         if self.path != ":memory:":os.chmod(self.path,0o600)
         self.db.row_factory = sqlite3.Row
