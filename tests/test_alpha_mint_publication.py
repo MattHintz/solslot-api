@@ -266,18 +266,56 @@ async def test_fresh_grant_to_vault_then_owner_plus_one_mint(monkeypatch, tmp_pa
         claims = AdminClaims(sub=admin_key.to_checksum_address(), auth_type='evm', iat=1, exp=2_000_000_000)
         publish_args = dict(proposal_id='synthetic-mint', body=mint_endpoints.PublishMintBundleRequest.model_validate(binding['body']),
             claims=claims, settings=settings, store=store, coinset=provider, request=request)
-        published = await mint_endpoints._publish_mint_bundle(**publish_args)
-        assert published['pushed'] is True
         if funded:
+            from fastapi import HTTPException
+            # Simulate the database failing after the full node accepted the
+            # signed MINT, before the application recorded publication.
+            def interrupted(*args, **kwargs):
+                raise ValueError('synthetic process interruption')
+            monkeypatch.setattr(store, 'set_published', interrupted)
+            with pytest.raises(HTTPException, match='synthetic process interruption'):
+                await mint_endpoints._publish_mint_bundle(**publish_args)
             import json
             saved = json.loads(funding_store.db.execute('SELECT document FROM funded_protocol_bundles').fetchone()[0])
-            assert published['spend_bundle_id'] == saved['spendBundleId'] != HX(bundle.name())
+            assert saved['spendBundleId'] != HX(bundle.name())
             assert saved['feeMojos'] == '7'
             assert len(saved['spendBundle']['coin_spends']) == len(bundle.coin_spends) + 1
+            assert store.get('synthetic-mint').state == 'DRAFT'
+            assert len(funding_store.pending_completions('testnet11')) == 1
         else:
+            published = await mint_endpoints._publish_mint_bundle(**publish_args)
+            assert published['pushed'] is True
             assert published['spend_bundle_id'] == HX(bundle.name())
         await sim.farm_block()
         assert (await client.get_coin_record_by_name(launch.eve_coin.name())).coin == launch.eve_coin
+        if funded:
+            from solslot_api.chia_provider import ChiaProvider
+            from solslot_api.mint_recovery import MintRecoveryWorker
+            from tests.test_chia_provider import config
+            # Reopen both databases; no signatures or HTTP request survive.
+            store.close()
+            funding_store.close()
+            store = MintProposalStore(str(tmp_path/'mint.db'))
+            funding_store = ProtocolFundingStore(str(tmp_path/'mint-funding.sqlite3'))
+            class RecoveryNode(Provider):
+                async def get_network_info(self):
+                    return {'success': True, 'network_name': 'testnet11'}
+                async def get_blockchain_state(self):
+                    peak = sim.block_records[-1]
+                    return {'success': True, 'blockchain_state': {'sync': {'synced': True},
+                        'peak': {'height': int(peak.height), 'header_hash': HX(peak.header_hash)}}}
+                async def push_tx(self, *_):
+                    pytest.fail('reconciliation must never broadcast')
+            observer = ChiaProvider(RecoveryNode(client), None, config())
+            worker = MintRecoveryWorker(submitter=SimpleNamespace(funding_store=funding_store,
+                faucet=world.faucet, provider=observer), proposals=store,
+                collection_factory=lambda: pytest.fail('no collection on this fixture'),
+                artifact_hash=lambda: artifact['artifactHash'])
+            await worker.once()
+            assert funding_store.pending_completions('testnet11') == []
+            assert store.get('synthetic-mint').published_bundle_id == saved['spendBundleId']
+            await worker.once()
+            publish_args['store'] = store
         assert store.get('synthetic-mint').state == 'PROPOSED'
         assert (await mint_endpoints._publish_mint_bundle(**publish_args))['status'] == 'ALREADY_RECORDED'
         store.close()

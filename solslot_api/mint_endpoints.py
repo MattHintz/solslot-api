@@ -114,7 +114,7 @@ async def _get_coinset_dep(request: Request) -> Optional[CoinsetClient]:
     return getattr(request.app.state, "coinset", None)
 
 
-async def _submit_validated_mint(bundle, *, request, settings, coinset):
+async def _submit_validated_mint(bundle, *, request, settings, coinset, completion):
     """Only called after complete owner/quorum/KoS semantic validation.
 
     The public committee-vote forwarder must never use this sponsor: its
@@ -127,10 +127,22 @@ async def _submit_validated_mint(bundle, *, request, settings, coinset):
     if not isinstance(submitter, ProtocolBundleSubmitter) or submitter.funding_store is None:
         raise HTTPException(status_code=503, detail="Durable MINT fee funding is unavailable; nothing was submitted.")
     try:
-        result = await submitter.submit(bundle.to_json_dict(), selection_purpose="mint")
+        original_id = "0x" + bundle.name().hex()
+        def before_push(prepared):
+            submitter.funding_store.save_completion(submitter.faucet.network, original_id,
+                {**completion, "bundleId": prepared.spend_bundle_id})
+        result = await submitter.submit(bundle.to_json_dict(), selection_purpose="mint", before_push=before_push)
     except ProtocolSubmissionError as exc:
         raise HTTPException(status_code=503, detail="MINT submission needs reconciliation. Its saved transaction is retained.") from exc
     return {"success": True, "status": result["status"]}, result["spendBundleId"]
+
+
+
+def _mark_mint_recorded(bundle, request, settings):
+    if not getattr(settings, "protocol_fee_funding_enabled", False):
+        return
+    submitter = request.app.state.protocol_submitter
+    submitter.funding_store.complete(submitter.faucet.network, "0x" + bundle.name().hex())
 
 
 # ── Wire schemas ────────────────────────────────────────────────────────────
@@ -805,26 +817,6 @@ async def _publish_mint_bundle(
         ancestor_coin_id=registry_launcher_id,
     )
 
-    try:
-        push_result, bundle_id = await _submit_validated_mint(bundle, request=request, settings=settings, coinset=coinset)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("Coinset publish failed for mint %s", proposal_id)
-        raise HTTPException(status_code=502, detail=f"Coinset publish failed: {exc}") from exc
-    chain_status = str(
-        push_result.get("status") or push_result.get("error") or push_result
-    )
-    accepted = bool(push_result.get("success")) or chain_status.upper() == "PENDING"
-    if not accepted:
-        return {
-            "pushed": False,
-            "status": chain_status,
-            "spend_bundle_id": bundle_id,
-            "proposal_id": proposal_id,
-            "proposal": _to_response(proposal),
-        }
-
     persisted_metadata = dict(proposal.off_chain_metadata or {})
     persisted_metadata["publish_context"] = {
         "owner_bundle_id": owner_bundle_id,
@@ -850,6 +842,42 @@ async def _publish_mint_bundle(
             else {}
         ),
     }
+    from .mint_recovery import PUBLISH_BYTES
+    completion = {"schema": "solslot.mint-completion.v1", "phase": "publish",
+        "proposalId": proposal_id, "owner": proposal.owner_pubkey,
+        "artifactHash": str(artifact["artifactHash"]),
+        "publication": {**{key: bytes(getattr(canonical, key)).hex() for key in PUBLISH_BYTES},
+            "deadline": canonical.voting_deadline, "off_chain_metadata": persisted_metadata},
+        "collection": None}
+    if collection_context is not None:
+        completion["collection"] = {"collection_id": body.proposal_metadata.collection_id,
+            "deed_id": collection_context[1], "actor_subject": claims.sub, "proposal_id": proposal_id,
+            "proposal_hash": bytes(canonical.proposal_hash).hex(),
+            "proposal_launcher_id": bytes(canonical.proposal_singleton_launcher_id).hex(),
+            "deed_launcher_id": bytes(canonical.deed_launcher_id).hex(),
+            "output_coin_id": Coin(bytes32(canonical.deed_launcher_id),
+                bytes32(canonical.deed_full_puzhash), uint64(1)).name().hex()}
+
+    try:
+        push_result, bundle_id = await _submit_validated_mint(bundle, request=request, settings=settings, coinset=coinset, completion=completion)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Coinset publish failed for mint %s", proposal_id)
+        raise HTTPException(status_code=502, detail=f"Coinset publish failed: {exc}") from exc
+    chain_status = str(
+        push_result.get("status") or push_result.get("error") or push_result
+    )
+    accepted = bool(push_result.get("success")) or chain_status.upper() == "PENDING"
+    if not accepted:
+        return {
+            "pushed": False,
+            "status": chain_status,
+            "spend_bundle_id": bundle_id,
+            "proposal_id": proposal_id,
+            "proposal": _to_response(proposal),
+        }
+
     try:
         published = store.set_published(
             proposal_id,
@@ -871,7 +899,14 @@ async def _publish_mint_bundle(
             deadline=canonical.voting_deadline,
             off_chain_metadata=persisted_metadata,
         )
-    except (InvalidTransition, ValueError) as exc:
+    except InvalidTransition as exc:
+        # The observer may have recorded this exact accepted bundle while the
+        # original RPC response was in flight. Preserve its later state.
+        published = store.get(proposal_id)
+        if (published.published_bundle_id != bundle_id
+                or any(getattr(published, key) != bytes(getattr(canonical, key)) for key in PUBLISH_BYTES)):
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     collection_record = None
     if collection_context is not None:
@@ -913,6 +948,7 @@ async def _publish_mint_bundle(
                     f"reconcile proposal {proposal_id}: {exc}"
                 ),
             ) from exc
+    _mark_mint_recorded(bundle, request, settings)
     logger.info("Canonical mint proposal %s submitted as %s", proposal_id, bundle_id)
     return {
         "pushed": True,
@@ -988,8 +1024,11 @@ async def _execute_mint_bundle(
     )
     bundle_id = "0x" + bytes(bundle.name()).hex()
 
+    completion = {"schema": "solslot.mint-completion.v1", "phase": "execute",
+        "proposalId": proposal_id, "owner": proposal.owner_pubkey, "actor": claims.sub,
+        "artifactHash": str(artifact["artifactHash"]), "collectionEnabled": settings.collection_metadata_enabled}
     try:
-        push_result, bundle_id = await _submit_validated_mint(bundle, request=request, settings=settings, coinset=coinset)
+        push_result, bundle_id = await _submit_validated_mint(bundle, request=request, settings=settings, coinset=coinset, completion=completion)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1011,7 +1050,11 @@ async def _execute_mint_bundle(
         executed = store.set_chain_executed(
             proposal_id, executed_bundle_id=bundle_id
         )
-    except (InvalidTransition, ValueError) as exc:
+    except InvalidTransition as exc:
+        executed = store.get(proposal_id)
+        if executed.executed_bundle_id != bundle_id:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     collection_record = None
     if settings.collection_metadata_enabled:
@@ -1033,6 +1076,7 @@ async def _execute_mint_bundle(
                     f"failed; reconcile proposal {proposal_id}: {exc}"
                 ),
             ) from exc
+    _mark_mint_recorded(bundle, request, settings)
     logger.info(
         "Canonical mint execution %s submitted as %s with KoS request %s",
         proposal_id,

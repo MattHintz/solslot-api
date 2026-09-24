@@ -929,6 +929,15 @@ class CollectionStore:
                 raise CollectionNotFound(f"deed {deed_id!r} is not in the sealed allocation")
             if deed["proposal_id"] and deed["proposal_id"] != proposal_id:
                 raise CollectionConflict(f"deed {deed_id!r} already has a proposal")
+            if deed["publish_bundle_id"]:
+                expected = {"publish_bundle_id": publish_bundle_id, "proposal_hash": proposal_hash,
+                    "proposal_launcher_id": proposal_launcher_id, "deed_launcher_id": deed_launcher_id,
+                    "output_coin_id": output_coin_id}
+                if any(deed[key] != value for key, value in expected.items()):
+                    raise CollectionConflict("publication already has different chain commitments")
+                # A reconciler and the HTTP response may finish together. Do
+                # not replay audit entries or downgrade later execution state.
+                return self.get(collection_id)
             first = row["metadata_anchor_id"] is None
             anchor = deed_launcher_id if first else bytes(row["metadata_anchor_id"])
             if not first and bytes(row["metadata_root"]) == b"":
@@ -1014,6 +1023,8 @@ class CollectionStore:
                 raise CollectionConflict(
                     f"proposal {proposal_id!r} already has a different execute bundle"
                 )
+            if existing:
+                return self.get(deed["collection_id"])
             cur.execute(
                 """
                 UPDATE property_collection_deeds

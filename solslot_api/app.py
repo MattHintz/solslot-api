@@ -588,9 +588,25 @@ async def lifespan(app: FastAPI):
             app.state.protocol_submitter, app.state.stamp_funding_store)
         await app.state.stamp_fee_recovery_worker.start()
 
+    app.state.mint_recovery_worker = None
+    if (settings.network == 'testnet11' and app.state.protocol_submitter is not None
+            and not genesis_faucet_exclusive):
+        from .mint_recovery import MintRecoveryWorker
+        from .mint_endpoints import get_mint_proposal_store
+        from .collection_store import get_collection_store
+        app.state.mint_recovery_worker = MintRecoveryWorker(
+            submitter=app.state.protocol_submitter,
+            proposals=get_mint_proposal_store(settings),
+            collection_factory=lambda: get_collection_store(settings),
+            artifact_hash=lambda: str(load_signed_public_artifact(settings)['artifactHash']))
+        await app.state.mint_recovery_worker.start()
+
     try:
         yield
     finally:
+        if app.state.mint_recovery_worker is not None:
+            await app.state.mint_recovery_worker.stop()
+        app.state.mint_recovery_worker = None
         if app.state.stamp_fee_recovery_worker is not None:
             await app.state.stamp_fee_recovery_worker.stop()
         app.state.stamp_fee_recovery_worker = None

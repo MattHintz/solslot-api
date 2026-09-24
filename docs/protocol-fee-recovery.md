@@ -40,14 +40,27 @@ MINT funding is available only after the exact owner-plus-one authorization
 and semantic publication checks, or the exact KoS execution check. The public
 structural committee-vote relay is not a sponsorship endpoint.
 
-Remaining acceptance work: reconcile application records if a process dies
-after chain acceptance but before writing the MINT/collection status. Source
-validation may encounter already-spent inputs before reaching the funding
-journal. Do not reset the proposal or sign a second mint to work around that
-condition. This case remains a release blocker for automatic MINT recovery.
+Before broadcasting a funded MINT, the validated endpoint also saves immutable
+application completion instructions bound to the exact funded bundle and signed
+genesis artifact. A Testnet11 observer reconciles pending instructions against
+the primary node every 15 seconds. It checks the exact mempool transaction or
+every canonical confirmed spend, then restores proposal and collection records.
+It does not sign or broadcast. Failed rows remain pending and do not prevent
+later rows from being checked. Old-genesis rows remain preserved for separate
+reconciliation rather than being applied to a new release.
+
+The proposal and collection writes are safe to replay after partial failure.
+Conflicting transaction IDs or commitments stop recovery; matching retries
+preserve later voting/execution states and do not duplicate collection audit
+entries. Do not reset a proposal or sign a second mint to work around a delayed
+application update. The API's existing accepted-versus-confirmed distinction
+still applies: finding a mempool entry does not claim finality.
 
 Local coverage includes restart after an ambiguous push, no new fee quote on
 retry, persistence before RPC, input conflicts, pending/confirmed/clear source
 observations, changed solutions/reorgs, detached sponsor rejection and a
-funded property publication in the Chia simulator. Hosted fault injection is
+funded property publication in the Chia simulator, including a crash after
+acceptance and recovery from reopened databases using the production source
+observer. Partial collection failures and mismatched genesis/owner/bundle
+records are covered separately. Hosted fault injection is
 still required for the exact release and runtime database paths.

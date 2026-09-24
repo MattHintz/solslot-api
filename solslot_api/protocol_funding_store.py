@@ -47,6 +47,11 @@ class ProtocolFundingStore:
             CREATE TABLE IF NOT EXISTS funded_protocol_events (
                 id INTEGER PRIMARY KEY, network TEXT NOT NULL, original_id TEXT NOT NULL,
                 event TEXT NOT NULL, error_code TEXT, recorded_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS funded_protocol_completions (
+                network TEXT NOT NULL, original_id TEXT NOT NULL,
+                payload TEXT NOT NULL, created_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                PRIMARY KEY(network, original_id));
         ''')
 
     def lookup(self, network, original_id, context):
@@ -97,6 +102,50 @@ class ProtocolFundingStore:
         with self.lock:
             self.db.execute("INSERT INTO funded_protocol_events(network,original_id,event,error_code,recorded_at) VALUES(?,?,?,?,?)",
                 (network, original_id, event, code, int(time.time())))
+
+    def save_completion(self, network, original_id, payload):
+        """Persist validated application recording instructions before RPC.
+
+        Payloads are private runtime records, not release evidence. Only the
+        trusted MINT endpoint can create them after semantic authorization.
+        """
+        encoded = canonical(payload)
+        with self.lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                reservation = self.db.execute(
+                    "SELECT document FROM funded_protocol_bundles WHERE network=? AND original_id=?",
+                    (network, original_id)).fetchone()
+                if reservation is None:
+                    raise ValueError("Completion requires a durable funded bundle")
+                document = json.loads(reservation[0])
+                if payload.get("bundleId") != document["spendBundleId"]:
+                    raise ValueError("Completion belongs to a different funded bundle")
+                prior = self.db.execute(
+                    "SELECT payload FROM funded_protocol_completions WHERE network=? AND original_id=?",
+                    (network, original_id)).fetchone()
+                if prior is not None and prior[0] != encoded:
+                    raise ValueError("Completion instructions are immutable")
+                self.db.execute("INSERT OR IGNORE INTO funded_protocol_completions VALUES(?,?,?,?,NULL)",
+                    (network, original_id, encoded, int(time.time())))
+                self.db.execute("COMMIT")
+            except BaseException:
+                self.db.execute("ROLLBACK")
+                raise
+
+    def pending_completions(self, network, *, limit=50, after=""):
+        with self.lock:
+            rows = self.db.execute('''SELECT c.original_id,c.payload,b.document
+                FROM funded_protocol_completions c JOIN funded_protocol_bundles b
+                ON c.network=b.network AND c.original_id=b.original_id
+                WHERE c.network=? AND c.completed_at IS NULL AND c.original_id>?
+                ORDER BY c.original_id LIMIT ?''', (network, after, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def complete(self, network, original_id):
+        with self.lock:
+            self.db.execute("UPDATE funded_protocol_completions SET completed_at=COALESCE(completed_at,?) WHERE network=? AND original_id=?",
+                (int(time.time()), network, original_id))
 
     def close(self):
         with self.lock:
