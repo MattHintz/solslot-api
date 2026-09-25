@@ -94,6 +94,25 @@ class ProtocolFundingStore:
                 self.db.execute("ROLLBACK")
                 raise
 
+    def lookup_by_input(self, network, coin_id, context):
+        """Find an exact saved submission before attempting to sign its input again."""
+        with self.lock:
+            row = self.db.execute(
+                "SELECT original_id FROM funded_protocol_inputs WHERE network=? AND coin_id=?",
+                (network, coin_id),
+            ).fetchone()
+            if row is None:
+                return None
+            document = self.lookup(network, row[0], context)
+            if document is None or "protocolSpendBundle" not in document:
+                raise ValueError("Saved protocol funding requires original-bundle reconciliation")
+            original = SpendBundle.from_json_dict(document["protocolSpendBundle"])
+            if "0x" + original.name().hex() != row[0]:
+                raise ValueError("Saved original protocol bundle does not match its identifier")
+            if coin_id not in {"0x" + coin.name().hex() for coin in original.removals()}:
+                raise ValueError("Reserved input is not part of the original protocol bundle")
+            return document
+
     def reserved_coin_ids(self):
         with self.lock:
             return {row[0] for row in self.db.execute("SELECT coin_id FROM funded_protocol_inputs")}

@@ -150,7 +150,9 @@ class ProtocolBundleSubmitter:
                         expected_backing_mojos=expected_backing_mojos
                     )
                     if store:
-                        store.reserve(self.faucet.network, original_id, context, prepared.to_json())
+                        store.reserve(self.faucet.network, original_id, context, {
+                            **prepared.to_json(), "protocolSpendBundle": original.to_json_dict(),
+                        })
             except ProtocolSubmissionError:
                 raise
             except Exception as exc:

@@ -94,6 +94,7 @@ from .launch_rehearsal import (
     rehearsal_status,
     start_rehearsal,
 )
+from .protocol_submission import PreparedProtocolBundle, ProtocolSubmissionError
 from .omnichain_ownership_activation import (
     BroadcastRequest as OwnershipBroadcastRequest,
     OwnershipActivationError,
@@ -837,7 +838,7 @@ def _decision_receipt(action_type: str, payload_hash: str) -> dict[str, Any]:
     labels = {
         "funding": (
             "Create the nine ceremony funding coins",
-            "Moves 1,000,567 testnet mojos into nine fixed ceremony inputs. No fee.",
+            "Creates nine fixed testnet inputs. Solslot sponsors the network fee within the configured cap.",
             "Creates fixed Testnet11 outputs; it cannot redirect funds.",
         ),
         "gate:ceremonyBroadcast": (
@@ -2664,6 +2665,14 @@ async def execute_fixed_funding(
         provider = getattr(request.app.state, "coinset", None)
         if faucet is None or provider is None:
             raise GenesisConflict("ceremony faucet or Chia provider is unavailable")
+        submitter = getattr(request.app.state, "protocol_submitter", None)
+        if (
+            submitter is None
+            or not submitter.policy.enabled
+            or submitter.funding_store is None
+            or submitter.funding_store.path == ":memory:"
+        ):
+            raise GenesisConflict("durable ceremony fee funding is unavailable")
         source_record = await provider.get_coin_record_by_name(
             str(receipt["plan"]["sourceCoinId"])
         )
@@ -2684,10 +2693,8 @@ async def execute_fixed_funding(
         if (
             reproduced.digest != receipt["planHash"]
             or reproduced.plan != receipt["plan"]
-            or source_record.get("spent") is True
-            or int(source_record.get("spent_block_index") or 0)
         ):
-            raise GenesisConflict("the approved funding source changed or was spent")
+            raise GenesisConflict("the approved funding source changed")
         conditions = [
             Program.to([CREATE_COIN, faucet.address_puzzle_hash, int(item["amount"])])
             for item in receipt["plan"]["outputs"]
@@ -2709,42 +2716,57 @@ async def execute_fixed_funding(
             faucet.key.puzzle,
             Program.to([0, delegated, Program.to(0)]),
         )
-        signature = G2Element.from_bytes(
-            faucet.sign_delegated_spend(
-                source,
-                conditions_program,
-                purpose="genesis",
-            )
-        )
-        bundle = SpendBundle([coin_spend], signature)
-        bundle_id = "0x" + bytes(bundle.name()).hex()
+        context = {"feeTill": faucet.address_hex, "purpose": "genesis", "backingMojos": 0}
         try:
-            response = await provider.push_tx(bundle.to_json_dict())
-        except Exception as exc:  # noqa: BLE001
+            saved = submitter.funding_store.lookup_by_input(
+                faucet.network, "0x" + source.name().hex(), context,
+            )
+        except ValueError as exc:
+            raise GenesisConflict("saved ceremony funding requires reconciliation") from exc
+        if not saved and (
+            source_record.get("spent") is True
+            or int(source_record.get("spent_block_index") or 0)
+        ):
+            raise GenesisConflict("the approved funding source was spent without a saved transaction")
+        if saved:
+            bundle = SpendBundle.from_json_dict(saved["protocolSpendBundle"])
+            if list(bundle.coin_spends) != [coin_spend]:
+                raise GenesisConflict("saved funding does not match the approved nine-coin plan")
+        else:
+            signature = G2Element.from_bytes(
+                faucet.sign_delegated_spend(source, conditions_program, purpose="genesis")
+            )
+            bundle = SpendBundle([coin_spend], signature)
+
+        def preserve_before_push(prepared: PreparedProtocolBundle) -> None:
+            # The shared journal already holds exact bytes and every input.
+            # Persist the funded id before RPC so a timeout/restart cannot
+            # misidentify the zero-fee fan-out as the submitted transaction.
+            if receipt["spendBundleId"] and receipt["spendBundleId"] != prepared.spend_bundle_id:
+                raise GenesisConflict("the saved ceremony funding transaction changed")
             store.set_funding_receipt(
                 session.ceremony_id,
                 plan=receipt["plan"],
                 plan_hash=receipt["planHash"],
                 state="ambiguous",
-                spend_bundle_id=bundle_id,
-                response={"error": "provider response was ambiguous"},
+                spend_bundle_id=prepared.spend_bundle_id,
+                response={k: v for k, v in prepared.to_json().items() if k != "spendBundle"},
             )
-            raise GenesisConflict(
-                "Funding submission is ambiguous. It is locked for reconciliation."
-            ) from exc
-        accepted = response.get("success") is True or str(
-            response.get("status", "")
-        ).upper() in {"SUCCESS", "PENDING"}
-        if not accepted:
-            raise GenesisConflict("Testnet11 rejected the fixed funding transaction")
+
+        response = await submitter.submit(
+            bundle.to_json_dict(), selection_purpose="genesis",
+            before_push=preserve_before_push,
+        )
         return store.set_funding_receipt(
             session.ceremony_id,
             plan=receipt["plan"],
             plan_hash=receipt["planHash"],
             state="broadcast",
-            spend_bundle_id=bundle_id,
-            response=response,
+            spend_bundle_id=response["spendBundleId"],
+            response={k: v for k, v in response.items() if k != "spendBundle"},
         )
+    except ProtocolSubmissionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except GenesisStoreError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
