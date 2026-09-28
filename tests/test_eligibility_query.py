@@ -15,8 +15,9 @@ def artifact():
     return {'evmChainId':11155111, 'identityPolicy':deepcopy(ELIGIBILITY_POLICY),
             'genesisPlan':{'identityPolicy':deepcopy(ELIGIBILITY_POLICY)}}
 
-def calldata(inputs=AGE+SANCTIONS, domain='solslot.com', dev=False, scope=None):
-    params = (ACCEPTED_PROOF_VERSION, (b'\x22'*32, b'proof', [b'\x33'*32]), inputs,
+def calldata(inputs=AGE+SANCTIONS, domain='solslot.com', dev=False, scope=None,
+             version=ACCEPTED_PROOF_VERSION):
+    params = (version, (b'\x22'*32, b'proof', [b'\x33'*32]), inputs,
               (604800, domain, scope or 'vault:0x'+VAULT.hex(), dev))
     return LEGACY_SELECTOR + encode([BINDING_ABI, 'bytes'],
         [(VAULT, b'\x44'*32, 1), encode([PROOF_PARAMS_ABI], [params])])
@@ -38,6 +39,27 @@ def test_rejects_unreviewed_or_disclosure_bearing_proofs(kwargs):
 def test_old_genesis_cannot_be_upgraded_by_runtime_flag():
     with pytest.raises(ValueError, match='not selected'):
         require_private_eligibility_query(calldata(), {'genesisPlan':{}})
+
+
+@pytest.mark.parametrize('version', [
+    bytes.fromhex('000000150000' + '00'*26),  # current 0.21.0
+    bytes.fromhex('000000160000' + '00'*26),  # unknown future version
+    bytes(32),
+])
+def test_unsupported_version_reports_compatibility_not_domain_error(version):
+    with pytest.raises(ValueError, match='verifier update required') as error:
+        require_private_eligibility_query(calldata(version=version), artifact())
+    assert 'domain' not in str(error.value)
+    assert 'No new scan is needed' in str(error.value)
+
+
+def test_noncanonical_envelope_has_its_own_diagnostic():
+    data = calldata()
+    from eth_abi import decode
+    binding, proof = decode([BINDING_ABI, 'bytes'], data[4:])
+    noncanonical = LEGACY_SELECTOR + encode([BINDING_ABI, 'bytes'], [binding, proof + bytes(32)])
+    with pytest.raises(ValueError, match='not canonical'):
+        require_private_eligibility_query(noncanonical, artifact())
 
 @pytest.mark.parametrize('runtime,selected', [('age-only',True), ('age-sanctions-v1',False)])
 def test_relayer_cannot_silently_change_signed_identity_policy(monkeypatch,runtime,selected):

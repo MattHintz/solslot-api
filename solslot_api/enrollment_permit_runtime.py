@@ -100,9 +100,17 @@ def require_private_eligibility_query(data: bytes, artifact: Mapping[str, Any]) 
         params = decode([PROOF_PARAMS_ABI], parsed.proof)[0]
     except (DecodingError, ValueError) as exc:
         raise ValueError('identity proof envelope is malformed') from exc
-    if (encode([PROOF_PARAMS_ABI], [params]) != parsed.proof
-            or params[0] != ACCEPTED_PROOF_VERSION
-            or params[3] != (604800, 'solslot.com', 'vault:' + parsed.vault, False)):
+    if encode([PROOF_PARAMS_ABI], [params]) != parsed.proof:
+        raise ValueError('identity proof envelope is not canonical')
+    if params[0] != ACCEPTED_PROOF_VERSION:
+        # Keep the deployed version pin. An SDK/circuit update must never
+        # silently change the emitter selected by the signed genesis.
+        raise ValueError(
+            'Solslot identity verifier update required: this proof version is '
+            'not supported by the deployed verifier. No new scan is needed '
+            'until Solslot updates its verifier.'
+        )
+    if params[3] != (604800, 'solslot.com', 'vault:' + parsed.vault, False):
         raise ValueError('identity proof domain, scope or real-document policy differs')
     require_eligibility_inputs(params[2])
 
