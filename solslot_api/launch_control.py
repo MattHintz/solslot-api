@@ -2223,9 +2223,10 @@ def guided_record_rail_broadcast(
 ) -> dict[str, Any]:
     _require_wallet_session(session)
     try:
-        current = _rail_phase_status(settings, ownership_store)
-        if current["phase"] != body.phase:
-            raise GenesisConflict("rail ownership phase changed before broadcast")
+        # Record the phase actually submitted. A mined schedule may already
+        # advance the displayed phase to execution before its receipt is saved.
+        # Each native recorder verifies the exact sealed transaction, both
+        # stored approvals, and the required on-chain result for that phase.
         request = OwnershipBroadcastRequest(transactionHash=body.transaction_hash)
         status_value = (
             record_ownership_activation_broadcast(request, settings, ownership_store)

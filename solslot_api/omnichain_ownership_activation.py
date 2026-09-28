@@ -795,6 +795,10 @@ def _web3(settings: Settings) -> Web3:
 def _chain_state(settings: Settings, package: Mapping[str, Any]) -> ChainState:
     w3 = _web3(settings)
     try:
+        # Inclusion can change both the Safe nonce and timelock operation.
+        # Read one block so a successful transaction cannot look like a
+        # changed nonce paired with a not-yet-scheduled operation.
+        latest_block = int(w3.eth.block_number)
         root_safe = w3.eth.contract(
             address=Web3.to_checksum_address(package["rootSafe"]),
             abi=_SAFE_ABI,
@@ -804,15 +808,14 @@ def _chain_state(settings: Settings, package: Mapping[str, Any]) -> ChainState:
             abi=_TIMELOCK_ABI,
         )
         operation_id = package["operationId"]
-        operation_exists = bool(timelock.functions.isOperation(operation_id).call())
-        operation_ready = bool(timelock.functions.isOperationReady(operation_id).call())
-        operation_done = bool(timelock.functions.isOperationDone(operation_id).call())
-        operation_timestamp = int(timelock.functions.getTimestamp(operation_id).call())
-        live_nonce = int(root_safe.functions.nonce().call())
+        operation_exists = bool(timelock.functions.isOperation(operation_id).call(block_identifier=latest_block))
+        operation_ready = bool(timelock.functions.isOperationReady(operation_id).call(block_identifier=latest_block))
+        operation_done = bool(timelock.functions.isOperationDone(operation_id).call(block_identifier=latest_block))
+        operation_timestamp = int(timelock.functions.getTimestamp(operation_id).call(block_identifier=latest_block))
+        live_nonce = int(root_safe.functions.nonce().call(block_identifier=latest_block))
         live_hash = root_safe.functions.getTransactionHash(
             *_transaction_arguments(package)
-        ).call()
-        latest_block = int(w3.eth.block_number)
+        ).call(block_identifier=latest_block)
     except Exception as exc:  # noqa: BLE001
         raise OwnershipActivationError(
             "Payment-chain Safe/timelock state could not be independently verified"
