@@ -17,7 +17,7 @@ from solslot_api.admin_operations import (
     request_binding_hash,
 )
 from solslot_api.config import Settings, get_settings
-from solslot_api.identity_deployment_endpoints import router
+from solslot_api.identity_deployment_endpoints import _identity_action_wire, router
 from solslot_api.protocol_submission import ProtocolSubmissionError
 
 
@@ -75,6 +75,22 @@ class _Bundle:
 
     def name(self):
         return bytes32(b"\x99" * 32)
+
+
+def test_identity_action_review_has_identity_specific_copy():
+    action = SimpleNamespace(
+        signer_slot=0,
+        to_wire=lambda *, signed: {
+            "title": "Owner approves proposal publication",
+            "summary": "Approve this exact SGT allocation",
+            "financialEffect": "No sale completes",
+            "signed": signed,
+        },
+    )
+    wire = _identity_action_wire(action)
+    assert wire["title"] == "Owner approves identity verifier activation"
+    assert "zkPassport verifier deployment" in wire["summary"]
+    assert wire["financialEffect"] == "No funds or assets move in this approval."
 
 
 def _client(tmp_path, monkeypatch, submitter):

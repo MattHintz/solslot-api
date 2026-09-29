@@ -44,6 +44,21 @@ def _binding(body: dict) -> dict:
     }
 
 
+def _identity_action_wire(action: object, *, signed: bool = False) -> dict:
+    wire = action.to_wire(signed=signed)
+    wire["title"] = (
+        "Owner approves identity verifier activation"
+        if action.signer_slot == 0
+        else "Coadministrator approves identity verifier activation"
+    )
+    wire["summary"] = (
+        "Approve the exact reviewed zkPassport verifier deployment for new vault checks. "
+        "Existing identity receipts remain bound to their saved deployment."
+    )
+    wire["financialEffect"] = "No funds or assets move in this approval."
+    return wire
+
+
 @router.get("/review")
 async def review_identity_deployment(
     request: Request,
@@ -71,7 +86,9 @@ async def review_identity_deployment(
             "replacementDeployment": replacement,
             "acceptedProofVersions": list(replacement["acceptedProofVersions"]),
             "credentialPolicy": build.statement["identityPolicy"],
-            "chainActions": [action.to_wire(signed=False) for action in build.actions],
+            "chainActions": [
+                _identity_action_wire(action, signed=False) for action in build.actions
+            ],
         }
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
