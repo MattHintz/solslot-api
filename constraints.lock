@@ -1,5 +1,5 @@
 CacheControl==0.14.4
-PyJWT==2.13.0
+PyJWT==2.14.0
 PyYAML==6.0.3
 Pygments==2.20.0
 SecretStorage==3.5.0

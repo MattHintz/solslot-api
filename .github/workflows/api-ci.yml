@@ -16,7 +16,7 @@ env:
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
   # Exact combined Authority V4 and Base-mainnet alpha protocol source.
   # Deployment environment pins remain separately governed.
-  PROTOCOL_REF: 73fa04266bdf74f2c75de8d18cd6ca5abf48aa49
+  PROTOCOL_REF: 108ac023d836cf0198775eebd377880d0f8d6aef
 
 jobs:
   verify:

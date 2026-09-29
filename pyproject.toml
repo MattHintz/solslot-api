@@ -22,7 +22,7 @@ dependencies = [
     "eth-keys>=0.5",
     "pycryptodome>=3.20",
     "python-dotenv>=1.2.2",
-    "pyjwt>=2.13.0",
+    "pyjwt>=2.14.0",
     "web3>=7,<8",
     # Solslot protocol (local path install)
     # Use: pip install -e ../solslot-protocol
