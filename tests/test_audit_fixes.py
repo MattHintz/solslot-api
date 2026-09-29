@@ -481,6 +481,8 @@ class TestVaultRegistrationSafetyFalsifiers:
 
         return SimpleNamespace(
             alpha_writes_enabled=True,
+            protocol_fee_funding_enabled=False,
+            runtime_environment="test",
             faucet_max_spend_mojos=10_000_000,
             zkpassport_bridge_policy_hash="0x" + "c1" * 32,
         )

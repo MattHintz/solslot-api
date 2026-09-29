@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from chia_rs import AugSchemeMPL
@@ -22,6 +23,11 @@ from solslot_api.public_artifact import (
     verify_signed_public_artifact_file,
 )
 from solslot_puzzles.artifact_schema_v4 import artifact_signing_typed_data
+from solslot_puzzles.identity_deployment_amendment import (
+    ZERO_HASH,
+    build_statement,
+    canonical_json,
+)
 from tests.test_genesis_api import _plan_body
 
 
@@ -251,6 +257,91 @@ def test_rejects_runtime_coordinate_and_release_commit_drift(tmp_path) -> None:
     )
     with pytest.raises(PublicArtifactError, match="API release commit"):
         load_signed_public_artifact(release_drift)
+
+
+def test_bound_identity_amendment_selects_activation_release_commits(tmp_path) -> None:
+    artifact = _signed_artifact()
+    deployment = json.loads(
+        (Path(__file__).parent / "fixtures" / "identity-deployment-v2.json").read_text()
+    )
+    activation_sources = {
+        "api": "a" * 40,
+        "protocol": "b" * 40,
+        "customerWeb": "c" * 40,
+        "adminPortal": "d" * 40,
+    }
+    roster = ["0x" + f"{value:02x}" * 32 for value in (1, 2, 3)]
+    statement = build_statement(
+        base_artifact=artifact,
+        deployment_artifact=deployment,
+        deployment_plan_hash="0x" + "e1" * 32,
+        activation_source_shas=activation_sources,
+        activation_boundary={
+            "authorityLauncherId": artifact["launcherIds"]["adminAuthority"],
+            "authorityCoinId": "0x" + "f1" * 32,
+            "authorityVersion": 1,
+            "rosterIdentityCoinIds": roster,
+            "signerSlots": [0, 1],
+            "signerIdentityCoinIds": roster[:2],
+        },
+        revision=1,
+        previous_amendment_hash=ZERO_HASH,
+        approval_expires_at=2_000_000_000,
+    )
+    amendment_path = tmp_path / "identity-amendment.json"
+    deployment_path = tmp_path / "identity-deployment.json"
+    release_path = tmp_path / "release.json"
+    amendment_path.write_bytes(canonical_json(statement))
+    deployment_path.write_text(json.dumps(deployment), encoding="utf-8")
+    release_path.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 2,
+                "protocolVersion": "solslot-v2",
+                "api_commit": activation_sources["api"],
+                "protocol_commit": activation_sources["protocol"],
+                "built_at_utc": "2026-09-29T00:00:00Z",
+                "package_name": "solslot_api",
+                "app_module": "solslot_api.app:app",
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = _settings(
+        tmp_path,
+        artifact,
+        release_metadata_path=str(release_path),
+        identity_deployment_amendment_path=str(amendment_path),
+        identity_deployment_artifact_path=str(deployment_path),
+        identity_deployment_plan_hash=statement["deploymentPlanHash"],
+    )
+    loaded = load_signed_public_artifact(settings)
+    assert loaded["artifactHash"] == artifact["artifactHash"]
+
+    release = json.loads(release_path.read_text())
+    release["api_commit"] = "f" * 40
+    wrong_release_path = tmp_path / "wrong-release.json"
+    wrong_release_path.write_text(json.dumps(release), encoding="utf-8")
+    settings.release_metadata_path = str(wrong_release_path)
+    with pytest.raises(PublicArtifactError, match="API release commit"):
+        load_signed_public_artifact(settings)
+
+
+def test_identity_activation_source_record_must_match_signed_base(tmp_path) -> None:
+    artifact = _signed_artifact()
+    amendment_path = tmp_path / "identity-amendment.json"
+    deployment_path = tmp_path / "identity-deployment.json"
+    amendment_path.write_text("{}", encoding="utf-8")
+    deployment_path.write_text("{}", encoding="utf-8")
+    settings = _settings(
+        tmp_path,
+        artifact,
+        identity_deployment_amendment_path=str(amendment_path),
+        identity_deployment_artifact_path=str(deployment_path),
+        identity_deployment_plan_hash="0x" + "11" * 32,
+    )
+    with pytest.raises(PublicArtifactError, match="activation source record"):
+        load_signed_public_artifact(settings)
 
 
 def test_public_endpoint_returns_only_verified_artifact(tmp_path) -> None:

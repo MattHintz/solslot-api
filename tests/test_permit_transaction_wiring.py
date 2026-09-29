@@ -322,6 +322,8 @@ def test_selected_api_stamp_outcome_for_every_validator_pair(setup,monkeypatch,a
     s.settings.zkpassport_validator_urls=['https://v0.test','https://v1.test','https://v2.test']
     s.settings.zkpassport_validator_pubkeys=s.a['validatorSet']['pubkeys'];s.settings.zkpassport_emitter_address=s.active['emitter']
     monkeypatch.setattr(public_artifact,'load_signed_public_artifact',lambda _:s.a)
+    from solslot_api.identity_deployment import genesis_identity_deployment
+    monkeypatch.setattr(enroll,'_current_identity_deployment',lambda *_:genesis_identity_deployment(s.a))
     monkeypatch.setattr(enroll,'_settings',lambda:s.settings)
     monkeypatch.setattr(enroll,'verify_vault_session',lambda *_:session)
     monkeypatch.setattr(enroll,'get_registry',lambda:SimpleNamespace(get=lambda _:vault_record))

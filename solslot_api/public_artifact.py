@@ -25,6 +25,8 @@ class PublicArtifactMissing(PublicArtifactError):
 
 MAX_PUBLIC_ARTIFACT_BYTES = 2 * 1024 * 1024
 ARTIFACT_WORKER_TIMEOUT_SECONDS = 15
+MAX_IDENTITY_AMENDMENT_BYTES = 256 * 1024
+MAX_IDENTITY_DEPLOYMENT_BYTES = 512 * 1024
 
 
 @lru_cache(maxsize=8)
@@ -107,6 +109,60 @@ def _require_configured_evm_binding(
         )
     if not _same_hex(configured, signed):
         raise PublicArtifactError(f"configured {label} does not match signed artifact")
+
+
+def _release_source_shas(
+    settings: Settings,
+    payload: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Select source pins from genesis or a fully bound staged amendment.
+
+    The identity amendment has to be installed before its Chia authority spend
+    can be assembled.  During that staged interval genesis remains the
+    effective identity deployment, but the reviewed activation release must be
+    able to boot.  Accepting the amendment's source pins therefore requires the
+    complete canonical amendment and deployment records; a path or mutable
+    source map by itself is never sufficient.  Chain confirmation and
+    contiguous revision selection remain enforced asynchronously by
+    ``load_effective_identity_deployment`` during application startup.
+    """
+    source_shas = payload.get("sourceShas")
+    if not isinstance(source_shas, Mapping):
+        raise PublicArtifactError("public artifact source commits are missing")
+    if not settings.identity_deployment_amendment_path:
+        return source_shas
+    if not settings.identity_deployment_artifact_path or not settings.identity_deployment_plan_hash:
+        raise PublicArtifactError("identity activation source configuration is incomplete")
+
+    from solslot_puzzles.identity_deployment_amendment import (
+        parse_canonical_statement,
+        verify_statement_against_records,
+    )
+
+    amendment_path = Path(settings.identity_deployment_amendment_path)
+    deployment_path = Path(settings.identity_deployment_artifact_path)
+    try:
+        if amendment_path.stat().st_size > MAX_IDENTITY_AMENDMENT_BYTES:
+            raise PublicArtifactError("identity deployment amendment exceeds the size limit")
+        if deployment_path.stat().st_size > MAX_IDENTITY_DEPLOYMENT_BYTES:
+            raise PublicArtifactError("identity deployment artifact exceeds the size limit")
+        statement = parse_canonical_statement(amendment_path.read_bytes())
+        deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
+        verify_statement_against_records(
+            statement,
+            base_artifact=payload,
+            deployment_artifact=deployment,
+            deployment_plan_hash=settings.identity_deployment_plan_hash,
+            previous_amendment_hash=statement["previousAmendmentHash"],
+        )
+    except PublicArtifactError:
+        raise
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise PublicArtifactError("identity activation source record is invalid") from exc
+    activation_sources = statement.get("activationSourceShas")
+    if not isinstance(activation_sources, Mapping):
+        raise PublicArtifactError("identity activation source commits are missing")
+    return activation_sources
 
 
 def _verify_runtime_bindings(settings: Settings, payload: Mapping[str, Any]) -> None:
@@ -217,10 +273,10 @@ def _verify_runtime_bindings(settings: Settings, payload: Mapping[str, Any]) -> 
     if release is None:
         if settings.runtime_environment in {"staging", "production"}:
             raise PublicArtifactError("release metadata is required beside a signed artifact")
+        if settings.identity_deployment_amendment_path:
+            _release_source_shas(settings, payload)
         return
-    source_shas = payload.get("sourceShas")
-    if not isinstance(source_shas, Mapping):
-        raise PublicArtifactError("public artifact source commits are missing")
+    source_shas = _release_source_shas(settings, payload)
     if source_shas.get("api") != release.apiCommit:
         raise PublicArtifactError("API release commit does not match signed artifact")
     if source_shas.get("protocol") != release.protocolCommit:

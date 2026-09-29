@@ -52,6 +52,22 @@ def genesis_identity_deployment(base: Mapping[str, Any]) -> dict[str, Any]:
     bridge = base.get("bridgePolicy")
     if not isinstance(bridge, Mapping):
         raise IdentityDeploymentError("genesis bridge policy is missing")
+    activation = base.get("enrollmentActivation")
+    if not isinstance(activation, Mapping):
+        plan = base.get("genesisPlan")
+        activation = (
+            plan.get("enrollmentActivation") if isinstance(plan, Mapping) else None
+        )
+    identity_chain_id = (
+        activation.get("evmChainId")
+        if isinstance(activation, Mapping)
+        else base.get("evmChainId", 11155111)
+    )
+    bridge_policy_hash = (
+        activation.get("bridgePolicyHash")
+        if isinstance(activation, Mapping)
+        else None
+    )
     return {
         "schema": "solslot.effective-identity-deployment.v1",
         "source": "signed-genesis",
@@ -61,14 +77,14 @@ def genesis_identity_deployment(base: Mapping[str, Any]) -> dict[str, Any]:
         "confirmedHeight": int(
             (base.get("ceremony") or {}).get("confirmedBlockIndex", 0)
         ),
-        "evmChainId": int(base.get("evmChainId", 11155111)),
+        "evmChainId": int(identity_chain_id),
         "addresses": dict(base["evmAddresses"]),
         "acceptedProofVersions": ["0.20.0"],
         "credentialPolicyVersion": int(bridge.get("policyVersion", 2)),
         "identityPolicy": dict(base.get("identityPolicy") or {}),
         "chiaBridgePolicyHash": str(
             (base.get("permanentRules") or {}).get(
-                "zkPassportPolicyHash", bridge["policyHash"]
+                "zkPassportPolicyHash", bridge_policy_hash or bridge["policyHash"]
             )
         ),
     }

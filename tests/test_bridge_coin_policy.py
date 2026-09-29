@@ -162,6 +162,7 @@ def test_ineligible_existing_coin_cannot_reach_either_sponsored_relay(monkeypatc
     monkeypatch.setattr(relay, "verify_vault_session", lambda *_: owner)
     monkeypatch.setattr(relay, "verify_owner_auth", lambda *_, **__: owner)
     monkeypatch.setattr(relay, "get_credential_ledger", lambda *_: SimpleNamespace(get_enrollment=lambda *_: old))
+    monkeypatch.setattr(relay, "_settings_for_enrollment", lambda *_: (settings, {}))
     monkeypatch.setattr(relay, "_w3", lambda *_: pytest.fail("ineligible coin reached relay RPC"))
     bls = _bls_request()
     if kind == "bls":

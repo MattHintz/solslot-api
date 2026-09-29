@@ -19,6 +19,7 @@ PARENT='0x'+'22'*32
 POLICY='0x'+'33'*32
 EMITTER='0x'+'44'*20
 FORWARDER='0x'+'55'*20
+VERIFIER='0x'+'77'*20
 OWNER=Account.from_key(bytes([1])*32)
 RELAYER=Account.from_key(bytes([2])*32)
 BLS='0x'+'66'*48
@@ -33,9 +34,11 @@ def rig(tmp_path, monkeypatch):
         zkpassport_emitter_address=EMITTER,zkpassport_forwarder_address=FORWARDER,
         zkpassport_bridge_policy_hash=POLICY,zkpassport_evm_chain_id=11155111,
         zkpassport_ledger_db_path=str(tmp_path/'relay.db'))
-    artifact={'artifactHash':'0x'+'77'*32,'network':'testnet11',
-        'bridgePolicy':{'policyHash':POLICY,'parentCoinIds':[PARENT],'bridgeCoinIds':[bridge]},
-        'evmAddresses':{'attestationEmitter':EMITTER,'forwarder':FORWARDER}}
+    artifact={'artifactHash':'0x'+'77'*32,'network':'testnet11','evmChainId':11155111,
+        'bridgePolicy':{'policyHash':POLICY,'policyVersion':2,
+            'parentCoinIds':[PARENT],'bridgeCoinIds':[bridge]},
+        'evmAddresses':{'attestationEmitter':EMITTER,'forwarder':FORWARDER,
+            'verifierAdapter':VERIFIER}}
     now=int(time.time())
     data=Web3.to_bytes(hexstr=relay._VERIFY_AND_EMIT_SELECTOR)+encode(
         ['(bytes32,bytes32,uint64)','bytes'],[(bytes.fromhex(VAULT[2:]),bytes.fromhex(PARENT[2:]),1),b'proof'])
@@ -91,7 +94,11 @@ def rig(tmp_path, monkeypatch):
     monkeypatch.setattr(relay,'verify_vault_session',lambda *a,**k:session)
     monkeypatch.setattr(relay,'verify_owner_auth',auth)
     monkeypatch.setattr(public_artifact,'load_signed_public_artifact',lambda s:artifact)
-    request=Request({'type':'http','method':'POST','path':'/zkpassport/relay/bls','headers':[], 'client':('203.0.113.5',1234)})
+    from solslot_api.identity_deployment import genesis_identity_deployment
+    app=SimpleNamespace(state=SimpleNamespace(
+        identity_deployment=genesis_identity_deployment(artifact)))
+    request=Request({'type':'http','method':'POST','path':'/zkpassport/relay/bls',
+        'headers':[],'client':('203.0.113.5',1234),'app':app})
     def setup(mode):
         if mode=='evm':session.auth_type='evm';session.owner_key=OWNER.address.lower();session.vault_record.owner_evm_address=OWNER.address
         ledger.reserve_enrollment(record=record,owner_key=session.owner_key,max_pending_per_owner=2)
@@ -146,9 +153,12 @@ def test_changed_authorization_context_cannot_resume(rig,monkeypatch,mutation):
     monkeypatch.setattr(relay.time,'time',lambda:rig.now+6)
     if mutation=='artifact':rig.artifact['artifactHash']='0x'+'99'*32
     elif mutation=='owner':rig.session.owner_key='0x'+'99'*48
+    elif mutation in ('emitter','forwarder'):
+        field={'emitter':'attestationEmitter','forwarder':'forwarder'}[mutation]
+        rig.artifact['evmAddresses'][field]='0x'+'99'*20
     else:
-        key={'environment':'runtime_environment','network':'network','emitter':'zkpassport_emitter_address','forwarder':'zkpassport_forwarder_address'}[mutation]
-        value={'environment':'staging','network':'mainnet','emitter':'0x'+'99'*20,'forwarder':'0x'+'99'*20}[mutation]
+        key={'environment':'runtime_environment','network':'network'}[mutation]
+        value={'environment':'staging','network':'mainnet'}[mutation]
         rig.settings.__dict__[key]=value
     with pytest.raises(HTTPException) as error:relay.resume_relay(VAULT,rig.request)
     assert error.value.status_code in (403,409)

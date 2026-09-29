@@ -22,13 +22,10 @@ from solslot_api.identity_deployment import (
 
 
 BASE = json.loads(
-    Path("/home/hiram/solslot-work/e2e-audit-draft144/evidence/public-artifact.json").read_text()
+    (Path(__file__).parent / "fixtures" / "identity-base-public-artifact.json").read_text()
 )
 DEPLOYMENT = json.loads(
-    Path(
-        "/home/hiram/secure/solslot-deployments/"
-        "AE-SOLSLOT-IDENTITY-COMPATIBILITY-20260928-148/deployment.json"
-    ).read_text()
+    (Path(__file__).parent / "fixtures" / "identity-deployment-v2.json").read_text()
 )
 PLAN_HASH = "0xdb9912f4e47ec349d6fb67aa95f78058f8c64c757a22a2244af8f0d9a73a381b"
 
