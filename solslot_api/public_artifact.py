@@ -193,8 +193,16 @@ def _verify_runtime_bindings(settings: Settings, payload: Mapping[str, Any]) -> 
             "attestation emitter address",
         ),
     )
-    for configured, signed, label in evm_bindings:
-        _require_configured_evm_binding(configured, signed, label)
+    if settings.identity_deployment_amendment_path:
+        # A confirmed authority amendment selects the replacement addresses.
+        # Their exact values are checked asynchronously against Chia history at
+        # application startup.  This synchronous genesis verifier still
+        # requires all redundant runtime bindings to be present and canonical.
+        for configured, _signed, label in evm_bindings:
+            _require_configured_evm_binding(configured, configured, label)
+    else:
+        for configured, signed, label in evm_bindings:
+            _require_configured_evm_binding(configured, signed, label)
 
     if validators.get("threshold") != settings.zkpassport_validator_threshold:
         raise PublicArtifactError("validator threshold does not match signed artifact")

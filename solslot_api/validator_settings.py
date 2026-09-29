@@ -36,6 +36,9 @@ class ValidatorSettings(BaseSettings):
     ledger_db_path: str = "./state/validator_signatures_v2.db"
     public_artifact_path: str = "./state/public_artifact_v4.json"
     release_metadata_path: str = "./release.json"
+    identity_deployment_amendment_path: str = ""
+    identity_deployment_artifact_path: str = ""
+    identity_deployment_plan_hash: str = ""
 
     network: Literal["testnet11"] = "testnet11"
     coinset_base_url: str = "https://testnet11.api.coinset.org"
@@ -51,6 +54,7 @@ class ValidatorSettings(BaseSettings):
     evm_forwarder_address: str
     evm_verifier_adapter_address: str
     evm_attestation_emitter_address: str
+    credential_policy_version: int = Field(2, ge=2)
     base_sepolia_rpc_url: str = ""
     base_sepolia_spoke_address: str = ""
     base_sepolia_usdc_address: str = ""

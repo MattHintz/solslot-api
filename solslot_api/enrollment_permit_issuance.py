@@ -43,7 +43,8 @@ def _fresh_vault(settings: Any, session: Any) -> Any:
 
 
 async def reserve_and_issue_permit(settings: Any, session: Any, artifact: dict[str,Any], policy: Any,
-        *, signer: Callable[...,str] | None = None) -> dict[str,Any]:
+        *, identity_binding: dict[str,Any] | None = None,
+        signer: Callable[...,str] | None = None) -> dict[str,Any]:
     from . import zkpassport_enrollments as enroll
     require_alpha_writes(settings)
     if getattr(session,'scope','vault')!='vault':
@@ -89,7 +90,8 @@ async def reserve_and_issue_permit(settings: Any, session: Any, artifact: dict[s
             wire=permit.to_wire()
             record=enroll.EnrollmentRecord(vaultLauncherId=vault,network=settings.network,policyVersion=2,status='reserved',
                 bridgePolicyHash=policy.policy_hash,bridgeParentId=candidate.parent_id,bridgeAmount=1,
-                bridgeCoinId=candidate.coin_id,createdAt=now,updatedAt=now).model_dump()
+                bridgeCoinId=candidate.coin_id,createdAt=now,updatedAt=now,
+                identityDeployment=identity_binding).model_dump()
             try:
                 existing,_=ledger.reserve_enrollment(record=record,owner_key=session.owner_key,
                     max_pending_per_owner=settings.zkpassport_enrollment_max_pending_per_owner,

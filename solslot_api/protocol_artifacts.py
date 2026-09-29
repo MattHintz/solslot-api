@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Mapping, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from chia_rs.sized_bytes import bytes32
 from web3 import Web3
@@ -143,6 +143,22 @@ async def get_signed_public_artifact(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="The signed RC23 public artifact failed verification.",
         ) from exc
+
+
+@router.get("/identity-deployment", response_model=dict[str, Any])
+async def get_effective_identity_deployment(request: Request) -> dict[str, Any]:
+    """Return the chain-selected public identity deployment.
+
+    This is intentionally separate from the signed genesis artifact so the
+    immutable artifact bytes and hash never change after genesis.
+    """
+    deployment = getattr(request.app.state, "identity_deployment", None)
+    if not isinstance(deployment, dict):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The chain-selected identity deployment is unavailable.",
+        )
+    return dict(deployment)
 
 
 class ProtocolPaymentTerms(BaseModel):

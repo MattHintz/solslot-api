@@ -168,6 +168,7 @@ class EnrollmentRecord(BaseModel):
     bridgeCoinId: str
     createdAt: int
     updatedAt: int
+    identityDeployment: Optional[dict[str, Any]] = None
     receipt: Optional[VaultCredentialReceipt] = None
 
 
@@ -226,6 +227,69 @@ class SyncChiaStampResponse(BaseModel):
 
 def _settings() -> Settings:
     return Settings()
+
+
+def _current_identity_deployment(
+    settings: Settings, request: Request
+) -> dict[str, Any]:
+    from .identity_deployment import genesis_identity_deployment
+    try:
+        selected = request.scope["app"].state.identity_deployment
+    except (AttributeError, KeyError):
+        selected = None
+    if selected is not None:
+        if settings.runtime_environment != "test":
+            return selected
+        selected = dict(selected)
+        addresses = dict(selected.get("addresses") or {})
+        addresses.setdefault("forwarder", settings.zkpassport_forwarder_address)
+        addresses.setdefault(
+            "verifierAdapter", settings.zkpassport_verifier_adapter_address
+        )
+        addresses.setdefault("attestationEmitter", settings.zkpassport_emitter_address)
+        selected["addresses"] = addresses
+        return selected
+    if settings.runtime_environment != "test":
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The active identity deployment is unavailable.",
+        )
+    selected = genesis_identity_deployment(_active_genesis_artifact(settings))
+    addresses = dict(selected.get("addresses") or {})
+    addresses.setdefault("forwarder", settings.zkpassport_forwarder_address)
+    addresses.setdefault("verifierAdapter", settings.zkpassport_verifier_adapter_address)
+    addresses.setdefault("attestationEmitter", settings.zkpassport_emitter_address)
+    selected["addresses"] = addresses
+    return selected
+
+
+def _settings_for_enrollment(
+    settings: Settings, request: Request, record: dict[str, Any]
+) -> tuple[Settings, dict[str, Any]]:
+    """Pin one request to the enrollment's immutable identity deployment."""
+    from .identity_deployment import (
+        IdentityDeploymentError,
+        deployment_for_enrollment,
+        settings_for_identity_deployment,
+    )
+    try:
+        selected = deployment_for_enrollment(
+            base_artifact=_active_genesis_artifact(settings),
+            current=_current_identity_deployment(settings, request),
+            enrollment=record,
+        )
+        if settings.runtime_environment == "test":
+            addresses = dict(selected.get("addresses") or {})
+            addresses.setdefault("forwarder", settings.zkpassport_forwarder_address)
+            addresses.setdefault("verifierAdapter", settings.zkpassport_verifier_adapter_address)
+            addresses.setdefault("attestationEmitter", settings.zkpassport_emitter_address)
+            selected["addresses"] = addresses
+        return settings_for_identity_deployment(settings, selected), selected
+    except (AttributeError, IdentityDeploymentError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The enrollment's identity deployment cannot be verified.",
+        ) from exc
 
 
 def _normalize_hex32(value: object, field: str) -> str:
@@ -333,11 +397,9 @@ def _record_permit(settings: Settings, record: dict[str, Any], *,
 
 def _active_emitter_address(settings: Settings) -> str:
     try:
-        value = _active_genesis_artifact(settings)["evmAddresses"][
-            "attestationEmitter"
-        ]
+        value = settings.zkpassport_emitter_address
         return Web3.to_checksum_address(value)
-    except (KeyError, ValueError) as exc:
+    except (TypeError, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="The signed V2 genesis artifact has no valid attestation emitter.",
@@ -1247,11 +1309,30 @@ async def create_enrollment(
     settings = _settings()
     vault_launcher_id = _normalize_hex32(req.vaultLauncherId, "vaultLauncherId")
     verified_owner = verify_vault_session(settings, request, vault_launcher_id)
+    if getattr(request.app.state, "identity_deployment_transition", None) is not None:
+        existing = get_credential_ledger(settings).get_enrollment(vault_launcher_id)
+        if existing:
+            _require_enrollment_bridge_policy(settings, existing)
+            return _public_record(existing)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Identity verification is completing a reviewed deployment update. "
+                "Try again after the service rollout finishes."
+            ),
+        )
+    from .identity_deployment import enrollment_identity_binding
+    identity_binding = enrollment_identity_binding(
+        _current_identity_deployment(settings, request)
+    )
     policy = _active_bridge_coin_policy(settings)
     if policy.permit_version is not None:
         artifact = _active_genesis_artifact(settings)
         from .enrollment_permit_issuance import reserve_and_issue_permit
-        return _public_record(await reserve_and_issue_permit(settings,verified_owner,artifact,policy))
+        return _public_record(await reserve_and_issue_permit(
+            settings, verified_owner, artifact, policy,
+            identity_binding=identity_binding,
+        ))
     bridge_policy_hash = policy.policy_hash
     if int(settings.zkpassport_bridge_amount) != 1:
         raise HTTPException(
@@ -1290,6 +1371,7 @@ async def create_enrollment(
                 bridgeCoinId=bridge_candidate.coin_id,
                 createdAt=now,
                 updatedAt=now,
+                identityDeployment=identity_binding,
             )
             try:
                 stored, _created = ledger.reserve_enrollment(
@@ -1349,6 +1431,16 @@ def record_evm_proof(
     if vault_from_body != key:
         raise HTTPException(status_code=422, detail="vaultLauncherId does not match URL.")
     verified_owner = verify_vault_session(settings, request, key)
+    ledger = get_credential_ledger(settings)
+    existing = ledger.get_enrollment(key)
+    if not existing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Create an enrollment before recording proof.",
+        )
+    settings, _identity_deployment = _settings_for_enrollment(
+        settings, request, existing
+    )
 
     event = _fetch_verified_evm_attestation(
         settings,
@@ -1402,7 +1494,6 @@ def record_evm_proof(
         )
 
     vault_record = verified_owner.vault_record
-    ledger = get_credential_ledger(settings)
     if (
         vault_record.owner_evm_address
         and vault_record.owner_evm_address.lower() != event.sender.lower()
@@ -1427,12 +1518,6 @@ def record_evm_proof(
         except LedgerConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    existing = ledger.get_enrollment(key)
-    if not existing:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Create an enrollment before recording proof.",
-        )
     record = EnrollmentRecord.model_validate(existing)
     if record.status != "reserved":
         raise HTTPException(
@@ -1732,6 +1817,9 @@ def prepare_chia_stamp(
     existing = get_credential_ledger(settings).get_enrollment(key)
     if not existing:
         raise HTTPException(status_code=404, detail="Enrollment not found.")
+    settings, _identity_deployment = _settings_for_enrollment(
+        settings, request, existing
+    )
     record = EnrollmentRecord.model_validate(existing)
     _require_enrollment_bridge_policy(settings, existing, execution=True)
     if record.status == "chia_confirmed":
@@ -1804,6 +1892,9 @@ async def submit_evm_chia_stamp(
     existing = get_credential_ledger(settings).get_enrollment(key)
     if not existing:
         raise HTTPException(status_code=404, detail="Enrollment not found.")
+    settings, _identity_deployment = _settings_for_enrollment(
+        settings, request, existing
+    )
     record = EnrollmentRecord.model_validate(existing)
     _require_enrollment_bridge_policy(settings, existing, execution=True)
     attempt = get_credential_ledger(settings).get_stamp_attempt(key)

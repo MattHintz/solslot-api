@@ -37,6 +37,7 @@ from .validator_service import (
     load_stripe_restricted_key,
     load_validator_artifact,
     load_validator_private_key,
+    _coordinator_settings,
     sign_validator_claim,
     sign_inventory_reservation_claim,
     sign_primary_purchase_claim,
@@ -159,6 +160,8 @@ class ValidatorHealthResponse(BaseModel):
     ledgerReady: bool
     evmChainId: int = 11155111
     enrollmentActivation: dict[str, Any] | None = None
+    identityDeploymentRevision: int = 0
+    identityDeploymentHash: str | None = None
 
 
 def create_validator_app(
@@ -184,9 +187,37 @@ def create_validator_app(
         if not active_ledger.healthcheck():
             raise RuntimeError("validator signature ledger failed SQLite quick_check")
         application.state.validator_ledger = active_ledger
+        from .chia_provider import ChiaProviderConfig, create_chia_provider
+        from .identity_deployment import (
+            load_effective_identity_deployment,
+            require_runtime_identity_bindings,
+        )
+        identity_provider = None
+        application.state.identity_deployment = None
+        if Path(signer_settings.public_artifact_path).is_file():
+            artifact, _release = load_validator_artifact(signer_settings)
+            identity_provider = create_chia_provider(
+                ChiaProviderConfig(
+                    network=signer_settings.network,
+                    primary_url=None,
+                    fallback_url=signer_settings.coinset_base_url,
+                )
+            )
+            await identity_provider.start()
+            coordinator = _coordinator_settings(signer_settings, artifact)
+            application.state.identity_deployment = (
+                await load_effective_identity_deployment(
+                    coordinator, provider=identity_provider
+                )
+            )
+            require_runtime_identity_bindings(
+                coordinator, application.state.identity_deployment
+            )
         try:
             yield
         finally:
+            if identity_provider is not None:
+                await identity_provider.close()
             if configured_ledger is None:
                 active_ledger.close()
 
@@ -238,6 +269,16 @@ def create_validator_app(
             ledgerReady=active_ledger.healthcheck(),
             evmChainId=signer_settings.evm_chain_id,
             enrollmentActivation=signer_settings.enrollment_activation,
+            identityDeploymentRevision=(
+                int(application.state.identity_deployment["revision"])
+                if application.state.identity_deployment is not None
+                else 0
+            ),
+            identityDeploymentHash=(
+                str(application.state.identity_deployment["amendmentHash"])
+                if application.state.identity_deployment is not None
+                else None
+            ),
         )
 
     @application.post(

@@ -50,7 +50,13 @@ from .credential_ledger import (
     get_credential_ledger,
 )
 from .server_hardening import trusted_client_ip
-from .zkpassport_enrollments import _record_permit, _require_enrollment_bridge_policy, _active_genesis_artifact, _fetch_verified_evm_attestation
+from .zkpassport_enrollments import (
+    _active_genesis_artifact,
+    _fetch_verified_evm_attestation,
+    _record_permit,
+    _require_enrollment_bridge_policy,
+    _settings_for_enrollment,
+)
 from .evm_relay_transaction import canonical_receipt
 
 router = APIRouter(prefix="/zkpassport", tags=["zkpassport"])
@@ -457,6 +463,7 @@ def _recovery_inputs(settings,request,vault_launcher_id):
 def get_relay_recovery(vault_launcher_id: str,request: Request):
     settings=_load_settings()
     enrollment,session=_recovery_inputs(settings,request,vault_launcher_id)
+    settings,_identity_deployment=_settings_for_enrollment(settings,request,enrollment)
     ledger=get_credential_ledger(settings)
     attempt=ledger.get_relay_attempt(enrollment['vaultLauncherId'])
     if attempt is None:
@@ -472,6 +479,7 @@ def get_relay_recovery(vault_launcher_id: str,request: Request):
 def resume_relay(vault_launcher_id: str,request: Request):
     settings=_load_settings()
     enrollment,session=_recovery_inputs(settings,request,vault_launcher_id)
+    settings,_identity_deployment=_settings_for_enrollment(settings,request,enrollment)
     saved=_saved_relay(settings,enrollment,session)
     if saved is None:raise HTTPException(status_code=404,detail='No retained relay transaction exists.')
     return _resume_saved(settings,enrollment,session,saved,dispatch=True)
@@ -493,23 +501,13 @@ def _existing_response(settings,enrollment,session,payload):
 def relay(req: RelayRequest, request: Request) -> RelayResponse:
     settings = _load_settings()
 
-    if not settings.zkpassport_forwarder_address or not settings.zkpassport_emitter_address:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Fresh Solslot V2 forwarder and emitter addresses are not configured.",
-        )
-
-    # ── Pin addresses; the client cannot redirect the relayer ──
+    # Decode the request first, then select addresses from the enrollment's
+    # immutable deployment binding. The client cannot select a target.
     try:
         to = Web3.to_checksum_address(req.to)
         signer = Web3.to_checksum_address(req.from_address)
-        forwarder_addr = Web3.to_checksum_address(settings.zkpassport_forwarder_address)
-        emitter_addr = Web3.to_checksum_address(settings.zkpassport_emitter_address)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=422, detail=f"Invalid address: {exc}") from exc
-
-    if to != emitter_addr:
-        raise HTTPException(status_code=400, detail="request.to must be the configured emitter.")
     from .enrollment_permit_runtime import PERMIT_SELECTOR
     if not req.data.lower().startswith((_VERIFY_AND_EMIT_SELECTOR, "0x" + PERMIT_SELECTOR.hex())):
         raise HTTPException(status_code=400, detail="request.data must call a supported enrollment function.")
@@ -545,6 +543,14 @@ def relay(req: RelayRequest, request: Request) -> RelayResponse:
     enrollment = ledger.get_enrollment(vault_launcher_id.lower())
     if not enrollment:
         raise HTTPException(status_code=404, detail="Enrollment not found for relay binding.")
+    settings,_identity_deployment=_settings_for_enrollment(settings,request,enrollment)
+    try:
+        forwarder_addr = Web3.to_checksum_address(settings.zkpassport_forwarder_address)
+        emitter_addr = Web3.to_checksum_address(settings.zkpassport_emitter_address)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="The selected identity deployment is incomplete.") from exc
+    if to != emitter_addr:
+        raise HTTPException(status_code=400, detail="request.to must be the enrollment's confirmed emitter.")
     _require_enrollment_bridge_policy(settings,enrollment, execution=True)
     _validate_relay_permit(settings, enrollment, verified_owner, data_bytes)
     existing=_existing_response(settings,enrollment,verified_owner,auth_payload)
@@ -706,13 +712,7 @@ def relay_bls(req: BlsRelayRequest, request: Request) -> RelayResponse:
     """
 
     settings = _load_settings()
-    if not settings.zkpassport_emitter_address:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Fresh Solslot V2 emitter address is not configured.",
-        )
     try:
-        emitter_addr = Web3.to_checksum_address(settings.zkpassport_emitter_address)
         data_bytes = Web3.to_bytes(hexstr=req.data)
         vault_launcher_id, bridge_parent_id, bridge_amount = _decode_enrollment_calldata(
             data_bytes
@@ -732,6 +732,11 @@ def relay_bls(req: BlsRelayRequest, request: Request) -> RelayResponse:
     ledger=get_credential_ledger(settings)
     enrollment=ledger.get_enrollment(vault_launcher_id.lower())
     if not enrollment:raise HTTPException(status_code=404,detail='Enrollment not found for relay binding.')
+    settings,_identity_deployment=_settings_for_enrollment(settings,request,enrollment)
+    try:
+        emitter_addr = Web3.to_checksum_address(settings.zkpassport_emitter_address)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="The selected identity deployment is incomplete.") from exc
     _require_enrollment_bridge_policy(settings,enrollment, execution=True)
     payload=_normalized_request(req)
     _validate_relay_permit(settings, enrollment, session, data_bytes)

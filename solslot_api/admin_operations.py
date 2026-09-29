@@ -35,6 +35,7 @@ ALLOWED_OPERATIONS = frozenset(
         "mint.cancel",
         "mint.execute",
         "mint.publish",
+        "identity.activate",
         "sgt.allocate",
         "presale.create",
         "presale.cancel",
@@ -427,26 +428,60 @@ class SignOperationRequest(BaseModel):
 
 
 async def _mint_build(value, request: Request, settings: Settings):
-    if value['operation'] != 'mint.publish':
-        return None
-    from .genesis import get_genesis_store
-    from .mint_publication import prepare_mint_authorization
-    provider = getattr(request.app.state, 'coinset', None)
-    if provider is None:
-        raise ValueError('Testnet11 Chia provider is unavailable')
-    return await prepare_mint_authorization(binding=value['request_binding'],
-        created_by=value['created_by'], provider=provider, settings=settings,
-        genesis_store=get_genesis_store(settings))
+    if value['operation'] == 'mint.publish':
+        from .genesis import get_genesis_store
+        from .mint_publication import prepare_mint_authorization
+        provider = getattr(request.app.state, 'coinset', None)
+        if provider is None:
+            raise ValueError('Testnet11 Chia provider is unavailable')
+        return await prepare_mint_authorization(binding=value['request_binding'],
+            created_by=value['created_by'], provider=provider, settings=settings,
+            genesis_store=get_genesis_store(settings))
+    return None
 
 
-def _with_mint_actions(public, build, value):
+async def _chain_build(value, request: Request, settings: Settings):
+    if value['operation'] == 'mint.publish':
+        return await _mint_build(value, request, settings)
+    if value['operation'] == 'identity.activate':
+        from .identity_deployment_activation import prepare_identity_activation
+        return await prepare_identity_activation(
+            binding=value['request_binding'], request=request, settings=settings
+        )
+    return None
+
+
+def _with_chain_actions(public, build, value):
     if build is None:
         return public
     signed = {item['action_id'] for item in value.get('chain_signatures', [])}
-    public['chainActions'] = [{**action.to_wire(signed=action.action_id in signed),
-        'summary': 'Approve this exact mint proposal, vault stake, deadline and current protocol inputs.',
-        'financialEffect': 'The chosen vault SGT is locked until the voting deadline. No deed is issued at publication.'}
-        for action in build.actions]
+    if value['operation'] == 'identity.activate':
+        summary = 'Activate this exact reviewed identity deployment for new vault checks.'
+        effect = 'No funds move. Existing identity receipts remain bound to their original deployment.'
+        public['identityReview'] = {
+            'amendmentHash': build.statement_hash,
+            'revision': int(build.statement['revision']),
+            'approvalExpiresAt': int(build.statement['approvalExpiresAt']),
+            'currentDeployment': build.statement['oldDeployment'],
+            'replacementDeployment': build.statement['newDeployment'],
+            'acceptedProofVersions': build.statement['newDeployment']['acceptedProofVersions'],
+            'credentialPolicy': build.statement['identityPolicy'],
+        }
+    else:
+        summary = 'Approve this exact mint proposal, vault stake, deadline and current protocol inputs.'
+        effect = 'The chosen vault SGT is locked until the voting deadline. No deed is issued at publication.'
+    chain_actions = []
+    for action in build.actions:
+        wire = action.to_wire(signed=action.action_id in signed)
+        if value['operation'] == 'identity.activate':
+            wire['title'] = (
+                'Owner approves identity verifier activation'
+                if action.signer_slot == 0
+                else 'Coadministrator approves identity verifier activation'
+            )
+        wire.update({'summary': summary, 'financialEffect': effect})
+        chain_actions.append(wire)
+    public['chainActions'] = chain_actions
     return public
 
 
@@ -522,10 +557,10 @@ async def prepare_operation(
             nonce=bytes32(secrets.token_bytes(32)),
             expires_at=now + body.expires_in_seconds,
         )
-        build = await _mint_build({'operation': body.operation, 'request_binding': binding,
+        build = await _chain_build({'operation': body.operation, 'request_binding': binding,
             'created_by': claims.sub}, request, settings)
         value = store.create(core=core, binding=binding, created_by=claims.sub, now=now)
-        return _with_mint_actions(_public_operation(value, core, chain_id=settings.eip712_chain_id), build, value)
+        return _with_chain_actions(_public_operation(value, core, chain_id=settings.eip712_chain_id), build, value)
     except (KeyError, TypeError, ValueError, sqlite3.IntegrityError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -569,7 +604,7 @@ async def get_operation(
             chain_id=settings.eip712_chain_id,
         )
         if value['status'] != 'consumed':
-            public = _with_mint_actions(public, await _mint_build(value, request, settings), value)
+            public = _with_chain_actions(public, await _chain_build(value, request, settings), value)
         return public
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -602,13 +637,22 @@ async def sign_operation(
             admin_index = roster.compressed_pubkeys.index(recovered.compressed_pubkey)
         except ValueError as exc:
             raise ValueError("signature key is not in the active admin roster") from exc
-        build = await _mint_build(value, request, settings)
+        build = await _chain_build(value, request, settings)
         chain_signature = None
         if build is not None:
             from solslot_puzzles.eip712_helpers import normalize_eip712_member_signature
-            action = build.actions[admin_index]
+            action = next(
+                (
+                    item
+                    for index, item in enumerate(build.actions)
+                    if getattr(item, "signer_slot", index) == admin_index
+                ),
+                None,
+            )
+            if action is None:
+                raise ValueError('this chain action is assigned to different administrators')
             if body.chain_action_id != action.action_id or body.chain_signature is None:
-                raise ValueError('mint approval requires this administrator\'s exact current chain action')
+                raise ValueError('approval requires this administrator\'s exact current chain action')
             chain_signature = '0x' + normalize_eip712_member_signature(
                 signature=bytes.fromhex(body.chain_signature[2:]),
                 digest=_parse_hex32(action.message_hash, 'identity action hash'),
@@ -625,14 +669,14 @@ async def sign_operation(
             chain_action_id=body.chain_action_id,
             chain_signature=chain_signature,
         )
-        return _with_mint_actions(_public_operation(value, core, chain_id=settings.eip712_chain_id), build, value)
+        return _with_chain_actions(_public_operation(value, core, chain_id=settings.eip712_chain_id), build, value)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-def require_admin_operation(expected_operation: str):
+def require_admin_operation(expected_operation: str, *, defer_consume: bool = False):
     if expected_operation not in ALLOWED_OPERATIONS:
         raise ValueError(f"unsupported admin operation {expected_operation}")
 
@@ -692,13 +736,37 @@ def require_admin_operation(expected_operation: str):
                 for index in (1, 2)
             ):
                 raise ValueError("admin operation signatures are stale for the active roster")
-            store.consume(
-                operation_id=operation_id,
-                expected_operation=expected_operation,
-                expected_payload_hash=request_binding_hash(binding),
-                caller=claims.sub,
-                now=int(time.time()),
-            )
+            expected_payload_hash = request_binding_hash(binding)
+            if defer_consume:
+                if value["consumed_at"] is not None:
+                    raise ValueError("admin operation is already consumed")
+                if int(value["expires_at"]) < int(time.time()):
+                    raise ValueError("admin operation is expired")
+                if value["approved_at"] is None:
+                    raise ValueError("admin operation lacks slot 0 plus one coadmin")
+                if value["operation"] != expected_operation:
+                    raise ValueError("admin operation type does not match this endpoint")
+                if value["payload_hash"] != _hex32(expected_payload_hash):
+                    raise ValueError("admin operation payload does not match this request")
+                if not any(
+                    str(item["signer_address"]).lower() == claims.sub.lower()
+                    for item in value["signatures"]
+                ):
+                    raise ValueError("calling JWT subject did not sign this operation")
+                request.state.admin_operation_consume = {
+                    "operation_id": operation_id,
+                    "expected_operation": expected_operation,
+                    "expected_payload_hash": expected_payload_hash,
+                    "caller": claims.sub,
+                }
+            else:
+                store.consume(
+                    operation_id=operation_id,
+                    expected_operation=expected_operation,
+                    expected_payload_hash=expected_payload_hash,
+                    caller=claims.sub,
+                    now=int(time.time()),
+                )
             request.state.admin_operation = value
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

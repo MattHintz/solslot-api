@@ -284,29 +284,34 @@ def load_validator_artifact(
         for value in (source_shas, bridge, validators, addresses)
     ):
         raise ValidatorEvidenceError("signed artifact runtime bindings are incomplete")
-    checks = (
+    checks = [
         (artifact.get("network"), settings.network, "network"),
         (source_shas.get("api"), release.apiCommit, "API commit"),
         (source_shas.get("protocol"), release.protocolCommit, "protocol commit"),
         (bridge.get("policyHash"), settings.bridge_policy_hash, "bridge policy"),
         (validators.get("threshold"), 2, "validator threshold"),
         (validators.get("pubkeys"), settings.roster_pubkeys, "validator roster"),
-        (
-            str(addresses.get("forwarder", "")).lower(),
-            settings.evm_forwarder_address,
-            "forwarder",
-        ),
-        (
-            str(addresses.get("verifierAdapter", "")).lower(),
-            settings.evm_verifier_adapter_address,
-            "verifier adapter",
-        ),
-        (
-            str(addresses.get("attestationEmitter", "")).lower(),
-            settings.evm_attestation_emitter_address,
-            "attestation emitter",
-        ),
-    )
+    ]
+    if not settings.identity_deployment_amendment_path:
+        checks.extend(
+            [
+                (
+                    str(addresses.get("forwarder", "")).lower(),
+                    settings.evm_forwarder_address,
+                    "forwarder",
+                ),
+                (
+                    str(addresses.get("verifierAdapter", "")).lower(),
+                    settings.evm_verifier_adapter_address,
+                    "verifier adapter",
+                ),
+                (
+                    str(addresses.get("attestationEmitter", "")).lower(),
+                    settings.evm_attestation_emitter_address,
+                    "attestation emitter",
+                ),
+            ]
+        )
     for observed, expected, label in checks:
         if observed != expected:
             raise ValidatorEvidenceError(f"signed artifact {label} does not match signer config")
@@ -558,6 +563,9 @@ def _coordinator_settings(
         coinset_base_url=settings.coinset_base_url,
         public_artifact_path=settings.public_artifact_path,
         release_metadata_path=settings.release_metadata_path,
+        identity_deployment_amendment_path=settings.identity_deployment_amendment_path,
+        identity_deployment_artifact_path=settings.identity_deployment_artifact_path,
+        identity_deployment_plan_hash=settings.identity_deployment_plan_hash,
         zkpassport_evm_rpc_url=settings.evm_rpc_url,
         zkpassport_evm_chain_id=settings.evm_chain_id,
         zkpassport_evm_min_confirmations=settings.evm_min_confirmations,
@@ -567,6 +575,7 @@ def _coordinator_settings(
         zkpassport_forwarder_address=settings.evm_forwarder_address,
         zkpassport_verifier_adapter_address=settings.evm_verifier_adapter_address,
         zkpassport_emitter_address=settings.evm_attestation_emitter_address,
+        zkpassport_policy_version=settings.credential_policy_version,
         pool_launcher_id=str(artifact["launcherIds"]["pool"]),
     )
 

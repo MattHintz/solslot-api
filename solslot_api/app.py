@@ -47,6 +47,7 @@ from .admin_auth import (
     validate_admin_config_at_startup,
 )
 from .admin_operations import router as admin_operations_router
+from .identity_deployment_endpoints import router as identity_deployment_endpoints_router
 from .admin_key_changes import router as admin_key_changes_router
 from .admin_security import router as admin_security_router
 from .omnichain_ownership_activation import (
@@ -309,6 +310,23 @@ async def lifespan(app: FastAPI):
         )
     )
     await app.state.coinset.start()
+    from .identity_deployment import (
+        IdentityDeploymentError,
+        load_effective_identity_deployment,
+        require_runtime_identity_bindings,
+    )
+    try:
+        app.state.identity_deployment = await load_effective_identity_deployment(
+            settings, provider=app.state.coinset
+        )
+        require_runtime_identity_bindings(settings, app.state.identity_deployment)
+    except (PublicArtifactMissing, IdentityDeploymentError):
+        if settings.runtime_environment != "test":
+            raise
+        # Unit-test applications may intentionally exercise routes that do
+        # not install a ceremony artifact. Identity routes still fail closed
+        # unless their tests provide the signed artifact fixture.
+        app.state.identity_deployment = None
 
     if settings.faucet_master_sk_hex:
         app.state.faucet = Faucet.from_master_private_key_hex(
@@ -683,6 +701,7 @@ app.include_router(launch_control_router)
 # records committed by the current admin-authority singleton.
 app.include_router(admin_auth_router)
 app.include_router(admin_operations_router)
+app.include_router(identity_deployment_endpoints_router)
 app.include_router(admin_key_changes_router)
 app.include_router(admin_security_router)
 app.include_router(omnichain_ownership_activation_router)

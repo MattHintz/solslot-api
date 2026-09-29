@@ -1003,6 +1003,13 @@ class Settings(BaseSettings):
     # coordinates come exclusively from the signed RC23 V4 public artifact.
     deployment_manifest_path: str = "./state/deployment_manifest_v2.json"
     public_artifact_path: str = "./state/public_artifact_v4.json"
+    # Append-only identity deployment activation.  Empty paths select the
+    # genesis deployment only when the authority lineage has no amendment
+    # announcement.  A configured statement is never trusted without an
+    # independently verified current-authority spend.
+    identity_deployment_amendment_path: str = ""
+    identity_deployment_artifact_path: str = ""
+    identity_deployment_plan_hash: str = ""
     # Public, version-pinned issuer coordinates only; private keys remain in Key Vault.
     enrollment_permit_release_identity: str = ""
     enrollment_permit_issuer_key_ref: str = ""
