@@ -156,6 +156,7 @@ from .external_settlement import (
 from .faucet import AGG_SIG_ME_DATA
 from .public_artifact import (
     PublicArtifactError,
+    _release_source_shas,
     verify_signed_public_artifact_file,
 )
 from .release_metadata import ReleaseMetadata, load_release_metadata
@@ -276,6 +277,13 @@ def load_validator_artifact(
         raise ValidatorEvidenceError("validator release metadata is missing")
 
     source_shas = artifact.get("sourceShas")
+    if settings.identity_deployment_amendment_path:
+        try:
+            source_shas = _release_source_shas(
+                _coordinator_settings(settings, artifact), artifact
+            )
+        except PublicArtifactError as exc:
+            raise ValidatorEvidenceError(str(exc)) from exc
     bridge = artifact.get("bridgePolicy")
     validators = artifact.get("validatorSet")
     addresses = artifact.get("evmAddresses")

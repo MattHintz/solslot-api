@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -21,6 +22,7 @@ from solslot_api.validator_service import (
     _fetch_coin,
     _verify_bridge_coin,
     _verify_vault_and_owner,
+    load_validator_artifact,
     verify_validator_claim,
 )
 from solslot_api.validator_settings import ValidatorSettings
@@ -50,6 +52,55 @@ def _settings() -> ValidatorSettings:
         evm_verifier_adapter_address="0x" + "22" * 20,
         evm_attestation_emitter_address="0x" + "33" * 20,
     )
+
+
+def test_validator_source_pin_uses_bound_identity_amendment(monkeypatch, tmp_path) -> None:
+    settings = _settings()
+    settings.identity_deployment_amendment_path = str(tmp_path / "amendment.json")
+    settings.identity_deployment_artifact_path = str(tmp_path / "deployment.json")
+    settings.identity_deployment_plan_hash = "0x" + "91" * 32
+    settings.release_metadata_path = str(tmp_path / "release.json")
+    activation_sources = {"api": "a" * 40, "protocol": "b" * 40}
+    (tmp_path / "release.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": 2,
+                "protocolVersion": "solslot-v2",
+                "api_commit": activation_sources["api"],
+                "protocol_commit": activation_sources["protocol"],
+                "package_name": "solslot_api",
+                "app_module": "solslot_api.validator_app:app",
+            }
+        ),
+        encoding="utf-8",
+    )
+    artifact = {
+        "network": settings.network,
+        "evmChainId": settings.evm_chain_id,
+        "sourceShas": {"api": "1" * 40, "protocol": "2" * 40},
+        "bridgePolicy": {"policyHash": settings.bridge_policy_hash},
+        "validatorSet": {"threshold": 2, "pubkeys": settings.roster_pubkeys},
+        "evmAddresses": {
+            "forwarder": "0x" + "44" * 20,
+            "verifierAdapter": "0x" + "55" * 20,
+            "attestationEmitter": "0x" + "66" * 20,
+        },
+        "launcherIds": {"pool": "0x" + "77" * 32},
+    }
+    monkeypatch.setattr(
+        "solslot_api.validator_service.verify_signed_public_artifact_file",
+        lambda _path: artifact,
+    )
+    monkeypatch.setattr(
+        "solslot_api.validator_service._release_source_shas",
+        lambda _settings, _artifact: activation_sources,
+    )
+
+    loaded, release = load_validator_artifact(settings)
+
+    assert loaded is artifact
+    assert release.apiCommit == activation_sources["api"]
+    assert release.protocolCommit == activation_sources["protocol"]
 
 
 def _claim(
