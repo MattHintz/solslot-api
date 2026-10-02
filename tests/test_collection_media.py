@@ -74,7 +74,7 @@ async def test_verify_scan_pin_and_refetch_pipeline() -> None:
         if request.url.host == "ipfs-api.example.test":
             return httpx.Response(200, text=json.dumps({"Hash": CID}) + "\n")
         if request.url.host == "pins.example.test":
-            return httpx.Response(202, json={"pin": {"cid": CID}})
+            return httpx.Response(200, json={"pin": {"cid": CID}, "status": "pinned"})
         return httpx.Response(404)
 
     pipeline = CollectionMediaPipeline(
@@ -156,3 +156,13 @@ def test_private_presign_uses_segregated_prefix() -> None:
     )
     assert upload["objectKey"].startswith("private/collections/v2/")
     assert upload["objectKey"].endswith("/asset.pdf")
+
+
+@pytest.mark.asyncio
+async def test_queued_pin_is_not_reported_as_persisted() -> None:
+    def handler(request):
+        return httpx.Response(202, json={"pin": {"cid": CID}, "status": "queued"})
+    pipeline = CollectionMediaPipeline(_settings(), transport=httpx.MockTransport(handler))
+    async with httpx.AsyncClient(transport=pipeline.transport) as client:
+        with pytest.raises(MediaPipelineUnavailable, match="pending"):
+            await pipeline._pin_cid(client, CID, "synthetic", hashlib.sha256(PNG_BYTES).hexdigest())

@@ -527,16 +527,43 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         )
     if settings.collection_metadata_enabled:
         required_collection_settings = {
-            "SOLSLOT_COLLECTION_S3_ENDPOINT_URL": settings.collection_s3_endpoint_url,
-            "SOLSLOT_COLLECTION_S3_ACCESS_KEY_ID": settings.collection_s3_access_key_id,
-            "SOLSLOT_COLLECTION_S3_SECRET_ACCESS_KEY": settings.collection_s3_secret_access_key,
-            "SOLSLOT_COLLECTION_S3_PUBLIC_BASE_URL": settings.collection_s3_public_base_url,
             "SOLSLOT_COLLECTION_IPFS_API_URL": settings.collection_ipfs_api_url,
-            "SOLSLOT_COLLECTION_IPFS_PINNING_SERVICE_URL": settings.collection_ipfs_pinning_service_url,
-            "SOLSLOT_COLLECTION_IPFS_PINNING_TOKEN": settings.collection_ipfs_pinning_token,
             "SOLSLOT_COLLECTION_IPFS_GATEWAY_URL": settings.collection_ipfs_gateway_url,
-            "SOLSLOT_COLLECTION_MALWARE_SCAN_URL": settings.collection_malware_scan_url,
         }
+        if settings.collection_storage_backend == "filesystem":
+            required_collection_settings.update({
+                "SOLSLOT_COLLECTION_LOCAL_ROOT": settings.collection_local_root,
+                "SOLSLOT_COLLECTION_LOCAL_BASE_URL": settings.collection_local_base_url,
+            })
+            if len(settings.admin_jwt_secret) < 32:
+                raise RuntimeError("Local collection capabilities require the protected admin signing secret")
+            if not str(settings.collection_local_base_url).startswith("https://"):
+                raise RuntimeError("Local collection media must use HTTPS when hosted")
+        else:
+            required_collection_settings.update({
+                "SOLSLOT_COLLECTION_S3_ENDPOINT_URL": settings.collection_s3_endpoint_url,
+                "SOLSLOT_COLLECTION_S3_ACCESS_KEY_ID": settings.collection_s3_access_key_id,
+                "SOLSLOT_COLLECTION_S3_SECRET_ACCESS_KEY": settings.collection_s3_secret_access_key,
+                "SOLSLOT_COLLECTION_S3_PUBLIC_BASE_URL": settings.collection_s3_public_base_url,
+            })
+        if settings.collection_ipfs_pinning_mode == "service":
+            required_collection_settings.update({
+                "SOLSLOT_COLLECTION_IPFS_PINNING_SERVICE_URL": settings.collection_ipfs_pinning_service_url,
+                "SOLSLOT_COLLECTION_IPFS_PINNING_TOKEN": settings.collection_ipfs_pinning_token,
+            })
+        else:
+            from urllib.parse import urlsplit
+            rpc = str(settings.collection_ipfs_api_url or "")
+            if not valid_internal_service_url(rpc) or urlsplit(rpc).hostname not in {"127.0.0.1", "::1"}:
+                raise RuntimeError("Unauthenticated Kubo RPC must stay on loopback")
+        required_collection_settings["collection malware scanner"] = (
+            settings.collection_clamav_socket if settings.collection_malware_scan_backend == "clamav"
+            else settings.collection_malware_scan_url
+        )
+        if settings.collection_malware_scan_backend == "clamav":
+            required_collection_settings["SOLSLOT_COLLECTION_CLAMAV_POLICY_PATH"] = settings.collection_clamav_policy_path
+            if settings.collection_asset_max_bytes > 20 * 1024 * 1024:
+                raise RuntimeError("Local ClamAV uploads must be capped at 20 MiB")
         missing = [name for name, value in required_collection_settings.items() if not value]
         if missing:
             raise RuntimeError(
@@ -1445,6 +1472,13 @@ class Settings(BaseSettings):
     collection_metadata_enabled: bool = False
     collection_minting_enabled: bool = False
 
+    # Optional existing-host backend; the S3 contract remains the default.
+    collection_storage_backend: Literal["s3", "filesystem"] = "s3"
+    collection_local_root: Optional[str] = None
+    collection_local_base_url: Optional[str] = None
+    collection_local_quota_bytes: int = Field(1024 * 1024 * 1024, ge=1)
+    collection_local_min_free_bytes: int = Field(5 * 1024 * 1024 * 1024, ge=0)
+
     # Authenticated S3-compatible staging store. Objects are never considered
     # investor-ready until the API has fetched and verified their bytes.
     collection_s3_endpoint_url: Optional[str] = None
@@ -1469,11 +1503,15 @@ class Settings(BaseSettings):
     collection_ipfs_pinning_service_url: Optional[str] = None
     collection_ipfs_pinning_token: Optional[str] = None
     collection_ipfs_gateway_url: Optional[str] = None
+    collection_ipfs_pinning_mode: Literal["service", "kubo"] = "service"
 
     # Scanner must return {"status":"CLEAN"}. No scanner means no publish;
     # there is deliberately no production fail-open mode.
     collection_malware_scan_url: Optional[str] = None
     collection_malware_scan_token: Optional[str] = None
+    collection_malware_scan_backend: Literal["http", "clamav"] = "http"
+    collection_clamav_socket: Optional[str] = None
+    collection_clamav_policy_path: Optional[str] = None
 
     # ── CORS ──────────────────────────────────────────────────────────────
     # Same-origin deployments need no CORS entries. Local development opts

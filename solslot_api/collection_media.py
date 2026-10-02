@@ -4,6 +4,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import asyncio
+import re
+from functools import wraps
+from weakref import WeakKeyDictionary
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,6 +25,21 @@ class MediaPipelineUnavailable(RuntimeError):
 
 class MediaVerificationError(ValueError):
     pass
+
+
+_verification_slots: WeakKeyDictionary = WeakKeyDictionary()
+
+
+def bounded_verification(method):
+    @wraps(method)
+    async def run(*args, **kwargs):
+        loop = asyncio.get_running_loop()
+        slots = _verification_slots.setdefault(loop, asyncio.Semaphore(2))
+        if slots.locked():
+            raise MediaPipelineUnavailable("Media checks are busy; retry completion shortly")
+        async with slots:
+            return await method(*args, **kwargs)
+    return run
 
 
 @dataclass(frozen=True)
@@ -60,6 +79,9 @@ class CollectionMediaPipeline:
         asset_id: str,
         filename: str,
         private: bool = False,
+        expected_sha256: str = "",
+        expected_byte_size: int = 0,
+        expected_mime_type: str = "",
     ) -> dict[str, Any]:
         self._require_s3()
         extension = ""
@@ -75,6 +97,17 @@ class CollectionMediaPipeline:
             f"{uuid.uuid4().hex}/asset{extension}"
         )
         expires = self.settings.collection_s3_presign_ttl_seconds
+        if self.settings.collection_storage_backend == "filesystem":
+            from .collection_local_storage import LocalStorage
+            storage = LocalStorage(self.settings)
+            token = storage.issue("PUT", object_key, expires, digest=expected_sha256.lower(),
+                                  size=expected_byte_size, mime=expected_mime_type.lower())
+            return {
+                "objectKey": object_key, "uploadUrl": storage.base_url + "/objects/" + object_key,
+                "method": "PUT", "headers": {"If-None-Match": "*", "Authorization": "Bearer " + token,
+                                               "Content-Type": expected_mime_type.lower()},
+                "expiresIn": expires,
+            }
         return {
             "objectKey": object_key,
             "uploadUrl": self._s3_signed_url("PUT", object_key, expires),
@@ -83,6 +116,7 @@ class CollectionMediaPipeline:
             "expiresIn": expires,
         }
 
+    @bounded_verification
     async def verify_and_pin(
         self,
         *,
@@ -93,14 +127,15 @@ class CollectionMediaPipeline:
         asset_name: str,
     ) -> VerifiedMedia:
         self._require_all()
+        if object_key.startswith("private/"):
+            raise MediaVerificationError("private originals cannot enter public IPFS verification")
         timeout = self.settings.collection_asset_verification_timeout_seconds
-        download_url = self._s3_signed_url("GET", object_key, 300)
         async with httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=False,
             transport=self.transport,
         ) as client:
-            payload, actual_sha256 = await self._read_bounded(client, download_url, expected_byte_size)
+            payload, actual_sha256 = await self._read_staged(client, object_key, expected_byte_size)
             actual_mime = _detect_mime(payload)
             if actual_sha256 != expected_sha256.lower():
                 raise MediaVerificationError("SHA-256 mismatch")
@@ -113,10 +148,17 @@ class CollectionMediaPipeline:
             cid = await self._add_to_ipfs(client, payload, asset_name)
             await self._pin_cid(client, cid, asset_name, actual_sha256)
 
-            https_url = self._public_s3_url(object_key)
-            await self._verify_remote_bytes(client, https_url, actual_sha256, len(payload))
             gateway_url = self._gateway_url(cid)
             await self._verify_remote_bytes(client, gateway_url, actual_sha256, len(payload))
+            if self.settings.collection_storage_backend == "filesystem":
+                from .collection_local_storage import LocalStorage
+                try:
+                    https_url = await asyncio.to_thread(LocalStorage(self.settings).promote, object_key, actual_sha256)
+                except (OSError, ValueError) as exc:
+                    raise MediaPipelineUnavailable("verified collection publication is unavailable") from exc
+            else:
+                https_url = self._public_s3_url(object_key)
+            await self._verify_remote_bytes(client, https_url, actual_sha256, len(payload))
 
         return VerifiedMedia(
             sha256=actual_sha256,
@@ -128,6 +170,7 @@ class CollectionMediaPipeline:
             availability_status="HEALTHY",
         )
 
+    @bounded_verification
     async def verify_private_document(
         self,
         *,
@@ -141,13 +184,12 @@ class CollectionMediaPipeline:
         if not object_key.startswith("private/collections/"):
             raise MediaVerificationError("private document is outside the private object prefix")
         timeout = self.settings.collection_asset_verification_timeout_seconds
-        download_url = self._s3_signed_url("GET", object_key, 300)
         async with httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=False,
             transport=self.transport,
         ) as client:
-            payload, actual_sha256 = await self._read_bounded(client, download_url, expected_byte_size)
+            payload, actual_sha256 = await self._read_staged(client, object_key, expected_byte_size)
             actual_mime = _detect_mime(payload)
             if actual_sha256 != expected_sha256.lower():
                 raise MediaVerificationError("SHA-256 mismatch")
@@ -166,6 +208,11 @@ class CollectionMediaPipeline:
     def presign_private_download(self, *, object_key: str) -> str:
         if not object_key.startswith("private/collections/"):
             raise MediaVerificationError("private document is outside the private object prefix")
+        if self.settings.collection_storage_backend == "filesystem":
+            from .collection_local_storage import LocalStorage
+            storage = LocalStorage(self.settings)
+            token = storage.issue("GET", object_key, self.settings.collection_private_download_ttl_seconds)
+            return storage.base_url + "/objects/" + object_key + "?token=" + token
         return self._s3_signed_url(
             "GET", object_key, self.settings.collection_private_download_ttl_seconds
         )
@@ -177,6 +224,10 @@ class CollectionMediaPipeline:
         digest: str,
         mime_type: str,
     ) -> None:
+        if self.settings.collection_malware_scan_backend == "clamav":
+            from .collection_scanner import scan_with_clamav
+            await scan_with_clamav(self.settings, payload)
+            return
         headers = {
             "content-type": mime_type,
             "x-content-sha256": digest,
@@ -204,6 +255,15 @@ class CollectionMediaPipeline:
         payload: bytes,
         name: str,
     ) -> str:
+        if self.settings.collection_ipfs_pinning_mode == "kubo":
+            stats = await client.post(str(self.settings.collection_ipfs_api_url).rstrip("/") + "/api/v0/repo/stat")
+            stats.raise_for_status()
+            try:
+                size = stats.json().get("SizeStat", stats.json())
+                if int(size["RepoSize"]) + len(payload) > int(size["StorageMax"]) * .9:
+                    raise MediaPipelineUnavailable("IPFS capacity is reserved; contact the administrator")
+            except (TypeError, ValueError, KeyError) as exc:
+                raise MediaPipelineUnavailable("IPFS capacity could not be verified") from exc
         url = str(self.settings.collection_ipfs_api_url).rstrip("/") + "/api/v0/add"
         response = await client.post(
             url,
@@ -216,7 +276,7 @@ class CollectionMediaPipeline:
             cid = str(json.loads(lines[-1])["Hash"])
         except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise MediaVerificationError("IPFS add endpoint returned no CID") from exc
-        if len(cid) < 10:
+        if not re.fullmatch(r"b[a-z2-7]{20,120}", cid):
             raise MediaVerificationError("IPFS add endpoint returned an invalid CID")
         return cid
 
@@ -227,6 +287,17 @@ class CollectionMediaPipeline:
         name: str,
         digest: str,
     ) -> None:
+        if self.settings.collection_ipfs_pinning_mode == "kubo":
+            base = str(self.settings.collection_ipfs_api_url).rstrip("/") + "/api/v0/"
+            response = await client.post(base + "pin/add", params={"arg": cid, "recursive": "true"})
+            response.raise_for_status()
+            if cid not in response.json().get("Pins", []):
+                raise MediaVerificationError("IPFS node did not persist the requested pin")
+            response = await client.post(base + "pin/ls", params={"arg": cid, "type": "recursive"})
+            response.raise_for_status()
+            if response.json().get("Keys", {}).get(cid, {}).get("Type") != "recursive":
+                raise MediaVerificationError("IPFS recursive pin could not be verified")
+            return
         headers = {
             "authorization": "Bearer " + str(self.settings.collection_ipfs_pinning_token),
             "content-type": "application/json",
@@ -239,10 +310,25 @@ class CollectionMediaPipeline:
         response.raise_for_status()
         try:
             returned_cid = str(response.json()["pin"]["cid"])
+            pinned = response.json().get("status") == "pinned"
         except (KeyError, TypeError, ValueError) as exc:
             raise MediaVerificationError("pinning service returned an invalid response") from exc
         if returned_cid != cid:
             raise MediaVerificationError("pinning service acknowledged a different CID")
+        if not pinned:
+            raise MediaPipelineUnavailable("IPFS pin is pending; retry completion after the provider confirms it")
+
+    async def _read_staged(self, client: httpx.AsyncClient, key: str, size: int) -> tuple[bytes, str]:
+        if not 0 < size <= self.settings.collection_asset_max_bytes:
+            raise MediaVerificationError("declared byte size exceeds the configured size cap")
+        if self.settings.collection_storage_backend == "filesystem":
+            from .collection_local_storage import LocalStorage
+            try:
+                payload = await asyncio.to_thread(LocalStorage(self.settings).read, key, size)
+            except (OSError, ValueError) as exc:
+                raise MediaVerificationError("staged collection file is missing or differs from its commitment") from exc
+            return payload, hashlib.sha256(payload).hexdigest()
+        return await self._read_bounded(client, self._s3_signed_url("GET", key, 300), size)
 
     async def _read_bounded(
         self,
@@ -370,6 +456,13 @@ class CollectionMediaPipeline:
         )
 
     def _require_s3(self) -> None:
+        if self.settings.collection_storage_backend == "filesystem":
+            from .collection_local_storage import LocalStorage
+            try:
+                LocalStorage(self.settings)
+            except ValueError as exc:
+                raise MediaPipelineUnavailable(str(exc)) from exc
+            return
         missing = [
             name
             for name, value in (
@@ -391,10 +484,10 @@ class CollectionMediaPipeline:
             name
             for name, value in (
                 ("IPFS API", self.settings.collection_ipfs_api_url),
-                ("IPFS pinning service", self.settings.collection_ipfs_pinning_service_url),
-                ("IPFS pinning token", self.settings.collection_ipfs_pinning_token),
+                ("IPFS pinning service", self.settings.collection_ipfs_pinning_mode == "kubo" or self.settings.collection_ipfs_pinning_service_url),
+                ("IPFS pinning token", self.settings.collection_ipfs_pinning_mode == "kubo" or self.settings.collection_ipfs_pinning_token),
                 ("IPFS gateway", self.settings.collection_ipfs_gateway_url),
-                ("malware scanner", self.settings.collection_malware_scan_url),
+                ("malware scanner", self.settings.collection_clamav_socket if self.settings.collection_malware_scan_backend == "clamav" else self.settings.collection_malware_scan_url),
             )
             if not value
         ]
@@ -405,7 +498,7 @@ class CollectionMediaPipeline:
 
     def _require_private_services(self) -> None:
         self._require_s3()
-        if not self.settings.collection_malware_scan_url:
+        if not (self.settings.collection_clamav_socket if self.settings.collection_malware_scan_backend == "clamav" else self.settings.collection_malware_scan_url):
             raise MediaPipelineUnavailable(
                 "collection private-document scanner is not configured"
             )

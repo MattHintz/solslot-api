@@ -530,6 +530,9 @@ async def presign_collection_asset(
             asset_id=body.asset_id,
             filename=body.filename,
             private=body.visibility == "PRIVATE",
+            expected_sha256=body.sha256,
+            expected_byte_size=body.byte_size,
+            expected_mime_type=body.mime_type,
         )
     except (MediaPipelineUnavailable, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
