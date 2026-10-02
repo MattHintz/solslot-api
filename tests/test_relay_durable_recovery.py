@@ -380,3 +380,121 @@ def test_malformed_evm_quantity_retains_422_error_contract(rig,field):
     values[field]='not-an-integer'
     with pytest.raises(HTTPException) as err:relay.relay(relay.RelayRequest(**values),rig.request)
     assert err.value.status_code==422 and rig.w3.eth.send_count==0
+
+
+@pytest.fixture
+def base_rig(rig, monkeypatch):
+    """Retain real signatures/SQLite while replacing only the RPC and chain selector."""
+    rig.settings.__dict__.update(zkpassport_evm_chain_id=8453,
+        zkpassport_base_relay_max_fee_wei=100_000_000_000_000,
+        zkpassport_base_relay_daily_fee_wei=1_000_000_000_000_000)
+    rig.w3.eth.chain_id=8453
+    rig.w3.eth.max_priority_fee=1_000_000
+    monkeypatch.setattr(rig.w3.eth, 'get_block', lambda *a: {'number':100,'baseFeePerGas':10_000_000})
+    monkeypatch.setattr(rig.w3.eth, 'get_balance', lambda *a: 10**17, raising=False)
+    original_contract=rig.w3.eth.contract
+    class FeeCall:
+        def call(self):return 1_000_000_000
+    class FeeFunctions:
+        def getL1FeeUpperBound(self,*a):return FeeCall()
+        def getOperatorFee(self,*a):return FeeCall()
+    def contract(*a, **kwargs):
+        if kwargs.get('address','').lower()=='0x420000000000000000000000000000000000000f':
+            return SimpleNamespace(functions=FeeFunctions())
+        return original_contract(*a,**kwargs)
+    monkeypatch.setattr(rig.w3.eth, 'contract', contract)
+    monkeypatch.setattr(relay, '_settings_for_enrollment', lambda *a: (rig.settings, None))
+    return rig
+
+
+@pytest.mark.parametrize('mode',['bls','evm'])
+def test_base_fee_budget_retained_and_exact_retry_is_not_charged_twice(base_rig,monkeypatch,mode):
+    rig=base_rig
+    action=rig.setup(mode)
+    rig.w3.eth.fail=True
+    first=action()
+    before=rig.counts.copy()
+    retained=rig.ledger.get_relay_transaction(VAULT)
+    fee=rig.ledger.get_relay_fee_reservation(retained['request_digest'])
+    assert fee['maximum_fee_wei']=='100000000000000'
+    assert fee['chain_id']==8453
+    quote=json.loads(fee['quote_json'])
+    assert quote['gas']==1_250_000 and quote['maxFeePerGas']==21_000_000
+    monkeypatch.setattr(relay.time,'time',lambda:rig.now+6)
+    rig.w3.eth.fail=False
+    result=action()
+    assert result.tx_hash==first.tx_hash
+    assert rig.counts==before
+    assert rig.w3.eth.raw[0]==rig.w3.eth.raw[1]
+    assert rig.ledger._conn.execute('SELECT COUNT(*) FROM relay_fee_reservations').fetchone()[0]==1
+
+
+@pytest.mark.parametrize('mode',['bls','evm'])
+@pytest.mark.parametrize('failure',['disabled','expensive','low_balance'])
+def test_base_fee_failure_never_reserves_signs_or_sends(base_rig,monkeypatch,caplog,mode,failure):
+    rig=base_rig
+    action=rig.setup(mode)
+    if failure=='disabled':rig.settings.__dict__['zkpassport_base_relay_max_fee_wei']=0
+    elif failure=='expensive':
+        monkeypatch.setattr(rig.w3.eth, 'get_block', lambda *a:{'number':100,'baseFeePerGas':10**12})
+    else:monkeypatch.setattr(rig.w3.eth, 'get_balance',lambda *a:0)
+    with pytest.raises(HTTPException) as exc:action()
+    assert exc.value.status_code==503
+    assert rig.counts['sign']==0 and rig.w3.eth.send_count==0
+    assert rig.ledger.get_relay_attempt(VAULT) is None
+    assert rig.ledger.get_relay_transaction(VAULT) is None
+    events=[json.loads(item.message) for item in caplog.records
+        if item.name==relay.__name__]
+    assert events==[{'event':'identity_relay_fee_check_failed','chainId':8453,
+        'phase':'prepare','code':'BASE_FEE_ALLOWANCE_UNAVAILABLE'}]
+
+
+@pytest.mark.parametrize('mode',['bls','evm'])
+def test_base_network_cost_increase_preserves_signed_bytes_for_later_retry(base_rig,monkeypatch,mode):
+    rig=base_rig
+    action=rig.setup(mode)
+    first=action()
+    retained=rig.ledger.get_relay_transaction(VAULT)
+    monkeypatch.setattr(relay.time,'time',lambda:rig.now+6)
+    monkeypatch.setattr(rig.w3.eth, 'get_block',lambda *a:{'number':101,'baseFeePerGas':10**12})
+    with pytest.raises(HTTPException) as exc:action()
+    assert exc.value.status_code==503
+    assert rig.w3.eth.send_count==1
+    assert rig.ledger.get_relay_transaction(VAULT)==retained
+    assert first.tx_hash==retained['tx_hash']
+
+
+def test_daily_base_fee_reservations_are_atomic_across_workers(base_rig):
+    rig=base_rig
+    from solslot_api.identity_relay_fees import quote_base_transaction
+    other=CredentialLedger(rig.tmp_path/'relay.db')
+    rig.settings.__dict__['zkpassport_base_relay_daily_fee_wei']=100_000_000_000_000
+    def prepare(index, ledger):
+        vault='0x'+f'{index+100:064x}'
+        parent='0x'+f'{index+200:064x}'
+        bridge='0x'+f'{index+300:064x}'
+        digest='0x'+f'{index+400:064x}'
+        record={**rig.record,'vaultLauncherId':vault,'bridgeParentId':parent,'bridgeCoinId':bridge}
+        ledger.reserve_enrollment(record=record,owner_key=BLS,max_pending_per_owner=20)
+        ledger.reserve_relay(request_digest=digest,vault_launcher_id=vault,owner_key=BLS,
+            source_ip=str(index),bridge_coin_id=bridge,forwarder_nonce=index,inner_gas=1_000_000,
+            per_ip_per_minute=100,per_owner_per_minute=100,per_vault_per_hour=100,global_gas_per_day=20_000_000)
+        tx,quote=quote_base_transaction(
+            rig.settings,rig.w3,{'chainId':8453,'nonce':9,'from':RELAYER.address,
+                'to':EMITTER,'data':'0x1234','gas':1_250_000,'value':0})
+        try:
+            ledger.prepare_relay_transaction(request_digest=digest,context=dict(owner=BLS,vaultLauncherId=vault,bridgeCoinId=bridge),
+                request={'data':'0x1234'},transaction=tx,sign_transaction=RELAYER.sign_transaction,
+                retry_until=int(time.time())+900,base_fee_quote=quote)
+            return 'signed'
+        except Exception as exc:
+            from solslot_api.credential_ledger import LedgerRateLimited
+            assert isinstance(exc,LedgerRateLimited)
+            return 'budget_exhausted'
+    try:
+        with ThreadPoolExecutor(2) as pool:
+            outcomes=list(pool.map(lambda pair:prepare(*pair),[(1,rig.ledger),(2,other)]))
+        assert sorted(outcomes)==['budget_exhausted','signed']
+        assert rig.ledger._conn.execute('SELECT COUNT(*) FROM relay_transactions').fetchone()[0]==1
+        assert rig.ledger._conn.execute('SELECT COUNT(*) FROM relay_fee_reservations').fetchone()[0]==1
+    finally:other.close()

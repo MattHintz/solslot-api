@@ -194,6 +194,7 @@ def create_validator_app(
         )
         identity_provider = None
         application.state.identity_deployment = None
+        application.state.identity_provider = None
         if Path(signer_settings.public_artifact_path).is_file():
             artifact, _release = load_validator_artifact(signer_settings)
             identity_provider = create_chia_provider(
@@ -204,6 +205,7 @@ def create_validator_app(
                 )
             )
             await identity_provider.start()
+            application.state.identity_provider = identity_provider
             coordinator = _coordinator_settings(signer_settings, artifact)
             application.state.identity_deployment = (
                 await load_effective_identity_deployment(
@@ -285,11 +287,26 @@ def create_validator_app(
         "/v1/zkpassport/sign",
         response_model=ValidatorSignatureResponse,
     )
-    def sign(request: ValidatorSignRequest) -> ValidatorSignatureResponse:
+    async def sign(request: ValidatorSignRequest) -> ValidatorSignatureResponse:
         signer_settings = current_settings()
         active_ledger: ValidatorLedger = application.state.validator_ledger
         try:
-            signature = sign_validator_claim(
+            if signer_settings.identity_deployment_amendment_path:
+                from .identity_deployment import (IdentityDeploymentError,
+                    load_effective_identity_deployment, require_runtime_identity_bindings)
+                provider = getattr(application.state, "identity_provider", None)
+                if provider is None:
+                    raise ValidatorEvidenceError("confirmed identity history provider is unavailable")
+                artifact, _release = load_validator_artifact(signer_settings)
+                coordinator = _coordinator_settings(signer_settings, artifact)
+                try:
+                    selected = await load_effective_identity_deployment(coordinator, provider=provider)
+                    require_runtime_identity_bindings(coordinator, selected)
+                except IdentityDeploymentError as exc:
+                    raise ValidatorEvidenceError(str(exc)) from exc
+            # Synchronous RPC and ledger work must not block the ASGI loop.
+            from starlette.concurrency import run_in_threadpool
+            signature = await run_in_threadpool(sign_validator_claim,
                 signer_settings,
                 active_ledger,
                 request.claim,

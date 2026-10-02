@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from functools import cache
 import re
@@ -58,8 +59,18 @@ from .zkpassport_enrollments import (
     _settings_for_enrollment,
 )
 from .evm_relay_transaction import canonical_receipt
+from .identity_relay_fees import quote_base_transaction, check_base_dispatch, RelayFeeUnavailable
 
 router = APIRouter(prefix="/zkpassport", tags=["zkpassport"])
+_logger = logging.getLogger(__name__)
+
+
+def _fee_failure(phase: str, *, provider_unavailable: bool = False) -> None:
+    # Do not include exception strings, RPC payloads, owners, or proof calldata.
+    _logger.warning(json.dumps({"event": "identity_relay_fee_check_failed",
+        "chainId": 8453, "phase": phase,
+        "code": "BASE_FEE_RPC_UNAVAILABLE" if provider_unavailable else "BASE_FEE_ALLOWANCE_UNAVAILABLE"},
+        sort_keys=True))
 
 # First 4 bytes of keccak256("verifyAndEmit((bytes32,bytes32,uint64),bytes)").
 _VERIFY_AND_EMIT_SELECTOR = "0xd33b3d83"
@@ -68,9 +79,8 @@ _REVERT_SELECTOR_RE = re.compile(r"0x[0-9a-fA-F]{8}")
 _KNOWN_REVERT_SELECTORS = {
     "0xd6bda275": (
         "OpenZeppelin FailedCall(): the trusted forwarder accepted the request, "
-        "but the emitter call reverted. Refresh the enrollment and QR; if it "
-        "persists, the proof domain/scope or bridge coin fields do not match "
-        "the deployed emitter."
+        "but the emitter call reverted during simulation. No transaction was sent. "
+        "The inner diagnostic identifies the verification stage that failed."
     ),
     "0xd611c318": "ProofVerificationFailed(): zkPassport verifier rejected the proof.",
     "0xa54999ed": "ScopeMismatch(): zkPassport proof scope does not match this vault.",
@@ -185,7 +195,8 @@ def _decode_enrollment_calldata(data: bytes) -> tuple[str, str, int]:
     return parsed.vault, parsed.parent, parsed.amount
 
 
-def _validate_relay_permit(settings, enrollment, session, data: bytes, *, live=False):
+def _validate_relay_permit(settings, enrollment, session, data: bytes, *, live=False,
+        identity_deployment=None):
     from .enrollment_permit_runtime import require_calldata_record, require_private_age_query
     selected = bool(settings.enrollment_permit_release_identity or enrollment.get("enrollmentPermit"))
     permit = _record_permit(settings, enrollment, owner_auth_type=session.vault_record.auth_type,
@@ -199,7 +210,8 @@ def _validate_relay_permit(settings, enrollment, session, data: bytes, *, live=F
             raise ValueError('Identity runtime policy differs from the signed genesis')
         if requires_sanctions:
             from .enrollment_permit_runtime import require_private_eligibility_query
-            require_private_eligibility_query(data, artifact)
+            require_private_eligibility_query(data, artifact,
+                identity_deployment=identity_deployment)
         elif selected:
             require_private_age_query(data, environment=settings.runtime_environment + '-alpha')
     except ValueError as exc:
@@ -223,10 +235,55 @@ def _require_relayer_account(settings: Settings):
         ) from exc
 
 
+# Only these exact upstream revert reasons may leave the proof boundary.
+# Error data and provider messages can contain proofs, signatures or request
+# fields. Never log or return their contents, even for unknown errors.
+_KNOWN_STANDARD_REVERTS = {
+    "Invalid certificate registry root": (
+        "ZKP_CERTIFICATE_ROOT_UNSUPPORTED: the selected identity network does not "
+        "accept this proof's certificate registry root. Solslot must correct its "
+        "verifier network configuration; refreshing or rescanning cannot fix this."
+    ),
+    "Invalid circuit registry root": "ZKP_CIRCUIT_ROOT_UNSUPPORTED: the selected identity network does not accept this circuit registry root.",
+    "Verifier not found": "ZKP_CIRCUIT_UNREGISTERED: this proof circuit is not registered on the selected identity network.",
+    "Subverifier not found for version": "ZKP_VERSION_UNREGISTERED: this proof version is not registered on the selected identity network.",
+    "Invalid domain or scope": "ZKP_SCOPE_MISMATCH: the proof does not match the configured Solslot domain and vault scope.",
+    "Invalid commitment": "ZKP_COMMITMENT_MISMATCH: the proof commitments do not match the submitted private check parameters.",
+    "Invalid committed inputs length": "ZKP_COMMITTED_INPUT_LENGTH: the private check parameter encoding is inconsistent.",
+    "Invalid parameter commitments": "ZKP_PARAMETER_COUNT: the private check parameter count is inconsistent.",
+    "The proof was generated outside the validity period": "ZKP_PROOF_EXPIRED: the proof is outside the permitted validity period.",
+    "Invalid sanctions registry root": "ZKP_SANCTIONS_ROOT_UNSUPPORTED: the selected identity network does not accept this sanctions registry root.",
+    "Invalid sanctions check mode": "ZKP_SANCTIONS_MODE_MISMATCH: the proof does not match the required sanctions matching mode.",
+    "Invalid OPRF public key": "ZKP_OPRF_KEY_MISMATCH: the selected verifier does not accept this nullifier key.",
+    "globalOPRFPubKeyHash hash not set": "ZKP_OPRF_KEY_UNAVAILABLE: the selected verifier has no nullifier key configured.",
+    "Mock proofs are only allowed in dev mode": "ZKP_REAL_DOCUMENT_REQUIRED: this verification requires a real document.",
+    "Root verifier is paused": "ZKP_ROOT_PAUSED: the upstream root verifier is paused.",
+    "Contract is paused": "ZKP_SUBVERIFIER_PAUSED: the upstream circuit verifier is paused.",
+}
+
+
+def _standard_revert_diagnostic(exc: BaseException) -> str | None:
+    # ContractLogicError.data carries the actual revert, rather than the
+    # provider's echoed transaction. Bound its size before ABI decoding.
+    raw = getattr(exc, "data", None)
+    if not isinstance(raw, str) or not raw.startswith("0x08c379a0") or len(raw) > 1034:
+        return None
+    try:
+        encoded = bytes.fromhex(raw[10:])
+        reason, = abi_decode(["string"], encoded, strict=True)
+        if abi_encode(["string"], [reason]) != encoded:
+            return None
+    except Exception:
+        return None
+    return _KNOWN_STANDARD_REVERTS.get(reason)
+
+
 def _describe_revert(exc: BaseException) -> str:
-    # Providers can echo the full request/calldata in their exception. Only
-    # fixed, known diagnostics may leave this boundary; never return raw text
-    # or unrecognized bytes from an identity verification request.
+    standard = _standard_revert_diagnostic(exc)
+    if standard is not None:
+        return standard
+    # Preserve existing custom-error diagnostics. Raw provider text and
+    # unrecognized revert bytes remain private.
     descriptions = []
     for match in _REVERT_SELECTOR_RE.findall(str(exc)):
         selector = match.lower()
@@ -398,7 +455,7 @@ def _relay_receipt_state(w3, settings, saved, enrollment, session):
         bridgeMessage=event.bridge_message,validatorMessage=event.validator_message))
 
 
-def _dispatch_saved(w3,settings,saved,session):
+def _dispatch_saved(w3,settings,saved,session,*,identity_deployment=None):
     require_alpha_writes(settings)
     if getattr(session, 'scope', 'vault') != 'vault':
         raise HTTPException(status_code=403, detail='Reconnect for full vault authorization before resubmitting the retained transaction.')
@@ -409,7 +466,20 @@ def _dispatch_saved(w3,settings,saved,session):
     _require_enrollment_bridge_policy(settings,enrollment,execution=True)
     request_payload = json.loads(saved['request_json'])
     _validate_relay_permit(settings, enrollment, session,
-        Web3.to_bytes(hexstr=request_payload['data']), live=True)
+        Web3.to_bytes(hexstr=request_payload['data']), live=True,
+        identity_deployment=identity_deployment)
+    if saved['chain_id'] == 8453:
+        fee_reservation = ledger.get_relay_fee_reservation(saved['request_digest'])
+        if fee_reservation is None:
+            raise HTTPException(status_code=503, detail='The retained Base transaction has no reviewed sponsorship budget.')
+        try:
+            check_base_dispatch(settings, w3, json.loads(fee_reservation['quote_json']))
+        except RelayFeeUnavailable as exc:
+            _fee_failure('dispatch')
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except Exception as exc:
+            _fee_failure('dispatch', provider_unavailable=True)
+            raise HTTPException(status_code=502, detail='The identity network fee check is unavailable. The original transaction is preserved.') from exc
     try:
         saved=ledger.begin_relay_dispatch(saved['request_digest'])
     except LedgerRateLimited as exc:
@@ -428,11 +498,14 @@ def _dispatch_saved(w3,settings,saved,session):
     ledger.finish_relay_dispatch(request_digest=saved['request_digest'],accepted=accepted,
         failure_threshold=settings.zkpassport_relay_circuit_failure_threshold,
         cooldown_seconds=settings.zkpassport_relay_circuit_cooldown_seconds)
+    _logger.info(json.dumps({"event": "identity_relay_dispatch", "chainId": saved['chain_id'],
+        "transactionHash": saved['tx_hash'], "attempt": saved['dispatch_count'],
+        "status": 'submitted' if accepted else 'unknown'}, sort_keys=True))
     return RelayResponse(tx_hash=saved['tx_hash'],relayer=saved['relayer'],signer=session.owner_key,
         submission_status='submitted' if accepted else 'unknown')
 
 
-def _resume_saved(settings,enrollment,session,saved,*,dispatch):
+def _resume_saved(settings,enrollment,session,saved,*,dispatch,identity_deployment=None):
     w3=_w3(settings.zkpassport_evm_rpc_url)
     _check_saved_deployment(w3,settings,saved)
     outcome=_relay_receipt_state(w3,settings,saved,enrollment,session)
@@ -443,7 +516,7 @@ def _resume_saved(settings,enrollment,session,saved,*,dispatch):
     if dispatch:
         if enrollment['status']!='reserved':
             raise HTTPException(status_code=409,detail='Enrollment has advanced; check its receipt without submitting again.')
-        _dispatch_saved(w3,settings,saved,session)
+        _dispatch_saved(w3,settings,saved,session,identity_deployment=identity_deployment)
     return RelayRecoveryResponse(vaultLauncherId=enrollment['vaultLauncherId'],status='pending',txHash=saved['tx_hash'],
         canResubmit=enrollment['status']=='reserved' and settings.alpha_writes_enabled)
 
@@ -472,7 +545,8 @@ def get_relay_recovery(vault_launcher_id: str,request: Request):
         raise HTTPException(status_code=403,detail='The retained relay belongs to a different vault owner.')
     if ledger.get_relay_transaction(enrollment['vaultLauncherId']) is None:
         return RelayRecoveryResponse(vaultLauncherId=enrollment['vaultLauncherId'],status='incomplete',txHash=attempt['tx_hash'])
-    return _resume_saved(settings,enrollment,session,_saved_relay(settings,enrollment,session),dispatch=False)
+    return _resume_saved(settings,enrollment,session,_saved_relay(settings,enrollment,session),
+        dispatch=False,identity_deployment=_identity_deployment)
 
 
 @router.post('/relay/{vault_launcher_id}/resume',response_model=RelayRecoveryResponse)
@@ -482,13 +556,15 @@ def resume_relay(vault_launcher_id: str,request: Request):
     settings,_identity_deployment=_settings_for_enrollment(settings,request,enrollment)
     saved=_saved_relay(settings,enrollment,session)
     if saved is None:raise HTTPException(status_code=404,detail='No retained relay transaction exists.')
-    return _resume_saved(settings,enrollment,session,saved,dispatch=True)
+    return _resume_saved(settings,enrollment,session,saved,dispatch=True,
+        identity_deployment=_identity_deployment)
 
 
-def _existing_response(settings,enrollment,session,payload):
+def _existing_response(settings,enrollment,session,payload,*,identity_deployment=None):
     saved=_saved_relay(settings,enrollment,session,payload)
     if saved is None:return None
-    outcome=_resume_saved(settings,enrollment,session,saved,dispatch=True)
+    outcome=_resume_saved(settings,enrollment,session,saved,dispatch=True,
+        identity_deployment=identity_deployment)
     return RelayResponse(tx_hash=saved['tx_hash'],relayer=saved['relayer'],signer=session.owner_key,
         submission_status={'pending':'unknown','confirmed':'confirmed','reverted':'reverted','expired':'expired'}[outcome.status])
 
@@ -552,10 +628,13 @@ def relay(req: RelayRequest, request: Request) -> RelayResponse:
     if to != emitter_addr:
         raise HTTPException(status_code=400, detail="request.to must be the enrollment's confirmed emitter.")
     _require_enrollment_bridge_policy(settings,enrollment, execution=True)
-    _validate_relay_permit(settings, enrollment, verified_owner, data_bytes)
-    existing=_existing_response(settings,enrollment,verified_owner,auth_payload)
+    _validate_relay_permit(settings, enrollment, verified_owner, data_bytes,
+        identity_deployment=_identity_deployment)
+    existing=_existing_response(settings,enrollment,verified_owner,auth_payload,
+        identity_deployment=_identity_deployment)
     if existing is not None:return existing
-    permit = _validate_relay_permit(settings, enrollment, verified_owner, data_bytes, live=True)
+    permit = _validate_relay_permit(settings, enrollment, verified_owner, data_bytes, live=True,
+        identity_deployment=_identity_deployment)
     if permit is not None and req.deadline > permit.expires_at:
         raise HTTPException(status_code=409, detail="ForwardRequest outlives the saved permit.")
     if str(enrollment.get("status")) != "reserved":
@@ -652,6 +731,30 @@ def relay(req: RelayRequest, request: Request) -> RelayResponse:
     request_digest = "0x" + hashlib.sha256(
         json.dumps(auth_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+    try:
+        estimated = forwarder.functions.execute(request_tuple).estimate_gas(
+            {"from": account.address, "value": 0}
+        )
+        tx = forwarder.functions.execute(request_tuple).build_transaction(
+            {
+                "from": account.address,
+                "nonce": w3.eth.get_transaction_count(account.address, "pending"),
+                "value": 0,
+                "chainId": settings.zkpassport_evm_chain_id,
+                "gas": int(estimated * 1.25),
+            }
+        )
+        fee_quote = None
+        if settings.zkpassport_evm_chain_id == 8453:
+            tx, fee_quote = quote_base_transaction(settings, w3, tx)
+    except RelayFeeUnavailable as exc:
+        _fee_failure('prepare')
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        if settings.zkpassport_evm_chain_id == 8453:
+            _fee_failure('prepare', provider_unavailable=True)
+        raise HTTPException(status_code=502, detail='Relay fee preparation is unavailable. The proof was not submitted.') from exc
+
     source_ip = trusted_client_ip(request.scope, settings)
     try:
         ledger.reserve_relay(
@@ -674,26 +777,19 @@ def relay(req: RelayRequest, request: Request) -> RelayResponse:
     except LedgerConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    # ── Build, sign, and broadcast the sponsored transaction ──
+    # Sign and retain exact bytes only after both admission budgets pass.
     try:
-        estimated = forwarder.functions.execute(request_tuple).estimate_gas(
-            {"from": account.address, "value": 0}
-        )
-        tx = forwarder.functions.execute(request_tuple).build_transaction(
-            {
-                "from": account.address,
-                "nonce": w3.eth.get_transaction_count(account.address, "pending"),
-                "value": 0,
-                "chainId": settings.zkpassport_evm_chain_id,
-                "gas": int(estimated * 1.25),
-            }
-        )
         saved=ledger.prepare_relay_transaction(request_digest=request_digest,context=context,request=auth_payload,
-            transaction=tx,sign_transaction=account.sign_transaction,retry_until=req.deadline)
+            transaction=tx,sign_transaction=account.sign_transaction,retry_until=req.deadline,
+            base_fee_quote=fee_quote)
+    except LedgerRateLimited as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except LedgerConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         # Nothing may be sent unless the exact signed bytes committed first.
         raise HTTPException(status_code=502,detail='Relay transaction preparation failed. Check the retained reservation before retrying.') from exc
-    return _dispatch_saved(w3,settings,saved,verified_owner)
+    return _dispatch_saved(w3,settings,saved,verified_owner,identity_deployment=_identity_deployment)
 
 
 @router.post(
@@ -739,11 +835,14 @@ def relay_bls(req: BlsRelayRequest, request: Request) -> RelayResponse:
         raise HTTPException(status_code=503, detail="The selected identity deployment is incomplete.") from exc
     _require_enrollment_bridge_policy(settings,enrollment, execution=True)
     payload=_normalized_request(req)
-    _validate_relay_permit(settings, enrollment, session, data_bytes)
-    existing=_existing_response(settings,enrollment,session,payload)
+    _validate_relay_permit(settings, enrollment, session, data_bytes,
+        identity_deployment=_identity_deployment)
+    existing=_existing_response(settings,enrollment,session,payload,
+        identity_deployment=_identity_deployment)
     if existing is not None:return existing
     context=_relay_context(settings,enrollment,session)
-    permit = _validate_relay_permit(settings, enrollment, session, data_bytes, live=True)
+    permit = _validate_relay_permit(settings, enrollment, session, data_bytes, live=True,
+        identity_deployment=_identity_deployment)
     retry_until=min(int(time.time())+900, permit.expires_at) if permit is not None else int(time.time())+900
     account=_require_relayer_account(settings)
     verified_owner = verify_owner_auth(
@@ -832,6 +931,28 @@ def relay_bls(req: BlsRelayRequest, request: Request) -> RelayResponse:
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+    try:
+        tx = {
+            "from": account.address,
+            "to": emitter_addr,
+            "value": 0,
+            "data": data_bytes,
+            "nonce": relayer_nonce,
+            "chainId": settings.zkpassport_evm_chain_id,
+            "gas": int(estimated * 1.25),
+            "gasPrice": int(w3.eth.gas_price),
+        }
+        fee_quote = None
+        if settings.zkpassport_evm_chain_id == 8453:
+            tx, fee_quote = quote_base_transaction(settings, w3, tx)
+    except RelayFeeUnavailable as exc:
+        _fee_failure('prepare')
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        if settings.zkpassport_evm_chain_id == 8453:
+            _fee_failure('prepare', provider_unavailable=True)
+        raise HTTPException(status_code=502, detail='Relay fee preparation is unavailable. The proof was not submitted.') from exc
+
     source_ip = trusted_client_ip(request.scope, settings)
     try:
         ledger.reserve_relay(
@@ -855,18 +976,13 @@ def relay_bls(req: BlsRelayRequest, request: Request) -> RelayResponse:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     try:
-        tx = {
-            "from": account.address,
-            "to": emitter_addr,
-            "value": 0,
-            "data": data_bytes,
-            "nonce": relayer_nonce,
-            "chainId": settings.zkpassport_evm_chain_id,
-            "gas": int(estimated * 1.25),
-            "gasPrice": int(w3.eth.gas_price),
-        }
         saved=ledger.prepare_relay_transaction(request_digest=request_digest,context=context,request=payload,
-            transaction=tx,sign_transaction=account.sign_transaction,retry_until=retry_until)
+            transaction=tx,sign_transaction=account.sign_transaction,retry_until=retry_until,
+            base_fee_quote=fee_quote)
+    except LedgerRateLimited as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except LedgerConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502,detail='Relay transaction preparation failed. Check the retained reservation before retrying.') from exc
-    return _dispatch_saved(w3,settings,saved,session)
+    return _dispatch_saved(w3,settings,saved,session,identity_deployment=_identity_deployment)

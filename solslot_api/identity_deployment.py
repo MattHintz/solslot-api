@@ -28,6 +28,8 @@ from solslot_puzzles.identity_deployment_amendment import (
     verify_statement_against_records,
 )
 
+from solslot_puzzles import identity_network_amendment as network_amendment
+
 from .admin_authority_v3 import (
     _inner_from_full_puzzle,
     _program,
@@ -183,6 +185,7 @@ def settings_for_identity_deployment(
     return settings.model_copy(
         update={
             "zkpassport_evm_chain_id": deployment["evmChainId"],
+            "zkpassport_evm_rpc_url": identity_rpc_url(settings, deployment["evmChainId"]),
             "zkpassport_forwarder_address": addresses["forwarder"],
             "zkpassport_verifier_adapter_address": addresses["verifierAdapter"],
             "zkpassport_emitter_address": addresses["attestationEmitter"],
@@ -190,6 +193,20 @@ def settings_for_identity_deployment(
             "zkpassport_bridge_policy_hash": deployment["chiaBridgePolicyHash"],
         }
     )
+
+
+def identity_rpc_url(settings: Settings, chain_id: int) -> str:
+    # URL selection is local release configuration. Every receipt reader still
+    # verifies eth_chainId before trusting any event from this endpoint.
+    if chain_id == 8453:
+        url = settings.zkpassport_base_evm_rpc_url
+    elif chain_id == settings.zkpassport_evm_chain_id:
+        url = settings.zkpassport_evm_rpc_url
+    else:
+        raise IdentityDeploymentError("identity chain has no reviewed RPC mapping")
+    if not url.startswith("https://"):
+        raise IdentityDeploymentError("identity RPC must use HTTPS")
+    return url
 
 
 @dataclass(frozen=True)
@@ -231,7 +248,8 @@ def _condition_messages(puzzle: Program, solution: Program) -> list[bytes]:
         ConditionOpcode.CREATE_COIN_ANNOUNCEMENT,
     ):
         for condition in conditions.get(opcode, []):
-            if condition.vars and condition.vars[0].startswith(ANNOUNCEMENT_PREFIX):
+            if condition.vars and any(condition.vars[0].startswith(prefix) for prefix in
+                                      (ANNOUNCEMENT_PREFIX, network_amendment.ANNOUNCEMENT_PREFIX)):
                 messages.append(condition.vars[0])
     return messages
 
@@ -272,7 +290,9 @@ async def discover_confirmed_identity_amendments(
             raise IdentityDeploymentError("authority spend emitted multiple identity amendments")
         if messages:
             message = messages[0]
-            if len(message) != len(ANNOUNCEMENT_PREFIX) + 32:
+            prefix = (network_amendment.ANNOUNCEMENT_PREFIX
+                      if message.startswith(network_amendment.ANNOUNCEMENT_PREFIX) else ANNOUNCEMENT_PREFIX)
+            if len(message) != len(prefix) + 32:
                 raise IdentityDeploymentError("identity amendment announcement is malformed")
             parsed = __import__(
                 "solslot_puzzles.admin_authority_v3_driver",
@@ -280,7 +300,7 @@ async def discover_confirmed_identity_amendments(
             ).parse_inner_puzzle(_inner_from_full_puzzle(puzzle))
             found.append(
                 ChainAmendment(
-                    digest="0x" + message[len(ANNOUNCEMENT_PREFIX) :].hex(),
+                    digest="0x" + message[len(prefix) :].hex(),
                     authority_coin_id=coin.coin_id,
                     authority_version=int(parsed.state.authority_version),
                     spent_height=coin.spent_height,
@@ -337,20 +357,20 @@ async def _verify_activation_boundary(
         raise IdentityDeploymentError("activation spend does not enforce the reviewed expiry")
 
 
-async def load_effective_identity_deployment(
+async def _load_revision_one(
     settings: Settings,
     *,
     provider: ChiaProvider,
+    base: Mapping[str, Any],
+    amendments: tuple[ChainAmendment, ...],
 ) -> dict[str, Any]:
-    """Return genesis or the latest confirmed amendment; fail closed on drift."""
-    base = load_signed_public_artifact(settings)
-    amendments = await discover_confirmed_identity_amendments(provider=provider, artifact=base)
+    """Preserve revision-one parsing and hashing."""
     configured = bool(settings.identity_deployment_amendment_path)
     required_config = (
         settings.identity_deployment_artifact_path,
         settings.identity_deployment_plan_hash,
     )
-    if configured != all(bool(value) for value in required_config):
+    if any(bool(value) for value in (settings.identity_deployment_amendment_path, *required_config)) and not (configured and all(bool(value) for value in required_config)):
         raise IdentityDeploymentError("identity deployment activation configuration is incomplete")
     if not configured:
         if amendments:
@@ -426,6 +446,69 @@ async def load_effective_identity_deployment(
             ),
         )
     except ValueError as exc:
+        raise IdentityDeploymentError(str(exc)) from exc
+
+
+def _network_configuration(settings: Settings) -> bool:
+    values = (settings.identity_network_amendment_path,
+              settings.identity_network_artifact_path, settings.identity_network_plan_hash)
+    if any(values) and not all(values):
+        raise IdentityDeploymentError("identity network candidate configuration is incomplete")
+    return all(values)
+
+
+async def load_confirmed_identity_predecessor(settings: Settings, *, provider: ChiaProvider,
+                                             base: Mapping[str, Any],
+                                             amendments: tuple[ChainAmendment, ...]) -> network_amendment.ConfirmedPredecessor:
+    if not amendments or not amendments[0].announcement.startswith(ANNOUNCEMENT_PREFIX):
+        raise IdentityDeploymentError("confirmed revision-one predecessor is missing")
+    # This verifies the actual authority spend, roster/identity spends, expiry,
+    # body digest and deployment records, not just an off-chain anchor object.
+    await _load_revision_one(settings, provider=provider, base=base, amendments=amendments[:1])
+    statement = parse_canonical_statement(_read_bounded(
+        settings.identity_deployment_amendment_path, MAX_AMENDMENT_BYTES, "predecessor amendment"))
+    selected = amendments[0]
+    predecessor = network_amendment.ConfirmedPredecessor(
+        statement=statement, deployment_artifact=_deployment_artifact(settings.identity_deployment_artifact_path),
+        deployment_plan_hash=settings.identity_deployment_plan_hash,
+        anchor=ConfirmedAmendmentAnchor(amendment_hash=selected.digest,
+            authority_launcher_id=statement["activationBoundary"]["authorityLauncherId"],
+            spent_authority_coin_id=selected.authority_coin_id, authority_version=selected.authority_version,
+            confirmed_height=selected.spent_height, confirmed_timestamp=statement["approvalExpiresAt"],
+            announcement=selected.announcement))
+    predecessor.verify(base)
+    return predecessor
+
+
+async def load_effective_identity_deployment(settings: Settings, *, provider: ChiaProvider) -> dict[str, Any]:
+    """Select only the exact confirmed revision; staging is not activation."""
+    base = load_signed_public_artifact(settings)
+    amendments = await discover_confirmed_identity_amendments(provider=provider, artifact=base)
+    configured = _network_configuration(settings)
+    if len(amendments) < 2:
+        return await _load_revision_one(settings, provider=provider, base=base, amendments=amendments)
+    if len(amendments) != 2 or not configured:
+        raise IdentityDeploymentError("latest confirmed revision requires its identity network candidate body")
+    try:
+        predecessor = await load_confirmed_identity_predecessor(
+            settings, provider=provider, base=base, amendments=amendments)
+        statement = network_amendment.parse_canonical_statement(_read_bounded(
+            settings.identity_network_amendment_path, MAX_AMENDMENT_BYTES, "identity network amendment"))
+        selected = amendments[1]
+        if (network_amendment.amendment_hash(statement) != selected.digest or
+                selected.announcement != network_amendment.announcement_message(selected.digest)):
+            raise IdentityDeploymentError("network candidate is not the latest confirmed revision")
+        await _verify_activation_boundary(provider=provider, artifact=base, statement=statement, selected=selected)
+        anchor = network_amendment.ConfirmedNetworkAnchor(amendment_hash=selected.digest,
+            authority_launcher_id=statement["activationBoundary"]["authorityLauncherId"],
+            spent_authority_coin_id=selected.authority_coin_id, authority_version=selected.authority_version,
+            confirmed_height=selected.spent_height, confirmed_timestamp=statement["approvalExpiresAt"],
+            announcement=selected.announcement)
+        return network_amendment.resolve_effective_identity_deployment(
+            base_artifact=base, deployment_artifact=_deployment_artifact(settings.identity_network_artifact_path),
+            deployment_plan_hash=settings.identity_network_plan_hash, statement=statement,
+            predecessor=predecessor, anchor=anchor)
+    except (ValueError, UnicodeError) as exc:
         raise IdentityDeploymentError(str(exc)) from exc
 
 

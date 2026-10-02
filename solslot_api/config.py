@@ -703,6 +703,14 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
     # The signed enrollment activation independently pins the exact identity
     # chain; complete issuer metadata is mandatory for either selected chain.
     identity_chains = {8453, 84532} if all(permit_metadata) else {expected_evm_chain_id}
+    network_metadata = (settings.identity_network_amendment_path,
+                        settings.identity_network_artifact_path, settings.identity_network_plan_hash)
+    if any(network_metadata):
+        if settings.network != "testnet11" or not all(network_metadata) or not all((
+            settings.identity_deployment_amendment_path, settings.identity_deployment_artifact_path,
+            settings.identity_deployment_plan_hash)):
+            raise RuntimeError("Identity network amendment requires complete isolated Testnet evidence.")
+        identity_chains.add(8453)
     if settings.zkpassport_evm_chain_id not in identity_chains:
         raise RuntimeError(
             "SOLSLOT_ZKPASSPORT_EVM_CHAIN_ID does not match the selected identity deployment."
@@ -1010,6 +1018,10 @@ class Settings(BaseSettings):
     identity_deployment_amendment_path: str = ""
     identity_deployment_artifact_path: str = ""
     identity_deployment_plan_hash: str = ""
+    # A separately staged candidate never replaces the confirmed V1 evidence.
+    identity_network_amendment_path: str = ""
+    identity_network_artifact_path: str = ""
+    identity_network_plan_hash: str = ""
     # Public, version-pinned issuer coordinates only; private keys remain in Key Vault.
     enrollment_permit_release_identity: str = ""
     enrollment_permit_issuer_key_ref: str = ""
@@ -1294,6 +1306,7 @@ class Settings(BaseSettings):
     )
     # JSON-RPC endpoint the relayer uses (defaults to a public Sepolia node).
     zkpassport_evm_rpc_url: str = "https://ethereum-sepolia-rpc.publicnode.com"
+    zkpassport_base_evm_rpc_url: str = "https://mainnet.base.org"
     # EIP-155 chain id the relayer signs for (11155111 = Eth Sepolia).
     zkpassport_evm_chain_id: int = 11155111
     # Fresh V2 addresses are intentionally unset until the EVM ceremony.
@@ -1311,6 +1324,10 @@ class Settings(BaseSettings):
     zkpassport_relay_per_owner_per_minute: int = Field(6, ge=1)
     zkpassport_relay_per_vault_per_hour: int = Field(2, ge=1)
     zkpassport_relay_global_gas_per_day: int = Field(20_000_000, ge=1)
+    # Base uses real ETH even for Testnet11 credentials. Zero disables new
+    # sponsored Base writes until an explicit operating budget is approved.
+    zkpassport_base_relay_max_fee_wei: int = Field(0, ge=0, le=100_000_000_000_000)
+    zkpassport_base_relay_daily_fee_wei: int = Field(0, ge=0, le=1_000_000_000_000_000)
     zkpassport_relay_circuit_failure_threshold: int = Field(5, ge=1)
     zkpassport_relay_circuit_cooldown_seconds: int = Field(900, ge=60)
 

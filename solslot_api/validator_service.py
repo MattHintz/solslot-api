@@ -156,6 +156,7 @@ from .external_settlement import (
 from .faucet import AGG_SIG_ME_DATA
 from .public_artifact import (
     PublicArtifactError,
+    _release_source_shas,
     verify_signed_public_artifact_file,
 )
 from .release_metadata import ReleaseMetadata, load_release_metadata
@@ -276,6 +277,11 @@ def load_validator_artifact(
         raise ValidatorEvidenceError("validator release metadata is missing")
 
     source_shas = artifact.get("sourceShas")
+    if settings.identity_deployment_amendment_path:
+        try:
+            source_shas = _release_source_shas(_coordinator_settings(settings, artifact), artifact)
+        except PublicArtifactError as exc:
+            raise ValidatorEvidenceError(str(exc)) from exc
     bridge = artifact.get("bridgePolicy")
     validators = artifact.get("validatorSet")
     addresses = artifact.get("evmAddresses")
@@ -334,7 +340,9 @@ def load_validator_artifact(
     if activation != settings.enrollment_activation:
         raise ValidatorEvidenceError("signed enrollment activation differs from signer configuration")
     identity_chain = activation['evmChainId'] if activation is not None else artifact.get('evmChainId')
-    if identity_chain != settings.evm_chain_id:
+    # An amendment-backed signer checks chain/address selection against the
+    # complete confirmed history in validator_app before any sign endpoint.
+    if not settings.identity_deployment_amendment_path and identity_chain != settings.evm_chain_id:
         raise ValidatorEvidenceError("signed artifact identity chain does not match signer config")
     return artifact, release
 
@@ -566,6 +574,9 @@ def _coordinator_settings(
         identity_deployment_amendment_path=settings.identity_deployment_amendment_path,
         identity_deployment_artifact_path=settings.identity_deployment_artifact_path,
         identity_deployment_plan_hash=settings.identity_deployment_plan_hash,
+        identity_network_amendment_path=settings.identity_network_amendment_path,
+        identity_network_artifact_path=settings.identity_network_artifact_path,
+        identity_network_plan_hash=settings.identity_network_plan_hash,
         zkpassport_evm_rpc_url=settings.evm_rpc_url,
         zkpassport_evm_chain_id=settings.evm_chain_id,
         zkpassport_evm_min_confirmations=settings.evm_min_confirmations,

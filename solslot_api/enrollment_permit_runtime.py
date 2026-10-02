@@ -89,7 +89,10 @@ def require_private_age_query(data: bytes, *, environment: str) -> None:
         raise ValueError('identity proof must contain only the private age-18 query for this vault')
 
 
-def require_private_eligibility_query(data: bytes, artifact: Mapping[str, Any]) -> None:
+def require_private_eligibility_query(
+    data: bytes, artifact: Mapping[str, Any], *,
+    identity_deployment: Mapping[str, Any] | None = None,
+) -> None:
     from solslot_puzzles.eligibility_policy import identity_policy_from_artifact, require_eligibility_inputs
     if identity_policy_from_artifact(artifact) is None:
         raise ValueError('age-plus-sanctions policy is not selected by the signed genesis')
@@ -102,9 +105,20 @@ def require_private_eligibility_query(data: bytes, artifact: Mapping[str, Any]) 
         raise ValueError('identity proof envelope is malformed') from exc
     if encode([PROOF_PARAMS_ABI], [params]) != parsed.proof:
         raise ValueError('identity proof envelope is not canonical')
-    if params[0] != ACCEPTED_PROOF_VERSION:
-        # Keep the deployed version pin. An SDK/circuit update must never
-        # silently change the emitter selected by the signed genesis.
+    # The immutable genesis accepts 0.20.0. An amended enrollment may also
+    # accept 0.21.0, but only from its previously authenticated deployment.
+    # Never infer acceptance from the browser, SDK or mutable runtime settings.
+    known_versions = {
+        '0.20.0': ACCEPTED_PROOF_VERSION,
+        '0.21.0': bytes.fromhex('000000150000' + '00' * 26),
+    }
+    versions = (identity_deployment.get('acceptedProofVersions')
+                if identity_deployment is not None else ['0.20.0'])
+    if (not isinstance(versions, list) or not versions
+            or any(not isinstance(v, str) or v not in known_versions for v in versions)
+            or len(set(versions)) != len(versions)):
+        raise ValueError('authenticated identity deployment proof versions are invalid')
+    if params[0] not in {known_versions[v] for v in versions}:
         raise ValueError(
             'Solslot identity verifier update required: this proof version is '
             'not supported by the deployed verifier. No new scan is needed '

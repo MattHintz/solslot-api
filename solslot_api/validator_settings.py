@@ -39,6 +39,9 @@ class ValidatorSettings(BaseSettings):
     identity_deployment_amendment_path: str = ""
     identity_deployment_artifact_path: str = ""
     identity_deployment_plan_hash: str = ""
+    identity_network_amendment_path: str = ""
+    identity_network_artifact_path: str = ""
+    identity_network_plan_hash: str = ""
 
     network: Literal["testnet11"] = "testnet11"
     coinset_base_url: str = "https://testnet11.api.coinset.org"
@@ -110,7 +113,13 @@ class ValidatorSettings(BaseSettings):
     def _permit_deployment(self) -> "ValidatorSettings":
         if self.enrollment_activation is None:
             if self.evm_chain_id != 11155111:
-                raise ValueError("Base enrollment requires complete activation evidence")
+                # This is only a completeness check. Startup and every identity
+                # sign request authenticate the full Chia amendment history.
+                evidence = (self.identity_deployment_amendment_path, self.identity_deployment_artifact_path,
+                            self.identity_deployment_plan_hash, self.identity_network_amendment_path,
+                            self.identity_network_artifact_path, self.identity_network_plan_hash)
+                if self.evm_chain_id != 8453 or not all(evidence):
+                    raise ValueError("Base enrollment requires complete activation evidence")
             return self
         from solslot_puzzles.enrollment_activation import validate_enrollment_activation
         value = self.enrollment_activation

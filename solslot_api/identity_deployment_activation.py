@@ -28,6 +28,12 @@ from solslot_puzzles.identity_deployment_amendment import (
     verify_statement_against_records,
 )
 
+from solslot_puzzles import identity_network_amendment as network_amendment
+
+from .identity_deployment import (
+    _network_configuration, discover_confirmed_identity_amendments,
+    load_confirmed_identity_predecessor,
+)
 from .admin_authority_v3 import (
     build_admin_authority_v3_snapshot,
     load_live_singleton_context,
@@ -63,11 +69,12 @@ class IdentityActivationBuild:
         }
 
 
-def _read_canonical_statement(path_text: str) -> dict[str, Any]:
+def _read_canonical_statement(path_text: str, *, network: bool = False) -> dict[str, Any]:
     path = Path(path_text)
     if not path.is_file() or path.is_symlink() or path.stat().st_size > 256 * 1024:
         raise ValueError("identity deployment amendment is unavailable")
-    return parse_canonical_statement(path.read_bytes())
+    parser = network_amendment.parse_canonical_statement if network else parse_canonical_statement
+    return parser(path.read_bytes())
 
 
 def _read_deployment_artifact(path_text: str) -> dict[str, Any]:
@@ -80,13 +87,23 @@ def _read_deployment_artifact(path_text: str) -> dict[str, Any]:
     return value
 
 
+def _activation_paths(settings: Any) -> tuple[str, str, str, bool]:
+    if _network_configuration(settings):
+        return (settings.identity_network_amendment_path, settings.identity_network_artifact_path,
+                settings.identity_network_plan_hash, True)
+    if not all((settings.identity_deployment_amendment_path,
+                settings.identity_deployment_artifact_path, settings.identity_deployment_plan_hash)):
+        raise ValueError("identity deployment activation evidence is not configured")
+    return (settings.identity_deployment_amendment_path, settings.identity_deployment_artifact_path,
+            settings.identity_deployment_plan_hash, False)
+
+
 def identity_activation_request(settings: Any) -> dict[str, Any]:
     """Return the only request body which can activate configured evidence."""
-    if not settings.identity_deployment_amendment_path:
-        raise ValueError("identity deployment activation evidence is not configured")
-    statement = _read_canonical_statement(settings.identity_deployment_amendment_path)
+    path, _deployment_path, _plan, network = _activation_paths(settings)
+    statement = _read_canonical_statement(path, network=network)
     return {
-        "amendmentHash": amendment_hash(statement),
+        "amendmentHash": (network_amendment.amendment_hash(statement) if network else amendment_hash(statement)),
         "revision": int(statement["revision"]),
     }
 
@@ -98,10 +115,9 @@ async def prepare_identity_activation(*, binding: Mapping[str, Any], request: An
         raise ValueError("identity activation must bind the exact activation endpoint")
     if binding.get("query") or binding.get("ifMatch"):
         raise ValueError("identity activation does not accept query or conditional mutation fields")
-    if not settings.identity_deployment_amendment_path or not settings.identity_deployment_artifact_path:
-        raise ValueError("identity deployment activation evidence is not configured")
-    statement = _read_canonical_statement(settings.identity_deployment_amendment_path)
-    digest = amendment_hash(statement)
+    path, deployment_path, plan_hash, network = _activation_paths(settings)
+    statement = _read_canonical_statement(path, network=network)
+    digest = network_amendment.amendment_hash(statement) if network else amendment_hash(statement)
     if dict(binding.get("body") or {}) != {
         "amendmentHash": digest,
         "revision": statement["revision"],
@@ -109,16 +125,24 @@ async def prepare_identity_activation(*, binding: Mapping[str, Any], request: An
         raise ValueError("identity activation request differs from the reviewed amendment")
 
     artifact, evidence, _ = await _verified_evidence_context(settings)
-    deployment = _read_deployment_artifact(settings.identity_deployment_artifact_path)
-    verify_statement_against_records(
-        statement,
-        base_artifact=artifact,
-        deployment_artifact=deployment,
-        deployment_plan_hash=settings.identity_deployment_plan_hash,
-    )
+    deployment = _read_deployment_artifact(deployment_path)
     provider = getattr(request.app.state, "coinset", None)
     if provider is None:
         raise ValueError("Testnet11 Chia provider is unavailable")
+    history = await discover_confirmed_identity_amendments(provider=provider, artifact=artifact)
+    if network:
+        if len(history) != 1:
+            raise ValueError("network activation requires exactly one confirmed predecessor")
+        predecessor = await load_confirmed_identity_predecessor(
+            settings, provider=provider, base=artifact, amendments=history)
+        network_amendment.verify_statement_against_records(
+            statement, base_artifact=artifact, deployment_artifact=deployment,
+            deployment_plan_hash=plan_hash, predecessor=predecessor)
+    else:
+        if history:
+            raise ValueError("revision-one identity deployment is already activated")
+        verify_statement_against_records(statement, base_artifact=artifact,
+            deployment_artifact=deployment, deployment_plan_hash=plan_hash)
     snapshot = await build_admin_authority_v3_snapshot(artifact=artifact, provider=provider)
     if not snapshot.chain_verified or snapshot.current_coin_id is None:
         raise ValueError("administrator authority is not confirmed on Testnet11")
@@ -182,7 +206,8 @@ async def prepare_identity_activation(*, binding: Mapping[str, Any], request: An
             1,
             [
                 [ASSERT_BEFORE_SECONDS_ABSOLUTE, int(statement["approvalExpiresAt"])],
-                [CREATE_PUZZLE_ANNOUNCEMENT, announcement_message(digest)],
+                [CREATE_PUZZLE_ANNOUNCEMENT, (network_amendment.announcement_message(digest)
+                                             if network else announcement_message(digest))],
             ],
         )
     )

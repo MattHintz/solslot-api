@@ -463,6 +463,8 @@ def _with_chain_actions(public, build, value):
             'revision': int(build.statement['revision']),
             'approvalExpiresAt': int(build.statement['approvalExpiresAt']),
             'currentDeployment': build.statement['oldDeployment'],
+            'currentEvmChainId': int(build.statement.get('previousEvmChainId', build.statement['evmChainId'])),
+            'replacementEvmChainId': int(build.statement['evmChainId']),
             'replacementDeployment': build.statement['newDeployment'],
             'acceptedProofVersions': build.statement['newDeployment']['acceptedProofVersions'],
             'credentialPolicy': build.statement['identityPolicy'],

@@ -155,6 +155,29 @@ def _release_source_shas(
             deployment_plan_hash=settings.identity_deployment_plan_hash,
             previous_amendment_hash=statement["previousAmendmentHash"],
         )
+        # Network candidates have their own canonical domain. Their release
+        # pins permit staging only; the async authority-history resolver is
+        # still mandatory before the application can serve identity writes.
+        network_fields = (settings.identity_network_amendment_path,
+                          settings.identity_network_artifact_path, settings.identity_network_plan_hash)
+        if any(network_fields):
+            if not all(network_fields):
+                raise PublicArtifactError("identity network source configuration is incomplete")
+            from solslot_puzzles import identity_network_amendment as network
+            candidate_path = Path(settings.identity_network_amendment_path)
+            candidate_deployment_path = Path(settings.identity_network_artifact_path)
+            for path, maximum in ((candidate_path, MAX_IDENTITY_AMENDMENT_BYTES),
+                                  (candidate_deployment_path, MAX_IDENTITY_DEPLOYMENT_BYTES)):
+                if not path.is_file() or path.is_symlink() or path.stat().st_size > maximum:
+                    raise PublicArtifactError("identity network source evidence is unavailable")
+            candidate = network.parse_canonical_statement(candidate_path.read_bytes())
+            candidate_deployment = json.loads(candidate_deployment_path.read_text(encoding="utf-8"))
+            network.verify_prepared_statement_against_records(candidate,
+                base_artifact=payload, deployment_artifact=candidate_deployment,
+                deployment_plan_hash=settings.identity_network_plan_hash,
+                predecessor_statement=statement, predecessor_deployment_artifact=deployment,
+                predecessor_deployment_plan_hash=settings.identity_deployment_plan_hash)
+            statement = candidate
     except PublicArtifactError:
         raise
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
