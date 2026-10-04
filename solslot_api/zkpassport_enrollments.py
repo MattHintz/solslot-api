@@ -1255,12 +1255,14 @@ def create_bls_relay_challenge(
     if not enrollment:
         raise HTTPException(status_code=404, detail="Create an enrollment before requesting relay authorization.")
     _require_enrollment_bridge_policy(settings, enrollment, execution=True)
+    settings, identity_deployment = _settings_for_enrollment(settings, request, enrollment)
     from .zkpassport_relay import _validate_relay_permit
     try:
         data = Web3.to_bytes(hexstr=req.data)
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=422, detail="Relay calldata must be hex.") from exc
-    _validate_relay_permit(settings, enrollment, session, data, live=True)
+    _validate_relay_permit(settings, enrollment, session, data, live=True,
+                           identity_deployment=identity_deployment)
     return issue_owner_challenge(
         settings,
         vault_launcher_id=key,
