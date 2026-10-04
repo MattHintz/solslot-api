@@ -506,9 +506,20 @@ def _dispatch_saved(w3,settings,saved,session,*,identity_deployment=None):
 
 
 def _resume_saved(settings,enrollment,session,saved,*,dispatch,identity_deployment=None):
-    w3=_w3(settings.zkpassport_evm_rpc_url)
-    _check_saved_deployment(w3,settings,saved)
-    outcome=_relay_receipt_state(w3,settings,saved,enrollment,session)
+    try:
+        w3=_w3(settings.zkpassport_evm_rpc_url)
+        _check_saved_deployment(w3,settings,saved)
+        outcome=_relay_receipt_state(w3,settings,saved,enrollment,session)
+    except HTTPException:
+        # Keep owner, release, network and receipt refusals unchanged.
+        raise
+    except Exception as exc:
+        # A provider outage or rate limit is not an absent receipt and must
+        # never reach dispatch. Preserve the existing signed transaction.
+        raise HTTPException(status_code=502, headers={'Retry-After': '5'},
+            detail='The identity network status check is temporarily unavailable. '
+                   'Your saved proof and original transaction are preserved; '
+                   'check status again without starting another proof.') from exc
     if outcome is not None:return outcome
     now=int(time.time())
     if now>=saved['retry_until']:

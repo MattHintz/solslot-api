@@ -601,10 +601,9 @@ def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_
         ),
         _request(),
     )
-    prepared = zkpassport_enrollments.prepare_chia_stamp(
-        VAULT_A,
-        _request(),
-    )
+    prepared = asyncio.run(zkpassport_enrollments.prepare_chia_stamp(
+        VAULT_A, _request(),
+    ))
     signature = Account.sign_message(
         encode_typed_data(full_message=prepared.typedData),
         private_key,
@@ -672,8 +671,9 @@ def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_
     assert synced.enrollment.receipt.confirmedBlockIndex == 789
 
 
+@pytest.mark.parametrize('prepare_dispatch', ['direct', 'http'])
 def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, prepare_dispatch
 ):
     _install_owner_bypass(monkeypatch)
     monkeypatch.setenv("SOLSLOT_ALPHA_WRITES_ENABLED", "true")
@@ -874,10 +874,27 @@ def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
         ),
         _request(),
     )
-    prepared = zkpassport_enrollments.prepare_chia_stamp(
-        VAULT_A,
-        _request(),
-    )
+    if prepare_dispatch == 'http':
+        from fastapi import FastAPI
+        import httpx
+        import threading
+        owner_thread = threading.get_ident()
+        original_builder = zkpassport_enrollments._build_bls_chia_stamp
+        def thread_checked_builder(*args, **kwargs):
+            assert threading.get_ident() == owner_thread
+            return original_builder(*args, **kwargs)
+        monkeypatch.setattr(zkpassport_enrollments, '_build_bls_chia_stamp', thread_checked_builder)
+        route_app = FastAPI()
+        route_app.include_router(zkpassport_enrollments.router)
+        async def prepare_over_http():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=route_app),
+                                        base_url='https://testserver') as client:
+                response = await client.post('/zkpassport/enrollments/'+VAULT_A+'/stamp/prepare')
+                assert response.status_code == 200, response.text
+                return zkpassport_enrollments.PrepareChiaStampResponse.model_validate(response.json())
+        prepared = asyncio.run(prepare_over_http())
+    else:
+        prepared = asyncio.run(zkpassport_enrollments.prepare_chia_stamp(VAULT_A, _request()))
     assert prepared.authType == "chia_bls"
     assert prepared.typedData is None
     assert prepared.currentTimestamp is not None

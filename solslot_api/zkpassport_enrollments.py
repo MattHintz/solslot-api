@@ -1809,10 +1809,13 @@ async def _push_chia_stamp_and_mark_pending(
 
 
 @router.post("/{vault_launcher_id}/stamp/prepare", response_model=PrepareChiaStampResponse)
-def prepare_chia_stamp(
+async def prepare_chia_stamp(
     vault_launcher_id: VaultLauncherPath,
     request: Request,
 ) -> PrepareChiaStampResponse:
+    # Canonical CLVM Programs are owned by the importing event-loop thread.
+    # Sage preparation builds its vault spend here, just as async submission
+    # does below; FastAPI's sync worker would access foreign Rust LazyNodes.
     settings = _settings()
     key = _normalize_hex32(vault_launcher_id, "vaultLauncherId")
     session = verify_vault_session(settings, request, key)
