@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import resource
+import stat
 import subprocess
 import tempfile
 import time
@@ -29,6 +30,32 @@ POLICY=('https://management.azure.com/subscriptions/5db856e6-9fdd-474d-96a4-241e
 KEY_REF=VAULT+'solslot-collection-backup-key-ae165/90df81b132264ccfb85df1fcff5acf52'
 NODE_REF=VAULT+'solslot-collection-ipfs-node-ae165/84694916ebc64c3aa159cea98d669c0a'
 SSH_REF=VAULT+'solslot-collection-ssh-ae181'
+TOKEN_FILE=RUN/'managed-identity-tokens.json'
+TOKEN_RESOURCES={'https://storage.azure.com/','https://management.azure.com/','https://vault.azure.net/'}
+
+
+def staged_token(resource):
+    if resource not in TOKEN_RESOURCES or TOKEN_FILE.parent.is_symlink():
+        raise ValueError('Identity resource differs')
+    fd=os.open(TOKEN_FILE,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    with os.fdopen(fd,'rb') as f:
+        st=os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_uid!=0 or st.st_mode&0o027 or st.st_size>65536:
+            raise ValueError('Identity credential is not protected')
+        q=json.loads(f.read(65537))
+    if set(q)!= {'schema','actionEnvelopeId','principalId','tenantId','tokens'} or (
+            q['schema']!='solslot.managed-identity-tokens.v1' or q['actionEnvelopeId']!=AE
+            or q['principalId']!=PRINCIPAL or q['tenantId']!='0c1708db-7f87-4fe9-9a96-eac4795c39bd'
+            or set(q['tokens'])!=TOKEN_RESOURCES):
+        raise ValueError('Staged identity authority differs')
+    token=q['tokens'][resource]
+    if not isinstance(token,str) or len(token)>16384:raise ValueError('Identity token bounds differ')
+    claims=json.loads(base64.urlsafe_b64decode(token.split('.')[1]+'=='))
+    if (claims.get('oid')!=PRINCIPAL or claims.get('tid')!=q['tenantId']
+            or str(claims.get('aud','')).rstrip('/')!=resource.rstrip('/')
+            or int(claims.get('exp',0))<=time.time()+300):
+        raise ValueError('Staged identity token is expired or differs')
+    return int(claims['exp']),token
 
 
 class Azure:
@@ -39,6 +66,8 @@ class Azure:
     def token(self,resource):
         old=self.tokens.get(resource)
         if old and old[0]>time.time()+300:return old[1]
+        if os.geteuid()!=0:
+            staged=staged_token(resource);self.tokens[resource]=staged;return staged[1]
         url='http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource='+urllib.parse.quote(resource,safe='')
         with self.opener.open(urllib.request.Request(url,headers={'Metadata':'true'}),timeout=15) as r:
             value=json.loads(r.read(65537))['access_token']

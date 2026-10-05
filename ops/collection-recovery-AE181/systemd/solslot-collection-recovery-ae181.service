@@ -8,6 +8,7 @@ Type=oneshot
 User=solslot-recovery-ae181
 Group=solslot-recovery-ae181
 WorkingDirectory=/opt/solslot/collection-recovery-AE181
+ExecStartPre=+/usr/bin/python3 -E -s /opt/solslot/collection-recovery-AE181/prepare_identity_tokens.py
 ExecStart=/usr/bin/python3 -E -s /opt/solslot/collection-recovery-AE181/replicate_collection.py
 RuntimeDirectory=solslot-collection-recovery-ae181
 RuntimeDirectoryMode=0700
@@ -25,4 +26,3 @@ RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 MemoryMax=512M
 TasksMax=32
-
