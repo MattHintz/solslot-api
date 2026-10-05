@@ -57,7 +57,8 @@ def api_dropin(plan,enabled):
     data+='Environment="SOLSLOT_COLLECTION_METADATA_ENABLED='+('true' if enabled else 'false')+'"\n'
     data+='Environment="SOLSLOT_COLLECTION_MINTING_ENABLED=false"\nEnvironment="SOLSLOT_MINTING_ENABLED=false"\n'
     data+='Environment="SOLSLOT_COLLECTION_LOCAL_QUOTA_BYTES=25165824"\nEnvironment="SOLSLOT_COLLECTION_ASSET_MAX_BYTES=8388608"\n'
-    data+='ExecStart=\nExecStart='+py+' -m uvicorn --app-dir '+str(OP/'recovery')+' --factory solslot_collection_recovery_AE181:create_app --host 127.0.0.1 --port 8792 --proxy-headers --forwarded-allow-ips 127.0.0.1 --timeout-keep-alive 5 --timeout-graceful-shutdown 30 --limit-concurrency 100 --backlog 256 --no-server-header --no-access-log\n'
+    scoped='PYTHONPATH='+str(OP/'release/api')+':/opt/solslot/genesis-rc28/operations/AE161/release/protocol '+'SOLSLOT_COLLECTION_METADATA_ENABLED='+('true' if enabled else 'false')+' SOLSLOT_COLLECTION_MINTING_ENABLED=false SOLSLOT_MINTING_ENABLED=false SOLSLOT_COLLECTION_LOCAL_QUOTA_BYTES=25165824 SOLSLOT_COLLECTION_ASSET_MAX_BYTES=8388608'
+    data+='ExecStart=\nExecStart=/usr/bin/env '+scoped+' '+py+' -m uvicorn --app-dir '+str(OP/'recovery')+' --factory solslot_collection_recovery_AE181:create_app --host 127.0.0.1 --port 8792 --proxy-headers --forwarded-allow-ips 127.0.0.1 --timeout-keep-alive 5 --timeout-graceful-shutdown 30 --limit-concurrency 100 --backlog 256 --no-server-header --no-access-log\n'
     return data.encode()
 
 def new_user(home,shell):
