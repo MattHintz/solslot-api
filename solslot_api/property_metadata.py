@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
+from urllib.parse import urlsplit
 from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
@@ -408,6 +409,55 @@ class DraftDeedAllocationV1(ContractModel):
     deed_launcher_id: Optional[HexBytes32] = None
 
 
+class ProjectPartyV1(ContractModel):
+    """Public professional profile; private contacts belong in restricted evidence."""
+
+    legal_name: str = Field(min_length=1, max_length=240)
+    display_name: Optional[str] = Field(default=None, min_length=1, max_length=180)
+    website: Optional[str] = Field(default=None, max_length=500)
+    summary: Optional[str] = Field(default=None, max_length=1200)
+    license_reference: Optional[str] = Field(default=None, max_length=180)
+    license_jurisdiction: Optional[str] = Field(default=None, max_length=100)
+
+    @field_validator("website")
+    @classmethod
+    def public_website(cls, value: Optional[str]) -> Optional[str]:
+        if value:
+            parsed = urlsplit(value)
+            if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+                raise ValueError("website must be a public HTTPS URL without credentials")
+        return value
+
+
+class DraftProjectPartyV1(ProjectPartyV1):
+    legal_name: Optional[str] = Field(default=None, min_length=1, max_length=240)
+
+
+class ProjectTeamV1(ContractModel):
+    sponsor: ProjectPartyV1
+    builder_status: Literal["selected", "not-appointed", "not-applicable"]
+    builder_is_sponsor: bool = False
+    builder: Optional[ProjectPartyV1] = None
+
+    @model_validator(mode="after")
+    def validate_roles(self) -> "ProjectTeamV1":
+        if self.builder_is_sponsor:
+            if self.builder_status != "selected" or self.builder is not None:
+                raise ValueError("a shared sponsor/builder uses the sponsor profile and selected status")
+        elif self.builder_status == "selected" and self.builder is None:
+            raise ValueError("identify the selected builder")
+        elif self.builder_status != "selected" and self.builder is not None:
+            raise ValueError("builder profile requires selected status")
+        return self
+
+
+class DraftProjectTeamV1(ContractModel):
+    sponsor: DraftProjectPartyV1 = Field(default_factory=DraftProjectPartyV1)
+    builder_status: Optional[Literal["selected", "not-appointed", "not-applicable"]] = None
+    builder_is_sponsor: bool = False
+    builder: Optional[DraftProjectPartyV1] = None
+
+
 class PropertyDossierV1(ContractModel):
     schema_version: Literal[PROPERTY_DOSSIER_SCHEMA]
     collection_id: str = Field(min_length=1, max_length=120)
@@ -415,6 +465,7 @@ class PropertyDossierV1(ContractModel):
     title: str = Field(min_length=1, max_length=180)
     summary: str = Field(min_length=1, max_length=4000)
     classification: Optional[ClassificationV1] = None
+    project_team: Optional[ProjectTeamV1] = None
     property: PropertyIdentityV1
     media: list[MediaAssetV1] = Field(min_length=1, max_length=40)
     valuation: ValuationV1
@@ -479,6 +530,7 @@ class PropertyDossierDraftV1(ContractModel):
     title: str = Field(min_length=1, max_length=180)
     summary: Optional[str] = Field(default=None, min_length=1, max_length=4000)
     classification: Optional[DraftClassificationV1] = None
+    project_team: Optional[DraftProjectTeamV1] = None
     property: Optional[DraftPropertyIdentityV1] = None
     media: list[DraftMediaAssetV1] = Field(default_factory=list, max_length=40)
     valuation: Optional[DraftValuationV1] = None

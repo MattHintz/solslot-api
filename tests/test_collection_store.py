@@ -24,6 +24,11 @@ def dossier_payload() -> dict:
         "revision": 1,
         "title": "17 Harbor Street",
         "summary": "Two-unit residential property with a documented renovation plan.",
+        "projectTeam": {
+            "sponsor": {"legalName": "Harbor Project Sponsor LLC"},
+            "builderStatus": "not-applicable",
+            "builderIsSponsor": False,
+        },
         "classification": {
             "assetClass": "RWA-RE-RES",
             "propertySubtype": "duplex",

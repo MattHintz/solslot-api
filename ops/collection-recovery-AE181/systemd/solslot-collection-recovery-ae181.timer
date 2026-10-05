@@ -1,0 +1,12 @@
+[Unit]
+Description=Renew Solslot collection recovery health every two minutes
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=120s
+AccuracySec=5s
+Persistent=true
+Unit=solslot-collection-recovery-ae181.service
+
+[Install]
+WantedBy=timers.target

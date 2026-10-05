@@ -753,6 +753,12 @@ class CollectionStore:
                 ).fetchall()
             }
         issues: list[dict[str, str]] = []
+        if draft.project_team is None:
+            issues.append({
+                "code": "PROJECT_TEAM_REQUIRED",
+                "path": "/projectTeam",
+                "message": "Identify the project sponsor and select the builder's appointment status.",
+            })
         if draft.classification is None:
             issues.append(
                 {

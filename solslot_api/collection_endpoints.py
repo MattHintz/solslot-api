@@ -233,11 +233,20 @@ def _store_call(call: Callable[[], T]) -> T:
 async def collection_feature_status(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict[str, Any]:
+    from .collection_recovery_health import read_receipt
+    try:
+        receipt = read_receipt()
+        recovery = {"healthy": True, "checkedAt": receipt["checkedAt"], "restoredAt": receipt["restoredAt"]}
+    except (OSError, ValueError, TypeError, KeyError):
+        recovery = {"healthy": False, "checkedAt": None, "restoredAt": None}
     return {
-        "metadataEnabled": settings.collection_metadata_enabled,
+        "metadataConfigured": settings.collection_metadata_enabled,
+        "metadataEnabled": settings.collection_metadata_enabled and recovery["healthy"],
+        "recovery": recovery,
         "mintingEnabled": settings.collection_minting_enabled,
         "maxCanonicalBytes": 24 * 1024,
         "maxAssetBytes": settings.collection_asset_max_bytes,
+        "storageQuotaBytes": settings.collection_local_quota_bytes,
         "network": settings.network,
     }
 

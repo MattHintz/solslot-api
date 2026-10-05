@@ -1,0 +1,28 @@
+[Unit]
+Description=Solslot AE181 collection recovery and isolated restore
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=solslot-recovery-ae181
+Group=solslot-recovery-ae181
+WorkingDirectory=/opt/solslot/collection-recovery-AE181
+ExecStart=/usr/bin/python3 -E -s /opt/solslot/collection-recovery-AE181/replicate_collection.py
+RuntimeDirectory=solslot-collection-recovery-ae181
+RuntimeDirectoryMode=0700
+TimeoutStartSec=300
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/solslot/collection-recovery-AE181/state
+ReadWritePaths=/run/solslot-collection-recovery-ae181
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=512M
+TasksMax=32
+

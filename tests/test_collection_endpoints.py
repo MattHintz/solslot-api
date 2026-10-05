@@ -51,12 +51,17 @@ def _draft(collection_id: str, revision: int, title: str = "17 Harbor Street") -
     }
 
 
-def test_feature_gate_and_revisioned_draft_round_trip(tmp_path) -> None:
+def test_feature_gate_and_revisioned_draft_round_trip(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("solslot_api.collection_recovery_health.read_receipt", lambda: {
+        "checkedAt": time.time(), "restoredAt": time.time(),
+    })
     client, store, _app = _client(tmp_path)
     try:
         flags = client.get("/admin/collections/feature-status")
         assert flags.status_code == 200
         assert flags.json()["metadataEnabled"] is True
+        assert flags.json()["metadataConfigured"] is True
+        assert flags.json()["recovery"]["healthy"] is True
 
         created = client.post(
             "/admin/collections",
@@ -81,6 +86,22 @@ def test_feature_gate_and_revisioned_draft_round_trip(tmp_path) -> None:
         )
         assert conflict.status_code == 409
         assert "current 2" in conflict.json()["detail"]
+    finally:
+        client.close()
+        store.close()
+
+
+def test_feature_status_pauses_authoring_when_recovery_is_unavailable(tmp_path, monkeypatch) -> None:
+    def stale():
+        raise ValueError("Recovery receipt is stale")
+    monkeypatch.setattr("solslot_api.collection_recovery_health.read_receipt", stale)
+    client, store, _app = _client(tmp_path)
+    try:
+        status = client.get("/admin/collections/feature-status").json()
+        assert status["metadataConfigured"] is True
+        assert status["metadataEnabled"] is False
+        assert status["recovery"] == {"healthy": False, "checkedAt": None, "restoredAt": None}
+        assert status["mintingEnabled"] is False
     finally:
         client.close()
         store.close()
