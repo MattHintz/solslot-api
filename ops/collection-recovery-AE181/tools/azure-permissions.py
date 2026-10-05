@@ -22,7 +22,7 @@ def main():
         if len(perms)!=1 or perms[0]['dataActions']!=['Microsoft.KeyVault/vaults/secrets/setSecret/action'] or perms[0]['actions'] or perms[0]['notActions'] or perms[0]['notDataActions']:
             raise ValueError('Temporary setter role differs')
         for grant in grants:
-            existing=az(['role','assignment','list','--scope',grant['scope'],'--all'])
+            existing=az(['role','assignment','list','--scope',grant['scope']])
             by_id=[r for r in existing if r['name']==grant['id']]
             if by_id:
                 if len(by_id)!=1 or by_id[0]['principalId']!=plan['azure']['principal'] or by_id[0]['roleDefinitionId'].rsplit('/',1)[-1]!=grant['role']:raise ValueError('Assignment collision')
@@ -34,7 +34,7 @@ def main():
         for grant in selected:
             target=grant['scope']+'/providers/Microsoft.Authorization/roleAssignments/'+grant['id']
             az(['role','assignment','delete','--ids',target])
-            if any(r['name']==grant['id'] for r in az(['role','assignment','list','--scope',grant['scope'],'--all'])):raise ValueError('Revocation did not complete')
+            if any(r['name']==grant['id'] for r in az(['role','assignment','list','--scope',grant['scope']])):raise ValueError('Revocation did not complete')
     else:raise ValueError('Unsupported permission phase')
     print(json.dumps({'actionEnvelopeId':AE,'phase':phase,'status':'completed','secretValuesRecorded':False}))
 
