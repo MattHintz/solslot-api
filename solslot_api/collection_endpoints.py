@@ -20,6 +20,7 @@ from .collection_display_units import (
     percentage_to_bps,
     usd_minor_to_asset_units,
 )
+from .collection_document_types import XLSX_MIME
 from .collection_media import (
     CollectionMediaPipeline,
     MediaPipelineUnavailable,
@@ -516,22 +517,37 @@ async def presign_collection_asset(
 ) -> dict[str, Any]:
     if body.byte_size > settings.collection_asset_max_bytes:
         raise HTTPException(status_code=413, detail="asset exceeds configured upload limit")
-    declared = _store_call(
-        lambda: store.declare_asset(
-            collection_id,
-            asset_id=body.asset_id,
-            kind=body.kind,
-            expected_sha256=body.sha256,
-            expected_mime_type=body.mime_type,
-            expected_byte_size=body.byte_size,
-            actor_subject=claims.sub,
-            role=body.role,
-            title=body.title,
-            alt_text=body.alt,
-            category=body.category,
-            visibility=body.visibility,
+    workspace = _store_call(lambda: store.get(collection_id))
+    if workspace["state"] not in ("DRAFT", "REVIEW", "PUBLISHED"):
+        raise HTTPException(status_code=409, detail="Assets cannot be changed in this collection state")
+    if body.mime_type.lower() == XLSX_MIME and (body.visibility != "PRIVATE" or body.kind != "DOCUMENT"):
+        raise HTTPException(status_code=422, detail="Spreadsheets are restricted private originals")
+    try:
+        existing = store.get_asset(collection_id, body.asset_id)
+    except CollectionNotFound:
+        existing = None
+    if existing is not None:
+        if workspace["state"] == "PUBLISHED":
+            raise HTTPException(status_code=409, detail="Published asset IDs are immutable; declare a new asset for an amendment")
+        expected = {"kind": body.kind, "visibility": body.visibility,
+                    "expectedSha256": body.sha256.lower(), "expectedMimeType": body.mime_type.lower(),
+                    "expectedByteSize": body.byte_size, "title": body.title, "category": body.category,
+                    "role": body.role, "alt": body.alt}
+        if any(existing.get(key) != value for key, value in expected.items()):
+            raise HTTPException(status_code=409, detail="This asset ID already identifies another file or declaration; the original is retained")
+        if existing["state"] in ("PINNED", "VERIFIED"):
+            return {"alreadyVerified": True, "asset": existing}
+        declared = existing
+    else:
+        declared = _store_call(
+            lambda: store.declare_asset(
+                collection_id, asset_id=body.asset_id, kind=body.kind,
+                expected_sha256=body.sha256, expected_mime_type=body.mime_type,
+                expected_byte_size=body.byte_size, actor_subject=claims.sub,
+                role=body.role, title=body.title, alt_text=body.alt,
+                category=body.category, visibility=body.visibility,
+            )
         )
-    )
     pipeline = CollectionMediaPipeline(settings)
     try:
         upload = pipeline.presign_upload(
@@ -542,10 +558,11 @@ async def presign_collection_asset(
             expected_sha256=body.sha256,
             expected_byte_size=body.byte_size,
             expected_mime_type=body.mime_type,
+            object_key=declared.get("objectKey"),
         )
     except (MediaPipelineUnavailable, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    asset = _store_call(
+    asset = declared if declared.get("objectKey") else _store_call(
         lambda: store.assign_asset_object_key(
             collection_id,
             body.asset_id,

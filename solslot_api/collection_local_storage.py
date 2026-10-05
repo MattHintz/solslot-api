@@ -25,6 +25,7 @@ from fastapi import FastAPI, HTTPException, Request
 from starlette.responses import Response
 
 from .config import Settings
+from .collection_document_types import XLSX_MIME
 
 PREFIX = "/collection-media"
 KEY = re.compile(r"(?:private/)?collections/v2/[0-9a-f]{64}/[0-9a-f]{32}/asset(?:\.[a-z0-9]{1,12})?\Z")
@@ -70,7 +71,8 @@ class LocalStorage:
               mime: str = "") -> str:
         self.object_id(key)
         if method == "PUT" and (not re.fullmatch(r"[0-9a-f]{64}", digest)
-                or not 0 < size <= self.settings.collection_asset_max_bytes or mime not in MIMES):
+                or not 0 < size <= self.settings.collection_asset_max_bytes
+                or (mime not in MIMES and not (mime == XLSX_MIME and key.startswith("private/")))):
             raise ValueError("local upload needs an exact hash, allowed type and bounded size")
         payload = _b64(json.dumps({"v": 1, "m": method, "k": key, "e": int(time.time()) + ttl,
                                   "h": digest, "n": size, "t": mime},

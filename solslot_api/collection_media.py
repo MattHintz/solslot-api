@@ -17,6 +17,7 @@ from urllib.parse import quote, urlparse
 import httpx
 
 from .config import Settings
+from .collection_document_types import XLSX_MIME, is_private_workbook
 
 
 class MediaPipelineUnavailable(RuntimeError):
@@ -82,8 +83,11 @@ class CollectionMediaPipeline:
         expected_sha256: str = "",
         expected_byte_size: int = 0,
         expected_mime_type: str = "",
+        object_key: str | None = None,
     ) -> dict[str, Any]:
         self._require_s3()
+        if expected_mime_type.lower() == XLSX_MIME and not private:
+            raise MediaVerificationError("Spreadsheets are restricted private originals")
         extension = ""
         if "." in filename:
             candidate = filename.rsplit(".", 1)[1].lower()
@@ -92,10 +96,12 @@ class CollectionMediaPipeline:
         identity = hashlib.sha256(json.dumps([collection_id, asset_id]).encode("utf-8")).hexdigest()
         # A new namespace and per-attempt version preserve historical URLs and
         # never collapse distinct IDs or filename extensions into the same key.
-        object_key = (
+        object_key = object_key or (
             f"{'private/' if private else ''}collections/v2/{identity}/"
             f"{uuid.uuid4().hex}/asset{extension}"
         )
+        if object_key.startswith("private/") != private:
+            raise MediaVerificationError("Upload destination visibility differs")
         expires = self.settings.collection_s3_presign_ttl_seconds
         if self.settings.collection_storage_backend == "filesystem":
             from .collection_local_storage import LocalStorage
@@ -190,7 +196,7 @@ class CollectionMediaPipeline:
             transport=self.transport,
         ) as client:
             payload, actual_sha256 = await self._read_staged(client, object_key, expected_byte_size)
-            actual_mime = _detect_mime(payload)
+            actual_mime = XLSX_MIME if is_private_workbook(payload) else _detect_mime(payload)
             if actual_sha256 != expected_sha256.lower():
                 raise MediaVerificationError("SHA-256 mismatch")
             if actual_mime != expected_mime_type.lower():
