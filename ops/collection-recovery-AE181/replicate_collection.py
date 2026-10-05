@@ -32,6 +32,11 @@ NODE_REF=VAULT+'solslot-collection-ipfs-node-ae165/84694916ebc64c3aa159cea98d669
 SSH_REF=VAULT+'solslot-collection-ssh-ae181'
 TOKEN_FILE=RUN/'managed-identity-tokens.json'
 TOKEN_RESOURCES={'https://storage.azure.com/','https://management.azure.com/','https://vault.azure.net/'}
+# Azure Key Vault can issue a v2 token addressed to its fixed public-cloud
+# application ID. Keep that alias restricted to Key Vault; never accept it for
+# Storage or ARM. Identity and tenant checks still apply to every token.
+TOKEN_AUDIENCES={resource:{resource.rstrip('/')} for resource in TOKEN_RESOURCES}
+TOKEN_AUDIENCES['https://vault.azure.net/'].add('cfa8b339-82a2-471a-a3c9-0fc0be7a4093')
 
 
 def staged_token(resource):
@@ -52,7 +57,7 @@ def staged_token(resource):
     if not isinstance(token,str) or len(token)>16384:raise ValueError('Identity token bounds differ')
     claims=json.loads(base64.urlsafe_b64decode(token.split('.')[1]+'=='))
     if (claims.get('oid')!=PRINCIPAL or claims.get('tid')!=q['tenantId']
-            or str(claims.get('aud','')).rstrip('/')!=resource.rstrip('/')
+            or str(claims.get('aud','')).rstrip('/') not in TOKEN_AUDIENCES[resource]
             or int(claims.get('exp',0))<=time.time()+300):
         raise ValueError('Staged identity token is expired or differs')
     return int(claims['exp']),token
