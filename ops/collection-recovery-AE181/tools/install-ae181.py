@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -16,6 +17,7 @@ OP=Path('/opt/solslot/genesis-rc28/operations/AE181')
 REC=Path('/opt/solslot/collection-recovery-AE181')
 UNIT='solslot-genesis-rc28.service'
 ADMIN=Path('/var/www/solslot-admin-ceremony')
+ADMIN_MOUNT=Path('/var/www/solslot-admin-mount/genesis-admin')
 USER='solslot-recovery-ae181'
 
 def command(args):
@@ -47,7 +49,15 @@ def verified_package(root):
 
 def service_health():
     if command(['systemctl','is-active',UNIT])!='active':raise ValueError('Coordinator not active')
-    with urllib.request.urlopen('http://127.0.0.1:8792/health',timeout=30) as r:q=json.loads(r.read(65536))
+    # systemctl restart returns before uvicorn finishes its cold startup.
+    deadline=time.monotonic()+30
+    while True:
+        try:
+            with urllib.request.urlopen('http://127.0.0.1:8792/health',timeout=3) as r:q=json.loads(r.read(65536))
+            break
+        except (OSError,ValueError):
+            if time.monotonic()>=deadline:raise
+            time.sleep(1)
     if q.get('network')!='testnet11' or q.get('ok') is not True:raise ValueError('Fresh coordinator health failed')
     return q
 
@@ -115,8 +125,9 @@ def coordinator(root,plan,phase,credential):
         atomic(drop,api_dropin(plan,True));command(['systemctl','daemon-reload']);command(['systemctl','restart',UNIT]);service_health();read_receipt()
     elif phase=='admin':
         current=ADMIN/'current';prior=Path(plan['priorAdminRelease'])
-        if current.resolve()!=prior:raise ValueError('Current admin release changed')
         dest=ADMIN/'releases/admin-property-form-AE181'
+        for pointer in (current,ADMIN_MOUNT):
+            if not pointer.is_symlink() or pointer.resolve() not in (prior,dest):raise ValueError('Current admin delivery changed')
         dest.mkdir(exist_ok=True)
         for file in (root/'admin').rglob('*'):
             if file.is_file():install_file(file,dest/file.relative_to(root/'admin'))
@@ -126,12 +137,14 @@ def coordinator(root,plan,phase,credential):
             target=dest/file.relative_to(prior)
             if not target.exists():install_file(file,target)
             elif file.suffix in ('.js','.css','.wasm') and digest(file)!=digest(target):raise ValueError('Retained shared code path differs')
-        link=ADMIN/'current-ae181';link.symlink_to(dest);os.replace(link,current)
+        for pointer in (current,ADMIN_MOUNT):
+            if pointer.resolve()==dest:continue
+            link=pointer.with_name(pointer.name+'-ae181');link.symlink_to(dest);os.replace(link,pointer)
     elif phase=='rollback':
         if drop.exists():drop.rename(OP/'disabled-drop-in-AE181.conf')
-        current=ADMIN/'current'
-        if current.resolve()==ADMIN/'releases/admin-property-form-AE181':
-            link=ADMIN/'rollback-ae181';link.symlink_to(plan['priorAdminRelease']);os.replace(link,current)
+        for current in (ADMIN/'current',ADMIN_MOUNT):
+            if current.resolve()==ADMIN/'releases/admin-property-form-AE181':
+                link=current.with_name(current.name+'-rollback-ae181');link.symlink_to(plan['priorAdminRelease']);os.replace(link,current)
         denied=Path('/etc/ssh/sshd_config.d/solslot-collection-recovery-ae181-disabled.conf')
         if not denied.exists():atomic(denied,('DenyUsers '+USER+'\n').encode())
         command(['/usr/sbin/sshd','-t']);command(['systemctl','reload','ssh.service'])
