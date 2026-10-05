@@ -1787,7 +1787,9 @@ async def _push_chia_stamp_and_mark_pending(
             funded = await submit_funded_stamp(submitter=fee_submitter, store=fee_store,
                 ledger=ledger, key=key, original=spend_bundle, expected_coin=expected_vault_coin)
         except (ProtocolSubmissionError, ChiaProviderError, ValueError) as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+            from .stamp_fee_admission import StampNetworkBusy
+            headers = {'Retry-After': '10'} if isinstance(exc, StampNetworkBusy) else None
+            raise HTTPException(status_code=503, headers=headers, detail=str(exc)) from exc
         updated = pending.model_dump(mode='json')
         updated['receipt']['chiaSpendBundleId'] = funded['spendBundleId']
         pending = EnrollmentRecord.model_validate(ledger.update_enrollment(updated, expected_statuses=['stamp_pending']))

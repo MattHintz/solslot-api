@@ -116,7 +116,10 @@ def test_real_signed_stamp_fee_funding_and_immutable_recovery(monkeypatch,tmp_pa
         store.db.close();observed.append(True)
         return result
     monkeypatch.setattr(enroll,'_push_chia_stamp_and_mark_pending',intercept)
-    journey(monkeypatch,tmp_path)
+    if journey is journeys.test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp:
+        journey(monkeypatch,tmp_path,prepare_dispatch='direct')
+    else:
+        journey(monkeypatch,tmp_path)
     assert observed==[True]
 
 

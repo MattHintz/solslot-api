@@ -26,6 +26,7 @@ from chia.wallet.wallet_spend_bundle import WalletSpendBundle
 from .chia_provider import ChiaProviderError, _mempool_item_matches_bundle
 from .chia_snapshot import PrimaryReadSnapshot
 from .protocol_submission import ProtocolBundleSubmitter, ProtocolSubmissionError
+from .stamp_fee_admission import StampFeeSubmitter, StampNetworkBusy, BUSY_MESSAGE, check_saved_stamp_admission
 
 logger = logging.getLogger(__name__)
 TIME_OPS = {ConditionOpcode.ASSERT_SECONDS_ABSOLUTE, ConditionOpcode.ASSERT_BEFORE_SECONDS_ABSOLUTE}
@@ -217,7 +218,7 @@ async def submit_funded_stamp(*, submitter, store, ledger, key, original, expect
                 raise ValueError('Identity stamp must have its exact one-mojo bridge receipt burn')
             # Share the same funding lock/reservations, with a target shorter
             # than the pinned vault's 120-second transaction deadline.
-            fast = ProtocolBundleSubmitter(provider=submitter.provider, faucet=submitter.faucet,
+            fast = StampFeeSubmitter(provider=submitter.provider, faucet=submitter.faucet,
                 policy=replace(submitter.policy, target_seconds=60))
             fast._fee_coin_reservation_sources = submitter._fee_coin_reservation_sources
             prepared = await fast._prepare_locked(protocol.to_json_dict(), expected_protocol_fee_mojos=1,
@@ -233,6 +234,9 @@ async def submit_funded_stamp(*, submitter, store, ledger, key, original, expect
             store.event(document['spendBundleId'], observed); return document
         if time.time() >= document['expiresAt']-15:
             raise ProtocolSubmissionError('Saved stamp window ended; check status before resuming')
+        await check_saved_stamp_admission(submitter, document)
+        if time.time() >= document['expiresAt']-15:
+            raise ProtocolSubmissionError('Saved stamp window ended during the network check; check status before resuming')
         store.event(document['spendBundleId'], 'dispatching')
         try:
             await submitter.provider.push_tx_confirmed_in_primary_mempool(document['spendBundle'],
@@ -244,6 +248,8 @@ async def submit_funded_stamp(*, submitter, store, ledger, key, original, expect
             from .submission_errors import error_code
             code = error_code(exc)
             store.event(document['spendBundleId'], 'uncertain' if code == 'TRANSPORT_OR_TIMEOUT' else 'rejected', code)
+            if code in {'INVALID_FEE_TOO_CLOSE_TO_ZERO', 'INVALID_FEE_LOW_FEE'}:
+                raise StampNetworkBusy(BUSY_MESSAGE, submission_attempted=True) from exc
             if code != 'TRANSPORT_OR_TIMEOUT':
                 raise ProtocolSubmissionError(f'Chia rejected the saved stamp ({code}); authorization and receipt are retained', submission_attempted=True) from exc
             raise ProtocolSubmissionError('Chia confirmation is delayed; the saved transaction will be checked before retrying', submission_attempted=True) from exc

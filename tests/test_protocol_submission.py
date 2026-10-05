@@ -74,7 +74,9 @@ class FakeProvider:
         self.estimates.append(spend_bundle)
         count = len(spend_bundle["coin_spends"])
         estimate = self.base_fee if count == 1 else self.aggregate_fee
-        return {"target_times": target_times, "estimates": [estimate]}
+        return {"target_times": target_times, "estimates": [estimate],
+                "full_node_synced": True, "peak_height": 4_779_194,
+                "mempool_size": 0, "mempool_max_size": 110_000_000_000}
 
     async def get_coin_records_by_puzzle_hash(
         self, puzzle_hash: str, *, include_spent: bool
