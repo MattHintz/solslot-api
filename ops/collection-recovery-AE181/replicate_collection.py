@@ -140,7 +140,10 @@ def ensure_blob(azure,plain,key):
         azure.call(url,method='PUT',data=encrypted(plain,key,KEY_REF),
                    headers={'x-ms-blob-type':'BlockBlob','Content-Type':'application/octet-stream','If-None-Match':'*'},limit=0)
     except urllib.error.HTTPError as e:
-        if e.code!=412:raise
+        # Locked WORM containers return 409 before the create-only precondition
+        # for an existing blob. Reuse only this exact conflict, and still GET,
+        # decrypt and compare the retained bytes below. Other failures close.
+        if e.code!=412 and not (e.code==409 and e.headers.get('x-ms-error-code') in {'BlobAlreadyExists','BlobImmutableDueToPolicy'}):raise
     payload,headers=azure.call(url,limit=32*1024*1024)
     if restored(payload,key,digest)!=plain:raise ValueError('Private isolated restore differs')
     return {'blobName':name,'sha256':digest,'bytes':len(plain),'etag':headers.get('ETag') or headers.get('Etag')}
