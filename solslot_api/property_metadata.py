@@ -7,6 +7,8 @@ from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
 
+from .collection_display_units import DisplayUnitError, allocate_par_mojos
+
 from solslot_puzzles.property_metadata import (
     MAX_CANONICAL_METADATA_BYTES,
     PROPERTY_AMENDMENT_SCHEMA,
@@ -498,8 +500,6 @@ class PropertyDossierV1(ContractModel):
         if len(diligence_keys) != len(set(diligence_keys)):
             raise ValueError("diligence keys must be unique")
         if self.classification is not None:
-            if self.classification.asset_class != self.offering.asset_class.strip().upper():
-                raise ValueError("classification asset class must match offering asset class")
             required = required_diligence_keys(
                 asset_class=self.classification.asset_class,
                 project_stage=self.classification.project_stage,
@@ -508,6 +508,9 @@ class PropertyDossierV1(ContractModel):
             missing = sorted(required - set(diligence_keys))
             if missing:
                 raise ValueError("missing required diligence: " + ", ".join(missing))
+        issues = metadata_consistency_issues(self)
+        if issues:
+            raise MetadataConsistencyError(issues)
         return self
 
     def canonical_payload(self) -> dict:
@@ -570,6 +573,71 @@ class PropertyDossierDraftV1(ContractModel):
         return PropertyDossierV1.model_validate(
             payload
         )
+
+
+class MetadataConsistencyError(ValueError):
+    """Carry field-specific checks through Pydantic's sealed-dossier boundary."""
+
+    def __init__(self, issues: list[dict[str, str]]) -> None:
+        self.issues = issues
+        super().__init__("; ".join(issue["message"] for issue in issues))
+
+
+def metadata_consistency_issues(
+    dossier: PropertyDossierDraftV1 | PropertyDossierV1,
+) -> list[dict[str, str]]:
+    """Check duplicated facts and references without completing an unfinished draft."""
+    issues: list[dict[str, str]] = []
+
+    def mismatch(code: str, path: str, message: str) -> None:
+        issues.append({"code": code, "path": path, "message": message})
+
+    classification, property_, offering = dossier.classification, dossier.property, dossier.offering
+    if classification is not None:
+        if (offering and classification.asset_class and offering.asset_class
+                and classification.asset_class.upper() != offering.asset_class.upper()):
+            mismatch("ASSET_CLASS_MISMATCH", "/offering/assetClass",
+                     "Offering asset class must match Property type classification.")
+        if (property_ and classification.property_subtype and property_.property_type
+                and classification.property_subtype.lower() != property_.property_type.lower()):
+            mismatch("PROPERTY_SUBTYPE_MISMATCH", "/property/propertyType",
+                     "Property type must match the classified property subtype.")
+
+    if offering and offering.currency:
+        for section in ("valuation", "operations", "capital"):
+            values = getattr(dossier, section)
+            if values and values.currency and values.currency.upper() != offering.currency.upper():
+                mismatch("CURRENCY_MISMATCH", f"/{section}/currency",
+                         f"{section.capitalize()} currency must match offering currency; no FX conversion is recorded.")
+    if (offering and offering.par_value_mojos is not None and dossier.deed_allocation
+            and all(deed.par_value_mojos is not None for deed in dossier.deed_allocation)):
+        total = sum(int(deed.par_value_mojos) for deed in dossier.deed_allocation)
+        if total != int(offering.par_value_mojos):
+            mismatch("ALLOCATION_PAR_MISMATCH", "/deedAllocation",
+                     f"SmartDeed par totals {total} mojos; it must equal collection par {offering.par_value_mojos}.")
+        elif (all(deed.share_ppm is not None for deed in dossier.deed_allocation)
+              and sum(deed.share_ppm for deed in dossier.deed_allocation) == TARGET_ALLOCATION_PPM):
+            shares = {f"deed.{index}": deed.share_ppm for index, deed in enumerate(dossier.deed_allocation)}
+            try:
+                expected = allocate_par_mojos(total, shares)
+            except DisplayUnitError as exc:
+                mismatch("ALLOCATION_PAR_INVALID", "/deedAllocation", str(exc))
+            else:
+                for index, deed in enumerate(dossier.deed_allocation):
+                    if int(deed.par_value_mojos) != expected[f"deed.{index}"]:
+                        mismatch("DEED_PAR_SHARE_MISMATCH", f"/deedAllocation/{index}/parValueMojos",
+                                 "SmartDeed par must match its ownership share using the standard allocation rounding.")
+
+    public_assets = {asset.asset_id for asset in [*dossier.media, *dossier.documents]}
+    for index, item in enumerate(dossier.diligence):
+        path = f"/diligence/{index}/evidenceAssetIds"
+        if len(item.evidence_asset_ids) != len(set(item.evidence_asset_ids)):
+            mismatch("DUPLICATE_EVIDENCE_REFERENCE", path,
+                     "Link each evidence asset only once in this diligence item.")
+        if any(asset_id not in public_assets for asset_id in item.evidence_asset_ids):
+            mismatch("EVIDENCE_REFERENCE_MISSING", path,
+                     "Public diligence evidence must reference media or documents included in the public dossier. Private originals stay in administrator review.")
+    return issues
 
 
 class Eip712AmendmentSignatureV1(ContractModel):

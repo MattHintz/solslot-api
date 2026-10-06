@@ -21,9 +21,11 @@ from fastapi import Depends
 from pydantic import ValidationError
 
 from .property_metadata import (
+    MetadataConsistencyError,
     PropertyAmendmentV1,
     PropertyDossierDraftV1,
     PropertyDossierV1,
+    metadata_consistency_issues,
     validate_amendment_paths,
 )
 from .config import Settings, get_settings
@@ -399,9 +401,15 @@ class CollectionStore:
             previous = PropertyDossierDraftV1.model_validate_json(row["dossier_json"])
             if row["allocation_locked"]:
                 _assert_protected_fields_unchanged(previous, draft)
-            next_revision = expected_revision + 1
-            updated = draft.model_copy(update={"revision": next_revision})
+            # Revisions identify reviewed content, not repeated Save clicks or
+            # the DRAFT -> REVIEW lifecycle transition. Keep strict If-Match
+            # checks above even for no-op requests from stale browsers.
+            content_changed = previous.model_dump(exclude={"revision"}) != draft.model_dump(exclude={"revision"})
             state = "REVIEW" if submit_for_review else row["state"]
+            if not content_changed and state == row["state"]:
+                return self.get(collection_id)
+            next_revision = expected_revision + int(content_changed)
+            updated = draft.model_copy(update={"revision": next_revision})
             cur.execute(
                 """
                 UPDATE property_collections
@@ -417,12 +425,13 @@ class CollectionStore:
                     collection_id,
                 ),
             )
-            self._sync_deeds(cur, collection_id, updated, bool(row["allocation_locked"]))
+            if content_changed:
+                self._sync_deeds(cur, collection_id, updated, bool(row["allocation_locked"]))
             self._audit(
                 cur,
                 collection_id,
                 actor_subject,
-                "DRAFT_UPDATED",
+                "DRAFT_UPDATED" if content_changed else "REVIEW_SUBMITTED",
                 {"revision": next_revision, "state": state},
             )
         return self.get(collection_id)
@@ -752,7 +761,7 @@ class CollectionStore:
                     (row["id"],),
                 ).fetchall()
             }
-        issues: list[dict[str, str]] = []
+        issues: list[dict[str, str]] = metadata_consistency_issues(draft)
         if draft.project_team is None:
             issues.append({
                 "code": "PROJECT_TEAM_REQUIRED",
@@ -772,6 +781,8 @@ class CollectionStore:
             dossier = draft.to_sealed_dossier()
         except ValidationError as exc:
             for error in exc.errors(include_url=False)[:100]:
+                if isinstance(error.get("ctx", {}).get("error"), MetadataConsistencyError):
+                    continue  # Already listed with exact paths above.
                 path = "/" + "/".join(str(part) for part in error["loc"])
                 issues.append({"code": "DOSSIER_INVALID", "path": path, "message": error["msg"]})
 
@@ -783,12 +794,17 @@ class CollectionStore:
                 issues.append({"code": "METADATA_INVALID", "path": "/", "message": str(exc)})
             if not any(asset.role == "hero" for asset in dossier.media):
                 issues.append({"code": "HERO_REQUIRED", "path": "/media", "message": "one verified hero image is required"})
-            for descriptor in [*dossier.media, *dossier.documents]:
+            descriptors = [("MEDIA", item) for item in dossier.media] + [("DOCUMENT", item) for item in dossier.documents]
+            for expected_kind, descriptor in descriptors:
                 asset = assets.get(descriptor.asset_id)
                 path = f"/assets/{descriptor.asset_id}"
                 if asset is None:
                     issues.append({"code": "ASSET_MISSING", "path": path, "message": "asset has not been uploaded"})
                     continue
+                if asset["visibility"] != "PUBLIC":
+                    issues.append({"code": "PUBLIC_ASSET_REQUIRED", "path": path, "message": "public metadata cannot reference a private original"})
+                if asset["kind"] != expected_kind:
+                    issues.append({"code": "ASSET_KIND_MISMATCH", "path": path, "message": "asset kind does not match its metadata section"})
                 if asset["state"] != "PINNED":
                     issues.append({"code": "ASSET_UNVERIFIED", "path": path, "message": f"asset state is {asset['state']}"})
                 expected_https = asset["verified_https_url"]
@@ -867,23 +883,17 @@ class CollectionStore:
         expected_revision: int,
         actor_subject: str,
     ) -> dict[str, Any]:
-        with self._lock:
-            current = self._collection_row(collection_id)
-            self._require_owner(current, actor_subject)
-            self._require_revision(current, expected_revision)
-            if current["state"] not in ("DRAFT", "REVIEW"):
-                raise CollectionInvalidState(
-                    f"cannot seal collection in {current['state']} state"
-                )
-        readiness = self.readiness(collection_id)
-        if not readiness["ready"]:
-            raise CollectionNotReady(readiness["issues"])
         with self._lock, self._txn() as cur:
             row = self._collection_row(collection_id, cur=cur)
             self._require_owner(row, actor_subject)
             self._require_revision(row, expected_revision)
             if row["state"] not in ("DRAFT", "REVIEW"):
                 raise CollectionInvalidState(f"cannot seal collection in {row['state']} state")
+            # Validate the exact snapshot committed below. Asset verification,
+            # review decisions and comments do not increment dossier revision.
+            readiness = self.readiness(collection_id)
+            if not readiness["ready"]:
+                raise CollectionNotReady(readiness["issues"])
             dossier = PropertyDossierDraftV1.model_validate_json(row["dossier_json"]).to_sealed_dossier()
             commitment = dossier.commitment()
             now = int(time.time())
