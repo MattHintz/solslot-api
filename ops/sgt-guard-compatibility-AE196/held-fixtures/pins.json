@@ -1,0 +1,9 @@
+{
+  "AE156/solslot_identity_http.py": "6deae5ec625ddb65a2cfdabcd378e44b670dde185f511f3ea9871833c90d290f",
+  "AE169/solslot_identity_chain_binding.py": "0e122908faf206bca04067f2bfb766b7ad47dca9a794509b24b55249fccd0d72",
+  "AE170/solslot_identity_fee_address.py": "8cd594fadced5316c79caa2cbfca69ad00bc0f6d9c583592034f12eebe06a860",
+  "AE175/solslot_sage_identity_challenge_AE175.py": "61e6d4b9c3352205eaffef96f17d1cf598d7903e9954c0178974da389c29cad7",
+  "AE176/solslot_sage_stamp_dispatch_AE176.py": "ecfe892f945c63cbdc411ffeb7a23eedd4b5957805cad11149f67253c69e528b",
+  "AE178/api/solslot_stamp_fee_admission_AE178.py": "69db32e9efbcfe04972ce50cac5434814234d148a85ce924be4aa47a65ddf268",
+  "AE178/api/stamp_fee_admission.py": "94390ae8717c7f79321dc73b5d1f27f6f6968d5bd1ecc6ca68b9dfd0760499cb"
+}
