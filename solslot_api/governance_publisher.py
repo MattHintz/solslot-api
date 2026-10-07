@@ -5,6 +5,7 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass
+from chia.types.condition_opcodes import ConditionOpcode
 from typing import Any, Mapping
 
 from chia.types.blockchain_format.coin import Coin
@@ -134,6 +135,8 @@ class GovernancePublicationBuild:
     actions: tuple[GovernanceSigningAction, GovernanceSigningAction]
     bundle: SpendBundle | None
     proposal_coin_id: str | None
+    approval_expires_at: int | None = None
+    vote_window_seconds: int = 300
 
 
 def _hex32(value: bytes | bytes32) -> str:
@@ -238,6 +241,7 @@ def _action(
     proposal_hash: bytes32,
     voting_deadline: int,
     purpose: str = "SGT_ALLOCATION_PROPOSAL",
+    approval_expires_at: int | None = None,
 ) -> GovernanceSigningAction:
     prefix = eip712_prefix_and_domain_separator(
         genesis_challenge_for_network("testnet11")
@@ -253,6 +257,9 @@ def _action(
         "delegatedPuzzleHash": _hex32(delegated_puzzle_hash),
         "messageHash": _hex32(digest),
     }
+    if approval_expires_at is not None:
+        payload.pop('votingDeadline')
+        payload.update(schemaVersion=2, purpose='SGT_ALLOCATION_PUBLICATION_APPROVAL', approvalExpiresAt=approval_expires_at)
     action_id = "0x" + hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -294,6 +301,23 @@ def _publication_delegated_puzzle(
             ],
         )
     )
+
+
+def _publication_approval_puzzle(proposal_hash: bytes32, expires_at: int, statutes_coin_id: bytes32) -> Program:
+    """Authorize this bill until expiry while binding the reviewed statutes coin.
+
+    The tracker enforces its existing voting window at submission. Approval time
+    is independent and cannot change that window or the canonical bill.
+    """
+    if expires_at <= 0:
+        raise ValueError('publication approval expiry must be positive')
+    commitment=hashlib.sha256(b'SOLSLOT_PUBLICATION_APPROVAL_V2'+bytes(proposal_hash)+expires_at.to_bytes(8,'big')+bytes(statutes_coin_id)).digest()
+    return Program.to((1, [
+        [CREATE_PUZZLE_ANNOUNCEMENT, admin_governance_proposal_message(proposal_hash)],
+        [CREATE_PUZZLE_ANNOUNCEMENT, commitment],
+        [ConditionOpcode.ASSERT_BEFORE_SECONDS_ABSOLUTE, expires_at],
+        [ConditionOpcode.ASSERT_CONCURRENT_SPEND, statutes_coin_id],
+    ]))
 
 
 async def build_governance_publication(
@@ -533,6 +557,24 @@ async def build_governance_publication(
         raise ValueError("queued proposal hash does not match its canonical bill")
     timestamp = int(time.time()) if now is None else now
     proposed_deadline = timestamp + statutes.parameters.voting_window_seconds
+    separate_approvals = record.kind in ('SGT_GRANT', 'SGT_SALE')
+    prior_expiry = getattr(record, 'publication_approval_expires_at', None) or record.publication_voting_deadline
+    if separate_approvals and (prior_expiry is None or (renew_expired and prior_expiry <= timestamp)):
+        approval_window = getattr(settings, 'governance_publication_approval_window_seconds', 86_400)
+        if type(approval_window) is not int or not 3_600 <= approval_window <= 7 * 86_400:
+            raise ValueError('publication approval window is outside its bound')
+        record = queue_store.prepare_publication_approvals(
+            proposal_id=record.id, expected_revision=record.revision, coadmin_slot=coadmin_slot,
+            expires_at=timestamp+approval_window, actor=actor, now=timestamp, renew_expired=renew_expired)
+    approval_expiry = getattr(record, 'publication_approval_expires_at', None)
+    if approval_expiry is not None:
+        if record.publication_coadmin_slot != coadmin_slot:
+            raise ValueError('a different coadministrator is already assigned')
+        if timestamp >= approval_expiry:
+            raise ValueError('publication approvals expired; the owner must restart them')
+        if record.publication_voting_deadline is not None and timestamp >= record.publication_voting_deadline:
+            raise ValueError('saved publication expired; reconcile its transaction before submitting again')
+        proposed_deadline = record.publication_voting_deadline or proposed_deadline
     effective_deadline = (proposed_deadline if record.publication_voting_deadline is None
                           or (renew_expired and record.publication_voting_deadline <= timestamp)
                           else record.publication_voting_deadline)
@@ -545,7 +587,9 @@ async def build_governance_publication(
         raise ValueError("SGT allocation exceeds the confirmed company reserve")
     if record.kind == "SGT_SALE" and int(record.bill.get("expiresAt") or 0) <= effective_deadline:
         raise ValueError("SGT sale must remain available beyond the committee vote")
-    if (
+    if approval_expiry is not None:
+        pass  # The approval window is already durably bound above.
+    elif (
         record.publication_coadmin_slot is None
         or record.publication_voting_deadline is None
     ):
@@ -564,15 +608,13 @@ async def build_governance_publication(
             coadmin_slot=coadmin_slot, voting_deadline=proposed_deadline,
             actor=actor, now=timestamp,
         )
-    if record.publication_voting_deadline is None:
+    if record.publication_voting_deadline is None and approval_expiry is None:
         raise ValueError("governance publication deadline is unavailable")
-    deadline = record.publication_voting_deadline
+    deadline = proposed_deadline if approval_expiry is not None else record.publication_voting_deadline
     if timestamp >= deadline:
         raise ValueError("governance publication deadline has expired")
-    delegated_puzzle = _publication_delegated_puzzle(
-        proposal_hash,
-        deadline,
-    )
+    delegated_puzzle = (_publication_approval_puzzle(proposal_hash, approval_expiry, statutes_context.coin.name())
+                        if approval_expiry is not None else _publication_delegated_puzzle(proposal_hash, deadline))
     mips = build_authority_operational_mips_spend(
         authority=authority,
         current_authority_inner_puzzle=authority_inner,
@@ -597,6 +639,7 @@ async def build_governance_publication(
             ),
             proposal_hash=proposal_hash,
             voting_deadline=deadline,
+            approval_expires_at=approval_expiry,
         )
         for slot in mips.selected_slots
     )
@@ -716,6 +759,8 @@ async def build_governance_publication(
         actions=actions,  # type: ignore[arg-type]
         bundle=bundle,
         proposal_coin_id=proposal_coin_id,
+        approval_expires_at=approval_expiry,
+        vote_window_seconds=statutes.parameters.voting_window_seconds,
     )
 
 

@@ -420,6 +420,20 @@ async def test_protocol_fee_estimate_fails_closed_without_primary() -> None:
 
 
 @pytest.mark.asyncio
+async def test_primary_admission_quote_bypasses_cached_review_snapshot(monkeypatch) -> None:
+    from solslot_api import chia_snapshot
+    class CachedReview:
+        async def read(self,*args,**kwargs):
+            raise AssertionError('Admission needs a fresh primary quote, not cached review telemetry')
+    monkeypatch.setattr(chia_snapshot,'active_snapshot',lambda:CachedReview())
+    primary,fallback=FakeRpc(fee_estimate=7),FakeRpc(fee_estimate=1)
+    provider=ChiaProvider(primary,fallback,config())
+    value=await provider.get_fee_estimate(target_times=[300],cost=100,require_primary=True)
+    assert value['estimates']==[7]
+    assert not any(name=='get_fee_estimate' for name,_ in fallback.calls)
+
+
+@pytest.mark.asyncio
 async def test_unsigned_cost_fee_estimate_uses_only_synchronized_primary() -> None:
     primary, fallback = FakeRpc(fee_estimate=7), FakeRpc(fee_estimate=1)
     provider = ChiaProvider(primary, fallback, config())

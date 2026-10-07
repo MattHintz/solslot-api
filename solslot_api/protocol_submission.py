@@ -47,6 +47,7 @@ class ProtocolFeePolicy:
     mempool_timeout_seconds: float = 20.0
     mempool_poll_seconds: float = 0.5
     estimate_buffer_bps: int = 10_000
+    native_admission_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -135,6 +136,8 @@ class ProtocolBundleSubmitter:
             try:
                 saved = store.lookup(self.faucet.network, original_id, context) if store else None
                 if saved:
+                    if store.is_released(self.faucet.network, original_id):
+                        raise ProtocolSubmissionError("Saved transaction expired and was reconciled; prepare the current reviewed action")
                     if not self.policy.enabled:
                         raise ProtocolSubmissionError("protocol fee funding is disabled")
                     prepared = PreparedProtocolBundle(
@@ -168,6 +171,12 @@ class ProtocolBundleSubmitter:
                 if store:
                     store.event(self.faucet.network, original_id, "observed" if mempool else "dispatching")
                 if mempool is None:
+                    if self.policy.native_admission_enabled:
+                        required_fee = await self._estimate_fee(prepared.bundle)
+                        if required_fee > prepared.fee_mojos:
+                            raise ProtocolSubmissionError(
+                                "Network fees changed. The exact saved transaction is retained; check it again before retrying. No replacement was sent."
+                            )
                     mempool = await self.provider.push_tx_confirmed_in_primary_mempool(
                         prepared.bundle.to_json_dict(),
                         required_coin_id=prepared.fee_coin_id,
@@ -198,6 +207,43 @@ class ProtocolBundleSubmitter:
             "ambiguousPushRecovered": bool(mempool["ambiguous_push"]),
             **({"confirmedHeight": mempool["confirmed_height"]} if "confirmed_height" in mempool else {}),
         }
+
+    async def release_expired_saved(self, original_id: str) -> dict:
+        """Release inputs only after native expiry and a healthy primary prove safety.
+
+        This is an explicit reconciliation operation, never an automatic fee
+        replacement. Private bundle bytes remain in the original journal.
+        """
+        from .protocol_admission import admission_conditions, primary_admission_state
+        async with self._lock:
+            store = self.funding_store
+            if store is None:
+                raise ProtocolSubmissionError('Durable funding journal is unavailable')
+            context = {'feeTill': self.faucet.address_hex, 'purpose': None, 'backingMojos': 0}
+            document = store.lookup(self.faucet.network, original_id, context)
+            if document is None:
+                raise ProtocolSubmissionError('Saved transaction is unavailable')
+            bundle = SpendBundle.from_json_dict(document['spendBundle'])
+            response = await self.provider.get_fee_estimate(target_times=[self.policy.target_seconds],
+                spend_bundle=bundle.to_json_dict(), require_primary=True)
+            height, _, _, peak_time = primary_admission_state(response)
+            conditions = admission_conditions(bundle, height, self.faucet.network)
+            expiry = conditions.before_seconds_absolute
+            if expiry is None or peak_time < int(expiry):
+                raise ProtocolSubmissionError('Saved transaction is not proven expired on chain; its inputs remain reserved')
+            if not await self.provider._primary_inputs_clear(bundle.to_json_dict()):
+                raise ProtocolSubmissionError('Saved transaction has spent, pending or unknown inputs; its reservation is retained')
+            final_quote = await self.provider.get_fee_estimate(target_times=[self.policy.target_seconds],
+                cost=int(conditions.cost), require_primary=True)
+            final_height, _, _, final_peak_time = primary_admission_state(final_quote)
+            if (final_height, final_peak_time) != (height, peak_time):
+                raise ProtocolSubmissionError('Chain changed during expiry reconciliation; check the saved transaction again')
+            proof = {'bundleId': document['spendBundleId'], 'absoluteExpiry': int(expiry),
+                'peakHeight': height, 'peakTimestamp': peak_time,
+                'inputIds': sorted('0x' + coin.name().hex() for coin in bundle.removals()),
+                'allInputsUnspentAndClear': True}
+            store.release_expired(self.faucet.network, original_id, proof)
+            return proof
 
     async def prepare_and_dispatch(
         self,
@@ -440,13 +486,24 @@ class ProtocolBundleSubmitter:
             raise ProtocolSubmissionError("fee estimate buffer is outside its approved bound")
         fee = max((estimate * self.policy.estimate_buffer_bps + 9_999) // 10_000,
                   self.policy.minimum_mojos)
+        if self.policy.native_admission_enabled:
+            from .protocol_admission import admission_conditions, primary_admission_state
+            height, used, capacity, _ = primary_admission_state(response)
+            conditions = admission_conditions(bundle, height, self.faucet.network)
+            cost = int(conditions.cost)
+            # Historical confirmation estimates do not enforce Chia's busy
+            # mempool floor. Price the whole bundle, including its sponsor.
+            floor = 5 * cost + 1 if used + cost > capacity else 0
+            fee = max(fee, floor)
+            logger.info("protocol_admission bundle_id=%s cost=%d used=%d capacity=%d floor_mojos=%d",
+                        "0x" + bundle.name().hex(), cost, used, capacity, floor)
         logger.info("protocol_fee_quote bundle_id=%s target_seconds=%d estimate_mojos=%d buffer_bps=%d fee_mojos=%d cap_mojos=%d",
             "0x" + bundle.name().hex(), self.policy.target_seconds, estimate,
             self.policy.estimate_buffer_bps, fee, self.policy.maximum_mojos)
         if fee > self.policy.maximum_mojos:
             raise ProtocolSubmissionError(
-                f"medium fee {fee} exceeds configured cap "
-                f"{self.policy.maximum_mojos}"
+                f"Network busy: required fee {fee} exceeds the existing limit {self.policy.maximum_mojos}. "
+                "Approvals are retained. Wait and check again; no transaction was sent."
             )
         return fee
 

@@ -44,6 +44,13 @@ class ProtocolFundingStore:
             CREATE TABLE IF NOT EXISTS funded_protocol_inputs (
                 network TEXT NOT NULL, coin_id TEXT NOT NULL, original_id TEXT NOT NULL,
                 PRIMARY KEY(network, coin_id));
+            CREATE TABLE IF NOT EXISTS funded_protocol_input_history (
+                network TEXT NOT NULL, coin_id TEXT NOT NULL, original_id TEXT NOT NULL,
+                PRIMARY KEY(network, coin_id, original_id));
+            INSERT OR IGNORE INTO funded_protocol_input_history SELECT * FROM funded_protocol_inputs;
+            CREATE TABLE IF NOT EXISTS funded_protocol_releases (
+                network TEXT NOT NULL, original_id TEXT NOT NULL, proof TEXT NOT NULL,
+                released_at INTEGER NOT NULL, PRIMARY KEY(network, original_id));
             CREATE TABLE IF NOT EXISTS funded_protocol_events (
                 id INTEGER PRIMARY KEY, network TEXT NOT NULL, original_id TEXT NOT NULL,
                 event TEXT NOT NULL, error_code TEXT, recorded_at INTEGER NOT NULL);
@@ -87,8 +94,16 @@ class ProtocolFundingStore:
                     (network, original_id, canonical(context), canonical(document), int(time.time())))
                 # Reserve every input, not only the fee. A second request with
                 # changed protocol bytes cannot sponsor the same spend again.
-                self.db.executemany("INSERT INTO funded_protocol_inputs VALUES(?,?,?)", [
-                    (network, "0x" + coin.name().hex(), original_id) for coin in bundle.removals()])
+                for coin in bundle.removals():
+                    coin_id = "0x" + coin.name().hex()
+                    active = self.db.execute("""SELECT h.original_id FROM funded_protocol_input_history h
+                        LEFT JOIN funded_protocol_releases r ON h.network=r.network AND h.original_id=r.original_id
+                        WHERE h.network=? AND h.coin_id=? AND r.original_id IS NULL""", (network, coin_id)).fetchone()
+                    if active is not None:
+                        raise ValueError("Protocol input belongs to an unreconciled saved transaction")
+                    # Keep the original table intact for rollback and evidence.
+                    self.db.execute("INSERT OR IGNORE INTO funded_protocol_inputs VALUES(?,?,?)", (network, coin_id, original_id))
+                    self.db.execute("INSERT INTO funded_protocol_input_history VALUES(?,?,?)", (network, coin_id, original_id))
                 self.db.execute("COMMIT")
             except BaseException:
                 self.db.execute("ROLLBACK")
@@ -98,7 +113,9 @@ class ProtocolFundingStore:
         """Find an exact saved submission before attempting to sign its input again."""
         with self.lock:
             row = self.db.execute(
-                "SELECT original_id FROM funded_protocol_inputs WHERE network=? AND coin_id=?",
+                """SELECT h.original_id FROM funded_protocol_input_history h
+                LEFT JOIN funded_protocol_releases r ON h.network=r.network AND h.original_id=r.original_id
+                WHERE h.network=? AND h.coin_id=? AND r.original_id IS NULL""",
                 (network, coin_id),
             ).fetchone()
             if row is None:
@@ -115,7 +132,36 @@ class ProtocolFundingStore:
 
     def reserved_coin_ids(self):
         with self.lock:
-            return {row[0] for row in self.db.execute("SELECT coin_id FROM funded_protocol_inputs")}
+            return {row[0] for row in self.db.execute("""SELECT h.coin_id FROM funded_protocol_input_history h
+                LEFT JOIN funded_protocol_releases r ON h.network=r.network AND h.original_id=r.original_id
+                WHERE r.original_id IS NULL""")}
+
+    def is_released(self, network, original_id):
+        with self.lock:
+            return self.db.execute("SELECT 1 FROM funded_protocol_releases WHERE network=? AND original_id=?", (network, original_id)).fetchone() is not None
+
+    def release_expired(self, network, original_id, proof):
+        """Append verified chain-expiry evidence; preserve all original records."""
+        with self.lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.db.execute("SELECT document FROM funded_protocol_bundles WHERE network=? AND original_id=?", (network, original_id)).fetchone()
+                if row is None:
+                    raise ValueError("Saved transaction is unavailable")
+                document = json.loads(row[0])
+                bundle = SpendBundle.from_json_dict(document['spendBundle'])
+                inputs = sorted('0x' + coin.name().hex() for coin in bundle.removals())
+                if (proof.get('bundleId') != document['spendBundleId'] or proof.get('inputIds') != inputs
+                        or type(proof.get('absoluteExpiry')) is not int or proof['absoluteExpiry'] <= 0
+                        or type(proof.get('peakTimestamp')) is not int or proof['peakTimestamp'] < proof['absoluteExpiry']
+                        or proof.get('allInputsUnspentAndClear') is not True):
+                    raise ValueError("Expiry proof does not match the exact saved transaction")
+                self.db.execute("INSERT OR IGNORE INTO funded_protocol_releases VALUES(?,?,?,?)", (network, original_id, canonical(proof), int(time.time())))
+                self.db.execute("INSERT INTO funded_protocol_events(network,original_id,event,recorded_at) VALUES(?,?,?,?)", (network, original_id, 'expired_inputs_released', int(time.time())))
+                self.db.execute("COMMIT")
+            except BaseException:
+                self.db.execute("ROLLBACK")
+                raise
 
     def event(self, network, original_id, event, code=None):
         with self.lock:

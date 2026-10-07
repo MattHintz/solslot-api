@@ -381,7 +381,7 @@ class ChiaProvider:
         estimate_args = {"spend_bundle": spend_bundle} if spend_bundle is not None else {"cost": cost}
         from .chia_snapshot import active_snapshot
         snapshot = active_snapshot()
-        if snapshot is not None:
+        if snapshot is not None and not require_primary:
             return await snapshot.read(self, "get_fee_estimate", lambda client: client.get_fee_estimate(
                 target_times=target_times, **estimate_args,
             ))

@@ -62,6 +62,8 @@ class GovernanceQueueRecord:
     sale_offer_published_at: int | None
     sale_offer_confirmed_height: int | None
     sale_offer_spent_height: int | None
+    publication_approval_expires_at: int | None = None
+    saved_publication: bool = False
 
 
 @dataclass(frozen=True)
@@ -173,6 +175,13 @@ class GovernanceQueueStore:
                     FOREIGN KEY (proposal_id)
                         REFERENCES governance_proposal_queue(id)
                 );
+                CREATE TABLE IF NOT EXISTS governance_publication_dispatches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, proposal_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL, original_id TEXT NOT NULL UNIQUE,
+                    bundle_id TEXT NOT NULL, proposal_coin_id TEXT NOT NULL,
+                    voting_deadline INTEGER NOT NULL, created_at INTEGER NOT NULL,
+                    reconciled_at INTEGER, outcome TEXT
+                );
                 """
             )
             if existing is not None and "FUNDED_REDEMPTION" not in str(existing[0]):
@@ -215,6 +224,7 @@ class GovernanceQueueStore:
             self._ensure_column(cursor, "governance_proposal_queue", "completion_bundle_id", "TEXT")
             self._ensure_column(cursor, "governance_proposal_queue", "publication_coadmin_slot", "INTEGER")
             self._ensure_column(cursor, "governance_proposal_queue", "publication_voting_deadline", "INTEGER")
+            self._ensure_column(cursor, "governance_proposal_queue", "publication_approval_expires_at", "INTEGER")
             self._ensure_column(cursor, "governance_proposal_queue", "execution_bundle_id", "TEXT")
             self._ensure_column(cursor, "governance_proposal_queue", "expected_output_coin_ids_json", "TEXT")
             self._ensure_column(cursor, "governance_proposal_queue", "execution_submitted_at", "INTEGER")
@@ -290,7 +300,7 @@ class GovernanceQueueStore:
     def get(self, proposal_id: str) -> GovernanceQueueRecord:
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM governance_proposal_queue WHERE id=?",
+                "SELECT q.*, EXISTS(SELECT 1 FROM governance_publication_dispatches d WHERE d.proposal_id=q.id AND d.reconciled_at IS NULL) AS saved_publication FROM governance_proposal_queue q WHERE id=?",
                 (proposal_id,),
             ).fetchone()
         if row is None:
@@ -320,7 +330,7 @@ class GovernanceQueueStore:
         where = "WHERE state IN ('READY','ACTIVE','EXECUTED','FAILED')" if public else ""
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT * FROM governance_proposal_queue {where} "
+                f"SELECT q.*, EXISTS(SELECT 1 FROM governance_publication_dispatches d WHERE d.proposal_id=q.id AND d.reconciled_at IS NULL) AS saved_publication FROM governance_proposal_queue q {where} "
                 "ORDER BY CASE state WHEN 'ACTIVE' THEN 0 WHEN 'READY' THEN 1 ELSE 2 END, "
                 "queue_position, created_at LIMIT ?",
                 (limit,),
@@ -562,6 +572,102 @@ class GovernanceQueueStore:
                 timestamp,
             )
         return self.get(proposal_id)
+
+    def prepare_publication_approvals(
+        self, *, proposal_id: str, expected_revision: int, coadmin_slot: int,
+        expires_at: int, actor: str, now: int, renew_expired: bool = False,
+    ) -> GovernanceQueueRecord:
+        """Bind a separate approval window; never extend a live signed request."""
+        if coadmin_slot not in (1, 2) or not now < expires_at <= now + 7 * 86_400:
+            raise GovernanceQueueConflict("approval window is invalid")
+        with self._txn() as cursor:
+            row = cursor.execute("SELECT * FROM governance_proposal_queue WHERE id=?", (proposal_id,)).fetchone()
+            if row is None:
+                raise GovernanceQueueNotFound(proposal_id)
+            if row['revision'] != expected_revision:
+                raise GovernanceQueueConflict("publication changed; refresh before preparing approvals")
+            if row['state'] != 'READY' or row['activation_bundle_id'] or row['proposal_coin_id']:
+                raise GovernanceQueueConflict("only an unsubmitted reviewed proposal can prepare approvals")
+            if cursor.execute('SELECT 1 FROM governance_publication_dispatches WHERE proposal_id=? AND reconciled_at IS NULL', (proposal_id,)).fetchone():
+                raise GovernanceQueueConflict('check the saved submission before restarting approvals')
+            prior = row['publication_approval_expires_at'] or row['publication_voting_deadline']
+            if row['publication_coadmin_slot'] not in (None, coadmin_slot):
+                raise GovernanceQueueConflict("a different coadministrator is already assigned")
+            if prior is not None:
+                if not renew_expired:
+                    return self.get(proposal_id)
+                if prior > now:
+                    raise GovernanceQueueConflict("current publication approvals have not expired")
+            elif renew_expired:
+                raise GovernanceQueueConflict("there are no expired approvals to renew")
+            revision = int(row['revision']) + (1 if prior is not None else 0)
+            cursor.execute("UPDATE governance_proposal_queue SET publication_coadmin_slot=?,publication_approval_expires_at=?,publication_voting_deadline=NULL,revision=?,updated_at=? WHERE id=?",
+                           (coadmin_slot, expires_at, revision, now, proposal_id))
+            self._audit(cursor, proposal_id, actor, 'PUBLICATION_APPROVALS_RENEWED' if prior else 'PUBLICATION_APPROVALS_PREPARED', revision,
+                        {'approvalExpiresAt':expires_at, 'previousExpiry':prior, 'coadminSlot':coadmin_slot,
+                         'previousSignaturesRetained':True, 'votingStartsOnSubmission':True}, now)
+        return self.get(proposal_id)
+
+    def bind_publication_dispatch(self, *, proposal_id: str, expected_revision: int,
+                                  voting_deadline: int, actor: str, now: int,
+                                  original_id: str, bundle_id: str, proposal_coin_id: str) -> GovernanceQueueRecord:
+        """Freeze the actual committee deadline before dispatch, preserving retry identity."""
+        with self._txn() as cursor:
+            row=cursor.execute('SELECT * FROM governance_proposal_queue WHERE id=?',(proposal_id,)).fetchone()
+            if row is None:
+                raise GovernanceQueueNotFound(proposal_id)
+            if (row['state'] != 'READY' or row['revision'] != expected_revision
+                    or row['activation_bundle_id'] or row['proposal_coin_id']):
+                raise GovernanceQueueConflict('publication changed before submission')
+            expiry=row['publication_approval_expires_at'] or row['publication_voting_deadline']
+            if expiry is None or not now < expiry or not now < voting_deadline:
+                raise GovernanceQueueConflict('publication approval or committee deadline expired')
+            prior=row['publication_voting_deadline']
+            if prior not in (None,voting_deadline):
+                raise GovernanceQueueConflict('saved publication requires reconciliation before another submission')
+            if prior is None:
+                cursor.execute('UPDATE governance_proposal_queue SET publication_voting_deadline=?,updated_at=? WHERE id=?',(voting_deadline,now,proposal_id))
+                self._audit(cursor,proposal_id,actor,'PUBLICATION_DISPATCH_PREPARED',expected_revision,{'votingDeadline':voting_deadline},now)
+            existing = cursor.execute('SELECT * FROM governance_publication_dispatches WHERE original_id=?', (original_id,)).fetchone()
+            if existing is not None:
+                if (existing['proposal_id'], existing['revision'], existing['bundle_id'], existing['proposal_coin_id'], existing['voting_deadline']) != (proposal_id, expected_revision, bundle_id, proposal_coin_id, voting_deadline):
+                    raise GovernanceQueueConflict('saved publication receipt changed')
+                if existing['reconciled_at'] is not None:
+                    raise GovernanceQueueConflict('saved publication is already reconciled')
+            else:
+                if cursor.execute('SELECT 1 FROM governance_publication_dispatches WHERE proposal_id=? AND reconciled_at IS NULL', (proposal_id,)).fetchone():
+                    raise GovernanceQueueConflict('check the saved submission before preparing a replacement')
+                cursor.execute('INSERT INTO governance_publication_dispatches(proposal_id,revision,original_id,bundle_id,proposal_coin_id,voting_deadline,created_at) VALUES(?,?,?,?,?,?,?)', (proposal_id,expected_revision,original_id,bundle_id,proposal_coin_id,voting_deadline,now))
+        return self.get(proposal_id)
+
+    def publication_dispatch(self, proposal_id: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute('SELECT * FROM governance_publication_dispatches WHERE proposal_id=? AND reconciled_at IS NULL ORDER BY id DESC LIMIT 1', (proposal_id,)).fetchone()
+        return dict(row) if row else None
+
+    def reconcile_publication_dispatch(self, *, proposal_id: str, original_id: str, outcome: str, actor: str, now: int):
+        if outcome not in ('EXPIRED', 'ACCEPTED'):
+            raise GovernanceQueueConflict('invalid publication reconciliation')
+        with self._txn() as cursor:
+            record = cursor.execute('SELECT * FROM governance_proposal_queue WHERE id=?', (proposal_id,)).fetchone()
+            dispatch = cursor.execute('SELECT * FROM governance_publication_dispatches WHERE proposal_id=? AND original_id=?', (proposal_id,original_id)).fetchone()
+            if record is None or dispatch is None:
+                raise GovernanceQueueConflict('saved publication receipt is unavailable')
+            if outcome == 'EXPIRED' and record['state'] != 'READY':
+                raise GovernanceQueueConflict('an active publication cannot release its dispatch')
+            if dispatch['reconciled_at'] is not None:
+                return self.get(proposal_id)
+            cursor.execute('UPDATE governance_publication_dispatches SET reconciled_at=?,outcome=? WHERE id=?', (now,outcome,dispatch['id']))
+            if outcome == 'EXPIRED' and record['publication_approval_expires_at'] is not None:
+                cursor.execute('UPDATE governance_proposal_queue SET publication_voting_deadline=NULL,updated_at=? WHERE id=?', (now,proposal_id))
+            self._audit(cursor,proposal_id,actor,'PUBLICATION_DISPATCH_'+outcome,record['revision'],{'originalBundleId':original_id,'bundleId':dispatch['bundle_id'],'approvalsRetained':True},now)
+        return self.get(proposal_id)
+
+    def signature_metadata(self, proposal_id: str, action_ids: tuple[str, str]) -> list[dict]:
+        """Bounded read of the two displayed actions; never return signature bytes."""
+        with self._lock:
+            rows=self._conn.execute('SELECT action_id,signer_slot,message_hash FROM governance_queue_signatures WHERE proposal_id=? AND action_id IN (?,?)', (proposal_id,*action_ids)).fetchall()
+        return [{'actionId':row['action_id'],'signerSlot':row['signer_slot'],'messageHash':row['message_hash']} for row in rows]
 
     def bind_publication_coadmin(
         self,
@@ -844,6 +950,8 @@ def _record(row: sqlite3.Row) -> GovernanceQueueRecord:
             if row["publication_voting_deadline"] is not None
             else None
         ),
+        publication_approval_expires_at=(int(row['publication_approval_expires_at']) if row['publication_approval_expires_at'] is not None else None),
+        saved_publication=bool(row['saved_publication']) if 'saved_publication' in row.keys() else False,
         execution_bundle_id=(
             str(row["execution_bundle_id"])
             if row["execution_bundle_id"] is not None

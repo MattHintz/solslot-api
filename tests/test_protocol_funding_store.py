@@ -79,7 +79,7 @@ async def test_reservation_failure_prevents_rpc_and_changed_bundle_cannot_reuse_
         await service.submit(protocol_bundle().to_json_dict(), before_push=reject)
     assert provider.submitted is None
     row = json.loads(store.db.execute("SELECT document FROM funded_protocol_bundles").fetchone()[0])
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(ValueError, match="unreconciled"):
         store.reserve("testnet11", "0x" + "91" * 32, {}, row)
     assert store.db.execute("SELECT COUNT(*) FROM funded_protocol_bundles").fetchone()[0] == 1
     store.close()

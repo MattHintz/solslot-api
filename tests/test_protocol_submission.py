@@ -356,7 +356,7 @@ async def test_fee_above_cap_fails_before_submission() -> None:
         aggregate_fee=101,
     )
 
-    with pytest.raises(ProtocolSubmissionError, match="exceeds configured cap"):
+    with pytest.raises(ProtocolSubmissionError, match="exceeds the existing limit"):
         await submitter(provider, faucet).submit(protocol_bundle().to_json_dict())
 
     assert provider.submitted is None

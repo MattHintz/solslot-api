@@ -408,6 +408,7 @@ async def lifespan(app: FastAPI):
                 enabled=True,
                 target_seconds=settings.protocol_medium_fee_target_seconds,
                 estimate_buffer_bps=settings.protocol_fee_estimate_buffer_bps,
+                native_admission_enabled=settings.network == 'testnet11' and settings.protocol_fee_native_admission_enabled,
                 minimum_mojos=settings.protocol_minimum_fee_mojos,
                 maximum_mojos=settings.protocol_maximum_fee_mojos,
                 maximum_funding_coin_mojos=settings.faucet_max_spend_mojos,
