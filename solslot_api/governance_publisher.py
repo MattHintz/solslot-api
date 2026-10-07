@@ -306,6 +306,7 @@ async def build_governance_publication(
     queue_store: GovernanceQueueStore,
     actor: str,
     now: int | None = None,
+    renew_expired: bool = False,
 ) -> GovernancePublicationBuild:
     if record.state != "READY":
         raise ValueError("proposal must be reviewed before publication")
@@ -532,6 +533,18 @@ async def build_governance_publication(
         raise ValueError("queued proposal hash does not match its canonical bill")
     timestamp = int(time.time()) if now is None else now
     proposed_deadline = timestamp + statutes.parameters.voting_window_seconds
+    effective_deadline = (proposed_deadline if record.publication_voting_deadline is None
+                          or (renew_expired and record.publication_voting_deadline <= timestamp)
+                          else record.publication_voting_deadline)
+    requested_sgt = (
+        statutes.parameters.min_proposal_stake
+        if record.kind == "FUNDED_REDEMPTION"
+        else int(record.bill.get("sgtAmount") or 0)
+    )
+    if requested_sgt <= 0 or requested_sgt > int(reserve_coin.amount):
+        raise ValueError("SGT allocation exceeds the confirmed company reserve")
+    if record.kind == "SGT_SALE" and int(record.bill.get("expiresAt") or 0) <= effective_deadline:
+        raise ValueError("SGT sale must remain available beyond the committee vote")
     if (
         record.publication_coadmin_slot is None
         or record.publication_voting_deadline is None
@@ -545,20 +558,17 @@ async def build_governance_publication(
         )
     elif record.publication_coadmin_slot != coadmin_slot:
         raise ValueError("a different coadministrator is already assigned")
+    elif renew_expired and record.publication_voting_deadline <= timestamp:
+        record = queue_store.renew_expired_publication(
+            proposal_id=record.id, expected_deadline=record.publication_voting_deadline,
+            coadmin_slot=coadmin_slot, voting_deadline=proposed_deadline,
+            actor=actor, now=timestamp,
+        )
     if record.publication_voting_deadline is None:
         raise ValueError("governance publication deadline is unavailable")
     deadline = record.publication_voting_deadline
     if timestamp >= deadline:
         raise ValueError("governance publication deadline has expired")
-    requested_sgt = (
-        statutes.parameters.min_proposal_stake
-        if record.kind == "FUNDED_REDEMPTION"
-        else int(record.bill.get("sgtAmount") or 0)
-    )
-    if requested_sgt <= 0 or requested_sgt > int(reserve_coin.amount):
-        raise ValueError("SGT allocation exceeds the confirmed company reserve")
-    if record.kind == "SGT_SALE" and int(record.bill.get("expiresAt") or 0) <= deadline:
-        raise ValueError("SGT sale must remain available beyond the committee vote")
     delegated_puzzle = _publication_delegated_puzzle(
         proposal_hash,
         deadline,

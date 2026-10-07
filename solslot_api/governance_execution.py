@@ -74,7 +74,7 @@ from .funded_redemption_store import get_funded_redemption_store
 from .governance_queue import GovernanceQueueRecord
 from .sols_swaps import _confirmed_cat_lineage, _confirmed_coin_and_lineage
 from .sgt_lineage import confirmed_sgt_lineage
-from .vault_eligibility import ApprovedVault, require_current_approved_vault
+from .sgt_vault_eligibility import ConfirmedSGTVault, require_current_sgt_vault
 
 
 _MAX_DEPTH = 4096
@@ -115,7 +115,7 @@ class AllocationVoteBuild:
     sgt_amount: int
     available_sgt_amounts: tuple[int, ...]
     locked_inner_puzzle_hash: bytes32
-    approved_vault: ApprovedVault
+    approved_vault: ConfirmedSGTVault
 
 
 def _hex32(value: bytes | bytes32) -> str:
@@ -720,7 +720,7 @@ async def build_allocation_vote(
     signature_data: bytes | None = None,
     now: int | None = None,
 ) -> AllocationVoteBuild:
-    """Build one exact SGT vote from an approved protocol vault.
+    """Build one exact SGT vote from a confirmed protocol vault.
 
     The existing ``p2_vault`` remains the SGT owner. The vault singleton only
     authorizes the exact proposal-bound LOCK transition, while the existing SGT
@@ -810,7 +810,7 @@ async def build_allocation_vote(
         "governance tracker coin",
     )
 
-    approved = require_current_approved_vault(settings, vault_launcher_id)
+    approved = await require_current_sgt_vault(settings, vault_launcher_id, provider)
     vault_record = require_vault_record(approved.launcher_id)
     if vault_record.auth_type not in (AUTH_TYPE_BLS, AUTH_TYPE_SECP256K1):
         raise ValueError("vault owner authorization is unsupported")

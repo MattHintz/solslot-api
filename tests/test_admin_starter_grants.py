@@ -12,7 +12,8 @@ async def test_starter_preview_uses_current_stake_and_three_explicit_vaults(monk
     artifact = {'genesisPlan': {'launcherIds': {'statutes': '0x'+'11'*32, 'adminAuthority': '0x'+'22'*32}}}
     monkeypatch.setattr(endpoints, 'require_sgt_allocation_drafts', lambda _: None)
     monkeypatch.setattr(endpoints, 'load_signed_public_artifact', lambda _: artifact)
-    monkeypatch.setattr(endpoints, 'require_current_approved_vault', lambda _, value: SimpleNamespace(launcher_id=value))
+    async def confirmed(_, value, provider): return SimpleNamespace(launcher_id=value)
+    monkeypatch.setattr(endpoints, 'require_current_sgt_vault', confirmed)
     async def tip(*_): return {}
     async def statutes(*_):
         return SimpleNamespace(parameters=SimpleNamespace(min_proposal_stake=15000), live_coin_id='0x'+'33'*32)
@@ -31,8 +32,8 @@ async def test_starter_preview_uses_current_stake_and_three_explicit_vaults(monk
     store = GovernanceQueueStore(str(tmp_path / 'queue.db'))
     assert store.list() == []
     store.close()
-    def denied(*_): raise ValueError('vault enrollment is not current')
-    monkeypatch.setattr(endpoints, 'require_current_approved_vault', denied)
+    async def denied(*_): raise ValueError('vault custody is not chain-confirmed')
+    monkeypatch.setattr(endpoints, 'require_current_sgt_vault', denied)
     with pytest.raises(HTTPException, match='409'):
         await endpoints.preview_starter_grants(body, request, None, None)
 

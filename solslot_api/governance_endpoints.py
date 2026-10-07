@@ -76,6 +76,7 @@ from .sols_swaps import (
     _verify_aggregate_signature,
 )
 from .vault_eligibility import ApprovedVault, require_current_approved_vault
+from .sgt_vault_eligibility import require_current_sgt_vault
 
 
 router = APIRouter(tags=["governance-queue"])
@@ -200,6 +201,10 @@ class TransitionRequest(BaseModel):
 
 class PublicationPackageRequest(BaseModel):
     coadmin_slot: int = Field(alias="coadminSlot", ge=1, le=2)
+
+
+class PublicationPrepareRequest(PublicationPackageRequest):
+    renew_expired: bool = Field(False, alias="renewExpired")
 
 
 class PublicationSignatureRequest(PublicationPackageRequest):
@@ -531,8 +536,9 @@ def _if_match(value: str | None) -> int:
 
 
 @router.post("/admin/governance/proposals", status_code=201)
-def create_proposal(
+async def create_proposal(
     body: CreateGovernanceProposal,
+    request: Request,
     response: Response,
     claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     settings: Annotated[Settings, Depends(get_settings)],
@@ -540,7 +546,13 @@ def create_proposal(
 ) -> dict:
     try:
         require_sgt_allocation_drafts(settings)
-        approved_vault, recipient = _recipient_vault(body, settings)
+        if body.kind == "SGT_GRANT":
+            approved_vault = await require_current_sgt_vault(
+                settings, body.recipient_vault_launcher_id, request.app.state.coinset,
+            )
+            recipient = _b32(approved_vault.p2_puzzle_hash, "SGT vault p2 puzzle hash", nonzero=True)
+        else:
+            approved_vault, recipient = _recipient_vault(body, settings)
         if body.kind == "SGT_SALE":
             treasury = _treasury(settings)
             reserve_owner = _reserve_owner(settings)
@@ -674,7 +686,7 @@ async def preview_starter_grants(
             raise ValueError('current minimum proposal stake is invalid')
         proposals = []
         for slot, vault_id in enumerate(body.vault_launcher_ids):
-            approved = require_current_approved_vault(settings, vault_id)
+            approved = await require_current_sgt_vault(settings, vault_id, provider)
             # These are explicitly selected recipients. The owner and coadmin
             # review the slot-to-vault mapping before any on-chain allocation.
             grant_id = hashlib.sha256(bytes(Program.to([
@@ -1201,10 +1213,13 @@ async def _publication_build(
     genesis_store: GenesisStore,
     queue_store: GovernanceQueueStore,
     actor: SecurityActor,
+    renew_expired: bool = False,
 ):
     record = queue_store.get(proposal_id)
     if record.publication_coadmin_slot is None and actor.authority_slot != 0:
         raise ValueError("the owner must assign the publication coadministrator")
+    if renew_expired and actor.authority_slot != 0:
+        raise ValueError("only the owner can restart expired publication approvals")
     return await build_governance_publication(
         record=record,
         coadmin_slot=coadmin_slot,
@@ -1213,6 +1228,7 @@ async def _publication_build(
         genesis_store=genesis_store,
         queue_store=queue_store,
         actor=actor.wallet,
+        renew_expired=renew_expired,
     )
 
 
@@ -1392,7 +1408,7 @@ async def complete_allocation_vote(
 @router.post("/admin/governance/proposals/{proposal_id}/publication/package")
 async def publication_package(
     proposal_id: str,
-    body: PublicationPackageRequest,
+    body: PublicationPrepareRequest,
     request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
     genesis_store: Annotated[GenesisStore, Depends(get_genesis_store)],
@@ -1409,6 +1425,32 @@ async def publication_package(
             genesis_store=genesis_store,
             queue_store=queue_store,
             actor=actor,
+            renew_expired=body.renew_expired,
+        )
+        return _publication_view(build, queue_store)
+    except (ValueError, GovernanceQueueNotFound, GovernanceQueueConflict) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/admin/governance/proposals/{proposal_id}/publication/status")
+async def publication_status(
+    proposal_id: str,
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    genesis_store: Annotated[GenesisStore, Depends(get_genesis_store)],
+    queue_store: Annotated[GovernanceQueueStore, Depends(get_governance_queue_store)],
+    actor: Annotated[SecurityActor, Depends(require_security_actor)],
+) -> dict:
+    """Read an already prepared package; never assign or renew approvals."""
+    try:
+        require_sgt_allocation_drafts(settings)
+        record = queue_store.get(proposal_id)
+        if record.publication_coadmin_slot is None or record.publication_voting_deadline is None:
+            raise ValueError("the owner must prepare approvals before checking status")
+        build = await _publication_build(
+            proposal_id=proposal_id, coadmin_slot=record.publication_coadmin_slot,
+            request=request, settings=settings, genesis_store=genesis_store,
+            queue_store=queue_store, actor=actor,
         )
         return _publication_view(build, queue_store)
     except (ValueError, GovernanceQueueNotFound, GovernanceQueueConflict) as exc:

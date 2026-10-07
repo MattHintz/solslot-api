@@ -619,6 +619,33 @@ class GovernanceQueueStore:
             )
         return self.get(proposal_id)
 
+    def renew_expired_publication(
+        self, *, proposal_id: str, expected_deadline: int, coadmin_slot: int,
+        voting_deadline: int, actor: str, now: int,
+    ) -> GovernanceQueueRecord:
+        """Replace an expired, unsubmitted package; retain every old signature."""
+        if coadmin_slot not in (1, 2) or voting_deadline <= now:
+            raise GovernanceQueueConflict("renewed publication parameters are invalid")
+        with self._txn() as cursor:
+            row = cursor.execute("SELECT * FROM governance_proposal_queue WHERE id=?", (proposal_id,)).fetchone()
+            if row is None:
+                raise GovernanceQueueNotFound(proposal_id)
+            if (row['state'] != 'READY' or row['activation_bundle_id'] is not None
+                    or row['proposal_coin_id'] is not None):
+                raise GovernanceQueueConflict("only an unsubmitted reviewed proposal can restart approvals")
+            if (row['publication_voting_deadline'] != expected_deadline
+                    or row['publication_coadmin_slot'] != coadmin_slot):
+                raise GovernanceQueueConflict("publication changed; refresh before restarting approvals")
+            if expected_deadline > now:
+                raise GovernanceQueueConflict("current publication approvals have not expired")
+            revision = int(row['revision']) + 1
+            cursor.execute("UPDATE governance_proposal_queue SET publication_voting_deadline=?,revision=?,updated_at=? WHERE id=?",
+                           (voting_deadline, revision, now, proposal_id))
+            self._audit(cursor, proposal_id, actor, 'PUBLICATION_RENEWED', revision,
+                        {'previousVotingDeadline': expected_deadline, 'votingDeadline': voting_deadline,
+                         'coadminSlot': coadmin_slot, 'previousSignaturesRetained': True}, now)
+        return self.get(proposal_id)
+
     def record_sale_offer_snapshot(
         self,
         *,
