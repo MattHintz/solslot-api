@@ -248,7 +248,7 @@ async def run_pipeline(stage, stream, headers=None):
         if request.url.host == "ipfs-api.example.test":
             return httpx.Response(200, text=json.dumps({"Hash": CID}))
         if request.url.host == "pins.example.test":
-            return httpx.Response(200, json={"pin": {"cid": CID}})
+            return httpx.Response(200, json={"status": "pinned", "pin": {"cid": CID}})
         raise AssertionError("unexpected test destination")
 
     pipeline = CollectionMediaPipeline(pipeline_settings(), transport=httpx.MockTransport(handler))

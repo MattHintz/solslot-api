@@ -7,11 +7,15 @@ import sqlite3
 import threading
 import time
 import uuid
+import secrets
+import hmac
 from pathlib import Path
 from typing import Annotated, Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
+from pydantic import ConfigDict
+from uuid import UUID
 
 from .config import Settings, get_settings
 from .server_hardening import trusted_client_ip
@@ -26,6 +30,34 @@ _MAX_DATABASE_BYTES = 64 * 1024 * 1024
 _RATE_WINDOW_SECONDS = 60
 _MAX_GLOBAL_PER_WINDOW = 600
 _MAX_SOURCE_PER_WINDOW = 60
+_JOURNEY_RATE_SALT = secrets.token_bytes(32)
+
+
+class JourneyEvent(BaseModel):
+    """No URLs, account keys, cookies, form contents or free-form error text."""
+    model_config = ConfigDict(extra="forbid")
+    event_id: UUID
+    flow_id: UUID
+    sequence: int = Field(ge=1, le=200)
+    release_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    diagnostics_revision: Literal["AE197"] = "AE197"
+    source: Literal["customer", "admin"]
+    actor: Literal["visitor", "operator", "synthetic"]
+    screen: Literal["market", "property", "learn", "help", "vault", "identity", "dashboard", "admin_login", "admin_approvals", "admin_grants", "admin_collection", "admin_mint", "admin_other", "other"]
+    action: Literal["screen_opened", "button_pressed", "connect_wallet", "sign_in", "check_status", "verify_id", "retry", "save_draft", "seal", "review_approval", "submit_proposal", "create_presale", "api_request", "wallet_prompt", "asset_load"]
+    stage: Literal["ui", "checking_session", "preparing_request", "awaiting_wallet", "saving_session", "network_confirmation", "proof", "stamp", "refresh"]
+    phase: Literal["started", "waiting", "completed", "failed", "cancelled"]
+    wallet: Literal["none", "sage", "goby", "evm", "google", "passkey"]
+    network: Literal["testnet11"]
+    error_code: Literal["none", "network", "unauthorized", "forbidden", "validation", "conflict", "rate_limit", "unavailable", "asset_unavailable", "wallet_rejected", "unknown"]
+    request_id: UUID | None = None
+    http_status: int | None = Field(default=None, ge=100, le=599)
+    latency_ms: int | None = Field(default=None, ge=0, le=600_000)
+
+
+class JourneyBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    events: list[JourneyEvent] = Field(min_length=1, max_length=20)
 
 
 class IntakeLimitExceeded(ValueError):
@@ -203,6 +235,25 @@ class AlphaObservabilityStore:
             )
         return report_id
 
+    def journey(self, batch: JourneyBatch, source_ip: str) -> int:
+        now = int(time.time())
+        # Rate limiting only: process-local rotating salt prevents an enduring
+        # IP fingerprint. Flow IDs are ephemeral client claims, never people.
+        source_hash = hmac.new(_JOURNEY_RATE_SALT, f"{now // 86400}:{source_ip}".encode(), hashlib.sha256).hexdigest()
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            for event in batch.events:
+                event_id = "ux_" + event.event_id.hex
+                if self._conn.execute("SELECT 1 FROM alpha_telemetry_events WHERE id=?", (event_id,)).fetchone():
+                    continue  # A retry of the same batch cannot double-count.
+                self._admit("alpha_telemetry_events", source_hash, now)
+                details = event.model_dump(mode="json", exclude={"event_id", "flow_id", "release_sha", "latency_ms"}, exclude_none=True)
+                self._conn.execute("INSERT INTO alpha_telemetry_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (event_id, now, "JOURNEY_" + event.action.upper(), str(event.flow_id), event.release_sha,
+                     "0x" + "0" * 64, None, None, event.latency_ms, source_hash,
+                     json.dumps(details, sort_keys=True, separators=(",", ":"))))
+        return len(batch.events)
+
 
 _store: Optional[AlphaObservabilityStore] = None
 
@@ -248,6 +299,18 @@ def record_alpha_telemetry(
         raise HTTPException(status_code=exc.status_code, detail=str(exc), headers={"Retry-After": "60"}) from exc
     except sqlite3.Error as exc:
         raise HTTPException(status_code=503, detail="telemetry is temporarily unavailable") from exc
+
+
+@router.post("/journey-events", status_code=202)
+def record_journey_events(payload: JourneyBatch, request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    store: Annotated[AlphaObservabilityStore, Depends(get_alpha_observability_store)]) -> dict[str, int]:
+    try:
+        return {"accepted": store.journey(payload, trusted_client_ip(request.scope, settings))}
+    except IntakeLimitExceeded as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc), headers={"Retry-After": "60"}) from exc
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=503, detail="journey diagnostics are temporarily unavailable") from exc
 
 
 @router.post("/bug-reports", status_code=201)

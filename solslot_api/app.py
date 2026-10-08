@@ -691,6 +691,9 @@ app.add_middleware(
     settings=_server_settings,
 )
 
+from .journey_logging import JourneyRequestLogging
+app.add_middleware(JourneyRequestLogging)
+
 # Run-once V2 ceremony routes use the operator token plus threshold admin
 # signatures. The retired single-session bootstrap router is intentionally
 # not mounted.
