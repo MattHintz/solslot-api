@@ -1219,6 +1219,7 @@ async def _publication_build(
     queue_store: GovernanceQueueStore,
     actor: SecurityActor,
     renew_expired: bool = False,
+    publication_chain_time: int | None = None,
 ):
     record = queue_store.get(proposal_id)
     if record.publication_coadmin_slot is None and actor.authority_slot != 0:
@@ -1234,6 +1235,7 @@ async def _publication_build(
         queue_store=queue_store,
         actor=actor.wallet,
         renew_expired=renew_expired,
+        publication_chain_time=publication_chain_time,
     )
 
 
@@ -1603,6 +1605,26 @@ async def submit_publication(
         require_sgt_allocation_drafts(settings)
         if actor.authority_slot != 0:
             raise ValueError("only the owner can submit an approved proposal")
+        if queue_store.publication_dispatch(proposal_id) is not None:
+            raise GovernanceQueueConflict('Check saved submission before submitting again')
+        provider = getattr(request.app.state, "coinset", None)
+        if provider is None:
+            raise ProtocolSubmissionError('The primary Testnet11 node is unavailable; approvals are retained')
+        publication_chain_time = None
+        if queue_store.get(proposal_id).publication_approval_expires_at is not None:
+            # Separate publication consent is bound to the unchanged bill and
+            # approval expiry, so the vote can begin on the chain's clock.
+            # Chia checks ASSERT_SECONDS_ABSOLUTE against the latest transaction
+            # block, which normally trails wall-clock time.
+            from .protocol_admission import primary_admission_state
+            try:
+                clock = await provider.get_fee_estimate(
+                    target_times=[settings.protocol_medium_fee_target_seconds],
+                    cost=1, require_primary=True,
+                )
+            except ChiaProviderError as exc:
+                raise ProtocolSubmissionError('The primary network clock is unavailable; approvals are retained') from exc
+            _, _, _, publication_chain_time = primary_admission_state(clock)
         build = await _publication_build(
             proposal_id=proposal_id,
             coadmin_slot=body.coadmin_slot,
@@ -1611,6 +1633,7 @@ async def submit_publication(
             genesis_store=genesis_store,
             queue_store=queue_store,
             actor=actor,
+            publication_chain_time=publication_chain_time,
         )
         if build.bundle is None or build.proposal_coin_id is None:
             raise GovernanceQueueConflict("owner-plus-one approvals are incomplete")

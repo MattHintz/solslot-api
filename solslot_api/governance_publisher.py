@@ -331,6 +331,7 @@ async def build_governance_publication(
     actor: str,
     now: int | None = None,
     renew_expired: bool = False,
+    publication_chain_time: int | None = None,
 ) -> GovernancePublicationBuild:
     if record.state != "READY":
         raise ValueError("proposal must be reviewed before publication")
@@ -556,7 +557,18 @@ async def build_governance_publication(
     if _hex32(proposal_hash) != record.proposal_hash.lower():
         raise ValueError("queued proposal hash does not match its canonical bill")
     timestamp = int(time.time()) if now is None else now
-    proposed_deadline = timestamp + statutes.parameters.voting_window_seconds
+    vote_start = timestamp
+    if publication_chain_time is not None:
+        if (type(publication_chain_time) is not int
+                or not 0 <= timestamp - publication_chain_time <= 600):
+            raise ValueError('publication requires a fresh primary chain clock')
+        vote_start = publication_chain_time
+    proposed_deadline = vote_start + statutes.parameters.voting_window_seconds
+    if publication_chain_time is not None and proposed_deadline <= timestamp + 60:
+        raise ValueError(
+            'The network is waiting for a recent block. Approvals are retained; '
+            'check again after the next block. Nothing was sent.'
+        )
     separate_approvals = record.kind in ('SGT_GRANT', 'SGT_SALE')
     prior_expiry = getattr(record, 'publication_approval_expires_at', None) or record.publication_voting_deadline
     if separate_approvals and (prior_expiry is None or (renew_expired and prior_expiry <= timestamp)):

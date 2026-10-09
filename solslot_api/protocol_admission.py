@@ -40,3 +40,26 @@ def admission_conditions(bundle, height, network):
     if not 0 < int(conditions.cost) <= constants.MAX_BLOCK_COST_CLVM:
         raise ProtocolSubmissionError('Protocol native cost is outside the consensus bound')
     return conditions
+
+
+def require_absolute_admission(conditions, *, height, peak_time):
+    """Check absolute timelocks against the primary's transaction-block clock.
+
+    Native CLVM/signature validation extracts these conditions but does not
+    evaluate them against the current chain. Do this before reserving a fee
+    coin, and again immediately before push. Expiry reconciliation deliberately
+    only extracts conditions and does not call this admission-only check.
+    """
+    if int(conditions.height_absolute) > height or int(conditions.seconds_absolute) > peak_time:
+        raise ProtocolSubmissionError(
+            'The network has not reached this transaction\'s start time yet. '
+            'Approvals are retained; wait for the next block and check again. Nothing was sent.'
+        )
+    before_height = conditions.before_height_absolute
+    before_time = conditions.before_seconds_absolute
+    if ((before_height is not None and height >= int(before_height))
+            or (before_time is not None and peak_time >= int(before_time))):
+        raise ProtocolSubmissionError(
+            'This saved transaction\'s chain window has expired. '
+            'Check its saved status before preparing another submission. Nothing was sent.'
+        )

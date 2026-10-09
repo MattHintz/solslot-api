@@ -6,6 +6,7 @@ from chia._tests.util.spend_sim import SpendSim, SimClient
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 from eth_keys import keys
+from chia.util.errors import Err
 
 from solslot_api import governance_publisher as publisher
 from solslot_api.governance_queue import GovernanceQueueStore
@@ -114,6 +115,19 @@ async def test_production_publisher_spends_fresh_issuance_and_statutes(monkeypat
         assert signed.approval_expires_at > signed.deadline
         assert signed.bundle is not None
         assert len(signed.bundle.coin_spends) == 6
+        # A real primary's transaction-block clock trails the coordinator's
+        # wall clock. Reproduce AE202's exact consensus rejection before
+        # proving the fixed builder reuses both approvals and is accepted.
+        chain_time = int(sim.timestamp)
+        arguments['now'] = chain_time + 90
+        ahead = await publisher.build_governance_publication(**arguments)
+        _, error = await client.push_tx(ahead.bundle)
+        assert error is Err.ASSERT_SECONDS_ABSOLUTE_FAILED
+        signed = await publisher.build_governance_publication(
+            **arguments, publication_chain_time=chain_time)
+        assert signed.actions == ahead.actions == before_wait.actions
+        assert signed.deadline == chain_time + world.plan.protocol.parameters.voting_window_seconds
+        assert signed.record.publication_voting_deadline is None
         await include(sim, client, signed.bundle)
         proposal = await client.get_coin_record_by_name(bytes32.from_hexstr(signed.proposal_coin_id))
         assert proposal and not proposal.spent
