@@ -45,6 +45,10 @@ from .chia_provider import ChiaProviderError
 from .genesis import get_genesis_store
 from .genesis_store import GenesisStore
 from .governance_publisher import build_governance_publication
+from .governance_sponsorship import (
+    require_reserve_sponsored_publication,
+    reserve_sponsored_publication_status,
+)
 from .governance_execution import build_allocation_execution, build_allocation_vote
 from .governance_sale_offer import (
     reconstruct_governed_sale_coin,
@@ -752,7 +756,10 @@ def get_sgt_allocation_options(
                 "serverPriced": True,
             }
         )
-    return {"paymentRails": rails}
+    return {
+        "paymentRails": rails,
+        "sponsoredPublication": reserve_sponsored_publication_status(),
+    }
 
 
 @router.post("/protocol/sgt-sales/{proposal_id}/purchase-artifact")
@@ -1605,6 +1612,7 @@ async def submit_publication(
         require_sgt_allocation_drafts(settings)
         if actor.authority_slot != 0:
             raise ValueError("only the owner can submit an approved proposal")
+        require_reserve_sponsored_publication()
         if queue_store.publication_dispatch(proposal_id) is not None:
             raise GovernanceQueueConflict('Check saved submission before submitting again')
         provider = getattr(request.app.state, "coinset", None)

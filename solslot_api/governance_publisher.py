@@ -74,6 +74,7 @@ from .admin_key_changes import (
 )
 from .genesis_store import GenesisStore
 from .governance_queue import GovernanceQueueRecord, GovernanceQueueStore
+from .governance_sponsorship import require_reserve_sponsored_publication
 
 
 CREATE_PUZZLE_ANNOUNCEMENT = 62
@@ -333,6 +334,7 @@ async def build_governance_publication(
     renew_expired: bool = False,
     publication_chain_time: int | None = None,
 ) -> GovernancePublicationBuild:
+    require_reserve_sponsored_publication()
     if record.state != "READY":
         raise ValueError("proposal must be reviewed before publication")
     if coadmin_slot not in (1, 2):
