@@ -284,6 +284,37 @@ async def collection_profiles() -> dict[str, Any]:
     }
 
 
+@router.get(
+    "/admin/collections/pricing/xch",
+    dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)],
+)
+async def collection_xch_pricing(
+    response: Response,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    """Read current verified pricing without changing any collection revision."""
+    response.headers["Cache-Control"] = "no-store"
+    now = int(time.time())
+    try:
+        authorized = load_authorized_oracle_round(settings, asset_id=bytes32.zeros, now=now)
+        round_ = authorized.round
+        if round_.network != settings.network or round_.asset_decimals != 12:
+            raise PaymentQuoteError("oracle round does not match native workspace XCH")
+    except PaymentQuoteError:
+        return {"status": "unavailable", "checkedAt": now, "quote": None}
+    return {
+        "status": "available", "checkedAt": now,
+        "quote": {
+            "priceUsdMinorPerXch": str(round_.price_usd_minor_per_asset),
+            "validUntil": round_.valid_until,
+            # Display the oldest supporting observation, not the fetch clock.
+            "observedAt": min(item.observed_at for item in round_.observations),
+            "sequence": str(round_.sequence), "roundHash": "0x" + round_.round_hash.hex(),
+            "sourceCount": len(round_.observations), "signerCount": len(authorized.signatures),
+        },
+    }
+
+
 @router.post(
     "/admin/collections/display-units/convert",
     dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)],
