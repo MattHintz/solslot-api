@@ -184,12 +184,13 @@ async def fetch_observations(*, now: int, credentials: Mapping[str, str], transp
                 if source == "coingecko":
                     method, options = "GET", {"headers": {"x-cg-demo-api-key": credential_values[source]}}
                 else:
+                    # Metadata supplies the coin code checked by the strict parser.
                     # Fixed short history window gives each operator a dated point.
                     # Do not mistake the undated /coins/single rate for fresh evidence.
                     end = now // 300 * 300 * 1000
                     method, options = "POST", {
                         "headers": {"x-api-key": credential_values[source]},
-                        "json": {"currency": "USD", "code": "XCH", "start": end - 300_000, "end": end, "meta": False},
+                        "json": {"currency": "USD", "code": "XCH", "start": end - 300_000, "end": end, "meta": True},
                     }
                 async with client.stream(method, url, **options) as response:
                     if response.status_code != 200:

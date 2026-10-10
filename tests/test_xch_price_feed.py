@@ -79,12 +79,13 @@ def test_dated_history_uses_usd_and_commits_provider_point():
     assert obs.evidence_hash != other.evidence_hash
 
 
-@pytest.mark.parametrize("mutation", ["empty", "wrong_coin", "missing_time", "stale", "duplicate", "fractional", "future", "invalid_rate"])
+@pytest.mark.parametrize("mutation", ["empty", "wrong_coin", "missing_coin", "missing_time", "stale", "duplicate", "fractional", "future", "invalid_rate"])
 def test_undated_ambiguous_wrong_coin_and_stale_history_cannot_renew_price(mutation):
     payload = responses()["livecoinwatch"]
     row = payload["history"][0]
     if mutation == "empty": payload["history"] = []
     elif mutation == "wrong_coin": payload["code"] = "BTC"
+    elif mutation == "missing_coin": del payload["code"]
     elif mutation == "missing_time": del row["date"]
     elif mutation == "stale": row["date"] = (NOW - 600) * 1000
     elif mutation == "duplicate": payload["history"].append(copy.deepcopy(row))
@@ -179,6 +180,27 @@ async def test_fetch_is_bounded_and_does_not_follow_redirects():
 
 
 @pytest.mark.asyncio
+async def test_livecoinwatch_requests_metadata_needed_to_identify_dated_xch_history():
+    """The live endpoint omits code for meta=false; retain strict coin checking."""
+    def handler(request):
+        if request.url.host == "api.coingecko.com":
+            return httpx.Response(200, content=json.dumps(responses()["coingecko"], default=str), headers={"content-type": "application/json"})
+        assert request.url.path == "/coins/single/history"
+        body = json.loads(request.content)
+        payload = responses()["livecoinwatch"]
+        if body.get("meta") is not True:
+            del payload["code"]
+        return httpx.Response(200, json=payload)
+
+    observations = await fetch_observations(
+        now=NOW, credentials={"coingecko": "test-only-coingecko-key", "livecoinwatch": "test-only-livecoinwatch-key"},
+        transport=httpx.MockTransport(handler),
+    )
+    assert len(observations) == 2
+    assert {item.observed_at for item in observations} == {NOW - 5, NOW - 120}
+
+
+@pytest.mark.asyncio
 async def test_verified_price_status_is_read_only_and_expires(tmp_path, monkeypatch):
     pubkeys, signed = authorized()
     config = settings(tmp_path, pubkeys)
@@ -214,6 +236,6 @@ async def test_free_provider_credentials_are_sent_only_to_their_own_https_origin
             assert request.method == "POST" and request.headers['x-api-key'] == credentials['livecoinwatch']
             assert 'x-cg-demo-api-key' not in request.headers
             body = json.loads(request.content)
-            assert body == {"currency":"USD", "code":"XCH", "start":NOW // 300 * 300 * 1000 - 300000, "end":NOW // 300 * 300 * 1000, "meta":False}
+            assert body == {"currency":"USD", "code":"XCH", "start":NOW // 300 * 300 * 1000 - 300000, "end":NOW // 300 * 300 * 1000, "meta":True}
     with pytest.raises(PriceFeedError, match="both free-provider"):
         await fetch_observations(now=NOW, credentials={}, transport=httpx.MockTransport(handler))
