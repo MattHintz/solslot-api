@@ -47,6 +47,7 @@ async def require_current_sgt_vault(
         one_leaf_merkle_root(bytes(record.owner_pubkey)),
         bytes32.fromhex(_active_pool_launcher_id(settings).removeprefix('0x')),
         identity_attest_root=DEFAULT_IDENTITY_ATTEST_ROOT,
+        generation_vault=bool(getattr(settings,'deployment_generation_id',None)),
         zkpassport_bridge_policy_hash=bytes32.fromhex(
             _active_bridge_policy_hash(settings).removeprefix('0x')),
     )

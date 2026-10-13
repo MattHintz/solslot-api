@@ -75,6 +75,7 @@ class VaultSessionResponse(BaseModel):
     protocolVersion: Literal["solslot-v2"] = "solslot-v2"
     expiresAt: int
     sessionFingerprint: str | None = None
+    generationId: str | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,7 @@ def vault_session_payload(settings: Settings) -> dict[str, Any]:
     return {
         "network": settings.network,
         "protocolVersion": "solslot-v2",
+        **({'generationId': settings.deployment_generation_id} if settings.deployment_generation_id else {}),
     }
 
 
@@ -129,6 +131,7 @@ def issue_vault_session(
         "authType": verified_owner.auth_type,
         "network": settings.network,
         "protocolVersion": "solslot-v2",
+        "generationId": settings.deployment_generation_id,
     }
     token = pyjwt.encode(claims, secret, algorithm="HS256")
     return token, VaultSessionResponse(
@@ -138,6 +141,7 @@ def issue_vault_session(
         network=settings.network,
         expiresAt=expires_at,
         sessionFingerprint=vault_session_fingerprint(claims["jti"]),
+        generationId=settings.deployment_generation_id,
     )
 
 
@@ -186,6 +190,7 @@ def verify_vault_session(
         claims.get("vaultLauncherId") != vault
         or claims.get("network") != settings.network
         or claims.get("protocolVersion") != "solslot-v2"
+        or claims.get('generationId') != settings.deployment_generation_id
         or claims.get("authType") not in {"evm", "chia_bls"}
         or not claims.get("sub")
     ):
@@ -267,7 +272,8 @@ def credential_typed_data(
     settings: Settings,
     challenge: OwnerChallenge,
 ) -> dict[str, Any]:
-    return {
+    from .generation_context import bind_typed_generation
+    return bind_typed_generation({
         "types": CREDENTIAL_ACTION_TYPES,
         "primaryType": CREDENTIAL_ACTION_PRIMARY_TYPE,
         "domain": {
@@ -282,7 +288,7 @@ def credential_typed_data(
             "nonce": challenge.nonce,
             "expiresAt": challenge.expires_at,
         },
-    }
+    }, settings.deployment_generation_id)
 
 
 def credential_bls_message(settings: Settings, challenge: OwnerChallenge) -> bytes:
@@ -296,6 +302,9 @@ def credential_bls_message(settings: Settings, challenge: OwnerChallenge) -> byt
             settings.network.encode("ascii"),
         )
     )
+    if settings.deployment_generation_id:
+        from .generation_context import generation_bytes
+        material += b'\x00SOLSLOT_GENERATION\x00' + generation_bytes(settings.deployment_generation_id)
     return hashlib.sha256(material).digest()
 
 

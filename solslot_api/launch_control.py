@@ -246,6 +246,7 @@ class LaunchSession:
     wallet: str | None
     setup: bool
     expires_at: int
+    generation_id: str | None = None
 
 
 _ephemeral_launch_secret: str | None = None
@@ -306,6 +307,7 @@ def _issue_session(
     token = pyjwt.encode(
         {
             "scope": LAUNCH_SCOPE,
+            "generationId": settings.deployment_generation_id,
             "ceremonyId": ceremony_id,
             "slot": slot,
             "wallet": wallet,
@@ -369,12 +371,15 @@ def _decode_session(token: str, settings: Settings) -> LaunchSession:
         raise HTTPException(status_code=403, detail="Administrator session is invalid.") from exc
     if payload.get("scope") != LAUNCH_SCOPE:
         raise HTTPException(status_code=403, detail="Administrator session has the wrong scope.")
+    if payload.get('generationId') != settings.deployment_generation_id:
+        raise HTTPException(status_code=403, detail='Administrator session belongs to another deployment generation.')
     return LaunchSession(
         ceremony_id=str(payload["ceremonyId"]),
         slot=int(payload["slot"]),
         wallet=str(payload["wallet"]).lower() if payload.get("wallet") else None,
         setup=bool(payload["setup"]),
         expires_at=int(payload["exp"]),
+        generation_id=settings.deployment_generation_id,
     )
 
 
@@ -641,7 +646,8 @@ def _ceremony_chain(record: Mapping[str, Any]) -> int:
 
 
 def _ceremony_binding(record: Mapping[str, Any]) -> dict[str, Any]:
-    return {"ceremonyId": record["ceremony_id"], "evmChainId": _ceremony_chain(record)}
+    return {"ceremonyId": record["ceremony_id"], "evmChainId": _ceremony_chain(record),
+            **({"generationId": record["draft"]["generationId"]} if record["draft"].get("generationId") else {})}
 
 
 def _selected_commitments(record: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -696,8 +702,10 @@ def _resume_typed_data(
     nonce: str,
     expires_at: int,
     chain_id: int = 11155111,
+    generation_id: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    from .generation_context import bind_typed_generation
+    return bind_typed_generation({
         "types": {
             "EIP712Domain": [
                 {"name": "name", "type": "string"},
@@ -721,7 +729,7 @@ def _resume_typed_data(
             "nonce": nonce,
             "expiresAt": expires_at,
         },
-    }
+    }, generation_id)
 
 
 def _action_typed_data(
@@ -732,8 +740,10 @@ def _action_typed_data(
     payload_hash: str,
     expires_at: int,
     chain_id: int = 11155111,
+    generation_id: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    from .generation_context import bind_typed_generation
+    return bind_typed_generation({
         "types": {
             "EIP712Domain": [
                 {"name": "name", "type": "string"},
@@ -757,7 +767,7 @@ def _action_typed_data(
             "payloadHash": payload_hash,
             "expiresAt": expires_at,
         },
-    }
+    }, generation_id)
 
 
 def _typed_digest(typed_data: Mapping[str, Any]) -> str:
@@ -1951,6 +1961,7 @@ async def resume_challenge(
             "nonce": nonce,
             "ceremonyBinding": _ceremony_binding(record),
             "typedData": _resume_typed_data(
+                generation_id=settings.deployment_generation_id,
                 ceremony_id=str(record["ceremony_id"]),
                 chain_id=_ceremony_chain(record),
                 slot=slot,
@@ -1978,6 +1989,7 @@ async def resume_login(
         ):
             raise GenesisExpired("administrator challenge expired or was already used")
         typed = _resume_typed_data(
+            generation_id=settings.deployment_generation_id,
             ceremony_id=str(challenge["ceremony_id"]),
             chain_id=_ceremony_chain(store.get(str(challenge["ceremony_id"]))),
             slot=int(challenge["slot"]),
@@ -2435,6 +2447,7 @@ async def prepare_launch_action(
         )
         expires_at = int(time.time()) + 600
         typed = _action_typed_data(
+            generation_id=session.generation_id,
             ceremony_id=session.ceremony_id,
             chain_id=_ceremony_chain(store.get(session.ceremony_id)),
             action_type=body.action_type,
@@ -2472,6 +2485,7 @@ async def approve_launch_action(
         if body.expires_at < now or body.expires_at > now + 600:
             raise GenesisExpired("launch action signature expired")
         typed = _action_typed_data(
+            generation_id=session.generation_id,
             ceremony_id=session.ceremony_id,
             chain_id=_ceremony_chain(store.get(session.ceremony_id)),
             action_type=body.action_type,
@@ -2523,6 +2537,7 @@ async def prepare_launch_abandonment(
         )
         expires_at = int(time.time()) + 600
         typed = _action_typed_data(
+            generation_id=session.generation_id,
             ceremony_id=session.ceremony_id,
             chain_id=_ceremony_chain(store.get(session.ceremony_id)),
             action_type="abandon",
@@ -2651,6 +2666,8 @@ async def execute_fixed_funding(
     session: Annotated[LaunchSession, Depends(require_launch_session)],
 ) -> dict[str, Any]:
     _require_owner(session)
+    if settings.deployment_generation_id:
+        raise HTTPException(409,detail='The replacement generation requires its reviewed reserved-coordinate funding plan.')
     try:
         _funding_ceiling_open(settings)
         action_id, _ = _funding_payload(store, session.ceremony_id)

@@ -7,6 +7,8 @@ before their coins can be reused. No private transaction bytes enter log output.
 """
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 import json
 import os
 from pathlib import Path
@@ -21,6 +23,19 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def valid_expired_input_evidence(bundle, proof):
+    if proof.get('allInputsKnownAndNoPendingSpends') is not True: return False
+    rows = proof.get('externalInputEvidence')
+    height = proof.get('peakHeight')
+    if not isinstance(rows, list) or type(height) is not int or height <= 0: return False
+    ephemeral = {coin.name() for coin in bundle.additions()}
+    expected = sorted('0x' + coin.name().hex() for coin in bundle.removals() if coin.name() not in ephemeral)
+    if [r.get('coinId') for r in rows if isinstance(r, dict)] != expected: return False
+    return all(type(r.get('confirmedHeight')) is int and 0 < r['confirmedHeight'] <= height
+        and type(r.get('spentHeight')) is int and (r['spentHeight'] == 0 or r['confirmedHeight'] <= r['spentHeight'] <= height)
+        for r in rows)
+
+
 class ProtocolFundingStore:
     def __init__(self, path: str):
         self.path = str(path)
@@ -32,7 +47,7 @@ class ProtocolFundingStore:
             os.fchmod(fd, 0o600)
             os.close(fd)
         self.lock = threading.RLock()
-        self.db = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
+        self.db = connect_generation_sqlite(self.path, isolation_level=None, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -140,6 +155,12 @@ class ProtocolFundingStore:
         with self.lock:
             return self.db.execute("SELECT 1 FROM funded_protocol_releases WHERE network=? AND original_id=?", (network, original_id)).fetchone() is not None
 
+    def expiry_proof(self, network, original_id):
+        with self.lock:
+            row = self.db.execute('SELECT proof FROM funded_protocol_releases WHERE network=? AND original_id=?',
+                (network, original_id)).fetchone()
+        return json.loads(row[0]) if row else None
+
     def release_expired(self, network, original_id, proof):
         """Append verified chain-expiry evidence; preserve all original records."""
         with self.lock:
@@ -154,7 +175,7 @@ class ProtocolFundingStore:
                 if (proof.get('bundleId') != document['spendBundleId'] or proof.get('inputIds') != inputs
                         or type(proof.get('absoluteExpiry')) is not int or proof['absoluteExpiry'] <= 0
                         or type(proof.get('peakTimestamp')) is not int or proof['peakTimestamp'] < proof['absoluteExpiry']
-                        or proof.get('allInputsUnspentAndClear') is not True):
+                        or (proof.get('allInputsUnspentAndClear') is not True and not valid_expired_input_evidence(bundle, proof))):
                     raise ValueError("Expiry proof does not match the exact saved transaction")
                 self.db.execute("INSERT OR IGNORE INTO funded_protocol_releases VALUES(?,?,?,?)", (network, original_id, canonical(proof), int(time.time())))
                 self.db.execute("INSERT INTO funded_protocol_events(network,original_id,event,recorded_at) VALUES(?,?,?,?)", (network, original_id, 'expired_inputs_released', int(time.time())))

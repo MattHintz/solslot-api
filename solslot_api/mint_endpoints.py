@@ -75,8 +75,20 @@ router = APIRouter(tags=["admin-mint"])
 def require_mint_writes(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> None:
+    _require_legacy_mint_generation(settings)
     require_minting_writes(settings)
     require_operation_gate(settings, "minting")
+
+
+def _require_legacy_mint_generation(settings: Settings) -> None:
+    # These routes build the old per-deed governance and reserve-quorum spends.
+    # New generations must use the authenticated holder snapshot and batch
+    # mint kernel. Reject before reserving inputs or persisting a proposal.
+    if getattr(settings, "deployment_generation_id", None):
+        raise HTTPException(status_code=409, detail={
+            "code": "GENERATION_MINT_ROUTE_REQUIRED",
+            "message": "Use the governed collection mint for this deployment generation.",
+        })
 
 
 # ── Module-level store singleton ────────────────────────────────────────────
@@ -553,6 +565,7 @@ def _validate_collection_publish_context(
     The spend bundle remains authoritative, but publication cannot substitute
     a different dossier root, anchor, allocation row, or collection owner.
     """
+    _require_legacy_mint_generation(settings)
     has_commitment = bool(metadata.metadata_root and metadata.metadata_anchor_id)
     if settings.collection_minting_enabled and not has_commitment:
         raise HTTPException(
@@ -571,6 +584,11 @@ def _validate_collection_publish_context(
         collection = collection_store.get(metadata.collection_id)
     except CollectionNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if collection.get("purpose") == "TEST_ONLY" or collection.get("dossier", {}).get("purpose") == "TEST_ONLY":
+        raise HTTPException(status_code=409, detail={
+            "code": "TEST_EDITION_MINT_ROUTE_REQUIRED",
+            "message": "Test editions require the generation-bound collection mint.",
+        })
     if collection["ownerSubject"] != claims.sub.lower():
         raise HTTPException(status_code=403, detail="only the collection owner may publish")
     if collection["state"] not in ("SEALED", "PUBLISHED"):

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 import hashlib
 import json
 import secrets
@@ -134,7 +136,7 @@ class OperationStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+        connection = connect_generation_sqlite(self.path, timeout=10, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 10000")

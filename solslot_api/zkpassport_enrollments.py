@@ -938,6 +938,24 @@ def _verify_current_chia_vault_coin(
     return record
 
 
+def _custody_full(settings,launcher,owner,auth,members,pool,**kwargs):
+    if getattr(settings,'deployment_generation_id',None):
+        from solslot_puzzles.generation_vault import vault_inner
+        from chia.wallet.puzzles.singleton_top_layer_v1_1 import puzzle_for_singleton
+        return puzzle_for_singleton(launcher,vault_inner(vault_launcher_id=launcher,owner_pubkey=owner,
+            auth_type=auth,members_merkle_root=members,pool_launcher_id=pool,**kwargs))
+    from solslot_puzzles.vault_driver import puzzle_for_vault_full
+    return puzzle_for_vault_full(launcher,owner,auth,members,pool,**kwargs)
+
+
+def _custody_identity_bundle(settings,**kwargs):
+    if getattr(settings,'deployment_generation_id',None):
+        from solslot_puzzles.generation_vault_identity import build_generation_identity_bundle
+        return build_generation_identity_bundle(**kwargs)
+    from solslot_puzzles.zkpassport_bridge_driver import build_bridge_and_vault_update_identity_bundle
+    return build_bridge_and_vault_update_identity_bundle(**kwargs)
+
+
 def _expected_stamped_vault_puzzle_hash(
     settings: Settings,
     *,
@@ -968,6 +986,7 @@ def _expected_stamped_vault_puzzle_hash(
             zkpassport_bridge_policy_hash=bytes32.fromhex(
                 bridge_policy_hash.removeprefix("0x")
             ),
+            generation_vault=bool(getattr(settings,'deployment_generation_id',None)),
         )
     except ValueError as exc:
         raise HTTPException(
@@ -1231,6 +1250,7 @@ def get_vault_session(
         expiresAt=session.expires_at,
         scope=session.scope,
         sessionFingerprint=vault_session_fingerprint(session.session_id),
+        generationId=settings.deployment_generation_id,
     )
 
 
@@ -1647,7 +1667,7 @@ def _build_bls_chia_stamp(
     pool_launcher_id = bytes32.fromhex(active_pool_launcher_id.removeprefix("0x"))
     bridge_policy_hash = bytes32.fromhex(record.bridgePolicyHash.removeprefix("0x"))
     members_root = one_leaf_merkle_root(owner_pubkey)
-    current_puzzle = puzzle_for_vault_full(
+    current_puzzle = _custody_full(settings,
         launcher,
         owner_pubkey,
         AUTH_TYPE_BLS,
@@ -1674,7 +1694,7 @@ def _build_bls_chia_stamp(
         )
 
     try:
-        built = build_bridge_and_vault_update_identity_bundle(
+        built = _custody_identity_bundle(settings,
             enrollment_permit=_record_permit(settings, record.model_dump(), now=int(time.time())),
             bridge_parent_id=bytes32.fromhex(record.bridgeParentId.removeprefix("0x")),
             bridge_amount=record.bridgeAmount,
@@ -1715,7 +1735,7 @@ def _build_bls_chia_stamp(
         )
 
     identity_root = bytes32.fromhex(record.receipt.identityAttestRoot.removeprefix("0x"))
-    expected_puzzle = puzzle_for_vault_full(
+    expected_puzzle = _custody_full(settings,
         launcher,
         owner_pubkey,
         AUTH_TYPE_BLS,
@@ -2072,7 +2092,7 @@ async def submit_evm_chia_stamp(
     pool_launcher_id = bytes32.fromhex(active_pool_launcher_id.removeprefix("0x"))
     bridge_policy_hash = bytes32.fromhex(record.bridgePolicyHash.removeprefix("0x"))
     members_root = one_leaf_merkle_root(recovery.compressed_pubkey)
-    current_puzzle = puzzle_for_vault_full(
+    current_puzzle = _custody_full(settings,
         launcher,
         recovery.compressed_pubkey,
         AUTH_TYPE_SECP256K1,
@@ -2115,7 +2135,7 @@ async def submit_evm_chia_stamp(
         raise HTTPException(status_code=409,
             detail="The retained stamp submission window expired. Check the existing attempt before recovery.")
     try:
-        built = build_bridge_and_vault_update_identity_bundle(
+        built = _custody_identity_bundle(settings,
             enrollment_permit=_record_permit(settings, record.model_dump(), now=int(time.time())),
             bridge_parent_id=bytes32.fromhex(record.bridgeParentId.removeprefix("0x")),
             bridge_amount=record.bridgeAmount,
@@ -2154,7 +2174,7 @@ async def submit_evm_chia_stamp(
             detail="The Chia bridge validator message does not match the EVM event.",
         )
 
-    expected_puzzle = puzzle_for_vault_full(
+    expected_puzzle = _custody_full(settings,
         launcher,
         recovery.compressed_pubkey,
         AUTH_TYPE_SECP256K1,
@@ -2186,7 +2206,7 @@ async def submit_evm_chia_stamp(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if quorum.signer_indices != (0, 1):
         try:
-            built = build_bridge_and_vault_update_identity_bundle(
+            built = _custody_identity_bundle(settings,
                 enrollment_permit=_record_permit(settings, record.model_dump(), now=int(time.time())),
                 bridge_parent_id=bytes32.fromhex(record.bridgeParentId.removeprefix("0x")),
                 bridge_amount=record.bridgeAmount,

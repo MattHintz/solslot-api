@@ -116,7 +116,7 @@ def admin_login_typed_data(
     be replayed to authenticate as ``auth_type='chia_bls'`` or for a
     different scope (POP-CANON-015 future-proofing).
     """
-    return {
+    envelope = {
         "types": ADMIN_LOGIN_TYPES,
         "primaryType": ADMIN_LOGIN_PRIMARY_TYPE,
         "domain": {
@@ -132,6 +132,12 @@ def admin_login_typed_data(
             "scope": scope,
         },
     }
+
+    if settings.deployment_generation_id:
+        envelope['types'] = {**ADMIN_LOGIN_TYPES, ADMIN_LOGIN_PRIMARY_TYPE: [
+            *ADMIN_LOGIN_TYPES[ADMIN_LOGIN_PRIMARY_TYPE], {'name': 'generationId', 'type': 'bytes32'}]}
+        envelope['message']['generationId'] = settings.deployment_generation_id
+    return envelope
 
 
 # ── Module-level state ───────────────────────────────────────────────────────
@@ -391,6 +397,7 @@ class AdminClaims:
     exp: int
     authority_slot: int | None = None
     compressed_pubkey: str | None = None
+    generation_id: str | None = None
 
 
 def issue_jwt(
@@ -411,6 +418,8 @@ def issue_jwt(
         "exp": exp,
         "scope": "admin",
     }
+    if settings.deployment_generation_id:
+        payload['generation_id'] = settings.deployment_generation_id
     if authority_slot is not None:
         payload["authority_slot"] = authority_slot
     if compressed_pubkey is not None:
@@ -440,12 +449,15 @@ def verify_jwt(token: str, settings: Optional[Settings] = None) -> AdminClaims:
     except pyjwt.InvalidTokenError as e:
         raise JWTVerifyError(f"invalid token: {e}") from e
 
+    if payload.get('generation_id') != s.deployment_generation_id:
+        raise JWTVerifyError('administrator session belongs to another deployment generation')
     if payload.get("scope") != "admin":
         raise JWTVerifyError("token scope is not 'admin'")
     auth_type = payload.get("auth_type", "")
     if auth_type not in ("evm", "chia_bls"):
         raise JWTVerifyError(f"unknown auth_type: {auth_type!r}")
     return AdminClaims(
+        generation_id=s.deployment_generation_id,
         sub=str(payload["sub"]),
         auth_type=auth_type,
         iat=int(payload["iat"]),

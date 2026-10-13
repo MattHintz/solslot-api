@@ -127,6 +127,8 @@ def test_predictive_buffer_respects_cap_and_never_submits():
     submitter=ProtocolBundleSubmitter(provider=provider,faucet=faucet,
         policy=ProtocolFeePolicy(enabled=True,maximum_mojos=13_000_000,estimate_buffer_bps=12500))
     from tests.test_protocol_submission import protocol_bundle
-    with pytest.raises(ProtocolSubmissionError,match='exceeds configured cap'):
+    with pytest.raises(ProtocolSubmissionError) as rejected:
         asyncio.run(submitter.submit(protocol_bundle().to_json_dict()))
+    assert rejected.value.code=='FEE_CAP_EXCEEDED'
+    assert rejected.value.submission_attempted is False
     assert provider.submitted is None

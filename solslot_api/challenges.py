@@ -29,6 +29,8 @@ Audit history:
 """
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 import secrets
 import sqlite3
 import time
@@ -88,7 +90,7 @@ class RequestRateLimiter:
             return True
 
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._db_path, timeout=5.0, isolation_level=None) as conn:
+        with connect_generation_sqlite(self._db_path, timeout=5.0, isolation_level=None) as conn:
             try:
                 conn.execute("PRAGMA busy_timeout = 5000")
                 conn.execute("BEGIN IMMEDIATE")
@@ -122,7 +124,7 @@ class RequestRateLimiter:
         if self._db_path is None:
             return
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._db_path, timeout=5.0) as conn:
+        with connect_generation_sqlite(self._db_path, timeout=5.0) as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = FULL")
             conn.executescript(
@@ -295,7 +297,7 @@ class ChallengeStore:
     def _connect(self) -> sqlite3.Connection:
         if self._db_path is None:
             raise RuntimeError("Persistent challenge storage is not configured")
-        conn = sqlite3.connect(self._db_path, timeout=5.0, isolation_level=None)
+        conn = connect_generation_sqlite(self._db_path, timeout=5.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout = 5000")
         return conn

@@ -189,6 +189,14 @@ def _release_source_shas(
 
 
 def _verify_runtime_bindings(settings: Settings, payload: Mapping[str, Any]) -> None:
+    if settings.deployment_generation_id:
+        generation = payload.get('deploymentGeneration')
+        if not isinstance(generation, Mapping) or generation.get('generationId') != settings.deployment_generation_id:
+            raise PublicArtifactError('signed artifact does not authorize this deployment generation')
+        from .vault_puzzle_hash import GENERATION_VAULT_INNER_HASH
+        puzzles=payload.get('puzzleHashes')
+        if not isinstance(puzzles,Mapping) or puzzles.get('vaultInnerModHash')!='0x'+GENERATION_VAULT_INNER_HASH.hex():
+            raise PublicArtifactError('signed generation artifact does not pin the installed custody module')
     from solslot_puzzles.inventory_activation import validate_inventory_activation
     try:
         validate_inventory_activation(payload, environment=settings.runtime_environment + "-alpha")

@@ -24,6 +24,8 @@ discrete public method so the rules are visible at the call site.
 """
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 import json
 import logging
 import re
@@ -245,7 +247,7 @@ class MintProposalStore:
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
 
-        self._conn = sqlite3.connect(
+        self._conn = connect_generation_sqlite(
             self.path,
             timeout=timeout,
             isolation_level=None,            # explicit transactions

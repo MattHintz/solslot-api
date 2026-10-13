@@ -30,6 +30,17 @@ def test_lost_response_retries_are_not_counted_twice():
     assert '203.0.113.9' not in json.dumps(dict(row))
     assert json.loads(row['details_json'])['stage']=='awaiting_wallet'
 
+
+@pytest.mark.parametrize('action',['sols_guide_review','sols_guide_offer','sols_guide_match','sols_guide_receive'])
+def test_sols_walkthrough_uses_bounded_events_without_purchase_or_wallet_details(action):
+    payload=event();payload.update(screen='sols_purchase',action=action,stage='ui',phase='started',wallet='none')
+    valid=JourneyEvent(**payload)
+    store=AlphaObservabilityStore(':memory:')
+    store.journey(JourneyBatch(events=[valid]),'203.0.113.9')
+    assert store.aggregate_counts()['telemetry_event_count']==1
+    for field in ('offer_bytes','amount','destination','purchase_id'):
+        with pytest.raises(ValidationError):JourneyEvent(**(payload|{field:'private'}))
+
 def test_batch_capacity_failure_is_atomic(monkeypatch):
     import solslot_api.alpha_observability as module
     monkeypatch.setattr(module,'_MAX_TELEMETRY_ROWS',1)

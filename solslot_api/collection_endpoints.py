@@ -3,6 +3,10 @@ from __future__ import annotations
 
 import secrets
 import time
+import hashlib
+import json
+import sqlite3
+from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, Mapping, Optional, TypeVar
 
 import httpx
@@ -11,6 +15,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 from .admin_auth import AdminClaims, require_admin_jwt
+from .test_collection_metadata import TestPropertyDraftV1
+from solslot_puzzles.property_metadata import commit_metadata
 from .admin_operations import require_admin_operation
 from .collection_display_units import (
     DisplayUnitError,
@@ -79,6 +85,37 @@ class CreateCollectionRequest(ApiModel):
     )
     title: str = Field(min_length=1, max_length=180)
     slug: Optional[str] = Field(default=None, min_length=1, max_length=100)
+
+
+class CreateTestEditionRequest(ApiModel):
+    source_collection_id: str = Field(alias='sourceCollectionId', min_length=1, max_length=120)
+    source_revision: int = Field(alias='sourceRevision', ge=1)
+    source_draft_hash: str = Field(alias='sourceDraftHash', pattern=r'^0x[0-9a-f]{64}$')
+
+
+class PreviewAcknowledgement(ApiModel):
+    draft_hash: str = Field(alias='draftHash', pattern=r'^0x[0-9a-f]{64}$')
+
+
+def require_test_editions(settings: Annotated[Settings, Depends(get_settings)]) -> None:
+    if not (settings.test_collection_editions_enabled and settings.network == 'testnet11'
+            and settings.deployment_generation_id):
+        raise HTTPException(503, 'Test editions are disabled for this deployment generation.')
+
+
+def _read_archive_draft(settings: Settings, collection_id: str) -> dict:
+    if not settings.collection_source_archive_db_path or not settings.collection_source_archive_generation_id:
+        raise HTTPException(503, 'The reviewed source archive is not configured.')
+    path = Path(settings.collection_source_archive_db_path).resolve()
+    # Read-only connection: no schema migrations, WAL changes or writes to the original.
+    connection = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
+    try:
+        row = connection.execute('SELECT dossier_json FROM property_collections WHERE id=?', (collection_id,)).fetchone()
+    finally:
+        connection.close()
+    if not row:
+        raise HTTPException(404, 'Source draft was not found in the reviewed archive.')
+    return PropertyDossierDraftV1.model_validate_json(row[0]).model_dump(mode='json', by_alias=True, exclude_none=True)
 
 
 class AssetUploadRequest(ApiModel):
@@ -241,6 +278,8 @@ async def collection_feature_status(
     except (OSError, ValueError, TypeError, KeyError):
         recovery = {"healthy": False, "checkedAt": None, "restoredAt": None}
     return {
+        "generationId": settings.deployment_generation_id,
+        "testEditionsEnabled": bool(settings.test_collection_editions_enabled and settings.network == 'testnet11' and settings.deployment_generation_id),
         "metadataConfigured": settings.collection_metadata_enabled,
         "metadataEnabled": settings.collection_metadata_enabled and recovery["healthy"],
         "recovery": recovery,
@@ -424,6 +463,50 @@ async def create_collection(
     return _with_etag(response, payload)
 
 
+@router.get('/admin/collection-source/{collection_id}', dependencies=[Depends(require_admin_jwt), Depends(require_test_editions)])
+async def collection_source_summary(collection_id: str, settings: Annotated[Settings, Depends(get_settings)]) -> dict:
+    payload = _read_archive_draft(settings, collection_id)
+    return {'collectionId': payload['collectionId'], 'revision': payload['revision'], 'title': payload['title'],
+        'draftHash': '0x' + commit_metadata(payload).metadata_root.hex(),
+        'generationId': settings.collection_source_archive_generation_id}
+
+
+@router.post('/admin/collections/test-editions', dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata), Depends(require_test_editions)])
+async def create_test_edition(body: CreateTestEditionRequest, response: Response,
+                             settings: Annotated[Settings, Depends(get_settings)],
+                             claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
+                             store: Annotated[CollectionStore, Depends(get_collection_store)]) -> dict:
+    source = _read_archive_draft(settings, body.source_collection_id)
+    digest = '0x' + commit_metadata(source).metadata_root.hex()
+    if source['revision'] != body.source_revision or digest != body.source_draft_hash:
+        raise HTTPException(409, 'Source revision changed. Review the source again.')
+    generation = settings.deployment_generation_id
+    collection_id = 'TEST-' + hashlib.sha256(f'{generation}:{digest}'.encode()).hexdigest()[:24].upper()
+    try:
+        existing = store.get(collection_id)
+    except CollectionNotFound:
+        existing = None
+    if existing:
+        if existing['ownerSubject'] != claims.sub.lower():
+            raise HTTPException(409, 'This source edition already belongs to another administrator.')
+        return _with_etag(response, existing)
+    payload = _store_call(lambda: store.create_test_edition(source=source,
+        source_generation_id=settings.collection_source_archive_generation_id,
+        collection_id=collection_id, actor_subject=claims.sub, actor_auth_type=claims.auth_type))
+    return _with_etag(response, payload)
+
+
+@router.post('/admin/collections/{collection_id}/preview-acknowledgements',
+    dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)])
+async def acknowledge_collection_preview(collection_id: str, body: PreviewAcknowledgement, response: Response,
+    claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
+    store: Annotated[CollectionStore, Depends(get_collection_store)],
+    if_match: Annotated[Optional[str], Header(alias='If-Match')] = None) -> dict:
+    payload = _store_call(lambda: store.acknowledge_preview(collection_id,
+        expected_revision=_expected_revision(if_match), expected_draft_hash=body.draft_hash, actor_subject=claims.sub))
+    return _with_etag(response, payload)
+
+
 @router.get(
     "/admin/collections",
     dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)],
@@ -459,7 +542,7 @@ async def get_collection(
 )
 async def update_collection(
     collection_id: str,
-    body: PropertyDossierDraftV1,
+    body: PropertyDossierDraftV1 | TestPropertyDraftV1,
     response: Response,
     claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     store: Annotated[CollectionStore, Depends(get_collection_store)],
@@ -475,6 +558,24 @@ async def update_collection(
             submit_for_review=submit_for_review,
         )
     )
+    return _with_etag(response, payload)
+
+
+@router.post('/admin/collections/{collection_id}/pricing/apply',
+    dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata), Depends(require_test_editions)])
+async def apply_test_collection_pricing(
+    collection_id: str, response: Response,
+    claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
+    store: Annotated[CollectionStore, Depends(get_collection_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    if_match: Annotated[Optional[str], Header(alias='If-Match')] = None,
+) -> dict[str, Any]:
+    try:
+        authorized = load_authorized_oracle_round(settings, asset_id=bytes32.zeros, now=int(time.time()))
+    except PaymentQuoteError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    payload = _store_call(lambda: store.apply_test_pricing(collection_id,
+        expected_revision=_expected_revision(if_match), actor_subject=claims.sub, authorized=authorized))
     return _with_etag(response, payload)
 
 

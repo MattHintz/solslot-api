@@ -269,6 +269,13 @@ def load_validator_artifact(
         artifact = verify_signed_public_artifact_file(settings.public_artifact_path)
     except PublicArtifactError as exc:
         raise ValidatorEvidenceError(str(exc)) from exc
+    if getattr(settings,'deployment_generation_id',None):
+        from .vault_puzzle_hash import GENERATION_VAULT_INNER_HASH
+        generation=artifact.get('deploymentGeneration');puzzles=artifact.get('puzzleHashes')
+        if (not isinstance(generation,Mapping) or not isinstance(puzzles,Mapping)
+                or generation.get('generationId')!=settings.deployment_generation_id
+                or puzzles.get('vaultInnerModHash')!='0x'+GENERATION_VAULT_INNER_HASH.hex()):
+            raise ValidatorEvidenceError('signed artifact generation or custody module differs from this signer')
     try:
         release = load_release_metadata(settings.release_metadata_path)
     except (OSError, ValueError) as exc:
@@ -530,6 +537,7 @@ def _verify_vault_and_owner(
         one_leaf_merkle_root(owner_pubkey),
         pool_launcher,
         identity_attest_root=DEFAULT_IDENTITY_ATTEST_ROOT,
+        generation_vault=bool(getattr(settings,'deployment_generation_id',None)),
         zkpassport_bridge_policy_hash=bridge_policy_hash,
     )
     if coin.puzzle_hash != expected_puzzle_hash:
@@ -568,6 +576,7 @@ def _coordinator_settings(
     return Settings(
         runtime_environment="test",
         network=settings.network,
+        deployment_generation_id=getattr(settings,'deployment_generation_id',None),
         coinset_base_url=settings.coinset_base_url,
         public_artifact_path=settings.public_artifact_path,
         release_metadata_path=settings.release_metadata_path,

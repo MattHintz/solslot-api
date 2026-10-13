@@ -119,6 +119,8 @@ class ChiaProvider:
             "primary provider is not configured" if primary is None else None
         )
         self._lock = asyncio.Lock()
+        from .cost_fees import CostFeeAdapter
+        self._cost_fees = CostFeeAdapter(primary, fallback, monotonic=monotonic)
 
     async def start(self) -> None:
         if self.primary is None:
@@ -255,6 +257,11 @@ class ChiaProvider:
             "get_network_info", lambda client: client.get_network_info()
         )
 
+    async def get_network_info_primary(self) -> dict[str, Any]:
+        return await self._primary_read(
+            "genesis network proof", lambda client: client.get_network_info()
+        )
+
     async def get_coin_record_by_name(
         self, coin_id: str
     ) -> Optional[dict[str, Any]]:
@@ -287,6 +294,13 @@ class ChiaProvider:
                 start_height=start_height,
                 end_height=end_height,
             ),
+        )
+
+    async def get_coin_records_by_puzzle_hash_primary(self, puzzle_hash: str, *, include_spent: bool = False):
+        """Authoritative funding selection; an advisory fallback cannot supply it."""
+        return await self._primary_read(
+            'generation mint funding catalog',
+            lambda client: client.get_coin_records_by_puzzle_hash(puzzle_hash, include_spent=include_spent),
         )
 
     async def get_coin_records_by_parent_ids(
@@ -409,6 +423,14 @@ class ChiaProvider:
                 **estimate_args,
             ),
         )
+
+    async def get_cost_fee_advice(self, *, cost: int, target_seconds: int):
+        if self.primary is None or not await self._primary_available():
+            raise ChiaProviderError('A healthy local node is required before cost fee advice')
+        try:
+            return await self._cost_fees.quote(cost=cost, target_seconds=target_seconds)
+        except Exception as exc:
+            raise ChiaProviderError('Primary cost fee advice is unavailable or invalid') from exc
 
     async def _logged_push(self, client, bundle, provider):
         from .submission_errors import record_submission, error_code
@@ -653,6 +675,40 @@ class ChiaProvider:
             return True
         except Exception:
             return False
+
+    async def primary_expiry_input_evidence(self, bundle, *, height):
+        """Exact external inputs for expired-bundle reconciliation only.
+
+        A confirmed competing spend proves an input is no longer usable. It
+        never proves our saved settlement filled. Unknown or pending inputs
+        cannot release a retained reservation.
+        """
+        if self.primary is None or type(height) is not int or height <= 0: return None
+        try:
+            from chia_rs import SpendBundle
+            from .generation_coin_evidence import read_confirmed_coin
+            parsed = SpendBundle.from_json_dict(bundle)
+            ephemeral = {coin.name() for coin in parsed.additions()}
+            rows = []
+            spends = {spend.coin.name(): spend for spend in parsed.coin_spends}
+            for coin in parsed.removals():
+                if coin.name() in ephemeral: continue
+                identity = '0x' + coin.name().hex()
+                evidence = read_confirmed_coin(await self.primary.get_coin_record_by_name(identity), coin.name())
+                if (evidence.coin != coin or evidence.confirmed_height > height or evidence.spent_height > height
+                        or await self.primary.get_mempool_items_by_coin_name(identity)):
+                    return None
+                matches = False
+                if evidence.spent_height:
+                    from chia_rs import CoinSpend
+                    actual=await self.primary.get_puzzle_and_solution(identity,evidence.spent_height)
+                    if not actual:return None
+                    matches=CoinSpend.from_json_dict(actual)==spends[coin.name()]
+                rows.append({'coinId': identity, 'confirmedHeight': evidence.confirmed_height,
+                    'spentHeight': evidence.spent_height, 'matchesSavedSpend':matches})
+            return sorted(rows, key=lambda row: row['coinId']) if rows else None
+        except Exception:
+            return None
 
     async def _spend_observed(self, spend_bundle_json: dict[str, Any]) -> bool:
         try:

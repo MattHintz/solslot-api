@@ -106,10 +106,177 @@ class Faucet:
         self.key = self._derive_wallet_key(0)
         self._exclusive_selection_purpose: str | None = None
         self._coin_reservation_sources: list[Callable[[], Iterable[str]]] = []
+        self._generation_preparation_json: str | None = None
+        self._generation_launch_store = None
+        self._generation_mint_reviews = None
+        self._generation_mint_parent_limit = None
+
+    def bind_generation_preparation(self, preparation, *, trusted_preparation_hash: str) -> None:
+        """Reserve frozen launch parents before any ordinary selection starts.
+
+        This does not authorize issuance, broadcasting or arbitrary signing.
+        The only scoped exception is the exact one-mojo recipient launch below.
+        """
+        from .generation_preparation import GenerationPreparation
+        frozen = GenerationPreparation.model_validate_json(preparation.model_dump_json(by_alias=True))
+        if self.network != 'testnet11' or frozen.manifest_hash != trusted_preparation_hash:
+            raise FaucetSelectionRestricted('generation preparation does not match the reviewed Testnet11 binding')
+        encoded = frozen.model_dump_json(by_alias=True)
+        if self._generation_preparation_json is not None:
+            if self._generation_preparation_json != encoded:
+                raise FaucetSelectionRestricted('reserved generation preparation cannot change in this runtime')
+            return
+        reserved = frozenset([frozen.sgt_funding_coin_id,
+            *(c.funding_coin_id for c in frozen.coordinates.values()),
+            *(a.custody.funding_coin_id for a in frozen.administrators)])
+        self._generation_preparation_json = encoded
+        # Keep this source separate from durable executions. The scoped signer
+        # must still reject a parent reserved by any other execution journal.
+        self._generation_preparation_reservations = lambda: reserved
+        self.add_coin_reservation_source(self._generation_preparation_reservations)
+
+    def sign_generation_recipient(self, coin: Coin, slot: int, *, preparation_manifest: str):
+        """Sign only the frozen recipient launch and unchanged-owner change."""
+        from .generation_preparation import GenerationPreparation
+        from .generation_recipient_launch import build_recipient_launch
+        from chia.types.coin_spend import make_spend
+        from chia.wallet.puzzles.singleton_top_layer_v1_1 import launch_conditions_and_coinsol
+        from chia_rs.sized_ints import uint64
+        self.require_spend_purpose('genesis')
+        if self.network != 'testnet11' or self._generation_preparation_json is None:
+            raise FaucetSelectionRestricted('reviewed generation preparation is not bound')
+        frozen = GenerationPreparation.model_validate_json(self._generation_preparation_json)
+        if (frozen.manifest_hash != preparation_manifest or type(slot) is not int or slot not in (1, 2, 3)
+                or '0x' + coin.name().hex() != frozen.administrators[slot-1].custody.funding_coin_id
+                or coin.puzzle_hash != self.address_puzzle_hash or coin.amount < 1):
+            raise FaucetSelectionRestricted('recipient funding is not the frozen owned parent')
+        for source in self._coin_reservation_sources:
+            if source is self._generation_preparation_reservations:
+                continue
+            try:
+                if coin.name() in {_hex_to_bytes32(value) for value in source()}:
+                    raise FaucetSelectionRestricted('recipient parent belongs to another retained execution')
+            except FaucetSelectionRestricted:
+                raise
+            except Exception as exc:
+                raise FaucetSelectionRestricted('recipient reservations are unavailable') from exc
+        conditions, _ = launch_conditions_and_coinsol(coin, frozen.custody_inner(frozen.administrators[slot-1]), [], uint64(1))
+        if coin.amount > 1:
+            conditions.append(Program.to([51, coin.puzzle_hash, int(coin.amount)-1]))
+        conditions = Program.to(conditions)
+        spend = make_spend(coin, self.key.puzzle, Program.to([0, Program.to((1, conditions)), 0]))
+        operation = build_recipient_launch(frozen, slot, spend, trusted_preparation_hash=preparation_manifest)
+        return operation.with_aggregated_signature(G2Element.from_bytes(self._delegated_signature(coin, conditions)))
+
+    def bind_generation_launch(self, store):
+        from .generation_launch import GenerationLaunchStore
+        if (not isinstance(store, GenerationLaunchStore) or self.network != 'testnet11'
+                or self._generation_preparation_json is None
+                or store.preparation.model_dump_json(by_alias=True) != self._generation_preparation_json):
+            raise FaucetSelectionRestricted('final launch differs from the reserved preparation')
+        if self._generation_launch_store is not None and self._generation_launch_store is not store:
+            raise FaucetSelectionRestricted('final launch cannot be rebound in this runtime')
+        self._generation_launch_store = store
+
+    def sign_generation_launch(self, identity, *, evidence, funding_coins, now):
+        """Only the installed release and two verified exact launch consents."""
+        from .generation_genesis_core import genesis_launch_funding_requests, assemble_genesis_launch
+        from chia.types.coin_spend import make_spend
+        from chia_rs import AugSchemeMPL
+        self.require_spend_purpose('genesis')
+        store=self._generation_launch_store
+        if store is None:raise FaucetSelectionRestricted('final launch is not bound')
+        store.require_ready(now);review=store.require_consent(identity,now)
+        args=dict(preparation=store.preparation,artifact=store.artifact,evidence=evidence,
+            trusted_preparation_hash=store.preparation.manifest_hash,trusted_artifact_hash=store.artifact.artifact_hash,
+            consent_issued_at=review['issuedAt'])
+        requests=genesis_launch_funding_requests(**args,funding_coins=dict(funding_coins))
+        for item in requests:
+            if item.coin.puzzle_hash!=self.address_puzzle_hash:
+                raise FaucetSelectionRestricted('final launch parent is not owned by the approved funder')
+            for source in self._coin_reservation_sources:
+                if source is self._generation_preparation_reservations:continue
+                try:
+                    if item.coin.name() in {_hex_to_bytes32(v) for v in source()}:
+                        raise FaucetSelectionRestricted('launch parent is retained by another operation')
+                except FaucetSelectionRestricted:raise
+                except Exception as exc:raise FaucetSelectionRestricted('launch reservations are unavailable') from exc
+        spends={r.name:make_spend(r.coin,self.key.puzzle,Program.to([0,Program.to((1,r.conditions)),0])) for r in requests}
+        unsigned=assemble_genesis_launch(**args,funding_spends=spends)
+        if '0x'+unsigned.operation.commitment.hex()!=review['assemblyHash']:
+            raise FaucetSelectionRestricted('native launch differs from signed release consent')
+        signatures=[G2Element.from_bytes(self._delegated_signature(r.coin,r.conditions)) for r in requests]
+        return unsigned.operation.with_aggregated_signature(AugSchemeMPL.aggregate(signatures))
 
     def add_coin_reservation_source(self, source: Callable[[], Iterable[str]]) -> None:
         if source not in self._coin_reservation_sources:
             self._coin_reservation_sources.append(source)
+
+    def bind_generation_mint_reviews(self, store, *, generation_id, maximum_parent_mojos):
+        """Bind one reviewed local namespace, never a browser-supplied store."""
+        from .generation_mint_reviews import GenerationMintReviewStore
+        if (self.network!='testnet11' or not isinstance(store,GenerationMintReviewStore)
+                or store.generation_id!=generation_id or type(maximum_parent_mojos) is not int
+                or not 0<maximum_parent_mojos<=1_000_000_000):
+            raise FaucetSelectionRestricted('test mint source or parent ceiling is not configured')
+        if self._generation_mint_reviews is not None and (
+                self._generation_mint_reviews.path!=store.path or self._generation_mint_parent_limit!=maximum_parent_mojos):
+            raise FaucetSelectionRestricted('test mint source cannot be rebound in this runtime')
+        self._generation_mint_reviews=store;self._generation_mint_parent_limit=maximum_parent_mojos
+        self._generation_mint_reservations=store.reserved_input_coin_ids
+        self.add_coin_reservation_source(self._generation_mint_reservations)
+
+    def sign_generation_mint(self, identity, *, chain, proposal):
+        """Build/sign only the voted source's fixed one-mojo launcher funding.
+
+        There is no reserved-coin bypass or arbitrary condition argument. The
+        known native assembler fixes all three authorities, every launcher,
+        every inventory output and unchanged-puzzle change before signing.
+        The caller must separately recheck fresh primary evidence and save the
+        returned bytes durably before dispatch. Generic spend signing stays
+        unable to use these retained parents.
+        """
+        from .generation_mint_reviews import reviewed_mint_edition, h
+        from solslot_puzzles.generation_mint import GenerationMint
+        from solslot_puzzles.generation_transactions import mint_collection
+        from chia.types.coin_spend import make_spend
+        from chia_rs.sized_ints import uint64
+        self.require_spend_purpose(None)
+        if self.network!='testnet11' or self._generation_mint_reviews is None:
+            raise FaucetSelectionRestricted('reviewed Testnet11 mint source is not bound')
+        review=self._generation_mint_reviews.status(identity);edition=reviewed_mint_edition(review)
+        gov,reg=chain.governance.state,chain.registry.state
+        history=chain.economic_components.get(bytes32.from_hexstr(review['mintAuthority']['componentId']))
+        if (history is None or not isinstance(history.state,GenerationMint) or reg.pause_mask&2 or reg.pending
+                or gov.active or gov.upgrade_reserved or gov.sgt.generation!=edition.generation):
+            raise FaucetSelectionRestricted('the exact approved mint authority is not available')
+        mint=history.state
+        if review['mintAuthority']!={'componentId':h(mint.component_id),'launcherId':h(mint.launcher_id),
+                'coinId':h(history.current.coin.name()),'moduleHash':h(mint.logic_hash()),'version':mint.version}:
+            raise FaucetSelectionRestricted('mint authority differs from its saved source')
+        other_holds=set()
+        for source in self._coin_reservation_sources:
+            if source==self._generation_mint_reservations:continue
+            try:other_holds.update(_hex_to_bytes32(v) for v in source())
+            except Exception as exc:raise FaucetSelectionRestricted('other retained reservations are unavailable') from exc
+        funding=[];conditions=[]
+        for row,inventory in zip(review['funding'],mint.inventories(edition),strict=True):
+            coin=Coin.from_json_dict(row['coin'])
+            if (coin.puzzle_hash!=self.address_puzzle_hash or not 0<coin.amount<=self._generation_mint_parent_limit
+                    or h(coin.name())!=row['coinId'] or h(inventory.launcher_spend.coin.name())!=row['launcherId']
+                    or h(inventory.coin.name())!=row['inventoryCoinId']):
+                raise FaucetSelectionRestricted('mint parent or output differs from its reviewed scope')
+            if coin.name() in other_holds:raise FaucetSelectionRestricted('mint parent belongs to another retained execution')
+            outputs=[[51,inventory.launcher_spend.coin.puzzle_hash,1]]
+            if coin.amount>1:outputs.append([51,coin.puzzle_hash,int(coin.amount)-1])
+            exact=Program.to(outputs);conditions.append((coin,exact))
+            funding.append(make_spend(coin,self.key.puzzle,Program.to([0,Program.to((1,exact)),0])))
+        operation,_,_,_=mint_collection(gov,chain.governance.verified_tip(reg.governance_id,gov.inner()),
+            reg,chain.registry.verified_tip(reg.launcher_id,reg.inner()),mint,
+            history.verified_tip(mint.launcher_id,mint.inner()),proposal,edition,tuple(funding))
+        signature=AugSchemeMPL.aggregate([G2Element.from_bytes(self._delegated_signature(coin,exact))
+            for coin,exact in conditions])
+        return operation.with_aggregated_signature(signature)
 
     def reserved_coin_ids(self) -> set[bytes32]:
         try:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 import sqlite3
 import json
 import threading
@@ -27,7 +29,7 @@ class ValidatorLedger(BaseLifecycleLedgerMixin, BaseInventoryHoldLedgerMixin, In
         self.path = str(path) if path == ":memory:" else str(Path(path))
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(
+        self._conn = connect_generation_sqlite(
             self.path,
             timeout=timeout,
             isolation_level=None,
@@ -37,6 +39,37 @@ class ValidatorLedger(BaseLifecycleLedgerMixin, BaseInventoryHoldLedgerMixin, In
         self._lock = threading.RLock()
         self._configure()
         self._migrate()
+
+    def record_generation_batch(self,*,claim,signature,now):
+        """Retain source-specific signatures; no generic message signing."""
+        canonical_claim=claim.canonical();identity=claim.digest()
+        with self._lock:
+            self._conn.execute('BEGIN IMMEDIATE')
+            try:
+                self._conn.execute('CREATE TABLE IF NOT EXISTS generation_primary_batch_signatures ('
+                    'claim_hash TEXT PRIMARY KEY,generation_id TEXT NOT NULL,canonical_claim TEXT NOT NULL,'
+                    'signature TEXT NOT NULL,expires_at INTEGER NOT NULL,signed_at INTEGER NOT NULL)')
+                self._conn.execute('CREATE TABLE IF NOT EXISTS generation_primary_batch_sources ('
+                    'generation_id TEXT NOT NULL,source_id TEXT NOT NULL,claim_hash TEXT NOT NULL,'
+                    'PRIMARY KEY(generation_id,source_id,claim_hash))')
+                old=self._conn.execute('SELECT canonical_claim,signature FROM generation_primary_batch_signatures WHERE claim_hash=?',(identity,)).fetchone()
+                if old:
+                    if old['canonical_claim']!=canonical_claim or old['signature']!=signature:
+                        raise ValidatorLedgerConflict('generation batch retry changes signed evidence')
+                else:
+                    if self._conn.execute('SELECT count(*) FROM generation_primary_batch_signatures').fetchone()[0]>=10000:
+                        raise ValidatorLedgerConflict('generation signature archive capacity requires review')
+                    for source in claim.primary_coin_ids:
+                        active=self._conn.execute('SELECT 1 FROM generation_primary_batch_sources s JOIN generation_primary_batch_signatures c ON c.claim_hash=s.claim_hash '
+                            'WHERE s.generation_id=? AND s.source_id=? AND c.expires_at>=?',(claim.generation_id,source,now)).fetchone()
+                        if active:raise ValidatorLedgerConflict('source already has a live batch authorization')
+                    self._conn.execute('INSERT INTO generation_primary_batch_signatures VALUES (?,?,?,?,?,?)',
+                        (identity,claim.generation_id,canonical_claim,signature,claim.expires_at,now))
+                    self._conn.executemany('INSERT INTO generation_primary_batch_sources VALUES (?,?,?)',
+                        [(claim.generation_id,source,identity) for source in claim.primary_coin_ids])
+                self._conn.execute('COMMIT')
+            except BaseException:
+                self._conn.execute('ROLLBACK');raise
 
     def _configure(self) -> None:
         with self._lock:

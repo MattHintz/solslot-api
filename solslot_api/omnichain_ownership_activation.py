@@ -8,6 +8,8 @@ for the byte-exact Root Safe transaction after both required signatures exist.
 
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 import hashlib
 import json
 import re
@@ -159,7 +161,7 @@ class OwnershipActivationStore:
         self._ensure_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10)
+        connection = connect_generation_sqlite(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys=ON")

@@ -7,6 +7,8 @@ database with ``MintProposalStore``.
 """
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 import json
 import re
 import sqlite3
@@ -19,6 +21,10 @@ from typing import Annotated, Any, Iterator, Optional
 
 from fastapi import Depends
 from pydantic import ValidationError
+
+from .test_collection_metadata import (TestPropertyDraftV1, TEST_EDITION_SCHEMA,
+    TEST_DISCLOSURE, CANONICAL_DILIGENCE, parse_collection_draft, require_edition_binding)
+from solslot_puzzles.property_metadata import commit_metadata
 
 from .property_metadata import (
     MetadataConsistencyError,
@@ -65,20 +71,45 @@ class CollectionNotReady(CollectionStoreError):
 class CollectionStore:
     """Thread-safe SQLite-WAL store with optimistic revision checks."""
 
-    def __init__(self, path: str | Path, timeout: float = 5.0) -> None:
+    def __init__(self, path: str | Path, timeout: float = 5.0, *, generation_id: str | None = None, network: str = "testnet11") -> None:
+        self.generation_id = generation_id.lower() if generation_id else None
+        self.network = network
         self.path = str(path) if path == ":memory:" else str(Path(path))
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(
+        self._conn = connect_generation_sqlite(
             self.path,
+            generation_id=generation_id, generation_network=network,
             timeout=timeout,
             isolation_level=None,
             check_same_thread=False,
         )
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
-        self._configure()
-        self._create_schema()
+        try:
+            # Check the binding before WAL setup or schema migrations can alter
+            # a database that belongs to the archived generation.
+            self._check_generation(self._conn)
+            self._configure()
+            with self._lock, self._txn() as cur:
+                self._check_generation(cur)
+                cur.execute("CREATE TABLE IF NOT EXISTS collection_generation (singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation_id TEXT NOT NULL, network TEXT NOT NULL)")
+                if self.generation_id:
+                    cur.execute("INSERT OR IGNORE INTO collection_generation VALUES(1, ?, ?)", (self.generation_id, network))
+            self._create_schema()
+        except Exception:
+            self._conn.close()
+            raise
+
+    def _check_generation(self, reader) -> None:
+        tables = {row[0] for row in reader.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        binding = (reader.execute("SELECT generation_id, network FROM collection_generation WHERE singleton=1").fetchone()
+            if 'collection_generation' in tables else None)
+        if binding and (binding['generation_id'], binding['network']) != (self.generation_id, self.network):
+            raise ValueError('collection database belongs to another deployment generation')
+        if (not binding and self.generation_id and 'property_collections' in tables
+                and reader.execute("SELECT 1 FROM property_collections LIMIT 1").fetchone()):
+            raise ValueError('existing collection records cannot be rebound to a new generation')
 
     def _configure(self) -> None:
         cur = self._conn.cursor()
@@ -120,6 +151,15 @@ class CollectionStore:
                     CHECK (revision > 0),
                     CHECK (metadata_root IS NULL OR length(metadata_root) = 32),
                     CHECK (metadata_anchor_id IS NULL OR length(metadata_anchor_id) = 32)
+                );
+
+                CREATE TABLE IF NOT EXISTS property_collection_previews (
+                    collection_id TEXT NOT NULL REFERENCES property_collections(id),
+                    revision INTEGER NOT NULL,
+                    draft_hash TEXT NOT NULL,
+                    actor_subject TEXT NOT NULL,
+                    reviewed_at INTEGER NOT NULL,
+                    PRIMARY KEY(collection_id, revision, draft_hash)
                 );
 
                 CREATE TABLE IF NOT EXISTS property_collection_deeds (
@@ -253,6 +293,14 @@ class CollectionStore:
                     ON property_collection_comments(collection_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_collection_audit_collection
                     ON property_collection_audit_events(collection_id, occurred_at);
+
+                CREATE TABLE IF NOT EXISTS collection_pricing_receipts (
+                    collection_id TEXT NOT NULL REFERENCES property_collections(id),
+                    round_hash TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    applied_at INTEGER NOT NULL,
+                    PRIMARY KEY(collection_id, round_hash)
+                );
                 """
             )
             comment_columns = {
@@ -312,13 +360,17 @@ class CollectionStore:
         owner_subject: str,
         owner_auth_type: str,
         slug: Optional[str] = None,
+        initial_draft: PropertyDossierDraftV1 | None = None,
     ) -> dict[str, Any]:
         now = int(time.time())
-        draft = PropertyDossierDraftV1(
+        draft = initial_draft or PropertyDossierDraftV1(
             collectionId=collection_id,
             revision=1,
             title=title,
         )
+        require_edition_binding(draft, network=self.network, generation_id=self.generation_id)
+        if draft.revision != 1 or draft.title != title:
+            raise ValueError('new edition must start at revision one with the reviewed title')
         chosen_slug = slug or _slugify(title)
         if draft.collection_id != collection_id:
             raise ValueError("collection ID must match its metadata representation exactly")
@@ -348,6 +400,156 @@ class CollectionStore:
                 raise CollectionConflict(f"collection {collection_id!r} already exists") from exc
             self._audit(cur, collection_id, owner_subject, "COLLECTION_CREATED", {})
         return self.get(collection_id)
+
+    def create_test_edition(self, *, source: dict[str, Any], source_generation_id: str,
+                            collection_id: str, actor_subject: str, actor_auth_type: str) -> dict[str, Any]:
+        if not self.generation_id or self.network != 'testnet11':
+            raise CollectionInvalidState('test editions require an isolated Testnet11 generation')
+        original = PropertyDossierDraftV1.model_validate(source)
+        payload = original.model_dump(mode='json', by_alias=True, exclude_none=True)
+        source_hash = '0x' + commit_metadata(payload).metadata_root.hex()
+        payload.update(schemaVersion=TEST_EDITION_SCHEMA, purpose='TEST_ONLY', network='testnet11',
+            generationId=self.generation_id, collectionId=collection_id, revision=1,
+            title=original.title.removesuffix(' — Testnet Edition') + ' — Testnet Edition',
+            provenance={'sourceCollectionId': original.collection_id, 'sourceRevision': original.revision,
+                'sourceDraftHash': source_hash, 'sourceGenerationId': source_generation_id})
+        # Files stay in their original evidence store. Public derivatives must
+        # be explicitly selected and verified in the new generation's UI.
+        payload.update(media=[], documents=[], privateDocuments=[])
+        for item in payload.get('diligence', []):
+            item['evidenceAssetIds'] = []  # Public derivatives require a new explicit selection.
+            if item['key'] in CANONICAL_DILIGENCE:
+                for field in ('value', 'unit', 'asOfDate'):
+                    item.pop(field, None)
+                item['references'] = CANONICAL_DILIGENCE[item['key']]
+        for deed in payload.get('deedAllocation', []):
+            deed.pop('proposalId', None)
+            deed.pop('deedLauncherId', None)
+        offering = payload.get('offering') or {}
+        for field in ('governanceQuorum', 'projectedReturnBps', 'termMonths'):
+            offering.pop(field, None)
+        payload['offering'] = offering
+        payload['disclosures'] = list(dict.fromkeys([TEST_DISCLOSURE, *payload.get('disclosures', [])]))
+        draft = TestPropertyDraftV1.model_validate(payload)
+        return self.create(collection_id=collection_id, title=draft.title,
+            owner_subject=actor_subject, owner_auth_type=actor_auth_type, initial_draft=draft)
+
+    def acknowledge_preview(self, collection_id: str, *, expected_revision: int,
+                            expected_draft_hash: str, actor_subject: str) -> dict[str, Any]:
+        with self._lock, self._txn() as cur:
+            row = self._collection_row(collection_id, cur=cur)
+            self._require_owner(row, actor_subject)
+            self._require_revision(row, expected_revision)
+            if row['state'] not in ('DRAFT', 'REVIEW'):
+                raise CollectionInvalidState('preview belongs to an editable revision')
+            draft = parse_collection_draft(json.loads(row['dossier_json']))
+            require_edition_binding(draft, network=self.network, generation_id=self.generation_id)
+            digest = '0x' + commit_metadata(draft.model_dump(mode='json', by_alias=True, exclude_none=True)).metadata_root.hex()
+            if digest != expected_draft_hash:
+                raise CollectionConflict('preview changed; reload and review the saved revision')
+            inserted = cur.execute('INSERT OR IGNORE INTO property_collection_previews VALUES (?, ?, ?, ?, ?)',
+                (collection_id, row['revision'], digest, actor_subject.lower(), int(time.time()))).rowcount
+            if inserted:
+                self._audit(cur, collection_id, actor_subject, 'PUBLIC_PREVIEW_REVIEWED', {'revision': row['revision'], 'draftHash': digest})
+        return self.get(collection_id)
+
+    def apply_test_pricing(self, collection_id: str, *, expected_revision: int,
+                           actor_subject: str, authorized) -> dict[str, Any]:
+        """Explicit material edit using a verified, currently live price receipt.
+
+        Read/status operations never call this. The immutable public receipt is
+        kept even if a later save fails; it cannot change the collection alone.
+        """
+        from .collection_display_units import allocate_par_mojos, usd_minor_to_asset_units
+        with self._lock:
+            row = self._collection_row(collection_id)
+            self._require_owner(row, actor_subject)
+            self._require_revision(row, expected_revision)
+            if row['state'] not in ('DRAFT', 'REVIEW'):
+                raise CollectionInvalidState('sealed pricing cannot change; create a reviewed revision')
+            draft = parse_collection_draft(json.loads(row['dossier_json']))
+            if not isinstance(draft, TestPropertyDraftV1):
+                raise CollectionInvalidState('this pricing action requires a test edition')
+            require_edition_binding(draft, network=self.network, generation_id=self.generation_id)
+            round_ = authorized.round
+            now = int(time.time())
+            round_.assert_live(now)
+            if round_.network != 'testnet11' or any(round_.asset_id) or round_.asset_decimals != 12:
+                raise ValueError('pricing receipt must be native Testnet11 XCH')
+            if not draft.offering or draft.offering.currency != 'USD' or not draft.offering.target_raise_minor:
+                raise ValueError('save the USD raise and complete allocation before applying pricing')
+            par = usd_minor_to_asset_units(int(draft.offering.target_raise_minor),
+                price_usd_minor_per_asset=round_.price_usd_minor_per_asset, asset_decimals=12)
+            allocation = allocate_par_mojos(par, {f'deed.{i}': d.share_ppm for i,d in enumerate(draft.deed_allocation)})
+            if not allocation:
+                raise ValueError('complete the allocation before applying pricing')
+            digest = '0x' + round_.round_hash.hex()
+            evidence = _json(authorized.public_evidence())
+            with self._txn() as cur:
+                prior = cur.execute('SELECT evidence_json FROM collection_pricing_receipts WHERE collection_id=? AND round_hash=?',
+                    (collection_id, digest)).fetchone()
+                if prior is not None and json.loads(prior['evidence_json'])['round'] != json.loads(evidence)['round']:
+                    raise CollectionConflict('price round conflicts with the saved receipt')
+                cur.execute('INSERT OR IGNORE INTO collection_pricing_receipts VALUES (?, ?, ?, ?)',
+                    (collection_id, digest, evidence, now))
+            payload = draft.model_dump(mode='json', by_alias=True, exclude_none=True)
+            payload['pricingRoundHash'] = digest
+            payload['offering']['parValueMojos'] = str(par)
+            for i,deed in enumerate(payload['deedAllocation']):
+                deed['parValueMojos'] = str(allocation[f'deed.{i}'])
+            return self.update_draft(collection_id, draft=TestPropertyDraftV1.model_validate(payload),
+                expected_revision=expected_revision, actor_subject=actor_subject)
+
+    def _test_pricing_receipt(self, collection_id: str, draft) -> dict:
+        from .collection_display_units import usd_minor_to_asset_units
+        from solslot_puzzles.payment_artifacts_v2 import oracle_round_from_json
+        if not draft.pricing_round_hash or not draft.offering:
+            raise ValueError('Apply signed XCH pricing to this saved test edition before review.')
+        receipt = self._conn.execute('SELECT * FROM collection_pricing_receipts WHERE collection_id=? AND round_hash=?',
+            (collection_id, draft.pricing_round_hash)).fetchone()
+        if receipt is None:
+            raise ValueError('The selected price round has no saved verification receipt.')
+        evidence = json.loads(receipt['evidence_json'])
+        round_ = oracle_round_from_json(evidence['round'])
+        round_.assert_live(receipt['applied_at'])
+        if ('0x'+round_.round_hash.hex() != draft.pricing_round_hash or round_.network != self.network
+                or any(round_.asset_id) or round_.asset_decimals != 12 or draft.offering.currency != 'USD'):
+            raise ValueError('The pricing receipt does not match this edition.')
+        par = usd_minor_to_asset_units(int(draft.offering.target_raise_minor or 0),
+            price_usd_minor_per_asset=round_.price_usd_minor_per_asset, asset_decimals=12)
+        if int(draft.offering.par_value_mojos or 0) != par:
+            raise ValueError('Dollar economics changed; apply pricing and review the new revision.')
+        return {'evidence': evidence, 'appliedAt': receipt['applied_at']}
+
+    def sealed_test_mint_snapshot(self, collection_id: str) -> dict:
+        """Read one verified sealed snapshot, including the exact reviewed preview.
+
+        Does not allocate inputs, mutate status, or build a transaction. Signing
+        code re-verifies the price signatures against frozen operator keys.
+        """
+        from .test_collection_metadata import TestPropertyDossierV1
+        with self._lock:
+            row = self._collection_row(collection_id)
+            if row['state'] not in ('SEALED', 'PUBLISHED') or not row['canonical_json']:
+                raise CollectionInvalidState('seal and independently review the test edition before minting')
+            dossier = TestPropertyDossierV1.model_validate_json(bytes(row['canonical_json']))
+            require_edition_binding(dossier, network=self.network, generation_id=self.generation_id)
+            commitment = dossier.commitment()
+            draft = parse_collection_draft(json.loads(row['dossier_json']))
+            if (bytes(row['metadata_root']) != commitment.metadata_root
+                    or bytes(row['canonical_json']) != commitment.canonical_json
+                    or draft.to_sealed_dossier().commitment().metadata_root != commitment.metadata_root
+                    or dossier.revision != row['revision'] or dossier.collection_id != row['id']):
+                raise CollectionConflict('sealed collection evidence is inconsistent')
+            draft_hash = '0x'+commit_metadata(draft.model_dump(mode='json',by_alias=True,exclude_none=True)).metadata_root.hex()
+            preview = self._conn.execute('SELECT 1 FROM property_collection_previews WHERE collection_id=? AND revision=? AND draft_hash=?',
+                (collection_id,row['revision'],draft_hash)).fetchone()
+            review = self._conn.execute("SELECT 1 FROM property_collection_reviews WHERE collection_id=? AND collection_revision=? AND decision='APPROVED' AND reviewer_subject<>?",
+                (collection_id,row['revision'],row['owner_subject'])).fetchone()
+            if not preview or not review:
+                raise CollectionInvalidState('the exact sealed revision requires preview and independent review evidence')
+            return {'canonicalMetadata': dossier.canonical_payload(), 'metadataRoot': '0x'+commitment.metadata_root.hex(),
+                'previewHash': draft_hash, 'pricing': self._test_pricing_receipt(collection_id,draft)}
 
     def list(
         self,
@@ -398,7 +600,14 @@ class CollectionStore:
                 raise CollectionInvalidState("sealed collections require an owner amendment")
             if draft.collection_id != collection_id:
                 raise ValueError("dossier collectionId does not match route collection id")
-            previous = PropertyDossierDraftV1.model_validate_json(row["dossier_json"])
+            previous = parse_collection_draft(json.loads(row["dossier_json"]))
+            require_edition_binding(draft, network=self.network, generation_id=self.generation_id)
+            if type(previous) is not type(draft):
+                raise CollectionInvalidState('collection purpose cannot change in place; create a new reviewed edition')
+            if isinstance(previous, TestPropertyDraftV1) and (
+                previous.provenance != draft.provenance or previous.generation_id != draft.generation_id
+            ):
+                raise CollectionInvalidState('edition provenance and generation are immutable')
             if row["allocation_locked"]:
                 _assert_protected_fields_unchanged(previous, draft)
             # Revisions identify reviewed content, not repeated Save clicks or
@@ -753,7 +962,7 @@ class CollectionStore:
     def readiness(self, collection_id: str) -> dict[str, Any]:
         with self._lock:
             row = self._collection_row(collection_id, allow_slug=True)
-            draft = PropertyDossierDraftV1.model_validate_json(row["dossier_json"])
+            draft = parse_collection_draft(json.loads(row["dossier_json"]))
             assets = {
                 asset["asset_id"]: asset
                 for asset in self._conn.execute(
@@ -762,6 +971,18 @@ class CollectionStore:
                 ).fetchall()
             }
         issues: list[dict[str, str]] = metadata_consistency_issues(draft)
+        require_edition_binding(draft, network=self.network, generation_id=self.generation_id)
+        if isinstance(draft, TestPropertyDraftV1):
+            try:
+                self._test_pricing_receipt(row['id'], draft)
+            except (ValueError, TypeError, KeyError) as exc:
+                issues.append({'code': 'PRICING_RECEIPT_REQUIRED', 'path': '/pricingRoundHash', 'message': str(exc)})
+            draft_hash = '0x' + commit_metadata(draft.model_dump(mode='json', by_alias=True, exclude_none=True)).metadata_root.hex()
+            preview = self._conn.execute('SELECT 1 FROM property_collection_previews WHERE collection_id=? AND revision=? AND draft_hash=?',
+                (row['id'], row['revision'], draft_hash)).fetchone()
+            if not preview:
+                issues.append({'code': 'PREVIEW_REVIEW_REQUIRED', 'path': '/preview',
+                    'message': 'Review and acknowledge the public preview for this exact saved revision.'})
         if draft.project_team is None:
             issues.append({
                 "code": "PROJECT_TEAM_REQUIRED",
@@ -894,7 +1115,7 @@ class CollectionStore:
             readiness = self.readiness(collection_id)
             if not readiness["ready"]:
                 raise CollectionNotReady(readiness["issues"])
-            dossier = PropertyDossierDraftV1.model_validate_json(row["dossier_json"]).to_sealed_dossier()
+            dossier = parse_collection_draft(json.loads(row["dossier_json"])).to_sealed_dossier()
             commitment = dossier.commitment()
             now = int(time.time())
             cur.execute(
@@ -1467,6 +1688,8 @@ class CollectionStore:
             "state": row["state"],
             "revision": row["revision"],
             "dossier": json.loads(row["dossier_json"]),
+            "generationId": self.generation_id,
+            "draftHash": '0x' + commit_metadata(json.loads(row['dossier_json'])).metadata_root.hex(),
             "metadataRoot": _hex(row["metadata_root"]),
             "metadataAnchorId": _hex(row["metadata_anchor_id"]),
             "firstProposalId": row["first_proposal_id"],
@@ -1712,18 +1935,22 @@ def _json(value: Any) -> str:
 
 
 _cached_store: Optional[CollectionStore] = None
-_cached_store_path: Optional[str] = None
+_cached_store_path: Optional[tuple[str, str | None, str]] = None
 
 
 def get_collection_store(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> CollectionStore:
     global _cached_store, _cached_store_path
-    if _cached_store is None or _cached_store_path != settings.admin_db_path:
+    path = settings.admin_db_path
+    if settings.deployment_generation_id:
+        path = str(Path(path).parent / 'generations' / settings.deployment_generation_id[2:] / 'collections.sqlite')
+    cache_key = (path, settings.deployment_generation_id, settings.network)
+    if _cached_store is None or _cached_store_path != cache_key:
         if _cached_store is not None:
             _cached_store.close()
-        _cached_store = CollectionStore(settings.admin_db_path)
-        _cached_store_path = settings.admin_db_path
+        _cached_store = CollectionStore(path, generation_id=settings.deployment_generation_id, network=settings.network)
+        _cached_store_path = cache_key
     return _cached_store
 
 

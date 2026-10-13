@@ -67,6 +67,7 @@ def build_and_sign_launch(
     pool_launcher_id: bytes32,
     zkpassport_bridge_policy_hash: bytes32,
     fee: int = 0,
+    generation_vault: bool = False,
 ) -> LaunchedVault:
     """Build and sign the vault launch SpendBundle.
 
@@ -90,17 +91,18 @@ def build_and_sign_launch(
 
     members_root = one_leaf_merkle_root(owner_pubkey)
     discovery_hint = vault_discovery_hint(auth_type, owner_pubkey)
+    def custody_inner(launcher_id):
+        if generation_vault:
+            from solslot_puzzles.generation_vault import vault_inner
+            return vault_inner(vault_launcher_id=launcher_id,owner_pubkey=owner_pubkey,auth_type=auth_type,
+                members_merkle_root=members_root,pool_launcher_id=pool_launcher_id,
+                zkpassport_bridge_policy_hash=zkpassport_bridge_policy_hash)
+        return puzzle_for_vault_inner(launcher_id,owner_pubkey,auth_type,members_root,pool_launcher_id,
+            zkpassport_bridge_policy_hash=zkpassport_bridge_policy_hash)
     launched = build_and_sign_singleton_launch(
         faucet=faucet,
         parent_coin=parent_coin,
-        inner_puzzle_for_launcher=lambda launcher_id: puzzle_for_vault_inner(
-            launcher_id,
-            owner_pubkey,
-            auth_type,
-            members_root,
-            pool_launcher_id,
-            zkpassport_bridge_policy_hash=zkpassport_bridge_policy_hash,
-        ),
+        inner_puzzle_for_launcher=custody_inner,
         launcher_memos=(discovery_hint,),
         fee=fee,
     )

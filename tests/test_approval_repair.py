@@ -37,6 +37,7 @@ def admission_quote(*, used=0, capacity=110_000_000_000, estimate=1, peak_time=N
 async def test_busy_native_cost_prevents_funding_and_push_before_cap(tmp_path):
     faucet = Faucet.from_seed_hex('01'*32, 'testnet11')
     class Node(FakeProvider):
+        async def get_network_info_primary(self):return {'network_name':'testnet11'}
         async def get_fee_estimate(self, **kwargs):
             assert kwargs['require_primary'] is True
             return admission_quote(used=110_000_000_000)
@@ -79,6 +80,7 @@ def test_invalid_or_stale_primary_admission_fails_closed(mutation):
 async def test_release_requires_native_chain_expiry_and_all_clear_inputs(tmp_path,clear,expiry_offset):
     faucet = Faucet.from_seed_hex('01'*32,'testnet11')
     class Node(FakeProvider):
+        async def get_network_info_primary(self):return {'network_name':'testnet11'}
         async def get_fee_estimate(self, **kwargs):
             return admission_quote()
         async def _primary_inputs_clear(self, bundle):
@@ -156,6 +158,7 @@ async def test_expiry_reconciliation_retains_inputs_if_peak_changes(tmp_path):
     faucet=Faucet.from_seed_hex('01'*32,'testnet11')
     class Node(FakeProvider):
         quotes=0
+        async def get_network_info_primary(self):return {'network_name':'testnet11'}
         async def get_fee_estimate(self, **kwargs):
             self.quotes+=1
             return {**admission_quote(), 'peak_height':4_800_000+self.quotes}

@@ -23,11 +23,13 @@ Removed endpoints:
       duplicate registrations — it is no longer exposed over HTTP.
 """
 from __future__ import annotations
+from .vault_puzzle_hash import GENERATION_VAULT_INNER_HASH
 
 import base64
 import logging
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+import asyncio
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
@@ -42,6 +44,14 @@ from chia_rs.sized_bytes import bytes32
 from .admin import router as admin_router
 from .genesis import get_genesis_store, router as genesis_router
 from .launch_control import router as launch_control_router
+from .generation_preparation_routes import router as generation_preparation_router
+from .generation_launch_routes import router as generation_launch_router
+from .generation_status_routes import router as generation_status_router
+from .generation_operation_routes import router as generation_operation_router
+from .generation_sols_batch_routes import router as generation_sols_batch_router
+from .generation_consent_routes import router as generation_consent_router
+from .generation_ballot_routes import router as generation_ballot_router
+from .generation_mint_review_routes import router as generation_mint_review_router
 from .admin_auth import (
     router as admin_auth_router,
     validate_admin_config_at_startup,
@@ -343,6 +353,38 @@ async def lifespan(app: FastAPI):
             "Set SOLSLOT_FAUCET_MASTER_SK_HEX, SOLSLOT_FAUCET_SEED_HEX, or SOLSLOT_FAUCET_MNEMONIC."
         )
 
+    # Reserve the reviewed generation's parents before any faucet-backed
+    # worker starts. Custody creation must work before the genesis chain
+    # anchor exists; it is not a generic post-genesis administrator privilege.
+    app.state.generation_preparation = None
+    if settings.generation_preparation_path or settings.generation_preparation_hash:
+        from .generation_preparation_routes import preparation_store
+        app.state.generation_preparation = preparation_store(settings)
+        if app.state.faucet is not None:
+            app.state.faucet.bind_generation_preparation(app.state.generation_preparation.preparation,
+                trusted_preparation_hash=settings.generation_preparation_hash)
+    from .generation_operations import GenerationOperationJournal, GenerationOperationReconciler
+    app.state.generation_operations = (
+        GenerationOperationJournal(settings.generation_operations_db_path, settings.deployment_generation_id)
+        if app.state.generation_preparation is not None or settings.generation_chain_anchor_path else None)
+    from .generation_launch import configured_launch_store
+    app.state.generation_launch = configured_launch_store(settings,app.state.generation_preparation)
+    if app.state.generation_launch is not None and app.state.faucet is not None:
+        app.state.faucet.bind_generation_launch(app.state.generation_launch)
+    from .generation_consents import GenerationConsentStore
+    app.state.generation_consents = (GenerationConsentStore(settings.generation_consents_db_path,settings.deployment_generation_id)
+        if app.state.generation_operations is not None else None)
+    from .generation_holder_ballots import GenerationBallotStore
+    app.state.generation_ballots = (GenerationBallotStore(settings.generation_ballots_db_path,settings.deployment_generation_id)
+        if app.state.generation_operations is not None else None)
+    from .generation_mint_reviews import GenerationMintReviewStore
+    app.state.generation_mint_reviews = (GenerationMintReviewStore(settings.generation_mint_reviews_db_path,settings.deployment_generation_id)
+        if app.state.generation_operations is not None else None)
+    if app.state.faucet is not None and app.state.generation_operations is not None:
+        app.state.faucet.add_coin_reservation_source(app.state.generation_operations.reserved_input_coin_ids)
+        app.state.faucet.bind_generation_mint_reviews(app.state.generation_mint_reviews,
+            generation_id=settings.deployment_generation_id,maximum_parent_mojos=settings.faucet_max_spend_mojos)
+
     pending_genesis_fee_coin_ids = _enforce_genesis_faucet_isolation(
         settings=settings,
         faucet=app.state.faucet,
@@ -409,6 +451,7 @@ async def lifespan(app: FastAPI):
                 target_seconds=settings.protocol_medium_fee_target_seconds,
                 estimate_buffer_bps=settings.protocol_fee_estimate_buffer_bps,
                 native_admission_enabled=settings.network == 'testnet11' and settings.protocol_fee_native_admission_enabled,
+                cost_fee_tiers_enabled=settings.network == 'testnet11' and settings.protocol_fee_cost_tiers_enabled,
                 minimum_mojos=settings.protocol_minimum_fee_mojos,
                 maximum_mojos=settings.protocol_maximum_fee_mojos,
                 maximum_funding_coin_mojos=settings.faucet_max_spend_mojos,
@@ -463,6 +506,10 @@ async def lifespan(app: FastAPI):
         app.state.protocol_submitter.add_fee_coin_reservation_source(
             app.state.redemption_review_store.reserved_input_coin_ids
         )
+        if app.state.generation_mint_reviews is not None:
+            app.state.protocol_submitter.add_fee_coin_reservation_source(app.state.generation_mint_reviews.reserved_input_coin_ids)
+        if app.state.generation_operations is not None:
+            app.state.protocol_submitter.add_fee_coin_reservation_source(app.state.generation_operations.reserved_input_coin_ids)
 
     app.state.voucher_issuance_worker = None
     app.state.stripe_delivery_worker = None
@@ -620,9 +667,64 @@ async def lifespan(app: FastAPI):
             artifact_hash=lambda: str(load_signed_public_artifact(settings)['artifactHash']))
         await app.state.mint_recovery_worker.start()
 
+    from .generation_index import configured_generation_index
+    app.state.generation_index = configured_generation_index(settings, app.state.coinset)
+    if app.state.generation_index is not None and app.state.generation_operations is None:
+        raise RuntimeError('generation index started without its durable operation journal')
+    from .generation_recipient_execution import GenerationRecipientObserver
+    recipient_observer = (GenerationRecipientObserver(app.state.generation_preparation,
+        app.state.generation_operations, app.state.coinset) if app.state.generation_preparation is not None else None)
+    from .generation_mint_execution import GenerationMintObserver
+    from .generation_launch import GenerationLaunchObserver
+    launch_observer=(GenerationLaunchObserver(app.state.generation_launch,app.state.generation_operations,app.state.coinset)
+        if app.state.generation_launch is not None else None)
+    mint_observer = (GenerationMintObserver(app.state.generation_mint_reviews,app.state.generation_operations,app.state.coinset)
+        if app.state.generation_mint_reviews is not None else None)
+    app.state.generation_sols_orders=None
+    app.state.generation_sols_guard=asyncio.Lock()
+    generation_sols_task=None
+    if settings.generation_sols_batch_enabled:
+        if (settings.network!='testnet11' or app.state.generation_index is None or app.state.generation_operations is None):
+            raise RuntimeError('Sols batch orders require the verified generation anchor and retained journals')
+        from solslot_puzzles.generation_pool import GenerationPool
+        from .generation_sols_batches import GenerationSolsOrderBook
+        from .generation_sols_batch_observer import GenerationSolsBatchObserver
+        pool=next((s for s in app.state.generation_index.anchor.economic_components if isinstance(s,GenerationPool)),None)
+        if pool is None:raise RuntimeError('Sols ordering cannot substitute an unbound pool')
+        # XCH opens first. A CAT requires a separately reviewed immutable asset
+        # binding; a label such as USDC never authorizes a different chain token.
+        app.state.generation_sols_orders=GenerationSolsOrderBook(settings.generation_sols_orders_db_path,
+            settings.deployment_generation_id,pool.permanent.permanent_rules.sols_tail_hash)
+        generation_sols_task=asyncio.create_task(GenerationSolsBatchObserver(app.state.generation_sols_orders,
+            app.state.generation_index,app.state.generation_operations,app.state.coinset,settings).run(),name='generation-sols-receipts')
+    generation_index_task = (
+        asyncio.create_task(app.state.generation_index.run(), name='generation-chain-index')
+        if app.state.generation_index is not None else None
+    )
+    generation_operations_task = (
+        asyncio.create_task(GenerationOperationReconciler(app.state.generation_operations,app.state.coinset,
+            recipient_observer=recipient_observer,mint_observer=mint_observer,launch_observer=launch_observer).run(),
+            name='generation-operation-observer') if app.state.generation_operations is not None else None)
     try:
         yield
     finally:
+        if generation_sols_task is not None:
+            generation_sols_task.cancel()
+            with suppress(asyncio.CancelledError):await generation_sols_task
+        app.state.generation_sols_orders=None
+        if generation_operations_task is not None:
+            generation_operations_task.cancel()
+            with suppress(asyncio.CancelledError):await generation_operations_task
+        app.state.generation_operations = None
+        app.state.generation_launch = None
+        app.state.generation_consents = None
+        app.state.generation_mint_reviews = None
+        app.state.generation_ballots = None
+        if generation_index_task is not None:
+            generation_index_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await generation_index_task
+        app.state.generation_index = None
         if app.state.mint_recovery_worker is not None:
             await app.state.mint_recovery_worker.stop()
         app.state.mint_recovery_worker = None
@@ -700,6 +802,14 @@ app.add_middleware(JourneyRequestLogging)
 app.include_router(admin_router)
 app.include_router(genesis_router)
 app.include_router(launch_control_router)
+app.include_router(generation_preparation_router)
+app.include_router(generation_launch_router)
+app.include_router(generation_status_router)
+app.include_router(generation_operation_router)
+app.include_router(generation_sols_batch_router)
+app.include_router(generation_consent_router)
+app.include_router(generation_ballot_router)
+app.include_router(generation_mint_review_router)
 
 # Post-genesis admin desk: wallet-signed JWT auth backed only by verified
 # records committed by the current admin-authority singleton.
@@ -1026,7 +1136,8 @@ async def protocol(
         network=settings.network,
         pool_launcher_id=pool_launcher,
         governance_launcher_id=governance_launcher,
-        vault_inner_mod_hash=VAULT_INNER_MOD_HASH_HEX,
+        vault_inner_mod_hash=('0x'+GENERATION_VAULT_INNER_HASH.hex()
+            if settings.deployment_generation_id else VAULT_INNER_MOD_HASH_HEX),
         eip712_domain=eip712_domain(),
         eip712_typehash_string=VAULT_SPEND_TYPEHASH_STRING,
         # Retained as nullable compatibility fields. Operational funding data
@@ -1208,6 +1319,7 @@ async def register_evm_vault(
             _strip0x(settings.zkpassport_bridge_policy_hash)
         ),
         fee=fee,
+        generation_vault=bool(settings.deployment_generation_id),
     )
 
     # POP-CANON-004 fix: hard-fail on push_tx rejection so the frontend
@@ -1333,6 +1445,7 @@ async def register_chia_vault(
             _strip0x(settings.zkpassport_bridge_policy_hash)
         ),
         fee=fee,
+        generation_vault=bool(settings.deployment_generation_id),
     )
 
     # POP-CANON-004 fix: hard-fail on push_tx rejection.

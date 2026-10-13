@@ -21,7 +21,7 @@ async def prepare_reserve_anchor(*,provider,artifact,config,pool_state,reserve_i
     from .sols_swaps import SolsSwapOfferError,_coin_from_record,_record_is_unspent_coin,_hex32
     inner_hash=reserve_inner_puzzle.get_tree_hash()
     if inner_hash!=config.reserve_puzzle_hash:
-        raise SolsSwapOfferError('Protocol fountain does not control the governed Sols reserve.')
+        raise SolsSwapOfferError('Sols reserve custody differs from the governed destination.')
     puzzle=construct_cat_puzzle(CAT_MOD,config.permanent_rules.sols_tail_hash,reserve_inner_puzzle)
     records=await provider.get_coin_records_by_puzzle_hash(_hex32(puzzle.get_tree_hash()),include_spent=False)
     coins=[]
@@ -47,6 +47,13 @@ async def prepare_reserve_anchor(*,provider,artifact,config,pool_state,reserve_i
                 asset_label='Sols reserve'))
     if len(coins)==1:
         return coins[0],proofs[0],()
+    from solslot_puzzles import load_puzzle
+    module,_=reserve_inner_puzzle.uncurry()
+    if module==load_puzzle('generation_sols_reserve_v1.clsp'):
+        from solslot_puzzles.generation_sols_reserve import merge_reserve
+        anchor,lineage,spends,conditions=merge_reserve(config=config,coins=tuple(coins),lineages=tuple(proofs))
+        return anchor,lineage,tuple(ReserveConsolidation(spend,condition)
+            for spend,condition in zip(spends,conditions))
     total=sum(int(coin.amount) for coin in coins)
     conditions=[Program.to([[51,inner_hash,total]])]+[Program.to([]) for _ in coins[1:]]
     bundle=unsigned_spend_bundle_for_spendable_cats(CAT_MOD,[SpendableCAT(

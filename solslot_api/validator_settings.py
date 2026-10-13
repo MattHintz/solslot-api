@@ -43,6 +43,17 @@ class ValidatorSettings(BaseSettings):
     identity_network_artifact_path: str = ""
     identity_network_plan_hash: str = ""
 
+    generation_sols_batch_enabled:bool=False
+    deployment_generation_id:str|None=Field(default=None,pattern=r'^0x[0-9a-f]{64}$')
+    generation_preparation_path:str|None=None
+    generation_preparation_hash:str|None=None
+    generation_chain_anchor_path:str|None=None
+    generation_chain_anchor_hash:str|None=None
+    generation_primary_url:str|None=None
+    generation_primary_ca_cert_path:str|None=None
+    generation_primary_client_cert_path:str|None=None
+    generation_primary_client_key_path:str|None=None
+
     network: Literal["testnet11"] = "testnet11"
     coinset_base_url: str = "https://testnet11.api.coinset.org"
     evm_rpc_url: str

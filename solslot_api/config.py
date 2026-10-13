@@ -15,7 +15,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Optional
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .service_urls import (
@@ -922,6 +922,7 @@ class Settings(BaseSettings):
     protocol_medium_fee_target_seconds: int = Field(300, ge=60, le=1800)
     protocol_fee_estimate_buffer_bps: int = Field(12_500, ge=10_000, le=30_000)
     protocol_fee_native_admission_enabled: bool = True
+    protocol_fee_cost_tiers_enabled: bool = False
     governance_publication_approval_window_seconds: int = Field(86_400, ge=3_600, le=7 * 86_400)
     protocol_minimum_fee_mojos: int = Field(1, ge=0)
     protocol_maximum_fee_mojos: int = Field(10_000_000, ge=1)
@@ -1471,6 +1472,31 @@ class Settings(BaseSettings):
     # ── Chain-verifiable collection minting ──────────────────────────────
     # Metadata authoring and proposal publication are independently gated.
     # Both default off so an API upgrade cannot expose an unfinished desk.
+    deployment_generation_id: Optional[str] = Field(default=None, pattern=r"^0x[0-9a-f]{64}$")
+    generation_preparation_path: Optional[str] = None
+    generation_preparation_hash: Optional[str] = Field(default=None,pattern=r"^0x[0-9a-f]{64}$")
+    generation_preparation_db_path: str = "./state/generation-preparation.sqlite3"
+    generation_launch_artifact_path: Optional[str] = None
+    generation_launch_certificate_path: Optional[str] = None
+    generation_launch_certificate_hash: Optional[str] = Field(default=None,pattern=r"^0x[0-9a-f]{64}$")
+    generation_launch_db_path: str = "./state/generation-launch.sqlite3"
+    generation_launch_enabled: bool = False
+    generation_chain_anchor_path: Optional[str] = None
+    generation_chain_anchor_hash: Optional[str] = Field(default=None,pattern=r"^0x[0-9a-f]{64}$")
+    generation_index_db_path: str = "./state/generation-index.sqlite3"
+    generation_operations_db_path: str = "./state/generation-operations.sqlite3"
+    generation_consents_db_path: str = "./state/generation-consents.sqlite3"
+    generation_ballots_db_path: str = "./state/generation-ballots.sqlite3"
+    generation_mint_reviews_db_path: str = "./state/generation-mint-reviews.sqlite3"
+    # Only a separately approved, verified generation deployment may enable
+    # native operation dispatch. Preparation/status never imply this consent.
+    generation_sols_batch_enabled: bool=False
+    generation_sols_orders_db_path: str='./state/generation-sols-orders.sqlite3'
+    generation_execution_enabled: bool = False
+    vault_registry_path: str = "./state/vault_registry_v2.db"
+    test_collection_editions_enabled: bool = False
+    collection_source_archive_db_path: Optional[str] = None
+    collection_source_archive_generation_id: Optional[str] = None
     collection_metadata_enabled: bool = False
     collection_minting_enabled: bool = False
 
@@ -1553,6 +1579,29 @@ class Settings(BaseSettings):
     faucet_consolidation_fee: int = 0
     # Cap on inputs per consolidation run (well below MAX_SPENDS_PER_BLOCK).
     faucet_consolidation_max_inputs: int = 500
+
+    @model_validator(mode='after')
+    def isolate_generation_runtime(self):
+        if self.deployment_generation_id is None:
+            if self.generation_launch_enabled:
+                raise ValueError('final launch requires a separate Testnet generation')
+            if self.generation_execution_enabled:
+                raise ValueError('generation execution requires an explicit Testnet11 generation')
+            return self
+        from .generation_storage import generation_path
+        from .generation_context import generation_bytes
+        generation_bytes(self.deployment_generation_id)
+        if self.network!='testnet11':
+            raise ValueError('replacement generations require Chia Testnet11')
+        # Explicit owned outputs only. Do not rewrite source evidence, keys,
+        # private documents, recovery locations or the read-only old archive.
+        for field in ('genesis_db_path','zkpassport_ledger_db_path','payment_purchase_db_path',
+            'stripe_delivery_db_path','admin_db_path','generation_preparation_db_path','generation_index_db_path','generation_operations_db_path','generation_consents_db_path','generation_ballots_db_path','generation_mint_reviews_db_path',
+            'generation_launch_db_path','generation_sols_orders_db_path',
+            'vault_registry_path','sols_capability_operations_path','challenge_store_path',
+            'genesis_output_dir','deployment_manifest_path','public_artifact_path','bootstrap_manifest_path'):
+            setattr(self,field,generation_path(getattr(self,field),self.deployment_generation_id))
+        return self
 
     def allowed_origins(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

@@ -144,7 +144,7 @@ def current_signed_admins(
     store: GenesisStore | None = None,
 ) -> list[tuple[str, str]]:
     artifact = load_signed_public_artifact(settings)
-    active_store = store or GenesisStore(settings.genesis_db_path)
+    active_store = store or GenesisStore.for_settings(settings)
     return current_artifact_admins(artifact, active_store)
 
 

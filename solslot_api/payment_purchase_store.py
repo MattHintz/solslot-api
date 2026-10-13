@@ -6,6 +6,8 @@ the first authenticated external payment message before fulfillment.
 """
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 import json
@@ -224,7 +226,7 @@ class PaymentPurchaseStore(BaseInventoryHoldStoreMixin, InventoryExtensionStoreM
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(
+        connection = connect_generation_sqlite(
             self.path,
             timeout=10,
             isolation_level=None,

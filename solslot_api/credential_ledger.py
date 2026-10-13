@@ -8,6 +8,8 @@ across threads and API worker processes.
 """
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 import json
 import hashlib
 import secrets
@@ -53,21 +55,28 @@ class OwnerChallenge:
 class CredentialLedger:
     """SQLite-backed V2 credential state machine and replay ledger."""
 
-    def __init__(self, path: str | Path, timeout: float = 10.0) -> None:
+    def __init__(self, path: str | Path, timeout: float = 10.0, *, generation_id: str | None = None, network: str = "testnet11") -> None:
         self.path = str(path) if path == ":memory:" else str(Path(path))
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(
+        self._conn = connect_generation_sqlite(
             self.path,
+            generation_id=generation_id, generation_network=network,
             timeout=timeout,
             isolation_level=None,
             check_same_thread=False,
         )
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
-        self._configure()
-        self._migrate()
-        self._prepare_owner_challenge_retention()
+        try:
+            from .generation_storage import bind_generation
+            bind_generation(self._conn, generation_id, network)
+            self._configure()
+            self._migrate()
+            self._prepare_owner_challenge_retention()
+        except Exception:
+            self._conn.close()
+            raise
 
     def _prepare_owner_challenge_retention(self) -> None:
         # Additive index, compatible with existing schema-1 ledgers. Owner
@@ -1151,29 +1160,37 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
-_LEDGERS: dict[str, CredentialLedger] = {}
+_LEDGERS: dict[tuple[str, str | None, str], CredentialLedger] = {}
 _LEDGERS_LOCK = threading.Lock()
 
 
 def get_credential_ledger(settings: Any) -> CredentialLedger:
-    path = str(settings.zkpassport_ledger_db_path)
+    from .generation_storage import generation_path
+    generation = getattr(settings, 'deployment_generation_id', None)
+    network = getattr(settings, 'network', 'testnet11')
+    path = generation_path(str(settings.zkpassport_ledger_db_path), generation)
+    key = (path, generation, network)
     with _LEDGERS_LOCK:
-        ledger = _LEDGERS.get(path)
+        ledger = _LEDGERS.get(key)
         if ledger is None:
-            ledger = CredentialLedger(path)
-            _LEDGERS[path] = ledger
+            ledger = CredentialLedger(path, generation_id=generation, network=network)
+            _LEDGERS[key] = ledger
         return ledger
 
 
 def get_existing_credential_ledger(settings: Any) -> CredentialLedger | None:
     """Open retained recovery state without creating a ledger for a blocked request."""
 
-    path = str(settings.zkpassport_ledger_db_path)
+    from .generation_storage import generation_path
+    generation = getattr(settings, 'deployment_generation_id', None)
+    network = getattr(settings, 'network', 'testnet11')
+    path = generation_path(str(settings.zkpassport_ledger_db_path), generation)
+    key = (path, generation, network)
     with _LEDGERS_LOCK:
-        ledger = _LEDGERS.get(path)
+        ledger = _LEDGERS.get(key)
         if ledger is None and path != ":memory:" and Path(path).is_file():
-            ledger = CredentialLedger(path)
-            _LEDGERS[path] = ledger
+            ledger = CredentialLedger(path, generation_id=generation, network=network)
+            _LEDGERS[key] = ledger
         return ledger
 
 

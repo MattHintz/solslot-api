@@ -173,9 +173,7 @@ class ServerHardeningMiddleware:
         if self._genesis_store is None:
             from .genesis_store import GenesisStore
 
-            self._genesis_store = GenesisStore(
-                self.settings.genesis_db_path
-            )
+            self._genesis_store = GenesisStore.for_settings(self.settings)
         return self._genesis_store
 
     @staticmethod
@@ -272,6 +270,10 @@ class ServerHardeningMiddleware:
             return False
         path = str(scope.get("path", "")).rstrip("/")
         if path == "/auth/challenge":
+            return True
+        if path in {'/sols/batches/review','/sols/batches/orders'}:
+            # Native offer inspection has a cost bound and also needs the
+            # existing per-source budget before parsing any submitted puzzle.
             return True
         parts = path.split("/")
         # Count before route/path/body validation. Canonical ASGI paths are

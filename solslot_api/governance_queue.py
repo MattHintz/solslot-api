@@ -1,6 +1,8 @@
 """Revisioned SQLite-WAL queue for typed governance proposals."""
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 import json
 import secrets
 import sqlite3
@@ -85,7 +87,7 @@ class GovernanceQueueStore:
         db_path = Path(path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(
+        self._conn = connect_generation_sqlite(
             str(db_path), check_same_thread=False, isolation_level=None
         )
         self._conn.row_factory = sqlite3.Row

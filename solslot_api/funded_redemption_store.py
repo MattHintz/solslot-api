@@ -1,6 +1,8 @@
 """Durable, chain-confirmable customer funded-redemption operations."""
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 import json
 import sqlite3
 import threading
@@ -59,7 +61,7 @@ class FundedRedemptionStore:
         db_path = Path(path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._conn = connect_generation_sqlite(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")

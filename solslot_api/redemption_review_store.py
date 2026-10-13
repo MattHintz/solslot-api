@@ -1,6 +1,8 @@
 """Private fee review and durable customer redemption dispatch records."""
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 from contextlib import contextmanager
 import json
 from pathlib import Path
@@ -36,7 +38,7 @@ class RedemptionReviewStore:
 
     @contextmanager
     def _transaction(self):
-        db = sqlite3.connect(self.path, timeout=30)
+        db = connect_generation_sqlite(self.path, timeout=30)
         db.row_factory = sqlite3.Row
         try:
             db.execute("PRAGMA journal_mode=WAL")

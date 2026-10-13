@@ -6,6 +6,8 @@ them confirmed only after the local Chia node proves the complete atomic set.
 """
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 from contextlib import contextmanager
 from dataclasses import dataclass
 import json
@@ -202,7 +204,7 @@ class GovernedOutputIndex:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(
+        connection = connect_generation_sqlite(
             self.path,
             timeout=10,
             isolation_level=None,

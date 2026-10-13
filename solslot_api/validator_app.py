@@ -56,6 +56,14 @@ class ValidatorSignRequest(BaseModel):
     claimHash: str
 
 
+from .generation_sols_batch_execution import PrimaryBatchClaim
+
+class PrimaryBatchSignRequest(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    claim:PrimaryBatchClaim
+    claimHash:str
+
+
 class PrimaryPurchaseSignRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -215,9 +223,24 @@ def create_validator_app(
             require_runtime_identity_bindings(
                 coordinator, application.state.identity_deployment
             )
+        application.state.generation_provider=None
+        generation_provider=None
+        if signer_settings.generation_sols_batch_enabled:
+            from .generation_sols_batch_validators import generation_settings
+            from .generation_index import load_generation_read_anchor
+            load_generation_read_anchor(generation_settings(signer_settings))
+            if not signer_settings.generation_primary_url:
+                raise RuntimeError('generation delivery requires an independent primary node')
+            generation_provider=create_chia_provider(ChiaProviderConfig(network='testnet11',
+                primary_url=signer_settings.generation_primary_url,fallback_url=signer_settings.coinset_base_url,primary_required=True,
+                primary_ca_cert_path=signer_settings.generation_primary_ca_cert_path,
+                primary_client_cert_path=signer_settings.generation_primary_client_cert_path,
+                primary_client_key_path=signer_settings.generation_primary_client_key_path))
+            await generation_provider.start();application.state.generation_provider=generation_provider
         try:
             yield
         finally:
+            if generation_provider is not None:await generation_provider.close()
             if identity_provider is not None:
                 await identity_provider.close()
             if configured_ledger is None:
@@ -231,6 +254,18 @@ def create_validator_app(
         openapi_url=None,
         lifespan=lifespan,
     )
+
+    @application.post('/v1/generation/primary-sols/sign',response_model=ValidatorSignatureResponse)
+    async def sign_generation_primary(body:PrimaryBatchSignRequest):
+        import time
+        from .generation_sols_batch_validators import sign_primary_batch
+        if body.claim.digest()!=body.claimHash:raise HTTPException(409,detail='BATCH_CLAIM_CHANGED')
+        provider=getattr(application.state,'generation_provider',None)
+        if provider is None:raise HTTPException(503,detail='BATCH_SIGNER_NOT_READY')
+        try:return await sign_primary_batch(body.claim,settings=current_settings(),provider=provider,
+            ledger=application.state.validator_ledger,clock=time.time)
+        except (ValueError,RuntimeError) as exc:
+            raise HTTPException(409,detail='BATCH_INDEPENDENT_EVIDENCE_REJECTED') from exc
 
     @application.get("/health", response_model=ValidatorHealthResponse)
     def health() -> ValidatorHealthResponse:

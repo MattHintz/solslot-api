@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 import hashlib
 import json
 import os
@@ -43,8 +45,8 @@ class JourneyEvent(BaseModel):
     diagnostics_revision: Literal["AE197"] = "AE197"
     source: Literal["customer", "admin"]
     actor: Literal["visitor", "operator", "synthetic"]
-    screen: Literal["market", "property", "learn", "help", "vault", "identity", "dashboard", "admin_login", "admin_approvals", "admin_grants", "admin_collection", "admin_mint", "admin_other", "other"]
-    action: Literal["screen_opened", "button_pressed", "connect_wallet", "sign_in", "check_status", "verify_id", "retry", "save_draft", "seal", "review_approval", "submit_proposal", "create_presale", "api_request", "wallet_prompt", "asset_load"]
+    screen: Literal["market", "property", "learn", "help", "vault", "identity", "dashboard", "sols_purchase", "admin_login", "admin_approvals", "admin_grants", "admin_collection", "admin_mint", "admin_other", "other"]
+    action: Literal["screen_opened", "button_pressed", "connect_wallet", "sign_in", "check_status", "verify_id", "retry", "save_draft", "seal", "review_approval", "submit_proposal", "create_presale", "api_request", "wallet_prompt", "asset_load", "sols_guide_review", "sols_guide_offer", "sols_guide_match", "sols_guide_receive"]
     stage: Literal["ui", "checking_session", "preparing_request", "awaiting_wallet", "saving_session", "network_confirmation", "proof", "stamp", "refresh"]
     phase: Literal["started", "waiting", "completed", "failed", "cancelled"]
     wallet: Literal["none", "sage", "goby", "evm", "google", "passkey"]
@@ -111,7 +113,7 @@ class AlphaObservabilityStore:
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._conn = connect_generation_sqlite(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys=ON")
         if self.path != ":memory:":

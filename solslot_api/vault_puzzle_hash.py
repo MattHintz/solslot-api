@@ -20,9 +20,11 @@ from solslot_puzzles.vault_driver import (
     VAULT_INNER_MOD,
     validate_owner_pubkey_for_auth_type,
 )
+from solslot_puzzles import load_puzzle
 
 # Read the module on its importing thread; never retain it in a returned puzzle.
 _VAULT_INNER_HASH = bytes32(VAULT_INNER_MOD.get_tree_hash())
+GENERATION_VAULT_INNER_HASH = bytes32(load_puzzle('vault_singleton_inner_generation_v1.clsp').get_tree_hash())
 
 
 def puzzle_hash_for_vault_full(
@@ -34,6 +36,7 @@ def puzzle_hash_for_vault_full(
     *,
     identity_attest_root: bytes32 = DEFAULT_IDENTITY_ATTEST_ROOT,
     zkpassport_bridge_policy_hash: bytes32 = DEFAULT_ZKPASSPORT_BRIDGE_POLICY_HASH,
+    generation_vault: bool = False,
 ) -> bytes32:
     owner = validate_owner_pubkey_for_auth_type(owner_pubkey_bytes, auth_type)
     singleton_struct = (SINGLETON_MOD_HASH, (vault_launcher_id, SINGLETON_LAUNCHER_HASH))
@@ -41,7 +44,7 @@ def puzzle_hash_for_vault_full(
     tree_hash = lambda value: bytes32(Program.to(value).get_tree_hash())
     struct_hash = tree_hash(singleton_struct)
     inner_hash = curry_and_treehash(
-        calculate_hash_of_quoted_mod_hash(_VAULT_INNER_HASH),
+        calculate_hash_of_quoted_mod_hash(GENERATION_VAULT_INNER_HASH if generation_vault else _VAULT_INNER_HASH),
         struct_hash,
         tree_hash(owner),
         tree_hash(auth_type),

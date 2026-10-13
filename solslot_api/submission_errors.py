@@ -1,4 +1,6 @@
 """Log node error categories without transaction payloads or credentials."""
+
+from .generation_storage import connect_generation_sqlite
 def error_code(error):
     text = str(error)
     known = ('INVALID_FEE_TOO_CLOSE_TO_ZERO','ASSERT_BEFORE_SECONDS_ABSOLUTE_FAILED',
@@ -20,7 +22,7 @@ def record_submission(path, *, network, bundle_id, provider, event, code=None, b
     fd=os.open(path,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
     os.fchmod(fd,0o600)
     os.close(fd)
-    db=sqlite3.connect(path,timeout=10)
+    db=connect_generation_sqlite(path,timeout=10)
     try:
         os.chmod(path,0o600)
         db.execute('PRAGMA synchronous=FULL')

@@ -21,7 +21,7 @@ def require_operation_gate(settings: Settings, gate_name: str) -> None:
     if not settings.launch_control_enabled:
         return
     try:
-        store = GenesisStore(settings.genesis_db_path)
+        store = GenesisStore.for_settings(settings)
         active = store.active()
         if active is None:
             history = store.list_ceremonies(limit=1)
