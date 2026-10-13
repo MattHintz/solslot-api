@@ -1,0 +1,32 @@
+{
+  "schema": "solslot.generation-recovery-source.v1",
+  "entity": "SOLSLOT",
+  "packagePurpose": "REVIEWED_INSTALLATION_CANDIDATE_NOT_INSTALLED",
+  "generationConfiguration": "PENDING_CONCRETE_GENERATION",
+  "files": {
+    "generation_export.py": "23ba8c84252a5994c8a515003e759ed8db1df2a9a6fb26d1c1c8cb8da62148c7",
+    "generation_health.py": "6eb7d183ff5ac9bdac3a936da56334e1fee5cb678114cfe5716cb4d4cd6f0ba2",
+    "generation_replication.py": "e7986a51a69f5be5dab7bd34ed5a7459c1a81a70f0258c365fee79d92025471e",
+    "generation_snapshot.py": "1339ca9b85adbb3da41506b61d9d60f5e4e5a0d98f204b86f215c0e523be6992",
+    "generation_worker.py": "5701fe67b1e46c4fb945da8a2be0405f9317029aa8b72e88ade1dbf8a19205f2",
+    "worker_entry.py": "ee1e0dcaf131f06ca5cfa00079fe73c4ccc7e50108cd7615eb3e5f4c2352f719",
+    "README.md": "142c4662b06bad76157dd800737616eb05fa7b6e4afc1f123b369a7ef664ca45",
+    "systemd/solslot-generation-recovery-ae222.service": "4b6335b691da181aa8540a6fe2e0aa0444c20749d7c9cadb12f2ec15a07cb1d5",
+    "systemd/solslot-generation-recovery-ae222.timer": "b6eece1ebde0449476543a160fdad44a48dc66015b39e1c7a5855a60e0c9717c",
+    "tests/test_generation_application_restore.py": "170cb4375e1c19674e985dd2aad3bab84dddec7aece5a0f8dd1961d264eb29e5",
+    "tests/test_generation_export.py": "7c0942875f2950f1ba5357066f0bbdb56874277d59d5aaf60d39a703eba03a03",
+    "tests/test_generation_health.py": "9d31d9d028abc67d7fe534f83fd38adcacbc78341f42befa9cc110218543ed6d",
+    "tests/test_generation_identity.py": "56b139ea20d203a5a5d927c1761d476fd5c5ff5b8be1f6ee3e2680eb38f3a5a9",
+    "tests/test_generation_replication.py": "e6b33649fbdc03bc8dec234b05d50daca51e088eb1ef62a13099c9df2f11d653",
+    "tests/test_generation_snapshot.py": "e272f271582d9224e20b7d2a85327b6c3cf9e2a780f96115e08a8f6a92ee7888"
+  },
+  "evidenceReferences": [
+    "generation-recovery/recovery-tests-v7.txt",
+    "generation-recovery/export-permissions-tests-v1.txt",
+    "generation-recovery/azure-drill-result-v8.json",
+    "generation-reward-progress-http-tests-v6.txt"
+  ],
+  "drillPurpose": "SYNTHETIC_RESTORE_DRILL",
+  "cloudPermissionsAdded": 0,
+  "subscriptionsAdded": 0
+}

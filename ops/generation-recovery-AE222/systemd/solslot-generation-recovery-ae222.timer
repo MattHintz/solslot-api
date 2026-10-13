@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Solslot generation restore evidence every two minutes
+
+[Timer]
+OnBootSec=45s
+OnUnitInactiveSec=120s
+RandomizedDelaySec=10s
+Unit=solslot-generation-recovery-ae222.service
+
+[Install]
+WantedBy=timers.target
