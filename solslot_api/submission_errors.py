@@ -17,6 +17,23 @@ def record_submission(path, *, network, bundle_id, provider, event, code=None, b
     logging.getLogger(__name__).info('protocol_submission network=%s bundle_id=%s provider=%s event=%s error_code=%s',
         network,bundle_id,provider,event,code)
     if not path:return
+    db=open_submission_journal(path)
+    try:
+        if bundle is not None:
+            import json
+            encoded=json.dumps(bundle,sort_keys=True,separators=(',',':'))
+            existing=db.execute('SELECT bundle_json FROM protocol_submission_bundles WHERE bundle_id=?',(bundle_id,)).fetchone()
+            if existing and existing[0]!=encoded:raise ValueError('Retained transaction bytes do not match their ID')
+            db.execute('INSERT OR IGNORE INTO protocol_submission_bundles VALUES(?,?,?,?)',(bundle_id,network,encoded,int(time.time())))
+        db.execute('INSERT INTO protocol_submission_events(network,bundle_id,provider,event,error_code,recorded_at) VALUES(?,?,?,?,?,?)',
+            (network,bundle_id,provider,event,code,int(time.time())))
+        db.commit()
+    finally:db.close()
+
+
+def open_submission_journal(path):
+    """Initialize actual journal schemas without inventing a submission event."""
+    import os
     from pathlib import Path
     Path(path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd=os.open(path,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
@@ -30,13 +47,8 @@ def record_submission(path, *, network, bundle_id, provider, event, code=None, b
             id INTEGER PRIMARY KEY, network TEXT NOT NULL, bundle_id TEXT NOT NULL,
             provider TEXT NOT NULL, event TEXT NOT NULL, error_code TEXT, recorded_at INTEGER NOT NULL)''')
         db.execute('CREATE TABLE IF NOT EXISTS protocol_submission_bundles(bundle_id TEXT PRIMARY KEY, network TEXT NOT NULL, bundle_json TEXT NOT NULL, created_at INTEGER NOT NULL)')
-        if bundle is not None:
-            import json
-            encoded=json.dumps(bundle,sort_keys=True,separators=(',',':'))
-            existing=db.execute('SELECT bundle_json FROM protocol_submission_bundles WHERE bundle_id=?',(bundle_id,)).fetchone()
-            if existing and existing[0]!=encoded:raise ValueError('Retained transaction bytes do not match their ID')
-            db.execute('INSERT OR IGNORE INTO protocol_submission_bundles VALUES(?,?,?,?)',(bundle_id,network,encoded,int(time.time())))
-        db.execute('INSERT INTO protocol_submission_events(network,bundle_id,provider,event,error_code,recorded_at) VALUES(?,?,?,?,?,?)',
-            (network,bundle_id,provider,event,code,int(time.time())))
         db.commit()
-    finally:db.close()
+        return db
+    except BaseException:
+        db.close()
+        raise

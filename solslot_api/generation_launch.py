@@ -86,8 +86,16 @@ class GenerationLaunchStore:
         self._trusted_certificate_hash=trusted_certificate_hash
         self._trusted_preparation_hash=p.manifest_hash
         self._trusted_artifact_hash=a.artifact_hash
-        self.path=generation_path(path,p.generation_id);Path(self.path).parent.mkdir(parents=True,exist_ok=True)
-        with closing(self.db()) as db,db:
+        self.path=self.initialize_storage(path,p.generation_id)
+
+    @staticmethod
+    def initialize_storage(path,generation_id):
+        # Schema setup carries no release authority and writes no reviews.
+        # This permits real recovery before a launch certificate is issued.
+        from .generation_context import generation_bytes
+        generation_bytes(generation_id)
+        path=generation_path(path,generation_id);Path(path).parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+        with closing(connect_generation_sqlite(path,timeout=5,generation_id=generation_id)) as db,db:
             db.executescript('''CREATE TABLE IF NOT EXISTS generation_launch_reviews (
                 id TEXT PRIMARY KEY, certificate TEXT NOT NULL, payload TEXT NOT NULL, created INTEGER NOT NULL,
                 confirmed_height INTEGER, checked_at INTEGER, error_code TEXT);
@@ -96,6 +104,8 @@ class GenerationLaunchStore:
                 PRIMARY KEY(review_id,slot));
                 CREATE TABLE IF NOT EXISTS generation_launch_read_anchors (
                 review_id TEXT PRIMARY KEY, document TEXT NOT NULL);''')
+        return path
+
     def db(self):
         db=connect_generation_sqlite(self.path,timeout=5,generation_id=self.preparation.generation_id)
         db.row_factory=sqlite3.Row

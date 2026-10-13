@@ -59,11 +59,17 @@ class GenerationSolsOrderBook:
         self.sols_asset = sols_asset
         self.approved_assets = frozenset(approved_assets)
         self.signature_data=signature_data
-        self.path = generation_path(path, self.generation_id)
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        self.path = self.initialize_storage(path,self.generation_id)
+
+    @staticmethod
+    def initialize_storage(path,generation_id):
+        generation_bytes(generation_id)
+        path=generation_path(path,generation_id)
+        Path(path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         os.fchmod(fd, 0o600); os.close(fd)
-        with self.db() as db:
+        from contextlib import closing
+        with closing(connect_generation_sqlite(path,generation_id=generation_id,timeout=5)) as db,db:
             db.executescript('''
               CREATE TABLE IF NOT EXISTS sols_orders (
                 order_id TEXT PRIMARY KEY, original_offer BLOB NOT NULL,
@@ -85,6 +91,7 @@ class GenerationSolsOrderBook:
               CREATE TABLE IF NOT EXISTS sols_order_timelocks (
                 order_id TEXT PRIMARY KEY, document TEXT NOT NULL);
             ''')
+        return path
 
     @contextmanager
     def db(self, write=False):

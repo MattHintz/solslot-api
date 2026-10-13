@@ -3,6 +3,10 @@
 This package supplements the preserved AE181 collection recovery. It exports only
 21 named SQLite databases in a separately configured generation journal namespace.
 A live receipt requires all 21; a partial inventory cannot be reported healthy.
+Every journal must also carry the exact completed initialization commitment.
+Live replication rejects absent or INITIALIZING markers before uploading any
+objects. Independent restore compares that state against actual decrypted bytes;
+caller-supplied READY metadata cannot replace a missing database marker.
 It never exports an old generation, credentials, arbitrary files or private plans.
 The separate AE181 lane continues to preserve accepted property objects.
 
@@ -32,15 +36,21 @@ memory/tmpfs. Neither appears in a repository, receipt or command output.
 
 ## Verified evidence as of 2026-10-13
 
-- `recovery-tests-v8.txt`: 61 local positive/adversarial checks passed.
+- `recovery-tests-v9.txt`: 100 local positive/adversarial checks passed.
+- `runtime-full-inventory-tests-v6.txt`: 33 checks cover actual API startup,
+  all21 genuine schemas, isolated restore, guarded first initialization,
+  interrupted setup, lost journals, unsafe paths and retained-data rejection.
+- `live-recovery-lost-journal-tests-v1.txt`: five current lost-journal checks
+  passed, including a recreated empty preparation database rejected by live backup.
 - `application-restore-tests-v1.txt`: cold API reopen preserved the exact original
   offer, operation bundle, receipt and funding holds; retries did not rebuild.
-- `azure-drill-result-v8.json`: the prior snapshot/replication/health/token profile restored matching
-  encrypted synthetic SQLite data on the existing Azure VM as an unprivileged
-  account using separately root-staged tokens. Purpose is SYNTHETIC_RESTORE_DRILL.
-  The subsequent 21-database inventory, collection-path and exporter-privilege
-  repairs require a fresh hosted actual-generation restore before deployment.
-- `privilege-and-inventory-tests-v2.txt`: the receipt publisher retains root ownership
+- `azure-drill-result-v10.json`: all21 current real empty API journal schemas
+  (1,667,072 restored bytes) passed encrypted independent Blob restore on the
+  existing Azure VM as an unprivileged account using separately root-staged
+  tokens. Purpose remains SYNTHETIC_RESTORE_DRILL. The current exporter was
+  hash-pinned but its Njalla forced-command/UID boundary was not exercised here.
+- `privilege-and-inventory-tests-v3.txt`: 13 focused checks cover the child OS
+  file-size bound and receipt permissions. The receipt publisher retains root ownership
   and explicitly grants the API group read access under a private umask. This
   permission refinement is locally verified; no live exporter was installed.
 - API `test_generation_reward_progress_routes.py`: two real native-consensus HTTP
@@ -67,6 +77,23 @@ The exporter deliberately refuses unexpected entries rather than omitting them.
 Archive source manifests, public artifacts and chain anchors as release evidence;
 this journal package is not a complete host disaster recovery or key-recovery kit.
 
+Before first initialization, keep alpha writes, generation execution, final
+launch and Sols ordering disabled, with no launch certificate/artifact or chain
+anchor configured. Install the reviewed preparation manifest and private canonical
+state directory with UMask=0077. Enable `generation_recovery_storage_enabled` for
+startup schema preparation. This creates real empty schemas without inventing
+orders, signatures, launch reviews, authority state or release certification.
+All later authority constructors retain their original validation.
+
+The initializer stores inventory phase commitments in every database and a
+separate metadata guard under `journals/generation-recovery-initialization`.
+Keep the guard and opt-in enabled for subsequent starts. Once initialized, a
+missing file or marker stops startup; never remove a guard to create empty
+replacement ledgers. An interrupted first setup can resume only behind paused
+prelaunch gates. An independently verified complete restore can reconstruct the
+metadata guard from all21 retained markers. The guard is not a key or business
+ledger, and does not authorize a restore or chain operation.
+
 Create the dedicated account `solslot-gen-recovery-ae222` on the two existing hosts.
 On Njalla, its SSH key entry and sshd Match block must accept only 10.77.0.12,
 disable terminals/forwarding, and force the root-owned generation exporter through
@@ -90,12 +117,15 @@ required.
 
 Additional reviewed repairs flatten the collection store to one generation directory
 and include stamp-funding, node-submission and telemetry journals. The actual API
-lifespan plus lazy collection/telemetry constructors now have a recovery regression;
-a synthetic allowlist fixture alone cannot establish real runtime coverage.
-That constructor check verifies only the stores it initializes, not the full
-21-database live-purpose inventory. The exporter applies its independent output
+lifespan plus all21 schema constructors now have a local recovery regression.
+This uses a synthetic preparation with production configuration validation stubbed;
+it does not certify a hosted configuration or actual user-state restoration.
+The exporter applies its independent output
 file-size limit in the child after dropping to the API user, because runuser resets
 inherited file-size limits on the supported host.
+
+Recovery health remains an explicit operator/deployment gate. This package does
+not install an automatic backup-health guard into every API write route.
 
 ## Open release gates
 

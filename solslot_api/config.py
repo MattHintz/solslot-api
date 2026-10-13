@@ -1476,6 +1476,8 @@ class Settings(BaseSettings):
     generation_preparation_path: Optional[str] = None
     generation_preparation_hash: Optional[str] = Field(default=None,pattern=r"^0x[0-9a-f]{64}$")
     generation_preparation_db_path: str = "./state/generation-preparation.sqlite3"
+    # Startup schema preparation only; never enables dispatch or certifies recovery.
+    generation_recovery_storage_enabled: bool = False
     generation_launch_artifact_path: Optional[str] = None
     generation_launch_certificate_path: Optional[str] = None
     generation_launch_certificate_hash: Optional[str] = Field(default=None,pattern=r"^0x[0-9a-f]{64}$")
@@ -1583,6 +1585,8 @@ class Settings(BaseSettings):
     @model_validator(mode='after')
     def isolate_generation_runtime(self):
         if self.deployment_generation_id is None:
+            if self.generation_recovery_storage_enabled:
+                raise ValueError('generation recovery storage requires a separate Testnet generation')
             if self.generation_launch_enabled:
                 raise ValueError('final launch requires a separate Testnet generation')
             if self.generation_execution_enabled:

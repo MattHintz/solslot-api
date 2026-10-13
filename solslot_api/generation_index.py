@@ -136,12 +136,19 @@ class GenerationIndexStore:
         from .generation_context import generation_bytes
         generation_bytes(generation_id);generation_bytes(anchor_hash)
         self.generation_id,self.anchor_hash=generation_id,anchor_hash
-        self.path=generation_path(path,generation_id)
-        Path(self.path).parent.mkdir(parents=True,exist_ok=True)
-        with closing(self._connect()) as con,con:
+        self.path=self.initialize_storage(path,generation_id)
+
+    @staticmethod
+    def initialize_storage(path,generation_id):
+        from .generation_context import generation_bytes
+        generation_bytes(generation_id)
+        path=generation_path(path,generation_id)
+        Path(path).parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+        with closing(connect_generation_sqlite(path,timeout=5,generation_id=generation_id)) as con,con:
             con.execute('CREATE TABLE IF NOT EXISTS generation_index_cache ('
                 'anchor_hash TEXT PRIMARY KEY,payload TEXT,checked_at INTEGER,last_attempt_at INTEGER NOT NULL,'
                 'error_code TEXT)')
+        return path
 
     def _connect(self):
         return connect_generation_sqlite(self.path,timeout=5,generation_id=self.generation_id)

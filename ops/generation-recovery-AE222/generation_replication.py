@@ -89,7 +89,7 @@ def restore_from_azure(azure,key,generation_id,manifest_record,*,parent):
         raise ValueError('RECOVERY_STORED_MANIFEST_DIFFERS')
     total=0
     for record in m['files'].values():
-        if not isinstance(record,dict) or set(record)!= {'sha256','bytes','schemaSha256','rowCounts'} or (
+        if not isinstance(record,dict) or set(record)!= {'sha256','bytes','schemaSha256','rowCounts','inventoryState'} or (
             not isinstance(record['sha256'],str) or not HEX.fullmatch(record['sha256'])
             or type(record['bytes']) is not int or not 0<record['bytes']<=MAX_DATABASE):
             raise ValueError('RECOVERY_STORED_COMMITMENT_DIFFERS')
@@ -114,6 +114,8 @@ def replicate(package,azure,key,generation_id,source_hash,*,parent,clock=time.ti
     m,payloads=validate_export(package,generation_id)
     if purpose=='LIVE_GENERATION_RECOVERY' and set(m['files'])!=DATABASES:
         raise ValueError('GENERATION_RECOVERY_REQUIRED_DATABASE_MISSING')
+    if purpose=='LIVE_GENERATION_RECOVERY' and any(record['inventoryState']!='READY' for record in m['files'].values()):
+        raise ValueError('GENERATION_RECOVERY_INITIALIZATION_INCOMPLETE')
     for digest,raw in payloads.items():ensure_object(azure,raw,key,generation_id,'database')
     manifest_record=ensure_object(azure,canonical(m),key,generation_id,'manifest')
     # No reuse of source bytes as restore evidence: every byte comes from GET.
@@ -123,5 +125,6 @@ def replicate(package,azure,key,generation_id,source_hash,*,parent,clock=time.ti
             'sourceHash':source_hash,'principalId':PRINCIPAL,'checkedAt':int(clock()),
             'restoredAt':int(clock()),'containerPrivate':True,'immutabilityVerified':True,
             'createOnly':True,'restoreMatches':restored['restoreMatches'],
+            'inventoryInitialized':set(m['files'])==DATABASES and all(r['inventoryState']=='READY' for r in m['files'].values()),
             'databaseCount':restored['databaseCount'],'restoredBytes':restored['restoredBytes'],
             'manifest':manifest_record,'restoreEvidenceSha256':sha256(canonical(restored)).hexdigest()}

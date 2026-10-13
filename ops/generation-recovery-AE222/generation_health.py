@@ -11,7 +11,7 @@ from generation_replication import AE, PRINCIPAL, object_name
 
 FIELDS={'schema','entity','network','actionEnvelopeId','purpose','generationId','sourceHash','principalId',
         'checkedAt','restoredAt','containerPrivate','immutabilityVerified','createOnly','restoreMatches',
-        'databaseCount','restoredBytes','manifest','restoreEvidenceSha256'}
+        'databaseCount','restoredBytes','manifest','restoreEvidenceSha256','inventoryInitialized'}
 
 
 def validate_receipt(q,generation_id,source_hash,*,now=None):
@@ -22,7 +22,7 @@ def validate_receipt(q,generation_id,source_hash,*,now=None):
         or q['network']!='testnet11' or q['actionEnvelopeId']!=AE or q['purpose']!='LIVE_GENERATION_RECOVERY'
         or q['generationId']!=generation_id or q['sourceHash']!=source_hash or q['principalId']!=PRINCIPAL):
         raise ValueError('GENERATION_RECOVERY_BINDING_DIFFERS')
-    if any(q[k] is not True for k in ('containerPrivate','immutabilityVerified','createOnly','restoreMatches')):
+    if any(q[k] is not True for k in ('containerPrivate','immutabilityVerified','createOnly','restoreMatches','inventoryInitialized')):
         raise ValueError('GENERATION_RECOVERY_NOT_HEALTHY')
     for name in ('checkedAt','restoredAt'):
         if type(q[name]) is not int or not now-600<=q[name]<=now+30:

@@ -32,6 +32,7 @@ DATABASES = frozenset({
 MAX_DATABASE = 256 * 1024**2
 MAX_TOTAL = 512 * 1024**2
 MAX_MANIFEST = 1024 * 1024
+INVENTORY_HASH=sha256(json.dumps(sorted(DATABASES),separators=(',',':')).encode()).hexdigest()
 
 
 def canonical(value):
@@ -110,7 +111,13 @@ def inspect_database(con, generation_id):
     for kind, name, _, _ in schemas:
         if kind == 'table':
             counts[name] = con.execute('SELECT count(*) FROM "'+name.replace('"', '""')+'"').fetchone()[0]
-    return {'schemaSha256': sha256(canonical(schemas)).hexdigest(), 'rowCounts': counts}
+    state=None
+    if 'generation_recovery_inventory' in counts:
+        rows=con.execute('SELECT singleton,inventory_hash,stage FROM generation_recovery_inventory').fetchall()
+        if len(rows)!=1 or rows[0][0]!=1 or rows[0][1]!=INVENTORY_HASH or rows[0][2] not in ('INITIALIZING','READY'):
+            raise ValueError('RECOVERY_INITIALIZATION_MARKER_DIFFERS')
+        state=rows[0][2]
+    return {'schemaSha256': sha256(canonical(schemas)).hexdigest(), 'rowCounts': counts,'inventoryState':state}
 
 
 def snapshot(root, generation_id, *, clock=time.monotonic, timeout=45):
@@ -186,11 +193,13 @@ def validate_export(package, generation_id):
         raise ValueError('RECOVERY_FILE_INVENTORY_DIFFERS')
     used = 0
     for name, entry in files.items():
-        if not isinstance(entry, dict) or set(entry) != {'sha256','bytes','schemaSha256','rowCounts'} or (
+        if not isinstance(entry, dict) or set(entry) != {'sha256','bytes','schemaSha256','rowCounts','inventoryState'} or (
             type(entry['bytes']) is not int or not 0 < entry['bytes'] <= MAX_DATABASE
             or not isinstance(entry['sha256'], str) or not HEX.fullmatch(entry['sha256'])
             or not isinstance(entry['schemaSha256'], str) or not HEX.fullmatch(entry['schemaSha256'])):
             raise ValueError('RECOVERY_FILE_COMMITMENT_DIFFERS')
+        if entry['inventoryState'] not in (None,'INITIALIZING','READY'):
+            raise ValueError('RECOVERY_INITIALIZATION_STATE_DIFFERS')
         if not isinstance(entry['rowCounts'], dict) or len(entry['rowCounts'])>1000 or any(
             not isinstance(k,str) or type(v) is not int or v<0 for k,v in entry['rowCounts'].items()):
             raise ValueError('RECOVERY_ROW_COMMITMENT_DIFFERS')
@@ -224,7 +233,7 @@ def verify_isolated_restore(package, generation_id, *, parent):
             with os.fdopen(fd,'wb') as stream:
                 stream.write(payloads[record['sha256']]);stream.flush();os.fsync(stream.fileno())
             with closing(connect(path)) as con:
-                if inspect_database(con,generation_id) != {k:record[k] for k in ('schemaSha256','rowCounts')}:
+                if inspect_database(con,generation_id) != {k:record[k] for k in ('schemaSha256','rowCounts','inventoryState')}:
                     raise ValueError('RECOVERY_RESTORE_STATE_DIFFERS')
             restored[name] = record['sha256']
         return {'schema':'solslot.generation-restore-evidence.v1','entity':'SOLSLOT','network':'testnet11',

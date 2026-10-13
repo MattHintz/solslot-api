@@ -8,7 +8,7 @@ import os
 
 import pytest
 from cryptography.exceptions import InvalidTag
-from generation_snapshot import snapshot, canonical, DATABASES
+from generation_snapshot import snapshot, canonical, DATABASES, INVENTORY_HASH
 from generation_replication import (replicate,restore_from_azure,decrypt,encrypt,STORAGE,KEY_REFERENCE)
 from test_generation_snapshot import namespace, database, GEN, OTHER
 
@@ -39,7 +39,9 @@ class Azure:
 def package(tmp_path):
     root=namespace(tmp_path)
     for name in DATABASES:
-        with closing(database(root,name)):pass
+        with closing(database(root,name)) as db,db:
+            db.execute('CREATE TABLE generation_recovery_inventory(singleton INTEGER PRIMARY KEY, inventory_hash TEXT, stage TEXT)')
+            db.execute('INSERT INTO generation_recovery_inventory VALUES(1,?,?)',(INVENTORY_HASH,'READY'))
     return snapshot(root,GEN)
 
 
@@ -88,3 +90,22 @@ def test_missing_live_database_cannot_be_relabelled_as_complete_recovery(tmp_pat
         replicate(p,Azure(),KEY,GEN,SOURCE,parent=tmp_path)
     receipt=replicate(p,Azure(),KEY,GEN,SOURCE,parent=tmp_path,purpose='SYNTHETIC_RESTORE_DRILL')
     assert receipt['purpose']=='SYNTHETIC_RESTORE_DRILL' and receipt['databaseCount']==len(DATABASES)-1
+
+
+@pytest.mark.parametrize('state',[None,'INITIALIZING'])
+def test_uninitialized_journal_cannot_publish_live_healthy_receipt(tmp_path,state):
+    p=package(tmp_path)
+    from generation_snapshot import generation,INVENTORY_HASH
+    import sqlite3
+    root=tmp_path/'generations'/generation(GEN)
+    with sqlite3.connect(root/'generation-preparation.sqlite3') as db:
+        if state is None:db.execute('DROP TABLE generation_recovery_inventory')
+        else:db.execute('UPDATE generation_recovery_inventory SET stage=?',(state,))
+    p=snapshot(root,GEN);azure=Azure()
+    with pytest.raises(ValueError,match='INITIALIZATION_INCOMPLETE'):
+        replicate(p,azure,KEY,GEN,SOURCE,parent=tmp_path)
+    assert azure.puts==0
+    # Forging the manifest state cannot survive independent cloud restoration.
+    p['manifest']['files']['generation-preparation.sqlite3']['inventoryState']='READY'
+    with pytest.raises(ValueError,match='RESTORE_STATE_DIFFERS'):
+        replicate(p,azure,KEY,GEN,SOURCE,parent=tmp_path)

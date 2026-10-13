@@ -363,6 +363,9 @@ async def lifespan(app: FastAPI):
         if app.state.faucet is not None:
             app.state.faucet.bind_generation_preparation(app.state.generation_preparation.preparation,
                 trusted_preparation_hash=settings.generation_preparation_hash)
+    if settings.generation_recovery_storage_enabled:
+        from .generation_recovery_storage import prepare_recovery_journals
+        prepare_recovery_journals(settings,app.state.generation_preparation)
     from .generation_operations import GenerationOperationJournal, GenerationOperationReconciler
     app.state.generation_operations = (
         GenerationOperationJournal(settings.generation_operations_db_path, settings.deployment_generation_id)

@@ -10,7 +10,7 @@ def test_only_fresh_live_matching_generation_can_satisfy_recovery_gate(tmp_path)
     assert validate_receipt(receipt,GEN,SOURCE,now=1234)==receipt
 
 
-@pytest.mark.parametrize('fault',['synthetic','generation','source','principal','stale','future','not_restored','count','url','etag','nan'])
+@pytest.mark.parametrize('fault',['synthetic','generation','source','principal','stale','future','not_restored','count','url','etag','nan','uninitialized'])
 def test_drill_stale_or_changed_recovery_receipt_cannot_admit_launch(tmp_path,fault):
     receipt=replicate(package(tmp_path),Azure(),KEY,GEN,SOURCE,parent=tmp_path,clock=lambda:1234)
     if fault=='synthetic':receipt['purpose']='SYNTHETIC_RESTORE_DRILL'
@@ -24,4 +24,5 @@ def test_drill_stale_or_changed_recovery_receipt_cannot_admit_launch(tmp_path,fa
     elif fault=='url':receipt['manifest']['blobName']='https://other-host/object'
     elif fault=='etag':receipt['manifest']['etag']=None
     elif fault=='nan':receipt['checkedAt']=float('nan')
+    elif fault=='uninitialized':receipt['inventoryInitialized']=False
     with pytest.raises(ValueError):validate_receipt(receipt,GEN,SOURCE,now=1234)
