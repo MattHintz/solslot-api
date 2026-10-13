@@ -140,3 +140,28 @@ async def test_new_generation_cannot_fall_through_historical_chain_builders():
     assert denied.value.status_code==409
     with pytest.raises(GenesisConflict):await _prepare_bundle(settings,Unused())
     with pytest.raises(GenesisConflict):await _broadcast_ceremony('ignored',Unused(),settings,Unused(),gate_authorization={})
+
+
+def test_collection_store_uses_one_normalized_generation_namespace(tmp_path):
+    from solslot_api.collection_store import get_collection_store,reset_collection_store_for_tests
+    root=tmp_path/'journals';settings=Settings(runtime_environment='test',deployment_generation_id=GEN,
+        admin_db_path=str(root/'admin_desk_v2.db'))
+    expected=Path(settings.admin_db_path).parent/'collections.sqlite'
+    try:
+        first=get_collection_store(settings)
+        assert Path(first.path)==expected
+        assert get_collection_store(Settings.model_validate(settings.model_dump())) is first
+        assert not (expected.parent/'generations').exists()
+        with sqlite3.connect(expected) as db:
+            assert db.execute('SELECT generation_id,network FROM deployment_generation_binding').fetchall()==[(GEN,'testnet11')]
+    finally:reset_collection_store_for_tests()
+
+
+def test_generation_collection_memory_store_never_creates_a_file(tmp_path,monkeypatch):
+    from solslot_api.collection_store import get_collection_store,reset_collection_store_for_tests
+    monkeypatch.chdir(tmp_path)
+    try:
+        store=get_collection_store(Settings(runtime_environment='test',deployment_generation_id=GEN,admin_db_path=':memory:'))
+        assert store.path==':memory:'
+        assert not list(tmp_path.iterdir())
+    finally:reset_collection_store_for_tests()

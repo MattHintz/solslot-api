@@ -46,7 +46,7 @@ def package(tmp_path):
 def test_create_only_encrypted_objects_deduplicate_and_restore_from_cloud_gets(tmp_path):
     p=package(tmp_path);a=Azure()
     receipt=replicate(p,a,KEY,GEN,SOURCE,parent=tmp_path,clock=lambda:1234)
-    assert receipt['restoreMatches'] and receipt['restoredAt']==1234 and receipt['databaseCount']==17
+    assert receipt['restoreMatches'] and receipt['restoredAt']==1234 and receipt['databaseCount']==len(DATABASES)
     assert a.puts==2 and a.reads==4 and a.policy_checks==1
     assert receipt==replicate(p,a,KEY,GEN,SOURCE,parent=tmp_path,clock=lambda:1234)
     assert a.puts==2 and a.reads==8
@@ -87,4 +87,4 @@ def test_missing_live_database_cannot_be_relabelled_as_complete_recovery(tmp_pat
     with pytest.raises(ValueError,match='REQUIRED_DATABASE_MISSING'):
         replicate(p,Azure(),KEY,GEN,SOURCE,parent=tmp_path)
     receipt=replicate(p,Azure(),KEY,GEN,SOURCE,parent=tmp_path,purpose='SYNTHETIC_RESTORE_DRILL')
-    assert receipt['purpose']=='SYNTHETIC_RESTORE_DRILL' and receipt['databaseCount']==16
+    assert receipt['purpose']=='SYNTHETIC_RESTORE_DRILL' and receipt['databaseCount']==len(DATABASES)-1

@@ -22,7 +22,8 @@ DATABASES = frozenset({
     'genesis_ceremony_v2.db', 'zkpassport_v2.db', 'payment_purchases_v2.db',
     'stripe_deliveries_v1.db', 'admin_desk_v2.db', 'vault_registry_v2.db',
     'sols_capability_operations.db', 'challenges_v2.db',
-    'zkpassport_v2.db.protocol-funding.sqlite3',
+    'zkpassport_v2.db.protocol-funding.sqlite3', 'zkpassport_v2.db.stamp-funding.sqlite3',
+    'protocol-submissions.sqlite3', 'admin_desk_v2.db.alpha-observability.db', 'collections.sqlite',
     'generation-preparation.sqlite3', 'generation-launch.sqlite3',
     'generation-index.sqlite3', 'generation-operations.sqlite3',
     'generation-consents.sqlite3', 'generation-ballots.sqlite3',
@@ -54,7 +55,7 @@ def protected_path(path, *, directory=False):
     if directory:
         if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o022:
             raise ValueError('RECOVERY_DIRECTORY_NOT_PROTECTED')
-    elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > MAX_DATABASE:
+    elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o022 or info.st_size > MAX_DATABASE:
         raise ValueError('RECOVERY_DATABASE_NOT_BOUNDED')
     return info
 

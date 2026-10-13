@@ -9,5 +9,8 @@ for p in (root,*root.parents):
 sys.path.insert(0,str(root))
 from generation_worker import run,stage_tokens
 if sys.argv[1:]==['--stage-identity']:stage_tokens()
+elif sys.argv[1:]==['--snapshot']:
+    from generation_export import child_snapshot
+    child_snapshot()
 elif sys.argv[1:]==[]:run()
 else:raise RuntimeError('Unsupported recovery entry action')

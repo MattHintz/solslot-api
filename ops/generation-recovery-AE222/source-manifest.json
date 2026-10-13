@@ -2,31 +2,37 @@
   "schema": "solslot.generation-recovery-source.v1",
   "entity": "SOLSLOT",
   "packagePurpose": "REVIEWED_INSTALLATION_CANDIDATE_NOT_INSTALLED",
+  "revision": 3,
   "generationConfiguration": "PENDING_CONCRETE_GENERATION",
+  "runtimeSourceHash": "0x1f77a492090c5d37a0dbb4b2803e849ab8a0cbbb9b123c5f1231ecedc64d75c1",
   "files": {
-    "generation_export.py": "23ba8c84252a5994c8a515003e759ed8db1df2a9a6fb26d1c1c8cb8da62148c7",
+    "generation_export.py": "ba42033cff21c6b582421faaee1da0ae81c58a74b1f6399551cf439d8d41e52e",
     "generation_health.py": "6eb7d183ff5ac9bdac3a936da56334e1fee5cb678114cfe5716cb4d4cd6f0ba2",
     "generation_replication.py": "e7986a51a69f5be5dab7bd34ed5a7459c1a81a70f0258c365fee79d92025471e",
-    "generation_snapshot.py": "1339ca9b85adbb3da41506b61d9d60f5e4e5a0d98f204b86f215c0e523be6992",
+    "generation_snapshot.py": "348f6482defe61535f1728a6f5adc54627f360169e5b1905b198a0d9993e4e3e",
     "generation_worker.py": "5701fe67b1e46c4fb945da8a2be0405f9317029aa8b72e88ade1dbf8a19205f2",
-    "worker_entry.py": "ee1e0dcaf131f06ca5cfa00079fe73c4ccc7e50108cd7615eb3e5f4c2352f719",
-    "README.md": "142c4662b06bad76157dd800737616eb05fa7b6e4afc1f123b369a7ef664ca45",
+    "worker_entry.py": "799cb2273984dc7a5792b41f62785aad1df5f355a811cc4c0ad88d24a7159ca8",
+    "README.md": "ee3d578a96c1e039dd04d8b1f9c279752c7134260b3ef4333280948f725a3900",
     "systemd/solslot-generation-recovery-ae222.service": "4b6335b691da181aa8540a6fe2e0aa0444c20749d7c9cadb12f2ec15a07cb1d5",
     "systemd/solslot-generation-recovery-ae222.timer": "b6eece1ebde0449476543a160fdad44a48dc66015b39e1c7a5855a60e0c9717c",
     "tests/test_generation_application_restore.py": "170cb4375e1c19674e985dd2aad3bab84dddec7aece5a0f8dd1961d264eb29e5",
-    "tests/test_generation_export.py": "7c0942875f2950f1ba5357066f0bbdb56874277d59d5aaf60d39a703eba03a03",
+    "tests/test_generation_export.py": "23355e272059b21f97fb85a54a50b237ea645d1a3ab09e6acc20b587c6b7b01f",
     "tests/test_generation_health.py": "9d31d9d028abc67d7fe534f83fd38adcacbc78341f42befa9cc110218543ed6d",
     "tests/test_generation_identity.py": "56b139ea20d203a5a5d927c1761d476fd5c5ff5b8be1f6ee3e2680eb38f3a5a9",
-    "tests/test_generation_replication.py": "e6b33649fbdc03bc8dec234b05d50daca51e088eb1ef62a13099c9df2f11d653",
-    "tests/test_generation_snapshot.py": "e272f271582d9224e20b7d2a85327b6c3cf9e2a780f96115e08a8f6a92ee7888"
+    "tests/test_generation_replication.py": "2684d33b4cf120141085c2bcacfde0172e0d7cbc15c31df34640004b6f8bac2a",
+    "tests/test_generation_snapshot.py": "e272f271582d9224e20b7d2a85327b6c3cf9e2a780f96115e08a8f6a92ee7888",
+    "tests/test_runtime_inventory.py": "518318a952bcbdc98a8aff26c6ec07fcd92c27f5769c7736b0746f059b1b0b70"
   },
   "evidenceReferences": [
-    "generation-recovery/recovery-tests-v7.txt",
-    "generation-recovery/export-permissions-tests-v1.txt",
+    "generation-recovery/recovery-tests-v8.txt",
+    "generation-recovery/privilege-and-inventory-tests-v2.txt",
+    "generation-collection-path-repair-tests-v1.txt",
     "generation-recovery/azure-drill-result-v8.json",
-    "generation-reward-progress-http-tests-v6.txt"
+    "generation-reward-progress-http-tests-v6.txt",
+    "generation-recovery/privilege-and-inventory-tests-v3.txt"
   ],
   "drillPurpose": "SYNTHETIC_RESTORE_DRILL",
+  "cloudDrillScope": "Prior snapshot/replication/token profile; new inventory/path/privilege refinements have local evidence and require actual-generation hosted verification.",
   "cloudPermissionsAdded": 0,
   "subscriptionsAdded": 0
 }

@@ -1,11 +1,14 @@
 # Generation-only recovery — AE222 candidate
 
 This package supplements the preserved AE181 collection recovery. It exports only
-17 named SQLite databases in a separately configured generation journal namespace.
-A live receipt requires all 17; a partial inventory cannot be reported healthy.
+21 named SQLite databases in a separately configured generation journal namespace.
+A live receipt requires all 21; a partial inventory cannot be reported healthy.
 It never exports an old generation, credentials, arbitrary files or private plans.
 The separate AE181 lane continues to preserve accepted property objects.
 
+The root forced command delegates SQLite capture to the existing unprivileged API
+identity, and keeps only protected receipt publication privileged. Filesystem
+replacement by the namespace owner therefore cannot grant root read/write access.
 The source sets briefly acquire SQLite write reservations and pin read snapshots
 before releasing the reservations. SQLite's backup API copies committed WAL pages.
 Each database is capped at 256 MiB and the complete snapshot at 512 MiB. Unknown
@@ -29,13 +32,15 @@ memory/tmpfs. Neither appears in a repository, receipt or command output.
 
 ## Verified evidence as of 2026-10-13
 
-- `recovery-tests-v7.txt`: 59 local positive/adversarial checks passed.
+- `recovery-tests-v8.txt`: 61 local positive/adversarial checks passed.
 - `application-restore-tests-v1.txt`: cold API reopen preserved the exact original
   offer, operation bundle, receipt and funding holds; retries did not rebuild.
-- `azure-drill-result-v8.json`: the current snapshot/replication/health/token modules restored matching
+- `azure-drill-result-v8.json`: the prior snapshot/replication/health/token profile restored matching
   encrypted synthetic SQLite data on the existing Azure VM as an unprivileged
   account using separately root-staged tokens. Purpose is SYNTHETIC_RESTORE_DRILL.
-- `export-permissions-tests-v1.txt`: the receipt publisher retains root ownership
+  The subsequent 21-database inventory, collection-path and exporter-privilege
+  repairs require a fresh hosted actual-generation restore before deployment.
+- `privilege-and-inventory-tests-v2.txt`: the receipt publisher retains root ownership
   and explicitly grants the API group read access under a private umask. This
   permission refinement is locally verified; no live exporter was installed.
 - API `test_generation_reward_progress_routes.py`: two real native-consensus HTTP
@@ -82,6 +87,15 @@ source releases, encrypted objects and chain evidence. Restore never automatical
 replaces live journals or reverses chain history. Reconciling retained submissions
 must precede a new transaction; actual sender and wallet authorizations remain
 required.
+
+Additional reviewed repairs flatten the collection store to one generation directory
+and include stamp-funding, node-submission and telemetry journals. The actual API
+lifespan plus lazy collection/telemetry constructors now have a recovery regression;
+a synthetic allowlist fixture alone cannot establish real runtime coverage.
+That constructor check verifies only the stores it initializes, not the full
+21-database live-purpose inventory. The exporter applies its independent output
+file-size limit in the child after dropping to the API user, because runuser resets
+inherited file-size limits on the supported host.
 
 ## Open release gates
 

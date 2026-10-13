@@ -1943,8 +1943,9 @@ def get_collection_store(
 ) -> CollectionStore:
     global _cached_store, _cached_store_path
     path = settings.admin_db_path
-    if settings.deployment_generation_id:
-        path = str(Path(path).parent / 'generations' / settings.deployment_generation_id[2:] / 'collections.sqlite')
+    if settings.deployment_generation_id and path != ':memory:':
+        from .generation_storage import generation_path
+        path = generation_path(str(Path(path).parent / 'collections.sqlite'), settings.deployment_generation_id)
     cache_key = (path, settings.deployment_generation_id, settings.network)
     if _cached_store is None or _cached_store_path != cache_key:
         if _cached_store is not None:
