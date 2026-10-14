@@ -27,6 +27,39 @@ SOURCE_KEYS = frozenset({'protocol','evm','omnichain','api','legacyBackend','key
 COORDINATE_KEYS = frozenset({'authority','registry','governance','holdings','pool','parameters','mint'})
 
 
+def read_generation_preparation(settings):
+    """Read the operator-pinned preparation without opening or creating state."""
+    from pathlib import Path
+    if (settings.network!='testnet11' or not settings.deployment_generation_id
+            or not settings.generation_preparation_path or not settings.generation_preparation_hash):
+        raise ValueError('reviewed generation preparation is not installed')
+    try:
+        with Path(settings.generation_preparation_path).open('rb') as stream:
+            raw=stream.read(131073)
+    except OSError as exc:
+        raise ValueError('reviewed generation preparation is unavailable') from exc
+    if len(raw)>131072:raise ValueError('generation preparation exceeds its size limit')
+    preparation=GenerationPreparation.model_validate_json(raw)
+    if (preparation.generation_id!=settings.deployment_generation_id
+            or preparation.manifest_hash!=settings.generation_preparation_hash):
+        raise ValueError('reviewed generation preparation commitment differs')
+    return preparation
+
+
+def require_prelaunch_configuration(settings):
+    """Permit setup before genesis, never unverified customer authority."""
+    from pathlib import Path
+    from .disposable_genesis import CLOSED_FLAGS
+    preparation=read_generation_preparation(settings)
+    if (settings.alpha_writes_enabled or settings.ceremony_mode_enabled
+            or settings.generation_chain_anchor_path or settings.generation_sols_batch_enabled
+            or any(getattr(settings, field) for field in CLOSED_FLAGS)
+            or any(Path(path).exists() or Path(path).is_symlink()
+                for path in (settings.public_artifact_path,settings.bootstrap_manifest_path))):
+        raise ValueError('generation prelaunch requires closed customer writes and no published authority')
+    return preparation
+
+
 def commitment(value: dict) -> str:
     return '0x'+hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode()).hexdigest()
 

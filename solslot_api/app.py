@@ -330,12 +330,21 @@ async def lifespan(app: FastAPI):
             settings, provider=app.state.coinset
         )
         require_runtime_identity_bindings(settings, app.state.identity_deployment)
-    except (PublicArtifactMissing, IdentityDeploymentError):
+    except PublicArtifactMissing:
         if settings.runtime_environment != "test":
-            raise
+            # A new generation has no signed public artifact before genesis.
+            # Admit only its pinned preparation while customer writes remain
+            # closed. This does not inherit the old generation's identity or
+            # authorize enrollment; those routes still require an artifact.
+            from .generation_preparation import require_prelaunch_configuration
+            require_prelaunch_configuration(settings)
         # Unit-test applications may intentionally exercise routes that do
         # not install a ceremony artifact. Identity routes still fail closed
         # unless their tests provide the signed artifact fixture.
+        app.state.identity_deployment = None
+    except IdentityDeploymentError:
+        if settings.runtime_environment != "test":
+            raise
         app.state.identity_deployment = None
 
     if settings.faucet_master_sk_hex:

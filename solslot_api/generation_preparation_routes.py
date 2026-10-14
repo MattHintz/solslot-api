@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from .config import Settings, get_settings
-from .generation_preparation import GenerationPreparation
+from .generation_preparation import GenerationPreparation,read_generation_preparation
 from .generation_preparation_store import GenerationPreparationStore
 from .generation_recipient_evidence import verify_single_recipient
 from .generation_recipient_execution import RecipientLaunchRequest, Hash, prepare_recipient_launch, recipient_operation
@@ -37,14 +37,7 @@ def preparation_store(settings: Annotated[Settings,Depends(get_settings)]) -> Ge
         raise HTTPException(503,detail={'code':'GENERATION_PREPARATION_NOT_READY',
             'message':'The reviewed preparation manifest is not installed.'})
     try:
-        path=Path(settings.generation_preparation_path)
-        # Bound the read itself, including a concurrently replaced file.
-        with path.open('rb') as stream: raw=stream.read(131073)
-        if len(raw)>131072:raise ValueError('manifest size limit')
-        preparation=GenerationPreparation.model_validate_json(raw)
-        if (preparation.generation_id!=settings.deployment_generation_id
-                or preparation.manifest_hash!=settings.generation_preparation_hash):
-            raise ValueError('reviewed preparation commitment differs')
+        preparation=read_generation_preparation(settings)
         return GenerationPreparationStore(settings.generation_preparation_db_path,preparation)
     except (OSError,ValueError) as exc:
         raise HTTPException(503,detail={'code':'GENERATION_PREPARATION_NOT_READY',

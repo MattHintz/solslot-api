@@ -175,6 +175,19 @@ def current_launch_authority(
     the pre-genesis ceremony, before any publication or bootstrap lock exists.
     """
     record = store.get(ceremony_id)
+    if settings.deployment_generation_id and settings.generation_preparation_path:
+        # The new generation has its own frozen roster and fresh sign-in
+        # challenges. Historical invitation signatures grant no access here.
+        # This is prelaunch authentication, never chain publication consent.
+        from .generation_preparation import read_generation_preparation
+        preparation=read_generation_preparation(settings)
+        if (ceremony_id!=preparation.generation_id
+                or record['draft'].get('generationId')!=preparation.generation_id
+                or record['draft'].get('preparationManifest')!=preparation.manifest_hash
+                or record['state'] not in ('draft','roster_open')
+                or settings.generation_chain_anchor_path):
+            raise PublicArtifactError('generation prelaunch authority context differs')
+        return LaunchAuthority({a.slot:a.wallet for a in preparation.administrators},bootstrap=False)
     publication = store.finalization_publication(ceremony_id)
     finalizing = record["state"] == "artifact_signed" and publication is not None
     if finalizing:

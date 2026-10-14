@@ -394,6 +394,12 @@ def require_launch_session(
     if not token:
         raise HTTPException(status_code=401, detail="Connect an enrolled administrator wallet.")
     session = _decode_session(token, settings)
+    if settings.deployment_generation_id and settings.generation_preparation_path:
+        path=request.scope.get('path','')
+        if not (path.startswith('/admin/launch/generation/') or
+                (request.scope.get('method'),path) in {('GET','/admin/launch/workspace'),
+                    ('GET','/admin/launch/audit'),('PUT','/admin/launch/profile')}):
+            raise HTTPException(status_code=403,detail='Use the reviewed generation workflow; legacy ceremony actions are unavailable.')
     try:
         record = store.get(session.ceremony_id)
     except GenesisStoreError as exc:
@@ -2046,6 +2052,14 @@ async def launch_workspace(
         response, settings, request.cookies[LAUNCH_COOKIE_NAME], session.expires_at
     )
     record = store.get(session.ceremony_id)
+    if settings.deployment_generation_id and settings.generation_preparation_path:
+        return {
+            'session':{'slot':session.slot,'role':'owner' if session.slot==1 else 'coadmin',
+                'wallet':session.wallet,'setup':False,'expiresAt':session.expires_at},
+            'launch':{**_public_ceremony(record,store),'generationId':settings.deployment_generation_id},
+            'readiness':[], 'nextTask':{'title':'Confirm your SGT recipient vault','action':'generationRecipients'},
+            'gates':{},'voucherRailControls':{},'actionApprovals':{},
+            'notice':'TESTNET, NO REAL INVESTMENT OR LEGAL RIGHT.'}
     readiness = await _readiness(request, settings, store, record)
     action_approvals: dict[str, Any] = {}
     funding = store.funding_receipt(session.ceremony_id)
