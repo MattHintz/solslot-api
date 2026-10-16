@@ -2006,6 +2006,10 @@ async def resume_login(
         recovered = recover_evm_signer(typed, body.signature)
         if recovered.address.lower() != wallet:
             raise GenesisConflict("signature wallet changed")
+        from .admin_roster import current_launch_authority
+        authority = current_launch_authority(settings, store, str(challenge['ceremony_id']))
+        if authority.wallets.get(int(challenge['slot'])) != wallet:
+            raise GenesisConflict('administrator authority changed since this sign-in request')
         store.consume_auth_challenge(
             settings=settings,
             nonce_hash=_token_hash(body.nonce), wallet_address=wallet

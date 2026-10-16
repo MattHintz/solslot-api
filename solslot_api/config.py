@@ -1485,6 +1485,10 @@ class Settings(BaseSettings):
     generation_launch_enabled: bool = False
     generation_chain_anchor_path: Optional[str] = None
     generation_chain_anchor_hash: Optional[str] = Field(default=None,pattern=r"^0x[0-9a-f]{64}$")
+    # Public recovery-policy preimages, pinned separately and always checked
+    # against the current confirmed identity custody before granting access.
+    generation_admin_identity_witnesses_path: Optional[str] = None
+    generation_admin_identity_witnesses_hash: Optional[str] = Field(default=None,pattern=r"^0x[0-9a-f]{64}$")
     generation_index_db_path: str = "./state/generation-index.sqlite3"
     generation_operations_db_path: str = "./state/generation-operations.sqlite3"
     generation_consents_db_path: str = "./state/generation-consents.sqlite3"

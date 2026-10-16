@@ -42,7 +42,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from .admin_roster import (
     current_signed_admin_allowlist,
-    current_signed_admins,
+    current_signed_admin_slots,
 )
 from .challenges import ChallengeStore, ChallengeStoreFullError, RateLimitedError
 from .config import Settings, get_settings
@@ -154,7 +154,7 @@ def _effective_admin_allowlist(settings: Settings) -> set[str]:
     explicit ``test`` environment. Deployed environments never consult that
     file and fail closed when the signed artifact is missing or invalid.
     """
-    if settings.runtime_environment == "test":
+    if settings.runtime_environment == "test" and not (settings.generation_chain_anchor_path or settings.generation_chain_anchor_hash):
         return settings.effective_admin_allowlist_set()
     try:
         return current_signed_admin_allowlist(settings)
@@ -263,6 +263,13 @@ def validate_admin_config_at_startup(settings: Settings) -> None:
             "SOLSLOT_ADMIN_RECORDS_PATH is retired for deployed RC23 releases. "
             "Administrator identities come from the signed public artifact."
         )
+
+    if settings.generation_chain_anchor_path or settings.generation_chain_anchor_hash:
+        from .generation_admission import require_handoff_configuration
+        require_handoff_configuration(settings)
+        # Primary-node proof is awaited by lifespan before accepting requests;
+        # configuration or an old public artifact cannot mint administrator JWTs.
+        return
 
     if settings.runtime_environment != "test":
         try:
@@ -528,13 +535,13 @@ def require_admin_jwt(
                 f"Re-authenticate via /admin/auth/login if your pubkey was re-added."
             ),
         )
-    if settings.runtime_environment != "test":
+    if settings.runtime_environment != "test" or settings.generation_chain_anchor_path or settings.generation_chain_anchor_hash:
         try:
-            administrators = current_signed_admins(settings)
+            administrators = current_signed_admin_slots(settings)
             if (
                 claims.authority_slot not in range(3)
                 or claims.compressed_pubkey is None
-                or administrators[claims.authority_slot]
+                or administrators.get(claims.authority_slot)
                 != (claims.sub.lower(), claims.compressed_pubkey.lower())
             ):
                 raise HTTPException(
@@ -749,15 +756,15 @@ async def admin_login(
             ),
         )
 
-    if settings.runtime_environment == "test":
+    if settings.runtime_environment == "test" and not (settings.generation_chain_anchor_path or settings.generation_chain_anchor_hash):
         authority_slot = 0
         compressed_pubkey = recovery.compressed_pubkey_hex.lower()
     else:
         try:
-            administrators = current_signed_admins(settings)
+            administrators = current_signed_admin_slots(settings)
             authority_slot, (_, compressed_pubkey) = next(
                 (slot, administrator)
-                for slot, administrator in enumerate(administrators)
+                for slot, administrator in administrators.items()
                 if administrator[0] == recovery.address.lower()
                 and administrator[1] == recovery.compressed_pubkey_hex.lower()
             )

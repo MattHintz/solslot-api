@@ -72,7 +72,9 @@ def test_explicit_prepare_has_strict_request_fields_and_never_signs_or_dispatche
         assert response.status_code==200 and response.json()==c.saved
         body=c.prepare.call_args.args[0]
         assert body.request_key=='exact-review' and body.scope==16
-        assert c.prepare.call_args.kwargs=={'anchor':c.index.anchor,'provider':c.provider,'store':c.store}
+        assert c.prepare.call_args.kwargs=={'anchor':c.index.anchor,'provider':c.provider,
+            'store':c.store,'settings':c.settings}
+        assert c.prepare.call_args.kwargs['settings'] is c.settings
         for bad in ({'scope':32},{'coadministratorSlot':True},{'feeCapMojos':True},{'signature':SIGNATURE},
                     {'spendBundle':{}},{'kind':'GRANT'}):
             assert client.post('/admin/generation/consents/prepare',json={**request(),**bad}).status_code==422

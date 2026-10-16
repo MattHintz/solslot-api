@@ -143,9 +143,21 @@ def current_signed_admins(
     settings: Settings,
     store: GenesisStore | None = None,
 ) -> list[tuple[str, str]]:
+    if settings.generation_chain_anchor_path or settings.generation_chain_anchor_hash:
+        slots = current_signed_admin_slots(settings, store)
+        if set(slots) != {0, 1, 2}:
+            raise PublicArtifactMissing('current administrator public policy witnesses are incomplete')
+        return [slots[slot] for slot in range(3)]
     artifact = load_signed_public_artifact(settings)
     active_store = store or GenesisStore.for_settings(settings)
     return current_artifact_admins(artifact, active_store)
+
+
+def current_signed_admin_slots(settings, store=None):
+    if settings.generation_chain_anchor_path or settings.generation_chain_anchor_hash:
+        from .generation_admission import current_admin_slots
+        return current_admin_slots(settings)
+    return dict(enumerate(current_signed_admins(settings, store)))
 
 
 def current_signed_admin_allowlist(
@@ -154,7 +166,7 @@ def current_signed_admin_allowlist(
 ) -> set[str]:
     return {
         identity
-        for administrator in current_signed_admins(settings, store)
+        for administrator in current_signed_admin_slots(settings, store).values()
         for identity in administrator
     }
 
@@ -184,9 +196,11 @@ def current_launch_authority(
         if (ceremony_id!=preparation.generation_id
                 or record['draft'].get('generationId')!=preparation.generation_id
                 or record['draft'].get('preparationManifest')!=preparation.manifest_hash
-                or record['state'] not in ('draft','roster_open')
-                or settings.generation_chain_anchor_path):
+                or record['state'] not in ('draft','roster_open')):
             raise PublicArtifactError('generation prelaunch authority context differs')
+        if settings.generation_chain_anchor_path or settings.generation_chain_anchor_hash:
+            return LaunchAuthority({slot + 1: identity[0]
+                for slot, identity in current_signed_admin_slots(settings).items()}, bootstrap=False)
         return LaunchAuthority({a.slot:a.wallet for a in preparation.administrators},bootstrap=False)
     publication = store.finalization_publication(ceremony_id)
     finalizing = record["state"] == "artifact_signed" and publication is not None
@@ -251,4 +265,5 @@ __all__ = [
     "current_launch_authority",
     "current_signed_admin_allowlist",
     "current_signed_admins",
+    "current_signed_admin_slots",
 ]

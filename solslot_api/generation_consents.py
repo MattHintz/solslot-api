@@ -223,8 +223,25 @@ def restore_consent(document,initial):
     raw=document['authorityTip']
     admin=SingletonTip(bytes32.from_hexstr(raw['launcherId']),_program(raw['inner']),
         Coin.from_json_dict(raw['coin']),CoinSpend.from_json_dict(raw['parentSpend']))
+    policies = initial.identity_vaults
+    if 'identityPublicKeys' in document:
+        from .generation_admission import PublicIdentity
+        from solslot_puzzles.admin_authority_v3_driver import build_admin_identity_vault
+        raw_policies = document['identityPublicKeys']
+        if not isinstance(raw_policies, list) or len(raw_policies) != 3:
+            raise ValueError('saved consent needs all three exact identity policies')
+        parsed = [PublicIdentity.model_validate(row) for row in raw_policies]
+        if [row.slot for row in parsed] != [0, 1, 2]:
+            raise ValueError('saved identity policy slots changed')
+        policies = tuple(build_admin_identity_vault(slot=row.slot,
+            launcher_id=initial.identity_vaults[row.slot].launcher_id,
+            authority_launcher_id=initial.authority_launcher_id, network='testnet11',
+            daily_compressed_pubkey=bytes.fromhex(row.daily_public_key[2:]),
+            recovery_bls_pubkey=bytes.fromhex(row.recovery_public_key[2:])) for row in parsed)
+    if len(document['identityTips']) != 3:
+        raise ValueError('saved consent identity inputs are incomplete')
     identities=tuple(AdministratorIdentityTip(policy,Coin.from_json_dict(v['coin']),
-        CoinSpend.from_json_dict(v['parentSpend'])) for policy,v in zip(initial.identity_vaults,document['identityTips']))
+        CoinSpend.from_json_dict(v['parentSpend'])) for policy,v in zip(policies,document['identityTips'],strict=True))
     request=ConsentRequest.model_validate(document['request'])
     subject=bytes32.from_hexstr(document['review']['proposalId']) if request.kind=='PUBLICATION_APPROVAL' else (
         document['review']['pauseEpoch'],request.scope)
@@ -329,10 +346,12 @@ async def prepare_consent(request,*,anchor,provider,store,clock=time.time,settin
                     raise ValueError('reopening scope differs from the current pause')
                 bill=Program.to([b'REOPEN',registry.pause_epoch,request.scope])
         current=admins.authority.verified_tip(registry.administrator_id,admins.authority.state)
-        # Until recovered public-key policies are separately frozen/configured,
-        # fail closed rather than invent a reveal from coordinator key metadata.
+        from .generation_admission import identity_policies
+        policies = identity_policies(settings, anchor.administrator)
+        # Public key preimages are not authority. Every policy must reconstruct
+        # the exact current custody output independently verified on chain.
         identities=tuple(e.verified_tip(policy,current.launcher_id)
-            for e,policy in zip(admins.identities,anchor.administrator.identity_vaults))
+            for e,policy in zip(admins.identities,policies,strict=True))
         now=int(clock());issued=now if bill is not None else 0
         subject=gov.proposal_id(bill,chain.holdings.state[0]) if bill is not None else (registry.pause_epoch,request.scope)
         target=chain.governance.current.coin.puzzle_hash if bill is not None else chain.registry.current.coin.puzzle_hash
@@ -371,6 +390,10 @@ async def prepare_consent(request,*,anchor,provider,store,clock=time.time,settin
                 'parentSpend':t.parent.to_json_dict()} for t in identities],
             'confirmedInputs':[raw_record(r) for r in records],
             'challenges':[_challenge(c) for c in prepared.challenges()]}
+        if policies != anchor.administrator.identity_vaults:
+            document['identityPublicKeys'] = [{'slot':p.slot,
+                'dailyPublicKey':h(p.daily_compressed_pubkey),
+                'recoveryPublicKey':h(p.recovery_bls_pubkey)} for p in policies]
         if redemption_records:document['redemptionParent']=raw_record(redemption_records[1])
         restore_consent(document,anchor.administrator)
         if not await current_evidence_unchanged(chain,provider=provider):raise ValueError('chain changed during preparation')

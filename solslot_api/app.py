@@ -320,16 +320,25 @@ async def lifespan(app: FastAPI):
         )
     )
     await app.state.coinset.start()
+    from .generation_admission import handoff_selected, initialize_handoff
+    app.state.generation_admission = None
     from .identity_deployment import (
         IdentityDeploymentError,
         load_effective_identity_deployment,
         require_runtime_identity_bindings,
     )
     try:
-        app.state.identity_deployment = await load_effective_identity_deployment(
-            settings, provider=app.state.coinset
-        )
-        require_runtime_identity_bindings(settings, app.state.identity_deployment)
+        if handoff_selected(settings):
+            # The separately reviewed chain anchor replaces no legacy release
+            # signature. Prove the complete native generation before admitting
+            # administrator access; customer identity enrollment stays closed.
+            app.state.generation_admission = await initialize_handoff(settings, app.state.coinset)
+            app.state.identity_deployment = None
+        else:
+            app.state.identity_deployment = await load_effective_identity_deployment(
+                settings, provider=app.state.coinset
+            )
+            require_runtime_identity_bindings(settings, app.state.identity_deployment)
     except PublicArtifactMissing:
         if settings.runtime_environment != "test":
             # A new generation has no signed public artifact before genesis.
@@ -346,6 +355,9 @@ async def lifespan(app: FastAPI):
         if settings.runtime_environment != "test":
             raise
         app.state.identity_deployment = None
+    except BaseException:
+        await app.state.coinset.close()
+        raise
 
     if settings.faucet_master_sk_hex:
         app.state.faucet = Faucet.from_master_private_key_hex(
@@ -717,9 +729,17 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(GenerationOperationReconciler(app.state.generation_operations,app.state.coinset,
             recipient_observer=recipient_observer,mint_observer=mint_observer,launch_observer=launch_observer).run(),
             name='generation-operation-observer') if app.state.generation_operations is not None else None)
+    generation_admission_task = (asyncio.create_task(app.state.generation_admission.run(),
+        name='generation-administrator-observer') if app.state.generation_admission is not None else None)
     try:
         yield
     finally:
+        if generation_admission_task is not None:
+            generation_admission_task.cancel()
+            with suppress(asyncio.CancelledError):await generation_admission_task
+        if app.state.generation_admission is not None:
+            app.state.generation_admission.snapshot = None
+        app.state.generation_admission = None
         if generation_sols_task is not None:
             generation_sols_task.cancel()
             with suppress(asyncio.CancelledError):await generation_sols_task
@@ -796,6 +816,8 @@ async def faucet_selection_restricted_handler(
 
 # Localhost matching is available only in development/test. Staging and
 # production accept exact HTTPS origins from SOLSLOT_CORS_ORIGINS.
+from .generation_admission import GenerationAdmissionMiddleware
+app.add_middleware(GenerationAdmissionMiddleware)
 app.add_middleware(
     CORSMiddleware,
     **cors_middleware_options(_server_settings),

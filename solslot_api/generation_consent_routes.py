@@ -47,7 +47,7 @@ def list_consents(request:Request,settings:Annotated[Settings,Depends(get_settin
 @router.post('/prepare')
 async def prepare_review(body:ConsentRequest,request:Request,settings:Annotated[Settings,Depends(get_settings)]):
     store,index,provider=_services(request,settings,write=True)
-    source={}
+    source={'settings':settings}
     try:
         if body.proposal_kind=='MINT_TEST_ONLY':
             source={'settings':settings,'collections':get_collection_store(settings),
