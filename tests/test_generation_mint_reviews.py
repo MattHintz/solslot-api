@@ -40,7 +40,9 @@ async def context(c, tmp_path, *, initialized_generation=None):
         return [r.to_json_dict() for r in await c.client.get_coin_records_by_puzzle_hash(bytes32.from_hexstr(ph)) if include_spent or not r.spent]
     c.provider.get_coin_records_by_puzzle_hash_primary = catalog
     payload = edition();payload['generationId'] = c.prep.generation_id
-    payload['offering']['royaltyPuzhash'] = c.artifact.treasury_puzzle_hash
+    from solslot_puzzles.generation_mint import GenerationMint
+    mint = next(s for s in built.anchor.economic_components if isinstance(s, GenerationMint))
+    payload['offering']['royaltyPuzhash'] = h(mint.treasury_puzzle_hash)
     collections = CollectionStore(tmp_path/'collections.db', generation_id=c.prep.generation_id)
     cid = payload['collectionId']
     collections.create(collection_id=cid,title=payload['title'],owner_subject='owner',owner_auth_type='evm',initial_draft=TestPropertyDraftV1.model_validate(payload))

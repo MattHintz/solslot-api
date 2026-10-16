@@ -98,6 +98,8 @@ class GenerationLaunchArtifact(GenerationCoreArtifact):
     """Full economic assembly intent, still separate from release approval."""
     price_oracle_public_keys: tuple[str,str,str] = Field(alias='priceOraclePublicKeys')
     purpose: Literal['GENERATION_LAUNCH_PREPARATION'] = 'GENERATION_LAUNCH_PREPARATION'
+    custody_policy: Literal['SEGREGATED_COMPANY_REVENUE_V1'] = Field(alias='custodyPolicy')
+    company_revenue_puzzle_hash: str = Field(alias='companyRevenuePuzzleHash', pattern=r'^0x[0-9a-f]{64}$')
 
 
 def component_id(generation: bytes32, label: str) -> bytes32:
@@ -144,6 +146,7 @@ class GenerationCoreAssembly:
             'exchangeFees': {'totalBps': parameters.exchange_fee_bps,
                             'protocolBps': parameters.protocol_fee_bps,
                             'sgtRewardsBps': parameters.sgt_rewards_fee_bps},
+            'custody': self._custody_review(),
             'readAnchor': {
                 'schemaVersion': 1, 'purpose': 'GENERATION_CHAIN_READ_ANCHOR',
                 'preparationManifest': self.preparation_manifest,
@@ -157,6 +160,18 @@ class GenerationCoreAssembly:
                     'recoveryPublicKeys':['0x'+i.recovery_bls_pubkey.hex() for i in self.authority.identity_vaults]},
             },
         }
+
+    def _custody_review(self):
+        from solslot_puzzles.generation_revenue import CompanyRevenue, BackingCustody, PrimaryFeeSplitter
+        generation = self.operation.generation
+        if not self.complete_assembly:
+            return {'assembly': 'INCOMPLETE_NOT_LAUNCH_AUTHORITY'}
+        revenue = CompanyRevenue(generation, self.authority.authority_launcher_id)
+        return {'policy': 'SEGREGATED_COMPANY_REVENUE_V1', 'companyRevenue': revenue.review(),
+            'primaryFeeSplitter': '0x'+PrimaryFeeSplitter(self.anchor.issuance.bindings(),
+                self.anchor.economic_components[0].launcher_id, revenue).inner().get_tree_hash().hex(),
+            'nonwithdrawableBacking': '0x'+BackingCustody(generation).inner().get_tree_hash().hex(),
+            'sgtRewards': 'SEPARATE_HOLDER_CLAIMS', 'redemptions': 'SEPARATE_ISSUER_FUNDED_LEAVES'}
 
 
 @dataclass(frozen=True)
@@ -193,6 +208,15 @@ def _graph(preparation, artifact, evidence, *, trusted_preparation_hash, trusted
             raise ValueError('recipient evidence differs from the exact frozen custody output')
     b = bytes32.from_hexstr
     coordinate = lambda name: b(prep.coordinates[name].launcher_id)
+    revenue = None
+    if complete:
+        from solslot_puzzles.generation_revenue import CompanyRevenue, BackingCustody, PrimaryFeeSplitter
+        revenue = CompanyRevenue(plan.generation, coordinate('authority'))
+        backing = BackingCustody(plan.generation)
+        if (b(art.treasury_puzzle_hash) != backing.inner().get_tree_hash()
+                or b(art.company_revenue_puzzle_hash) != revenue.inner().get_tree_hash()
+                or b(art.protocol_puzzle_hash) in (backing.inner().get_tree_hash(), revenue.inner().get_tree_hash())):
+            raise ValueError('launch requires exact segregated backing/revenue custody and separate primary proceeds')
     authority = build_genesis_admin_authority_v3(
         parent_coin_id=b(prep.coordinates['authority'].funding_coin_id), network='testnet11',
         daily_compressed_pubkeys=tuple(bytes.fromhex(v[2:]) for v in art.daily_public_keys),
@@ -210,13 +234,13 @@ def _graph(preparation, artifact, evidence, *, trusted_preparation_hash, trusted
             b(prep.bridge_policy_hash),b(art.treasury_puzzle_hash),plan.generation))
     mint = GenerationMint(plan.generation, coordinate('registry'), coordinate('governance'),
         coordinate('mint'), component_id(plan.generation, 'mint'), coordinate('pool'),
-        b(art.treasury_puzzle_hash), b(art.protocol_puzzle_hash),
+        PrimaryFeeSplitter(plan.bindings(),coordinate('parameters'),revenue).inner().get_tree_hash() if complete else b(art.treasury_puzzle_hash), b(art.protocol_puzzle_hash),
         tuple(bytes.fromhex(v[2:]) for v in art.delivery_validator_public_keys), b(art.delivery_provider_id))
     if complete:
         from solslot_puzzles.generation_primary_inventory import batch_bindings
         mint = replace(mint, primary_batch_bindings=batch_bindings(generation=plan.generation,
             pool_id=coordinate('pool'), sgt=plan.bindings(), statutes_id=coordinate('parameters'),
-            treasury=b(art.treasury_puzzle_hash),oracle_pubkeys=tuple(bytes.fromhex(v[2:]) for v in art.price_oracle_public_keys)))
+            treasury=revenue.inner().get_tree_hash(),oracle_pubkeys=tuple(bytes.fromhex(v[2:]) for v in art.price_oracle_public_keys),pool_kernel_version=2))
     gov_component = Component(gov.component_id, coordinate('governance'),
         load_puzzle('generation_governance_v1.clsp').get_tree_hash(), gov.module_hash, 1, 1)
     economic=(params,mint)
@@ -231,7 +255,7 @@ def _graph(preparation, artifact, evidence, *, trusted_preparation_hash, trusted
         from solslot_puzzles.sols_pool_v4 import SolsPoolStateV4
         from solslot_puzzles.sols_economics_v3 import SolsEconomicState
         pool_component=component_id(plan.generation,'pool')
-        reserve=reserve_inner(generation=plan.generation,registry_id=coordinate('registry'),pool_id=coordinate('pool'),component_id=pool_component)
+        reserve=reserve_inner(generation=plan.generation,registry_id=coordinate('registry'),pool_id=coordinate('pool'),component_id=pool_component,pool_kernel_version=2)
         reward=RewardCustody(plan.bindings(),params.launcher_id,params.permanent_rules.sols_tail_hash)
         permanent=PoolV4Config(coordinate('pool'),load_puzzle('generation_statutes_v1.clsp').get_tree_hash(),
             singleton_struct(params.launcher_id),singleton_struct(coordinate('governance')),params.permanent_rules,
@@ -240,7 +264,8 @@ def _graph(preparation, artifact, evidence, *, trusted_preparation_hash, trusted
             load_puzzle('singleton_launcher_with_did.clsp').curry(singleton_struct(mint.launcher_id)).get_tree_hash(),
             reserve.get_tree_hash(),reward.inner().get_tree_hash())
         pool=GenerationPool(plan.generation,coordinate('registry'),pool_component,permanent,
-            SolsPoolStateV4(Program.to([]).get_tree_hash(),SolsEconomicState(False,0,0,0,0,1,1),1))
+            SolsPoolStateV4(Program.to([]).get_tree_hash(),SolsEconomicState(False,0,0,0,0,1,1),1),
+            company_revenue_puzzle_hash=revenue.inner().get_tree_hash())
         economic=(*economic,pool)
     registry = Registry(plan.generation, coordinate('registry'), coordinate('governance'),
         coordinate('authority'), (gov_component, *(s.component() for s in economic)))

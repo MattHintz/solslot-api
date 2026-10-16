@@ -49,8 +49,8 @@ async def final(core,tmp_path,monkeypatch):
     prep=GenerationPreparationStore(str(tmp_path/'prep.db'),c.prep)
     for receipt in c.evidence.recipients:prep.record_confirmation(receipt,now)
     for slot,sig in signatures(c.prep,accounts).items():prep.acknowledge(slot,sig,now)
-    raw=c.artifact.model_dump(mode='json',by_alias=True);raw['purpose']='GENERATION_LAUNCH_PREPARATION'
-    artifact=GenerationLaunchArtifact.model_validate(raw)
+    from tests.test_generation_genesis_launch import launch_artifact
+    artifact=launch_artifact(c)
     certificate=LaunchCertificate.model_validate(dict(generationId=c.prep.generation_id,preparationManifest=c.prep.manifest_hash,
         artifactHash=artifact.artifact_hash,sourceCommits=c.prep.source_commits,runtimeSourceHash=runtime_source_hash(),
         releaseManifestHash=b32(94),actionEnvelope='AE-SOLSLOT-SYNTHETIC-LAUNCH',securityReviewHash=b32(93),

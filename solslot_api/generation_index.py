@@ -108,7 +108,7 @@ def load_generation_read_anchor(settings) -> GenerationChainAnchor:
         states.append(state)
     # Every supported registered economic authority needs its original state;
     # omitting it must not make upgrades rely on a cached/coordinator state.
-    kernels={load_puzzle(n).get_tree_hash() for n in ('generation_parameters_v1.clsp','generation_statutes_v1.clsp','generation_mint_v1.clsp','generation_pool_v1.clsp')}
+    kernels={load_puzzle(n).get_tree_hash() for n in ('generation_parameters_v1.clsp','generation_statutes_v1.clsp','generation_mint_v1.clsp','generation_pool_v1.clsp','generation_pool_v2.clsp')}
     if {c.component_id for c in registry.components if c.kernel_hash in kernels}!={s.component_id for s in states}:
         raise ValueError('frozen economic component evidence is incomplete')
     administrator=None

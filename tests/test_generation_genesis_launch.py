@@ -84,9 +84,19 @@ async def initialize_and_upgrade(c,path,*,initialized=None):
     return built,chain
 
 
-def complete(c):
+def launch_artifact(c):
     raw=c.artifact.model_dump(mode='json',by_alias=True);raw['purpose']='GENERATION_LAUNCH_PREPARATION'
-    artifact=GenerationLaunchArtifact.model_validate(raw)
+    from solslot_puzzles.generation_revenue import CompanyRevenue, BackingCustody
+    from chia_rs.sized_bytes import bytes32
+    gen=bytes32.from_hexstr(c.prep.generation_id)
+    raw.update(custodyPolicy='SEGREGATED_COMPANY_REVENUE_V1',
+        treasuryPuzzleHash='0x'+BackingCustody(gen).inner().get_tree_hash().hex(),
+        companyRevenuePuzzleHash='0x'+CompanyRevenue(gen,bytes32.from_hexstr(c.prep.coordinates['authority'].launcher_id)).inner().get_tree_hash().hex())
+    return GenerationLaunchArtifact.model_validate(raw)
+
+
+def complete(c):
+    artifact=launch_artifact(c)
     coins=dict(c.funding,pool=next(coin for coin in c.parents if '0x'+coin.name().hex()==c.prep.coordinates['pool'].funding_coin_id))
     arguments=dict(preparation=c.prep,artifact=artifact,evidence=c.evidence,
         trusted_preparation_hash=c.prep.manifest_hash,trusted_artifact_hash=artifact.artifact_hash)
@@ -94,6 +104,32 @@ def complete(c):
     spends={r.name:standard_spend(c.faucet,r.coin,r.conditions) for r in requests}
     signatures=[G2Element.from_bytes(c.faucet.sign_delegated_spend(r.coin,r.conditions,purpose='genesis')) for r in requests]
     return artifact,requests,assemble_genesis_launch(**arguments,funding_spends=spends,aggregated_signature=AugSchemeMPL.aggregate(signatures))
+
+
+@pytest.mark.asyncio
+async def test_launch_rejects_wallet_treasury_and_mixed_revenue_buckets(core):
+    from chia_rs.sized_bytes import bytes32
+    from solslot_puzzles.generation_revenue import CompanyRevenue, BackingCustody
+    c=core;artifact=launch_artifact(c)
+    gen=bytes32.from_hexstr(c.prep.generation_id)
+    changed={
+        'wallet_backing':dict(treasuryPuzzleHash='0x'+'43'*32),
+        'wallet_revenue':dict(companyRevenuePuzzleHash='0x'+'43'*32),
+        'backing_is_revenue':dict(treasuryPuzzleHash=artifact.company_revenue_puzzle_hash),
+        'revenue_is_backing':dict(companyRevenuePuzzleHash=artifact.treasury_puzzle_hash),
+        'another_generation':dict(companyRevenuePuzzleHash='0x'+CompanyRevenue(bytes32(bytes([77])*32),
+            bytes32.from_hexstr(c.prep.coordinates['authority'].launcher_id)).inner().get_tree_hash().hex()),
+        'another_authority':dict(companyRevenuePuzzleHash='0x'+CompanyRevenue(gen,bytes32(bytes([77])*32)).inner().get_tree_hash().hex()),
+        'principal_is_revenue':dict(protocolPuzzleHash=artifact.company_revenue_puzzle_hash),
+        'principal_is_backing':dict(protocolPuzzleHash=artifact.treasury_puzzle_hash),
+    }
+    coins=dict(c.funding,pool=next(coin for coin in c.parents if '0x'+coin.name().hex()==c.prep.coordinates['pool'].funding_coin_id))
+    for name,fields in changed.items():
+        raw=artifact.model_dump(mode='json',by_alias=True);raw.update(fields)
+        altered=GenerationLaunchArtifact.model_validate(raw)
+        with pytest.raises(ValueError,match='segregated'):
+            genesis_launch_funding_requests(preparation=c.prep,artifact=altered,evidence=c.evidence,
+                trusted_preparation_hash=c.prep.manifest_hash,trusted_artifact_hash=altered.artifact_hash,funding_coins=coins)
 
 
 @pytest.mark.asyncio
@@ -105,7 +141,7 @@ async def test_full_atomic_launch_has_readable_pool_exact_rewards_and_conserved_
     assert initial_pool.permanent.sgt_rewards_puzzle_hash==RewardCustody(built.anchor.issuance.bindings(),
         statutes.launcher_id,statutes.permanent_rules.sols_tail_hash).inner().get_tree_hash()
     assert initial_pool.permanent.reserve_puzzle_hash==reserve_inner(generation=initial_pool.generation,
-        registry_id=initial_pool.registry_id,pool_id=initial_pool.launcher_id,component_id=initial_pool.component_id).get_tree_hash()
+        registry_id=initial_pool.registry_id,pool_id=initial_pool.launcher_id,component_id=initial_pool.component_id,pool_kernel_version=2).get_tree_hash()
     assert sum(coin.amount for coin in bundle.removals())==sum(coin.amount for coin in bundle.additions())
     # Omission is rejected at consensus, not merely by the assembler.
     for i in range(len(bundle.coin_spends)):

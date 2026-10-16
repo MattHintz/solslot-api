@@ -268,7 +268,7 @@ async def prepare_launch_review(store,journal,provider,faucet,*,clock=time.time)
         'securityReviewHash':store.certificate.security_review_hash,'backupReceiptHash':store.certificate.backup_receipt_hash,
         'restoreReceiptHash':store.certificate.restore_receipt_hash,'recipients':store.preparation.review()['recipients'],
         'supply':assembly['supply'],'sgtTailHash':assembly['sgtTailHash'],'sgtOutputs':assembly['sgtOutputs'],
-        'exchangeFees':assembly['exchangeFees'],'readAnchorHash':commitment(assembly['readAnchor']),
+        'exchangeFees':assembly['exchangeFees'],'custody':assembly['custody'],'readAnchorHash':commitment(assembly['readAnchor']),
         'expectedOutputs':[c.to_json_dict() for c in (*[s.coin for s in built.operation.successors],*built.operation.auxiliary_outputs)]}
     return store.save(payload,now,assembly['readAnchor'])
 
