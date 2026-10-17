@@ -1,5 +1,5 @@
 CacheControl==0.14.4
-PyJWT==2.14.0
+pyjwt==2.15.0
 PyYAML==6.0.3
 Pygments==2.20.0
 SecretStorage==3.5.0
@@ -20,10 +20,10 @@ botocore==1.43.51
 certifi==2026.6.17
 cffi==2.1.0
 charset-normalizer==3.4.9
-chia-blockchain==2.7.2
+chia-blockchain==2.7.4
 chia_base==0.1.7
 chia-puzzles-py @ https://codeload.github.com/Chia-Network/chia_puzzles/tar.gz/8ac1b8f794b6de159a74af334d562f71f4883798#sha256=b30f696398995845888f950d86351e203de534fec697a78710eec0758bf8ad64
-chia_rs==0.45.1
+chia_rs==0.48.0
 chiabip158==1.5.4
 chialisp==0.4.6
 chialisp_loader==0.1.2
@@ -133,4 +133,4 @@ websockets==15.0.1
 wheel==0.47.0
 yarl==1.24.2
 zipp==4.1.0
-zstd==1.5.7.3
+zstd==1.5.7.2
