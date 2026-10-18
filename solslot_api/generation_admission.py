@@ -219,7 +219,12 @@ class GenerationAdmissionMiddleware:
         if settings is None or not handoff_selected(settings) or not path.startswith('/admin/'):
             return await self.app(scope, receive, send)
         from starlette.responses import JSONResponse
-        if not path.startswith(('/admin/generation/', '/admin/auth/', '/admin/launch/')):
+        # Collection authoring uses its established UI/API paths, but its store
+        # and JWT are generation-bound. Admit it through the same fresh chain
+        # authority below; legacy execution routes remain unavailable.
+        collection_workflow = (path == '/admin/collections'
+            or path.startswith(('/admin/collections/', '/admin/collection-source/')))
+        if not collection_workflow and not path.startswith(('/admin/generation/', '/admin/auth/', '/admin/launch/')):
             return await JSONResponse({'detail': {'code': 'GENERATION_WORKFLOW_REQUIRED',
                 'message': 'Use the reviewed generation workflow; legacy administration is unavailable.'}}, status_code=403)(scope, receive, send)
         if path == '/admin/launch/auth/logout':
