@@ -85,6 +85,44 @@ async def test_confirmed_generation_can_author_test_edition_without_opening_lega
                     clean = await client.put('/admin/collections/'+identifier, headers={**headers,'If-Match':'"1"'}, json=workspace['dossier'])
                     assert clean.status_code == 200, clean.text
                     assert clean.json()['revision'] == 1
+                    # Exercise the editor's actual convert-then-save pipeline.
+                    # No legacy artifact or oracle is present in this generation.
+                    conversion = await client.post('/admin/collections/display-units/convert', headers=headers, json={
+                        'money': {'marketValue':'1550000','targetRaise':'75000','minimumInvestment':'3000'},
+                        'percentages': {'technologyFee':'1'},
+                        'ownershipShares': {f'deed.{i}':'4' for i in range(25)}, 'deriveXchPar':False})
+                    assert conversion.status_code == 200, conversion.text
+                    units = conversion.json()
+                    assert units['governanceQuorum'] is None
+                    assert units['xchParMojos'] is None and units['xchOracle'] is None
+                    draft = clean.json()['dossier']
+                    draft.update(title='127 Eastmoreland St — Testnet Edition',
+                        fsreTerms={'participationBps':1500,'outsideTermMonths':14,'projectedMonthsMin':10,'projectedMonthsMax':12},
+                        valuationBasis='TO_BE_BUILT', valuationEvidence='USER_CONFIRMED')
+                    draft['valuation'] = {'currency':'USD','marketValueMinor':units['moneyMinor']['marketValue']}
+                    draft['offering'] = {'currency':'USD','targetRaiseMinor':units['moneyMinor']['targetRaise'],
+                        'minimumInvestmentMinor':units['moneyMinor']['minimumInvestment'],
+                        'royaltyBps':units['percentageBps']['technologyFee']}
+                    draft['deedAllocation'] = [{'deedId':f'EAST-T11-{i+1:03d}', 'sharePpm':units['ownershipPpm'][f'deed.{i}']} for i in range(25)]
+                    saved = await client.put('/admin/collections/'+identifier, headers={**headers,'If-Match':'"1"'}, json=draft)
+                    assert saved.status_code == 200, saved.text
+                    saved = saved.json()
+                    assert saved['revision'] == 2
+                    assert saved['dossier']['offering']['targetRaiseMinor'] == '7500000'
+                    assert saved['dossier']['valuation']['marketValueMinor'] == '155000000'
+                    assert saved['dossier']['fsreTerms']['returnBasis'] == 'MARKET_VALUE'
+                    assert 'governanceQuorum' not in saved['dossier']['offering']
+                    assert 'debtBalanceMinor' not in saved['dossier'].get('capital', {})
+                    repeated = await client.put('/admin/collections/'+identifier,
+                        headers={**headers,'If-Match':'"2"'}, json=saved['dossier'])
+                    assert repeated.status_code == 200 and repeated.json()['revision'] == 2
+                    assert repeated.json()['auditEvents'] == saved['auditEvents']
+                    # Pricing and chain authority remain separate, closed checks.
+                    rejected_price = await client.post('/admin/collections/'+identifier+'/pricing/apply',
+                        headers={**headers,'If-Match':'"2"'})
+                    assert rejected_price.status_code == 422
+                    assert (await client.post('/admin/collections/'+identifier+'/seal',
+                        headers={**headers,'If-Match':'"2"'}, json={})).status_code == 428
                     # The metadata editor still requires a current generation JWT.
                     assert (await client.get('/admin/collections/feature-status')).status_code == 401
                     assert (await client.get('/admin/operations', headers=headers)).status_code == 403

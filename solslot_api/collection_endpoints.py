@@ -372,8 +372,9 @@ async def convert_collection_display_units(
 ) -> dict[str, Any]:
     """Convert owner-facing values into canonical protocol integers.
 
-    The browser cannot choose governance or oracle-derived values.  Both are
-    taken from cryptographically verified runtime artifacts.
+    The browser cannot choose oracle-derived values. Generation quorum belongs
+    to the consensus opening snapshot, never to property metadata; only legacy
+    deployments obtain their fixed display threshold from the signed artifact.
     """
 
     try:
@@ -393,12 +394,16 @@ async def convert_collection_display_units(
             key: ownership_to_ppm(value, label=key)
             for key, value in body.ownership_shares.items()
         }
-        governance_quorum = _signed_governance_threshold(settings)
+        # The confirmed-generation handoff deliberately has no RC23 artifact.
+        # Its holder-supply quorum is frozen when a proposal opens. A monetary
+        # conversion must neither require legacy authority nor invent a quorum.
+        governance_quorum = (None if settings.deployment_generation_id
+                             else _signed_governance_threshold(settings))
         result: dict[str, Any] = {
             "moneyMinor": money_minor,
             "percentageBps": percentage_bps,
             "ownershipPpm": ownership_ppm,
-            "governanceQuorum": str(governance_quorum),
+            "governanceQuorum": str(governance_quorum) if governance_quorum is not None else None,
             "xchParMojos": None,
             "xchOracle": None,
         }
