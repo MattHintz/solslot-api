@@ -25,16 +25,18 @@ def load_config(path=CONFIG):
         if not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022 or info.st_size>8192:
             raise ValueError('GENERATION_RECOVERY_CONFIG_NOT_PROTECTED')
         q=json.loads(stream.read(8193))
-    if not isinstance(q,dict) or set(q)!= {'schema','generationId','sourceHash','journalRoot'} or (
+    if not isinstance(q,dict) or set(q) not in ({'schema','generationId','sourceHash','journalRoot'}, {'schema','generationId','sourceHash','journalRoot','mediaRoot'}) or (
         q['schema']!='solslot.generation-recovery-config.v1'):
         raise ValueError('GENERATION_RECOVERY_CONFIG_DIFFERS')
     identity=generation(q['generationId']);generation(q['sourceHash'])
     if q['journalRoot']!='/opt/solslot/generation-AE220/state/journals/generations/'+identity:
         raise ValueError('GENERATION_RECOVERY_SOURCE_DIFFERS')
+    if 'mediaRoot' in q and q['mediaRoot']!='/opt/solslot/generation-AE220/state/collection-media/'+identity:
+        raise ValueError('GENERATION_MEDIA_SOURCE_DIFFERS')
     return q
 
 
-def dispatch(request,config,*,capture=snapshot,publish=None):
+def dispatch(request,config,*,capture=snapshot,publish=None,capture_media=None,publish_media=None):
     if not isinstance(request,dict) or request.get('generationId')!=config['generationId']:
         raise ValueError('GENERATION_RECOVERY_REQUEST_DIFFERS')
     if request.get('op')=='snapshot' and set(request)=={'op','generationId'}:
@@ -44,20 +46,29 @@ def dispatch(request,config,*,capture=snapshot,publish=None):
         if publish is None:raise ValueError('GENERATION_RECOVERY_RECEIPT_WRITER_MISSING')
         publish(value)
         return {'accepted':True,'generationId':config['generationId']}
+    if config.get('mediaRoot') and request.get('op')=='media-snapshot' and set(request)=={'op','generationId'} and capture_media is not None:
+        return capture_media(Path(config['journalRoot']),Path(config['mediaRoot']),config['generationId'])
+    if config.get('mediaRoot') and request.get('op')=='media-receipt' and set(request)=={'op','generationId','receipt'} and publish_media is not None:
+        from generation_media import validate_receipt as validate_media
+        import time
+        value=validate_media(request['receipt'],config['generationId'],config['sourceHash'],now=time.time())
+        publish_media(value)
+        return {'accepted':True,'generationId':config['generationId'],'media':True}
     raise ValueError('GENERATION_RECOVERY_OPERATION_REJECTED')
 
 
-def publish_receipt(value):
-    protected_path(RECEIPT.parent,directory=True)
-    target=RECEIPT.with_name('latest.incoming-ae222')
+def publish_receipt(value, *, media=False):
+    receipt=RECEIPT.with_name('media-latest.json') if media else RECEIPT
+    protected_path(receipt.parent,directory=True)
+    target=receipt.with_name(receipt.name+'.incoming-ae222')
     fd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o640)
     try:
         os.fchown(fd,0,grp.getgrnam('solslot-api').gr_gid)
         os.fchmod(fd,0o640)
         with os.fdopen(fd,'wb') as stream:
             stream.write(canonical(value));stream.flush();os.fsync(stream.fileno())
-        os.replace(target,RECEIPT)
-        fd=os.open(RECEIPT.parent,os.O_RDONLY|os.O_DIRECTORY)
+        os.replace(target,receipt)
+        fd=os.open(receipt.parent,os.O_RDONLY|os.O_DIRECTORY)
         try:os.fsync(fd)
         finally:os.close(fd)
     finally:
@@ -66,21 +77,25 @@ def publish_receipt(value):
 
 
 
-def capture_unprivileged(root,generation_id):
+def capture_unprivileged(root,generation_id, *, media=False):
     # The root forced command publishes protected receipts, but it must never
     # reopen API-owned paths as root. A separate child gets only the API uid's
     # existing filesystem access, closing the check/open replacement boundary.
     limit=MAX_OUTPUT
     with tempfile.TemporaryFile(dir='/run') as output:
         result=subprocess.run(['/usr/sbin/runuser','-u','solslot-api','--','/usr/bin/python3','-I',
-            '/opt/solslot/generation-recovery-AE222/worker_entry.py','--snapshot'],
+            '/opt/solslot/generation-recovery-AE222/worker_entry.py','--media-snapshot' if media else '--snapshot'],
             stdout=output,stderr=subprocess.DEVNULL,check=False,timeout=90)
         if result.returncode or output.tell()>limit:raise ValueError('GENERATION_SNAPSHOT_CHILD_FAILED')
         output.seek(0);raw=output.read(limit+1)
         if len(raw)>limit:raise ValueError('GENERATION_SNAPSHOT_CHILD_TOO_LARGE')
     result=json.loads(raw)
-    from generation_snapshot import validate_export
-    validate_export(result,generation_id)
+    if media:
+        from generation_media import validate
+        validate(result,generation_id)
+    else:
+        from generation_snapshot import validate_export
+        validate_export(result,generation_id)
     return result
 
 
@@ -90,19 +105,26 @@ def bound_snapshot_output(limit=MAX_OUTPUT):
     resource.setrlimit(resource.RLIMIT_FSIZE,(limit,limit))
 
 
-def child_snapshot():
+def child_snapshot(*, media=False):
     if os.geteuid()!=pwd.getpwnam('solslot-api').pw_uid:
         raise ValueError('GENERATION_SNAPSHOT_REQUIRES_API_IDENTITY')
     bound_snapshot_output()
     config=load_config()
-    sys.stdout.buffer.write(canonical(snapshot(Path(config['journalRoot']),config['generationId']))+b'\n')
+    if media:
+        from generation_media import capture
+        if not config.get('mediaRoot'):raise ValueError('GENERATION_MEDIA_NOT_CONFIGURED')
+        package=capture(Path(config['journalRoot']),Path(config['mediaRoot']),config['generationId'])
+    else:package=snapshot(Path(config['journalRoot']),config['generationId'])
+    sys.stdout.buffer.write(canonical(package)+b'\n')
 
 
 def main():
     if os.geteuid()!=0:raise ValueError('FIXED_PRIVILEGED_EXPORT_REQUIRED')
     raw=sys.stdin.buffer.read(16385)
     if len(raw)>16384:raise ValueError('GENERATION_RECOVERY_REQUEST_TOO_LARGE')
-    result=dispatch(json.loads(raw),load_config(),capture=capture_unprivileged,publish=publish_receipt)
+    result=dispatch(json.loads(raw),load_config(),capture=capture_unprivileged,publish=publish_receipt,
+        capture_media=lambda root,media,gen:capture_unprivileged(root,gen,media=True),
+        publish_media=lambda value:publish_receipt(value,media=True))
     sys.stdout.buffer.write(canonical(result)+b'\n')
 
 

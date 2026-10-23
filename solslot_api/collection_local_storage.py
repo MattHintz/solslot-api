@@ -48,8 +48,12 @@ class LocalStorage:
         self.root = Path(settings.collection_local_root)
         if not self.root.is_absolute() or self.root.is_symlink():
             raise ValueError("collection storage root must be an absolute, nonsymlink path")
-        self.signing_key = hmac.digest(settings.admin_jwt_secret.encode(),
-                                      b"solslot.collection-media.capabilities.v1", "sha256")
+        domain = b"solslot.collection-media.capabilities.v1"
+        if settings.deployment_generation_id:
+            domain = (b"solslot.collection-media.capabilities.v2\0"
+                      + settings.network.encode("ascii") + b"\0"
+                      + bytes.fromhex(settings.deployment_generation_id[2:]))
+        self.signing_key = hmac.digest(settings.admin_jwt_secret.encode(), domain, "sha256")
         self.base_url = str(settings.collection_local_base_url).rstrip("/")
 
     @staticmethod

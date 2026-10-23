@@ -12,5 +12,8 @@ if sys.argv[1:]==['--stage-identity']:stage_tokens()
 elif sys.argv[1:]==['--snapshot']:
     from generation_export import child_snapshot
     child_snapshot()
+elif sys.argv[1:]==['--media-snapshot']:
+    from generation_export import child_snapshot
+    child_snapshot(media=True)
 elif sys.argv[1:]==[]:run()
 else:raise RuntimeError('Unsupported recovery entry action')

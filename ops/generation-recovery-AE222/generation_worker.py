@@ -137,11 +137,24 @@ def run():
         raise ValueError('EXISTING_RECOVERY_CREDENTIAL_INVALID')
     key=base64.b64decode(json.loads(azure.secret(KEY_REFERENCE)['value'])['keyB64'],validate=True)
     if len(key)!=32:raise ValueError('EXISTING_BACKUP_KEY_INVALID')
-    package=ssh_request(private,{'op':'snapshot','generationId':config['generationId']},limit=MAX_TOTAL*2+1024**2)
-    validate_export(package,config['generationId'])
-    receipt=replicate(package,azure,key,config['generationId'],config['sourceHash'],parent=RUN)
+    media_receipt=None
+    if config.get('mediaRoot'):
+        from generation_media import replicate as replicate_media, validate as validate_media
+        package=ssh_request(private,{'op':'media-snapshot','generationId':config['generationId']},limit=MAX_TOTAL*2+1024**2)
+        manifest,_=validate_media(package,config['generationId'])
+        node_ref='https://kv-sfcog-sols2-856e6.vault.azure.net/secrets/solslot-collection-ipfs-node-ae165/84694916ebc64c3aa159cea98d669c0a'
+        node=json.loads(azure.secret(node_ref)['value'])
+        if manifest['ipfsPeerId']!=node['PeerID']:raise ValueError('GENERATION_MEDIA_IPFS_ID_DIFFERS')
+        receipt,media_receipt=replicate_media(package,azure,key,config['generationId'],config['sourceHash'],parent=RUN,clock=time.time)
+    else:
+        package=ssh_request(private,{'op':'snapshot','generationId':config['generationId']},limit=MAX_TOTAL*2+1024**2)
+        validate_export(package,config['generationId'])
+        receipt=replicate(package,azure,key,config['generationId'],config['sourceHash'],parent=RUN)
     answer=ssh_request(private,{'op':'receipt','generationId':config['generationId'],'receipt':receipt},limit=16384)
     if answer!={'accepted':True,'generationId':config['generationId']}:raise ValueError('GENERATION_RECOVERY_RECEIPT_NOT_ACCEPTED')
+    if media_receipt is not None:
+        answer=ssh_request(private,{'op':'media-receipt','generationId':config['generationId'],'receipt':media_receipt},limit=16384)
+        if answer!={'accepted':True,'generationId':config['generationId'],'media':True}:raise ValueError('GENERATION_MEDIA_RECEIPT_NOT_ACCEPTED')
     print(json.dumps({'actionEnvelopeId':AE,'generationId':config['generationId'],
         'manifestSha256':receipt['manifest']['sha256'],'databaseCount':receipt['databaseCount'],
         'restoredBytes':receipt['restoredBytes'],'restoreMatches':True,'checkedAt':receipt['checkedAt']}))

@@ -93,11 +93,7 @@ def require_preparation_step(request, settings):
     if not settings.deployment_generation_id or request.method in ('GET', 'HEAD', 'OPTIONS'):
         return
     require_record_recovery(settings)
-    # This release opens private form preparation only. A subsequent reviewed
-    # release must establish media recovery before enabling uploads or sealing.
     path = request.url.path
     if '/assets/' in path or path.endswith(('/assets', '/seal', '/amendments')):
-        raise HTTPException(503, detail={
-            'code': 'COLLECTION_MEDIA_RECOVERY_PENDING',
-            'message': 'Property details can be saved now. Uploads and sealing will open after this workspace’s media backup is verified.',
-        })
+        from .collection_generation_media_recovery import require_media_recovery
+        require_media_recovery(settings, require_current_inventory=path.endswith(('/seal', '/amendments')))

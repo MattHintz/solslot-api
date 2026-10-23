@@ -145,3 +145,37 @@ async def test_capability_dispatch_does_not_bypass_existing_auth_or_chain_bounda
         assert len(calls) == 4
         assert (await client.put("/collection-media/objects/bogus", content=b"x")).status_code == 403
         assert len(calls) == 4
+
+
+@pytest.mark.asyncio
+async def test_upload_capabilities_cannot_cross_deployment_generations(tmp_path):
+    first = local_settings(tmp_path / "first", deployment_generation_id="0x" + "a1" * 32)
+    second = local_settings(tmp_path / "second", deployment_generation_id="0x" + "b2" * 32)
+    legacy = local_settings(tmp_path / "legacy")
+    first_upload = presign(first)
+    legacy_upload = presign(legacy)
+    # Same signing secret and URL do not allow a capability from either a
+    # previous generation or the legacy workspace to write into this generation.
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_media_app(second))) as client:
+        for upload in (first_upload, legacy_upload):
+            assert (await client.put(upload["uploadUrl"], content=PNG, headers=upload["headers"])).status_code == 403
+    assert not list((Path(second.collection_local_root) / "quarantine").iterdir())
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_media_app(first))) as client:
+        assert (await client.put(first_upload["uploadUrl"], content=PNG, headers=first_upload["headers"])).status_code == 201
+
+
+def test_private_download_capabilities_are_generation_bound_and_legacy_stays_compatible(tmp_path):
+    from fastapi import HTTPException
+    settings = local_settings(tmp_path / "store", deployment_generation_id="0x" + "a1" * 32)
+    key = "private/collections/v2/" + "a" * 64 + "/" + "b" * 32 + "/asset.pdf"
+    source = LocalStorage(settings)
+    token = source.issue("GET", key, 300)
+    assert LocalStorage(settings).authorize(token, "GET", key)["k"] == key
+    for generation in ("0x" + "b2" * 32, None):
+        other = LocalStorage(settings.model_copy(update={"deployment_generation_id": generation}))
+        with pytest.raises(HTTPException) as error:
+            other.authorize(token, "GET", key)
+        assert error.value.status_code == 403
+    legacy = LocalStorage(settings.model_copy(update={"deployment_generation_id": None}))
+    old_token = legacy.issue("GET", key, 300)
+    assert legacy.authorize(old_token, "GET", key)["k"] == key
