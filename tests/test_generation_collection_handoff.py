@@ -19,6 +19,8 @@ from tests.test_generation_prelaunch_auth import sign_in
 
 @pytest.mark.asyncio
 async def test_confirmed_generation_can_author_test_edition_without_opening_legacy_operations(core, tmp_path, monkeypatch):
+    monkeypatch.setattr('solslot_api.collection_generation_recovery.read_record_receipt',
+        lambda settings: {'checkedAt': int(time.time()), 'restoredAt': int(time.time())})
     c = core
     built = complete(c)[2]
     settings = configuration(c, built, tmp_path)

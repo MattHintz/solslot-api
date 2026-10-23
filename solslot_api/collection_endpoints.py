@@ -194,6 +194,7 @@ def _signed_governance_threshold(settings: Settings) -> int:
 
 
 def require_collection_metadata(
+    request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> None:
     if not settings.collection_metadata_enabled:
@@ -201,12 +202,15 @@ def require_collection_metadata(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Chain-verifiable collection metadata is disabled.",
         )
+    from .collection_generation_recovery import require_preparation_step
+    require_preparation_step(request, settings)
 
 
 def require_collection_minting(
+    request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> None:
-    require_collection_metadata(settings)
+    require_collection_metadata(request, settings)
     if not settings.collection_minting_enabled:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -273,7 +277,11 @@ async def collection_feature_status(
 ) -> dict[str, Any]:
     from .collection_recovery_health import read_receipt
     try:
-        receipt = read_receipt()
+        if settings.deployment_generation_id:
+            from .collection_generation_recovery import read_record_receipt
+            receipt = read_record_receipt(settings)
+        else:
+            receipt = read_receipt()
         recovery = {"healthy": True, "checkedAt": receipt["checkedAt"], "restoredAt": receipt["restoredAt"]}
     except (OSError, ValueError, TypeError, KeyError):
         recovery = {"healthy": False, "checkedAt": None, "restoredAt": None}

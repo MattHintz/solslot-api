@@ -1503,6 +1503,8 @@ class Settings(BaseSettings):
     test_collection_editions_enabled: bool = False
     collection_source_archive_db_path: Optional[str] = None
     collection_source_archive_generation_id: Optional[str] = None
+    collection_generation_recovery_path: Optional[str] = None
+    collection_generation_recovery_source_hash: Optional[str] = None
     collection_metadata_enabled: bool = False
     collection_minting_enabled: bool = False
 

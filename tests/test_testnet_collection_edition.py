@@ -157,7 +157,9 @@ def test_generation_binds_real_login_signature_and_jwt():
     reset_admin_state_for_tests()
 
 
-def test_native_api_can_derive_and_resume_test_edition_without_touching_source(tmp_path):
+def test_native_api_can_derive_and_resume_test_edition_without_touching_source(tmp_path, monkeypatch):
+    monkeypatch.setattr('solslot_api.collection_generation_recovery.read_record_receipt',
+        lambda settings: {'checkedAt': 10000, 'restoredAt': 10000})
     import time
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
