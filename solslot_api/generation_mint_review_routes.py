@@ -25,6 +25,10 @@ def _store(request, settings):
 
 
 def _error(exc):
+    from .collection_generation_mint import MintTreasuryMismatch
+    if isinstance(exc,MintTreasuryMismatch):
+        return HTTPException(409,detail={'code':'GENERATION_MINT_TREASURY_MISMATCH',
+            'message':'This sealed edition uses a fee destination from another generation. Create a corrected revision in Financials, then preview, review and seal it. No mint batch or funding holds were saved.'})
     if isinstance(exc, GenerationRetentionFull):
         return HTTPException(503, detail={'code':'GENERATION_RETAINED_STATE_FULL',
             'message':'Your saved evidence is retained. Review archive capacity before preparing another batch.'})

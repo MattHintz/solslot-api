@@ -74,6 +74,8 @@ class CollectionStore:
     def __init__(self, path: str | Path, timeout: float = 5.0, *, generation_id: str | None = None, network: str = "testnet11") -> None:
         self.generation_id = generation_id.lower() if generation_id else None
         self.network = network
+        self.mint_authority_required = False
+        self.mint_treasury = None
         self.path = str(path) if path == ":memory:" else str(Path(path))
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -267,6 +269,14 @@ class CollectionStore:
                     action TEXT NOT NULL,
                     details_json TEXT NOT NULL,
                     occurred_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS property_collection_seal_archives (
+                    collection_id TEXT NOT NULL REFERENCES property_collections(id),
+                    revision INTEGER NOT NULL, metadata_root BLOB NOT NULL,
+                    canonical_json BLOB NOT NULL, dossier_json TEXT NOT NULL,
+                    sealed_at INTEGER NOT NULL, correction_json TEXT NOT NULL,
+                    PRIMARY KEY(collection_id, revision)
                 );
 
                 CREATE TABLE IF NOT EXISTS property_anchor_evidence (
@@ -973,6 +983,13 @@ class CollectionStore:
         issues: list[dict[str, str]] = metadata_consistency_issues(draft)
         require_edition_binding(draft, network=self.network, generation_id=self.generation_id)
         if isinstance(draft, TestPropertyDraftV1):
+            if self.mint_authority_required or self.mint_treasury:
+                if not self.mint_treasury:
+                    issues.append({'code':'MINT_AUTHORITY_REQUIRED','path':'/offering/royaltyPuzhash',
+                        'message':'The current generation fee destination could not be verified. Refresh before review or sealing.'})
+                elif not draft.offering or draft.offering.royalty_puzhash != self.mint_treasury:
+                    issues.append({'code':'MINT_TREASURY_MISMATCH','path':'/offering/royaltyPuzhash',
+                        'message':'This fee destination belongs to a different protocol configuration. Apply the current generation destination, then review the new revision.'})
             try:
                 self._test_pricing_receipt(row['id'], draft)
             except (ValueError, TypeError, KeyError) as exc:
@@ -1130,6 +1147,53 @@ class CollectionStore:
                 cur, collection_id, actor_subject, "COLLECTION_SEALED",
                 {"metadataRoot": "0x" + commitment.metadata_root.hex(), "byteSize": commitment.byte_size},
             )
+        return self.get(collection_id)
+
+    def correct_unissued_test_treasury(self, collection_id, *, expected_revision,
+            expected_metadata_root, treasury, actor_subject):
+        """Archive a wrong unissued seal and create a new, unapproved revision.
+
+        The endpoint independently proves current chain authority and absence of
+        any saved mint review while holding the same funding lock as preparation.
+        All prior bytes, previews, content reviews and wallet approvals remain.
+        """
+        with self._lock, self._txn() as cur:
+            row=self._collection_row(collection_id,cur=cur)
+            self._require_owner(row,actor_subject)
+            previous=cur.execute('SELECT correction_json FROM property_collection_seal_archives WHERE collection_id=? AND revision=?',
+                (collection_id,expected_revision)).fetchone()
+            if previous:
+                saved=json.loads(previous[0])
+                if saved['metadataRoot'] != expected_metadata_root or saved['treasury'] != treasury:
+                    raise CollectionConflict('The retained correction differs from this request')
+                return self.get(collection_id)
+            self._require_revision(row,expected_revision)
+            if (self.network!='testnet11' or not self.generation_id or row['state']!='SEALED'
+                    or row['published_at'] or row['allocation_locked'] or row['first_proposal_id']
+                    or _hex(row['metadata_root'])!=expected_metadata_root):
+                raise CollectionInvalidState('Only an exact sealed, unpublished test edition can be corrected')
+            if cur.execute('SELECT 1 FROM property_collection_deeds WHERE collection_id=? AND proposal_id IS NOT NULL',
+                    (collection_id,)).fetchone():
+                raise CollectionInvalidState('An issuance proposal already exists')
+            draft=parse_collection_draft(json.loads(row['dossier_json']))
+            if not isinstance(draft,TestPropertyDraftV1):
+                raise CollectionInvalidState('Only test editions support this preparation correction')
+            require_edition_binding(draft,network=self.network,generation_id=self.generation_id)
+            self.sealed_test_mint_snapshot(collection_id)
+            if not draft.offering or not self.mint_treasury or treasury!=self.mint_treasury or draft.offering.royalty_puzhash==treasury:
+                raise CollectionInvalidState('Correction requires the different verified generation destination')
+            payload=draft.model_dump(mode='json',by_alias=True,exclude_none=True)
+            payload['revision']=expected_revision+1
+            payload['offering']['royaltyPuzhash']=treasury
+            corrected=TestPropertyDraftV1.model_validate(payload)
+            record={'metadataRoot':expected_metadata_root,'treasury':treasury,
+                'previousTreasury':draft.offering.royalty_puzhash,'nextRevision':corrected.revision,
+                'actorSubject':actor_subject.lower(),'correctedAt':int(time.time())}
+            cur.execute('INSERT INTO property_collection_seal_archives VALUES(?,?,?,?,?,?,?)',
+                (collection_id,expected_revision,row['metadata_root'],row['canonical_json'],row['dossier_json'],row['sealed_at'],_json(record)))
+            cur.execute("UPDATE property_collections SET state='DRAFT',revision=?,dossier_json=?,canonical_json=NULL,metadata_root=NULL,sealed_at=NULL,updated_at=? WHERE id=?",
+                (corrected.revision,_json(payload),record['correctedAt'],collection_id))
+            self._audit(cur,collection_id,actor_subject,'UNISSUED_TEST_TREASURY_CORRECTED',record)
         return self.get(collection_id)
 
     def record_proposal_publication(
@@ -1745,6 +1809,14 @@ class CollectionStore:
                 (collection_id,),
             ).fetchall()
         ]
+        result['retainedSeals'] = [
+            {'revision': item['revision'], 'metadataRoot': _hex(item['metadata_root']),
+             'canonicalByteSize': len(item['canonical_json']), 'sealedAt': item['sealed_at'],
+             'correction': json.loads(item['correction_json'])}
+            for item in self._conn.execute(
+                'SELECT * FROM property_collection_seal_archives WHERE collection_id=? ORDER BY revision',
+                (collection_id,)).fetchall()
+        ]
         result["anchorEvidence"] = [
             self._render_evidence(item)
             for item in self._conn.execute(
@@ -1952,6 +2024,13 @@ def get_collection_store(
             _cached_store.close()
         _cached_store = CollectionStore(path, generation_id=settings.deployment_generation_id, network=settings.network)
         _cached_store_path = cache_key
+    _cached_store.mint_authority_required = bool(settings.deployment_generation_id)
+    if settings.deployment_generation_id:
+        from .collection_mint_authority import collection_mint_authority
+        try:
+            _cached_store.mint_treasury = collection_mint_authority(settings)['treasuryPuzzleHash']
+        except (OSError,ValueError,TypeError,KeyError):
+            _cached_store.mint_treasury = None
     return _cached_store
 
 

@@ -17,6 +17,10 @@ from .payment_quotes import parse_authorized_oracle_round
 from .test_collection_metadata import TestPropertyDossierV1
 
 
+class MintTreasuryMismatch(ValueError):
+    pass
+
+
 def build_sealed_test_mint(store: CollectionStore, settings: Settings, mint: GenerationMint,
                           collection_id: str, funding_parents: tuple[bytes32, ...]) -> TestMintEdition:
     generation = '0x'+mint.generation.hex()
@@ -32,7 +36,7 @@ def build_sealed_test_mint(store: CollectionStore, settings: Settings, mint: Gen
     if '0x'+authorized.round.round_hash.hex() != dossier.pricing_round_hash:
         raise ValueError('sealed price commitment does not match its verified receipt')
     if bytes32.from_hexstr(dossier.offering.royalty_puzhash) != mint.treasury_puzzle_hash:
-        raise ValueError('sealed technology fee destination must be the generation treasury')
+        raise MintTreasuryMismatch('sealed technology fee destination must be the generation treasury')
     if len(funding_parents) != len(dossier.deed_allocation):
         raise ValueError('one fixed launcher funding parent is required for every deed')
     rows = []

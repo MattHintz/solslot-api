@@ -97,6 +97,20 @@ class PreviewAcknowledgement(ApiModel):
     draft_hash: str = Field(alias='draftHash', pattern=r'^0x[0-9a-f]{64}$')
 
 
+class TreasuryCorrectionRequest(ApiModel):
+    generation_id: str = Field(alias='generationId', pattern=r'^0x[0-9a-f]{64}$')
+    metadata_root: str = Field(alias='metadataRoot', pattern=r'^0x[0-9a-f]{64}$')
+    treasury: str = Field(pattern=r'^0x[0-9a-f]{64}$')
+
+
+def _collection_mint_authority_or_none(settings):
+    from .collection_mint_authority import collection_mint_authority
+    try:
+        return collection_mint_authority(settings)
+    except (OSError,ValueError,TypeError,KeyError):
+        return None
+
+
 def require_test_editions(settings: Annotated[Settings, Depends(get_settings)]) -> None:
     if not (settings.test_collection_editions_enabled and settings.network == 'testnet11'
             and settings.deployment_generation_id):
@@ -287,6 +301,7 @@ async def collection_feature_status(
         recovery = {"healthy": False, "checkedAt": None, "restoredAt": None}
     return {
         "generationId": settings.deployment_generation_id,
+        "mintAuthority": _collection_mint_authority_or_none(settings),
         "testEditionsEnabled": bool(settings.test_collection_editions_enabled and settings.network == 'testnet11' and settings.deployment_generation_id),
         "metadataConfigured": settings.collection_metadata_enabled,
         "metadataEnabled": settings.collection_metadata_enabled and recovery["healthy"],
@@ -518,6 +533,31 @@ async def acknowledge_collection_preview(collection_id: str, body: PreviewAcknow
     payload = _store_call(lambda: store.acknowledge_preview(collection_id,
         expected_revision=_expected_revision(if_match), expected_draft_hash=body.draft_hash, actor_subject=claims.sub))
     return _with_etag(response, payload)
+
+
+@router.post('/admin/collections/{collection_id}/corrections/treasury',
+    dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata), Depends(require_test_editions)])
+async def correct_unissued_treasury(collection_id: str, body: TreasuryCorrectionRequest,
+    request: Request, response: Response, settings: Annotated[Settings, Depends(get_settings)],
+    claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
+    store: Annotated[CollectionStore, Depends(get_collection_store)],
+    if_match: Annotated[Optional[str], Header(alias='If-Match')] = None):
+    from .collection_treasury_correction import correct_treasury
+    from .collection_store import CollectionStoreError
+    revision = _expected_revision(if_match)
+    try:
+        payload=await correct_treasury(collection_id=collection_id,generation_id=body.generation_id,
+            revision=revision,metadata_root=body.metadata_root,treasury=body.treasury,actor=claims.sub,
+            settings=settings,collections=store,index=getattr(request.app.state,'generation_index',None),
+            provider=getattr(request.app.state,'coinset',None),submitter=getattr(request.app.state,'protocol_submitter',None),
+            reviews=getattr(request.app.state,'generation_mint_reviews',None))
+        return _with_etag(response,payload)
+    except CollectionForbidden as exc:
+        raise HTTPException(403,str(exc)) from exc
+    except (ValueError,CollectionStoreError) as exc:
+        raise HTTPException(409,str(exc)) from exc
+    except (OSError,RuntimeError,TimeoutError) as exc:
+        raise HTTPException(503,'The current mint authority could not be checked. No correction was saved.') from exc
 
 
 @router.get(
