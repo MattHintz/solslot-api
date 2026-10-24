@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from .generation_storage import connect_generation_sqlite
+from .generation_admission import handoff_selected
+from .generation_index import load_generation_read_anchor
 
 import hashlib
 import json
@@ -100,7 +102,16 @@ class AdminRoster:
 
 
 def resolve_admin_roster(settings: Settings) -> AdminRoster:
-    if settings.runtime_environment == "test" and settings.effective_admin_records_path():
+    if handoff_selected(settings):
+        # The generation intentionally has no legacy RC23 artifact. Its frozen
+        # anchor fixes the authority identity; fresh request-scoped chain
+        # evidence supplies the current keys, including completed recoveries.
+        values = current_signed_admins(settings)
+        anchor = load_generation_read_anchor(settings)
+        if anchor.administrator is None:
+            raise ValueError("generation administrator authority is unavailable")
+        launcher = anchor.administrator.authority_launcher_id
+    elif settings.runtime_environment == "test" and settings.effective_admin_records_path():
         records = get_admin_records_for_settings(settings)
         if records is None or len(records.admin_records) != 3:
             raise ValueError("test admin records must contain exactly three slots")
@@ -114,12 +125,13 @@ def resolve_admin_roster(settings: Settings) -> AdminRoster:
             keys.append(record.leaves[0].secp256k1_pubkey)
         return AdminRoster(records.launcher_id, tuple(keys))  # type: ignore[arg-type]
 
-    artifact = load_signed_public_artifact(settings)
-    launcher = _parse_hex32(
-        str(artifact["launcherIds"]["adminAuthority"]),
-        "admin authority launcher",
-    )
-    values = current_signed_admins(settings)
+    else:
+        artifact = load_signed_public_artifact(settings)
+        launcher = _parse_hex32(
+            str(artifact["launcherIds"]["adminAuthority"]),
+            "admin authority launcher",
+        )
+        values = current_signed_admins(settings)
     if len(values) != 3:
         raise ValueError("current signed roster must contain exactly three admin keys")
     keys = tuple(bytes.fromhex(value[1].removeprefix("0x")) for value in values)
