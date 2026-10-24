@@ -2010,8 +2010,28 @@ _cached_store: Optional[CollectionStore] = None
 _cached_store_path: Optional[tuple[str, str | None, str]] = None
 
 
+def _collection_mint_treasury(settings: Settings) -> dict[str, str | None]:
+    treasury = None
+    if settings.deployment_generation_id:
+        from .collection_mint_authority import collection_mint_authority
+        try:
+            treasury = collection_mint_authority(settings)['treasuryPuzzleHash']
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+    return {'treasury': treasury}
+
+
+async def _request_mint_treasury(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, str | None]:
+    # FastAPI runs synchronous dependencies in a worker thread. Native Chia
+    # Programs belong to the event-loop thread; only plain values may cross.
+    return _collection_mint_treasury(settings)
+
+
 def get_collection_store(
     settings: Annotated[Settings, Depends(get_settings)],
+    authority: Annotated[dict[str, str | None] | None, Depends(_request_mint_treasury)] = None,
 ) -> CollectionStore:
     global _cached_store, _cached_store_path
     path = settings.admin_db_path
@@ -2025,12 +2045,11 @@ def get_collection_store(
         _cached_store = CollectionStore(path, generation_id=settings.deployment_generation_id, network=settings.network)
         _cached_store_path = cache_key
     _cached_store.mint_authority_required = bool(settings.deployment_generation_id)
-    if settings.deployment_generation_id:
-        from .collection_mint_authority import collection_mint_authority
-        try:
-            _cached_store.mint_treasury = collection_mint_authority(settings)['treasuryPuzzleHash']
-        except (OSError,ValueError,TypeError,KeyError):
-            _cached_store.mint_treasury = None
+    # Direct lifecycle callers remain synchronous. The injected dictionary is
+    # present even when authority is unavailable, so HTTP never resolves native
+    # state from this worker or retains a prior successful destination on failure.
+    resolved = _collection_mint_treasury(settings) if authority is None else authority
+    _cached_store.mint_treasury = resolved['treasury']
     return _cached_store
 
 
