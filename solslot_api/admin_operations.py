@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Annotated, Any, Iterator, Literal, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from chia_rs.sized_bytes import bytes32
 from solslot_puzzles.admin_operation_v1 import AdminOperationCoreV1, canonical_json
@@ -294,7 +294,7 @@ class OperationStore:
                 value
                 for value in values
                 if value["status"] in {"pending", "approved"}
-                and int(value["expires_at"]) >= current
+                and int(value["expires_at"]) > current
             ]
         if status_filter == "all":
             return values
@@ -321,7 +321,7 @@ class OperationStore:
                 raise KeyError("admin operation not found")
             if row["consumed_at"] is not None:
                 raise ValueError("admin operation is already consumed")
-            if int(row["expires_at"]) < now:
+            if int(row["expires_at"]) <= now:
                 raise ValueError("admin operation is expired")
             try:
                 connection.execute(
@@ -378,7 +378,7 @@ class OperationStore:
                 raise KeyError("admin operation not found")
             if row["consumed_at"] is not None:
                 raise ValueError("admin operation is already consumed")
-            if int(row["expires_at"]) < now:
+            if int(row["expires_at"]) <= now:
                 raise ValueError("admin operation is expired")
             if row["approved_at"] is None:
                 raise ValueError("admin operation lacks slot 0 plus one coadmin")
@@ -424,7 +424,7 @@ class RequestBindingV1(BaseModel):
 class PrepareOperationRequest(BaseModel):
     operation: str
     revision: int = Field(..., ge=0)
-    expires_in_seconds: int = Field(600, ge=60, le=900, alias="expiresInSeconds")
+    expires_in_seconds: int = Field(600, ge=60, le=86_400, alias="expiresInSeconds")
     request_binding: RequestBindingV1 = Field(..., alias="requestBinding")
 
     @field_validator("operation")
@@ -433,6 +433,14 @@ class PrepareOperationRequest(BaseModel):
         if value not in ALLOWED_OPERATIONS:
             raise ValueError("unsupported admin operation")
         return value
+
+    @model_validator(mode="after")
+    def validate_signing_window(self) -> "PrepareOperationRequest":
+        # Sealing commits metadata only. Chain and money-moving operations keep
+        # their existing short expiry; their separate authorizations also apply.
+        if self.operation != "collection.seal" and self.expires_in_seconds > 900:
+            raise ValueError("only collection.seal permits a signing window over 900 seconds")
+        return self
 
 
 class SignOperationRequest(BaseModel):
@@ -756,7 +764,7 @@ def require_admin_operation(expected_operation: str, *, defer_consume: bool = Fa
             if defer_consume:
                 if value["consumed_at"] is not None:
                     raise ValueError("admin operation is already consumed")
-                if int(value["expires_at"]) < int(time.time()):
+                if int(value["expires_at"]) <= int(time.time()):
                     raise ValueError("admin operation is expired")
                 if value["approved_at"] is None:
                     raise ValueError("admin operation lacks slot 0 plus one coadmin")
