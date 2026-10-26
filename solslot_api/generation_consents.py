@@ -10,6 +10,7 @@ from hashlib import sha256
 from pathlib import Path
 import asyncio
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -38,8 +39,15 @@ from .generation_operations import canonical
 from .generation_registry_evidence import _program
 from .generation_storage import connect_generation_sqlite, generation_path, admit_retained_bytes
 from .generation_mint_reviews import revalidate_mint_review
-from .generation_mint_checks import checked_mint_chain_cache
+from .generation_mint_checks import checked_mint_chain_cache, checked_mint_administrators, primary_mint_coin_records
 
+
+logger=logging.getLogger(__name__)
+
+class MintConsentTimeout(TimeoutError):
+    def __init__(self,stage):
+        super().__init__('mint publication preparation timed out')
+        self.stage=stage
 
 def h(value): return '0x'+value.hex()
 
@@ -262,10 +270,21 @@ def _challenge(challenge):
 async def consent_inputs_unchanged(document,provider):
     if (await provider.get_network_info_primary()).get('network_name')!='testnet11':
         raise ValueError('consent requires the primary Testnet11 node')
-    for raw in document['confirmedInputs']:
-        expected=read_confirmed_coin(raw, Coin.from_json_dict(raw['coin']).name())
-        observed=read_confirmed_coin(await provider.get_coin_record_by_name_primary(h(expected.coin.name())),expected.coin.name())
-        if observed!=expected or observed.spent_height:raise ValueError('a reviewed input changed; refresh and prepare a new review')
+    if document['request'].get('proposalKind')=='MINT_TEST_ONLY':
+        expected=[read_confirmed_coin(raw,Coin.from_json_dict(raw['coin']).name()) for raw in document['confirmedInputs']]
+        identities=list(dict.fromkeys(h(r.coin.name()) for r in expected));observed={}
+        for offset in range(0,len(identities),100):
+            batch=identities[offset:offset+100]
+            values=await primary_mint_coin_records(batch,provider=provider)
+            observed.update(zip(batch,values,strict=True))
+        for record in expected:
+            current=read_confirmed_coin(observed[h(record.coin.name())],record.coin.name())
+            if current!=record or current.spent_height:raise ValueError('a reviewed input changed; refresh and prepare a new review')
+    else:
+        for raw in document['confirmedInputs']:
+            expected=read_confirmed_coin(raw, Coin.from_json_dict(raw['coin']).name())
+            observed=read_confirmed_coin(await provider.get_coin_record_by_name_primary(h(expected.coin.name())),expected.coin.name())
+            if observed!=expected or observed.spent_height:raise ValueError('a reviewed input changed; refresh and prepare a new review')
     intent=document['request'].get('redemption')
     if intent:
         raw=document.get('redemptionParent')
@@ -283,125 +302,142 @@ async def consent_inputs_unchanged(document,provider):
         raise ValueError('an unrelated consent cannot contain redemption funding evidence')
 
 
-async def prepare_consent(request,*,anchor,provider,store,clock=time.time,settings=None,collections=None,mint_reviews=None,index=None):
+async def prepare_consent(request,*,anchor,provider,store,clock=time.time,settings=None,collections=None,mint_reviews=None,index=None,admission=None):
     request=ConsentRequest.model_validate_json(request.model_dump_json(by_alias=True))
     if request.generation_id!=store.generation_id or bytes32.from_hexstr(request.generation_id)!=anchor.issuance.generation:
         raise ValueError('consent belongs to another generation')
     saved=store.reviewed_request(request,int(clock()))
     if saved:return saved # Explicit retry recovers the original clock even offline.
     if anchor.administrator is None:raise ValueError('frozen administrator anchor is unavailable')
-    async with asyncio.timeout(50 if request.proposal_kind=='MINT_TEST_ONLY' else 60):
-        chain=await checked_mint_chain_cache(anchor,provider=provider,index=index) if request.proposal_kind=='MINT_TEST_ONLY' else None
-        if chain is None:chain=await resolve_generation_chain(anchor,provider=provider)
-        admins=await resolve_generation_administrators(anchor.administrator,provider=provider)
-        gov,registry=chain.governance.state,chain.registry.state
-        for name in ('registry','governance','holdings'):
-            if h(getattr(chain,name).current.coin.name())!=getattr(request.expected_inputs,name):
-                raise ValueError('confirmed chain inputs changed before review')
-        mint_source=None;mint_records=();redemption_records=()
-        if request.proposal_kind=='MINT_TEST_ONLY':
-            mint_source,edition,mint_records=await revalidate_mint_review(request.mint_review_id,
-                settings=settings,collections=collections,store=mint_reviews,chain=chain,provider=provider)
-            for transition in chain.governance.transitions:
-                previous=transition.after.active if transition.action=='OPEN' else None
-                if (previous is not None and previous.bill==edition.bill()
-                        and gov.action_key(previous.proposal_id,previous.bill) in gov.approved.keys):
-                    raise ValueError('the approved test edition awaits execution; do not open another vote')
-        required=({bytes32.from_hexstr(request.parameters.component_id)} if request.proposal_kind=='PARAMETERS'
-            else {bytes32.from_hexstr(request.statutes.component_id)} if request.proposal_kind=='STATUTES'
-            else {bytes32.from_hexstr(mint_source['mintAuthority']['componentId'])} if mint_source else set())
-        if {bytes32.from_hexstr(k) for k in request.expected_inputs.components}!=required:
-            raise ValueError('affected economic inputs must be explicitly reviewed')
-        if mint_source and request.expected_inputs.components[mint_source['mintAuthority']['componentId']]!=mint_source['mintAuthority']['coinId']:
-            raise ValueError('reviewed mint authority input changed')
-        bill=None
-        if request.kind=='PUBLICATION_APPROVAL':
-            if gov.active or not chain.holdings.state[0].root.eligible or (registry.pause_mask&1 and request.proposal_kind!='REOPEN'):
-                raise ValueError('finish the existing vote or unblock proposal opening first')
-            if request.proposal_kind=='UPGRADE':
-                if registry.pending or gov.upgrade_reserved:raise ValueError('finish the pending upgrade first')
-                plan=request.upgrade.plan();registry.updated_components(plan)
-                bill=Program.to([b'UPGRADE',registry.nonce,plan.program()])
-            elif request.proposal_kind=='PARAMETERS':
-                p=request.parameters;history=chain.economic_components.get(bytes32.from_hexstr(p.component_id))
-                if (history is None or not isinstance(history.state,GenerationParameters)
-                        or h(history.current.coin.name())!=request.expected_inputs.components[p.component_id]
-                        or h(history.state.launcher_id)!=p.launcher_id or history.state.revision!=p.revision
-                        or h(Program.to(list(history.state.values)).get_tree_hash())!=p.previous_values_hash):
-                    raise ValueError('parameter intent differs from the current authority')
-                bill=history.state.bill(p.values)
-            elif request.proposal_kind=='STATUTES':
-                intent=request.statutes;history=chain.economic_components.get(bytes32.from_hexstr(intent.component_id))
-                if history is None or h(history.current.coin.name())!=request.expected_inputs.components[intent.component_id]:
-                    raise ValueError('statutes input changed before review')
-                bill=intent.bill(history.state)
-            elif request.proposal_kind=='MINT_TEST_ONLY':
-                bill=edition.bill()
-            elif request.proposal_kind=='FUND_REDEMPTION':
-                from solslot_puzzles.generation_redemptions import redemption_bill
-                from .generation_redemption_evidence import verified_redemption_source
-                if registry.pause_mask&8:raise ValueError('new redemption funding is paused')
-                source,redemption_records=await verified_redemption_source(request.redemption,governance=gov,provider=provider)
-                bill=redemption_bill(gov,source,request.redemption.plan(),bytes32.from_hexstr(request.redemption.deed_launcher_puzzle_hash))
-            else:
-                if registry.reopening or request.scope&registry.pause_mask!=request.scope:
-                    raise ValueError('reopening scope differs from the current pause')
-                bill=Program.to([b'REOPEN',registry.pause_epoch,request.scope])
-        current=admins.authority.verified_tip(registry.administrator_id,admins.authority.state)
-        from .generation_admission import identity_policies
-        policies = identity_policies(settings, anchor.administrator)
-        # Public key preimages are not authority. Every policy must reconstruct
-        # the exact current custody output independently verified on chain.
-        identities=tuple(e.verified_tip(policy,current.launcher_id)
-            for e,policy in zip(admins.identities,policies,strict=True))
-        now=int(clock());issued=now if bill is not None else 0
-        subject=gov.proposal_id(bill,chain.holdings.state[0]) if bill is not None else (registry.pause_epoch,request.scope)
-        target=chain.governance.current.coin.puzzle_hash if bill is not None else chain.registry.current.coin.puzzle_hash
-        prepared=PreparedAdministratorAction(anchor.issuance.generation,anchor.administrator,current,identities,
-            target,request.kind,subject,issued,request.coadministrator_slot).validate()
-        review={'generationId':request.generation_id,'network':'testnet11','kind':request.kind,
-            'request':request.document(),
-            'requestKey':request.request_key,'requestDigest':request.digest,'createdAt':now,
-            'issuedAt':issued,'expiresAt':now+ADMIN_APPROVAL_SECONDS,'feeCapMojos':str(request.fee_cap_mojos),
-            'coadministratorSlot':request.coadministrator_slot,'targetPuzzleHash':h(target),
-            'authorityLauncherId':h(current.launcher_id),'authorityCoinId':h(current.coin.name()),
-            'authorityCoin':current.coin.to_json_dict(),
-            'authorityPuzzleHash':h(current.coin.puzzle_hash),'authorityInnerHash':h(current.inner.get_tree_hash()),
-            'sourceManifestHash':h(anchor.administrator.source_manifest_hash),
-            'authorityVersion':parse_inner_puzzle(current.inner).state.authority_version,
-            'authorityDelegatedHash':h(prepared.delegated().get_tree_hash()),
-            'identityCustodies':[h(t.identity.custody_hash) for t in identities],
-            'identityPuzzles':[h(t.identity.full_puzzle_hash) for t in identities],
-            'identityLauncherIds':[h(t.identity.launcher_id) for t in identities],
-            'identityCoins':[t.coin.to_json_dict() for t in identities],
-            'proposalId':h(subject) if bill is not None else None,'proposal':public_bill(bill) if bill is not None else None,
-            'billHash':h(bill.get_tree_hash()) if bill is not None else None,
-            'eligibleSupply':chain.holdings.state[0].root.eligible,
-            'governanceNonce':gov.nonce,'eligibleTotal':chain.holdings.state[0].root.total,
-            'requiredVotes':quorum(chain.holdings.state[0].root.eligible) if bill is not None else None,
-            'holdingsRoot':h(chain.holdings.state[0].root.hash),'pauseEpoch':registry.pause_epoch,
-            'scope':request.scope,'expectedInputs':request.expected_inputs.model_dump(mode='json',by_alias=True)}
-        if mint_source:review['mintSource']=mint_source
-        records=(*chain.current_records,*admins.current_records,*mint_records,*redemption_records[:1])
-        def raw_record(record):
-            return {'coin':record.coin.to_json_dict(),'confirmed_block_index':record.confirmed_height,
-                'spent_block_index':record.spent_height,'spent':bool(record.spent_height)}
-        document={'generationId':request.generation_id,'request':request.document(),
-            'createdAt':now,'expiresAt':review['expiresAt'],'review':review,
-            'authorityTip':_tip_document(current),'identityTips':[{'coin':t.coin.to_json_dict(),
-                'parentSpend':t.parent.to_json_dict()} for t in identities],
-            'confirmedInputs':[raw_record(r) for r in records],
-            'challenges':[_challenge(c) for c in prepared.challenges()]}
-        if policies != anchor.administrator.identity_vaults:
-            document['identityPublicKeys'] = [{'slot':p.slot,
-                'dailyPublicKey':h(p.daily_compressed_pubkey),
-                'recoveryPublicKey':h(p.recovery_bls_pubkey)} for p in policies]
-        if redemption_records:document['redemptionParent']=raw_record(redemption_records[1])
-        restore_consent(document,anchor.administrator)
-        if not await current_evidence_unchanged(chain,provider=provider):raise ValueError('chain changed during preparation')
-        await consent_inputs_unchanged(document,provider)
-        identity=store.save(request,document,now)
-        return store.status(identity,now)
+    stage='VERIFYING_CHAIN'
+    def phase(value):
+        nonlocal stage
+        stage=value
+        if request.proposal_kind=='MINT_TEST_ONLY':logger.info('mint_consent stage=%s request=%s',stage,request.digest)
+    phase(stage)
+    try:
+        async with asyncio.timeout(40 if request.proposal_kind=='MINT_TEST_ONLY' else 60):
+            chain=await checked_mint_chain_cache(anchor,provider=provider,index=index) if request.proposal_kind=='MINT_TEST_ONLY' else None
+            if chain is None:chain=await resolve_generation_chain(anchor,provider=provider)
+            phase('VERIFYING_ADMINISTRATORS')
+            admins=await checked_mint_administrators(anchor,settings=settings,provider=provider,admission=admission) if request.proposal_kind=='MINT_TEST_ONLY' else None
+            if admins is None:admins=await resolve_generation_administrators(anchor.administrator,provider=provider)
+            gov,registry=chain.governance.state,chain.registry.state
+            for name in ('registry','governance','holdings'):
+                if h(getattr(chain,name).current.coin.name())!=getattr(request.expected_inputs,name):
+                    raise ValueError('confirmed chain inputs changed before review')
+            mint_source=None;mint_records=();redemption_records=()
+            if request.proposal_kind=='MINT_TEST_ONLY':
+                phase('RECHECKING_SEALED_BATCH')
+                mint_source,edition,mint_records=await revalidate_mint_review(request.mint_review_id,
+                    settings=settings,collections=collections,store=mint_reviews,chain=chain,provider=provider)
+                for transition in chain.governance.transitions:
+                    previous=transition.after.active if transition.action=='OPEN' else None
+                    if (previous is not None and previous.bill==edition.bill()
+                            and gov.action_key(previous.proposal_id,previous.bill) in gov.approved.keys):
+                        raise ValueError('the approved test edition awaits execution; do not open another vote')
+            required=({bytes32.from_hexstr(request.parameters.component_id)} if request.proposal_kind=='PARAMETERS'
+                else {bytes32.from_hexstr(request.statutes.component_id)} if request.proposal_kind=='STATUTES'
+                else {bytes32.from_hexstr(mint_source['mintAuthority']['componentId'])} if mint_source else set())
+            if {bytes32.from_hexstr(k) for k in request.expected_inputs.components}!=required:
+                raise ValueError('affected economic inputs must be explicitly reviewed')
+            if mint_source and request.expected_inputs.components[mint_source['mintAuthority']['componentId']]!=mint_source['mintAuthority']['coinId']:
+                raise ValueError('reviewed mint authority input changed')
+            bill=None
+            if request.kind=='PUBLICATION_APPROVAL':
+                if gov.active or not chain.holdings.state[0].root.eligible or (registry.pause_mask&1 and request.proposal_kind!='REOPEN'):
+                    raise ValueError('finish the existing vote or unblock proposal opening first')
+                if request.proposal_kind=='UPGRADE':
+                    if registry.pending or gov.upgrade_reserved:raise ValueError('finish the pending upgrade first')
+                    plan=request.upgrade.plan();registry.updated_components(plan)
+                    bill=Program.to([b'UPGRADE',registry.nonce,plan.program()])
+                elif request.proposal_kind=='PARAMETERS':
+                    p=request.parameters;history=chain.economic_components.get(bytes32.from_hexstr(p.component_id))
+                    if (history is None or not isinstance(history.state,GenerationParameters)
+                            or h(history.current.coin.name())!=request.expected_inputs.components[p.component_id]
+                            or h(history.state.launcher_id)!=p.launcher_id or history.state.revision!=p.revision
+                            or h(Program.to(list(history.state.values)).get_tree_hash())!=p.previous_values_hash):
+                        raise ValueError('parameter intent differs from the current authority')
+                    bill=history.state.bill(p.values)
+                elif request.proposal_kind=='STATUTES':
+                    intent=request.statutes;history=chain.economic_components.get(bytes32.from_hexstr(intent.component_id))
+                    if history is None or h(history.current.coin.name())!=request.expected_inputs.components[intent.component_id]:
+                        raise ValueError('statutes input changed before review')
+                    bill=intent.bill(history.state)
+                elif request.proposal_kind=='MINT_TEST_ONLY':
+                    bill=edition.bill()
+                elif request.proposal_kind=='FUND_REDEMPTION':
+                    from solslot_puzzles.generation_redemptions import redemption_bill
+                    from .generation_redemption_evidence import verified_redemption_source
+                    if registry.pause_mask&8:raise ValueError('new redemption funding is paused')
+                    source,redemption_records=await verified_redemption_source(request.redemption,governance=gov,provider=provider)
+                    bill=redemption_bill(gov,source,request.redemption.plan(),bytes32.from_hexstr(request.redemption.deed_launcher_puzzle_hash))
+                else:
+                    if registry.reopening or request.scope&registry.pause_mask!=request.scope:
+                        raise ValueError('reopening scope differs from the current pause')
+                    bill=Program.to([b'REOPEN',registry.pause_epoch,request.scope])
+            phase('BUILDING_REVIEW')
+            current=admins.authority.verified_tip(registry.administrator_id,admins.authority.state)
+            from .generation_admission import identity_policies
+            policies = identity_policies(settings, anchor.administrator)
+            # Public key preimages are not authority. Every policy must reconstruct
+            # the exact current custody output independently verified on chain.
+            identities=tuple(e.verified_tip(policy,current.launcher_id)
+                for e,policy in zip(admins.identities,policies,strict=True))
+            now=int(clock());issued=now if bill is not None else 0
+            subject=gov.proposal_id(bill,chain.holdings.state[0]) if bill is not None else (registry.pause_epoch,request.scope)
+            target=chain.governance.current.coin.puzzle_hash if bill is not None else chain.registry.current.coin.puzzle_hash
+            prepared=PreparedAdministratorAction(anchor.issuance.generation,anchor.administrator,current,identities,
+                target,request.kind,subject,issued,request.coadministrator_slot).validate()
+            review={'generationId':request.generation_id,'network':'testnet11','kind':request.kind,
+                'request':request.document(),
+                'requestKey':request.request_key,'requestDigest':request.digest,'createdAt':now,
+                'issuedAt':issued,'expiresAt':now+ADMIN_APPROVAL_SECONDS,'feeCapMojos':str(request.fee_cap_mojos),
+                'coadministratorSlot':request.coadministrator_slot,'targetPuzzleHash':h(target),
+                'authorityLauncherId':h(current.launcher_id),'authorityCoinId':h(current.coin.name()),
+                'authorityCoin':current.coin.to_json_dict(),
+                'authorityPuzzleHash':h(current.coin.puzzle_hash),'authorityInnerHash':h(current.inner.get_tree_hash()),
+                'sourceManifestHash':h(anchor.administrator.source_manifest_hash),
+                'authorityVersion':parse_inner_puzzle(current.inner).state.authority_version,
+                'authorityDelegatedHash':h(prepared.delegated().get_tree_hash()),
+                'identityCustodies':[h(t.identity.custody_hash) for t in identities],
+                'identityPuzzles':[h(t.identity.full_puzzle_hash) for t in identities],
+                'identityLauncherIds':[h(t.identity.launcher_id) for t in identities],
+                'identityCoins':[t.coin.to_json_dict() for t in identities],
+                'proposalId':h(subject) if bill is not None else None,'proposal':public_bill(bill) if bill is not None else None,
+                'billHash':h(bill.get_tree_hash()) if bill is not None else None,
+                'eligibleSupply':chain.holdings.state[0].root.eligible,
+                'governanceNonce':gov.nonce,'eligibleTotal':chain.holdings.state[0].root.total,
+                'requiredVotes':quorum(chain.holdings.state[0].root.eligible) if bill is not None else None,
+                'holdingsRoot':h(chain.holdings.state[0].root.hash),'pauseEpoch':registry.pause_epoch,
+                'scope':request.scope,'expectedInputs':request.expected_inputs.model_dump(mode='json',by_alias=True)}
+            if mint_source:review['mintSource']=mint_source
+            records=(*chain.current_records,*admins.current_records,*mint_records,*redemption_records[:1])
+            def raw_record(record):
+                return {'coin':record.coin.to_json_dict(),'confirmed_block_index':record.confirmed_height,
+                    'spent_block_index':record.spent_height,'spent':bool(record.spent_height)}
+            document={'generationId':request.generation_id,'request':request.document(),
+                'createdAt':now,'expiresAt':review['expiresAt'],'review':review,
+                'authorityTip':_tip_document(current),'identityTips':[{'coin':t.coin.to_json_dict(),
+                    'parentSpend':t.parent.to_json_dict()} for t in identities],
+                'confirmedInputs':[raw_record(r) for r in records],
+                'challenges':[_challenge(c) for c in prepared.challenges()]}
+            if policies != anchor.administrator.identity_vaults:
+                document['identityPublicKeys'] = [{'slot':p.slot,
+                    'dailyPublicKey':h(p.daily_compressed_pubkey),
+                    'recoveryPublicKey':h(p.recovery_bls_pubkey)} for p in policies]
+            if redemption_records:document['redemptionParent']=raw_record(redemption_records[1])
+            restore_consent(document,anchor.administrator)
+            phase('RECHECKING_INPUTS')
+            if not await current_evidence_unchanged(chain,provider=provider):raise ValueError('chain changed during preparation')
+            await consent_inputs_unchanged(document,provider)
+            phase('SAVING_REVIEW')
+            identity=store.save(request,document,now)
+            return store.status(identity,now)
+    except TimeoutError as exc:
+        if request.proposal_kind!='MINT_TEST_ONLY':raise
+        logger.warning('mint_consent timeout stage=%s request=%s',stage,request.digest)
+        raise MintConsentTimeout(stage) from exc
 
 
 async def sign_consent(identity,slot,signature,*,anchor,provider,store,clock=time.time):

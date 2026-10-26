@@ -22,6 +22,38 @@ async def checked_mint_chain_cache(anchor, *, provider, index=None):
     return None
 
 
+async def checked_mint_administrators(anchor, *, settings, provider, admission=None):
+    """Reuse only the actual admission observer's fresh native proof."""
+    from .generation_admission import GenerationAdmission, RosterSnapshot, MAX_ROSTER_AGE, binding
+    from .generation_administrator_evidence import GenerationAdministratorEvidence
+    from .generation_coin_evidence import read_confirmed_coin
+    if not isinstance(admission, GenerationAdmission) or settings is None:
+        return None
+    snapshot, evidence = admission.snapshot, admission.evidence
+    if (admission.provider is not provider or admission.anchor != anchor
+            or admission.deployment != binding(settings)
+            or binding(admission.settings) != admission.deployment
+            or not isinstance(snapshot, RosterSnapshot)
+            or snapshot.deployment != admission.deployment
+            or not isinstance(evidence, GenerationAdministratorEvidence)
+            or not 0 <= admission.clock() - snapshot.checked < MAX_ROSTER_AGE):
+        return None
+    if (await provider.get_network_info_primary()).get('network_name') != 'testnet11':
+        raise ValueError('mint consent requires the primary Testnet11 node')
+    records=evidence.current_records
+    observed=await primary_mint_coin_records(('0x'+r.coin.name().hex() for r in records),provider=provider)
+    if any(read_confirmed_coin(raw,prior.coin.name())!=prior for prior,raw in zip(records,observed,strict=True)):
+        return None
+    current=admission.snapshot
+    if (admission.evidence is not evidence or not isinstance(current,RosterSnapshot)
+            or current.deployment!=admission.deployment or current.slots!=snapshot.slots
+            or binding(settings) != admission.deployment
+            or binding(admission.settings) != admission.deployment
+            or not 0 <= admission.clock() - current.checked < MAX_ROSTER_AGE):
+        return None
+    return evidence
+
+
 async def primary_mint_coin_records(identities, *, provider):
     ids = tuple(identities)
     if (not 1 <= len(ids) <= 100 or len(set(ids)) != len(ids)

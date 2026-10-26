@@ -89,6 +89,7 @@ def test_test_mint_publication_loads_only_the_saved_generation_source(monkeypatc
     getter=Mock(return_value=collections)
     monkeypatch.setattr('solslot_api.generation_consent_routes.get_collection_store',getter)
     c.app.state.generation_mint_reviews=mint_reviews
+    admission=object();c.app.state.generation_admission=admission
     body={k:v for k,v in request().items() if k!='scope'}
     body.update(kind='PUBLICATION_APPROVAL',proposalKind='MINT_TEST_ONLY',mintReviewId=PACKAGE)
     body['expectedInputs']['components']={'0x'+'48'*32:'0x'+'49'*32}
@@ -96,10 +97,10 @@ def test_test_mint_publication_loads_only_the_saved_generation_source(monkeypatc
         response=client.post('/admin/generation/consents/prepare',json=body)
         assert response.status_code==200
         assert c.prepare.call_args.kwargs=={'anchor':c.index.anchor,'provider':c.provider,'store':c.store,
-            'settings':c.settings,'collections':collections,'mint_reviews':mint_reviews,'index':c.index}
+            'settings':c.settings,'collections':collections,'mint_reviews':mint_reviews,'index':c.index,'admission':admission}
         getter.assert_called_once_with(c.settings)
         for mutation in ({'mintReviewId':None},{'mintReviewId':True},{'editionProgram':'0x80'},
-                         {'funding':[PACKAGE]}, {'canonicalMetadata':{}}, {'scope':2}, {'index':{'verified':True}}):
+                         {'funding':[PACKAGE]}, {'canonicalMetadata':{}}, {'scope':2}, {'index':{'verified':True}}, {'admission':{'snapshot':{}}}):
             assert client.post('/admin/generation/consents/prepare',json={**body,**mutation}).status_code==422
         assert c.prepare.await_count==1;c.sign.assert_not_called();c.pause.assert_not_called()
 
