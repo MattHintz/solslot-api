@@ -367,7 +367,10 @@ class OperationStore:
         expected_payload_hash: bytes32,
         caller: str,
         now: int,
+        reconcile_seal: bool = False,
     ) -> None:
+        if reconcile_seal and expected_operation != 'collection.seal':
+            raise ValueError('only metadata sealing supports outcome reconciliation')
         with self._transaction() as connection:
             row = connection.execute(
                 "SELECT operation,payload_hash,expires_at,approved_at,consumed_at FROM "
@@ -376,7 +379,7 @@ class OperationStore:
             ).fetchone()
             if row is None:
                 raise KeyError("admin operation not found")
-            if row["consumed_at"] is not None:
+            if row["consumed_at"] is not None and not reconcile_seal:
                 raise ValueError("admin operation is already consumed")
             if int(row["expires_at"]) <= now:
                 raise ValueError("admin operation is expired")
@@ -393,6 +396,8 @@ class OperationStore:
             ).fetchone()
             if signer is None:
                 raise ValueError("calling JWT subject did not sign this operation")
+            if row['consumed_at'] is not None:
+                return  # Preserve the original consumption evidence.
             connection.execute(
                 "UPDATE admin_operations SET consumed_at=? WHERE operation_id=?",
                 (now, operation_id.lower()),
@@ -510,9 +515,9 @@ def _with_chain_actions(public, build, value):
 
 
 def _public_operation(
-    value: dict[str, Any], core: AdminOperationCoreV1, *, chain_id: int
+    value: dict[str, Any], core: AdminOperationCoreV1, *, chain_id: int, settings=None
 ) -> dict[str, Any]:
-    return {
+    public = {
         "schemaVersion": 1,
         "operationId": value["operation_id"],
         "status": value["status"],
@@ -538,6 +543,10 @@ def _public_operation(
         ],
         "typedData": core.eip712_typed_data(chain_id=chain_id),
     }
+    if settings is not None and value['operation'] == 'collection.seal':
+        from .collection_seal_execution import seal_execution
+        public['sealExecution'] = seal_execution(value, settings)
+    return public
 
 
 def _core_from_record(value: dict[str, Any]) -> AdminOperationCoreV1:
@@ -598,15 +607,22 @@ def list_operations(
     limit: int = 100,
 ) -> dict[str, Any]:
     try:
-        values = store.list(status_filter=status_filter, limit=limit)
+        # Old failed seals were consumed before their transaction ran. Keep
+        # those exact, still-authorized requests discoverable for reconciliation.
+        values = store.list(status_filter='all' if status_filter == 'active' else status_filter, limit=limit)
         operations = [
             _public_operation(
                 value,
                 _core_from_record(value),
                 chain_id=settings.eip712_chain_id,
+                settings=settings,
             )
             for value in values
         ]
+        if status_filter == 'active':
+            operations = [value for value in operations if value['expiresAt'] > int(time.time()) and (
+                value['status'] in ('pending', 'approved') or
+                value.get('sealExecution', {}).get('state') == 'retry_required')]
         return {"operations": operations, "count": len(operations)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -626,6 +642,7 @@ async def get_operation(
             value,
             _core_from_record(value),
             chain_id=settings.eip712_chain_id,
+            settings=settings,
         )
         if value['status'] != 'consumed':
             public = _with_chain_actions(public, await _chain_build(value, request, settings), value)
@@ -700,9 +717,11 @@ async def sign_operation(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-def require_admin_operation(expected_operation: str, *, defer_consume: bool = False):
+def require_admin_operation(expected_operation: str, *, defer_consume: bool = False, reconcile_seal: bool = False):
     if expected_operation not in ALLOWED_OPERATIONS:
         raise ValueError(f"unsupported admin operation {expected_operation}")
+    if reconcile_seal and (expected_operation != 'collection.seal' or not defer_consume):
+        raise ValueError('only deferred metadata sealing supports reconciliation')
 
     async def dependency(
         request: Request,
@@ -762,9 +781,10 @@ def require_admin_operation(expected_operation: str, *, defer_consume: bool = Fa
                 raise ValueError("admin operation signatures are stale for the active roster")
             expected_payload_hash = request_binding_hash(binding)
             if defer_consume:
-                if value["consumed_at"] is not None:
+                authorized_at = int(time.time())
+                if value["consumed_at"] is not None and not reconcile_seal:
                     raise ValueError("admin operation is already consumed")
-                if int(value["expires_at"]) <= int(time.time()):
+                if int(value["expires_at"]) <= authorized_at:
                     raise ValueError("admin operation is expired")
                 if value["approved_at"] is None:
                     raise ValueError("admin operation lacks slot 0 plus one coadmin")
@@ -783,6 +803,7 @@ def require_admin_operation(expected_operation: str, *, defer_consume: bool = Fa
                     "expected_payload_hash": expected_payload_hash,
                     "caller": claims.sub,
                 }
+                request.state.admin_operation_authorized_at = authorized_at
             else:
                 store.consume(
                     operation_id=operation_id,

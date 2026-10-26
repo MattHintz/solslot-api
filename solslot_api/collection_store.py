@@ -1120,11 +1120,26 @@ class CollectionStore:
         *,
         expected_revision: int,
         actor_subject: str,
+        operation_id: str | None = None,
+        payload_hash: str | None = None,
     ) -> dict[str, Any]:
+        if (operation_id is None) != (payload_hash is None):
+            raise CollectionConflict('sealing requires the exact operation and payload together')
         with self._lock, self._txn() as cur:
             row = self._collection_row(collection_id, cur=cur)
             self._require_owner(row, actor_subject)
             self._require_revision(row, expected_revision)
+            if operation_id is not None:
+                events = cur.execute("SELECT details_json FROM property_collection_audit_events WHERE collection_id=? AND action='COLLECTION_SEALED'", (collection_id,)).fetchall()
+                for event in events:
+                    receipt = json.loads(event[0])
+                    if receipt.get('operationId') != operation_id:
+                        continue
+                    if (receipt.get('payloadHash') != payload_hash or receipt.get('revision') != expected_revision
+                            or row['state'] not in ('SEALED', 'PUBLISHED')
+                            or receipt.get('metadataRoot') != _hex(row['metadata_root'])):
+                        raise CollectionConflict('saved sealing outcome differs from this request')
+                    return self.get(collection_id)
             if row["state"] not in ("DRAFT", "REVIEW"):
                 raise CollectionInvalidState(f"cannot seal collection in {row['state']} state")
             # Validate the exact snapshot committed below. Asset verification,
@@ -1145,7 +1160,9 @@ class CollectionStore:
             )
             self._audit(
                 cur, collection_id, actor_subject, "COLLECTION_SEALED",
-                {"metadataRoot": "0x" + commitment.metadata_root.hex(), "byteSize": commitment.byte_size},
+                {"metadataRoot": "0x" + commitment.metadata_root.hex(), "byteSize": commitment.byte_size,
+                 **({'operationId': operation_id, 'payloadHash': payload_hash,
+                     'revision': expected_revision} if operation_id is not None else {})},
             )
         return self.get(collection_id)
 

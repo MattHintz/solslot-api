@@ -21,7 +21,7 @@ from tests.test_testnet_collection_edition import edition
 @pytest.mark.asyncio
 @pytest.mark.parametrize('generation_chain', ['economic'], indirect=True)
 async def test_real_native_anchor_survives_http_reads_restart_and_invalidation(
-    generation_chain, prepared, tmp_path,
+    generation_chain, prepared, tmp_path, monkeypatch,
 ):
     # Native fixtures and ASGI run on the same event-loop thread, as in uvicorn.
     # Neither the anchor resolver nor the store dependency is replaced.
@@ -64,6 +64,16 @@ async def test_real_native_anchor_survives_http_reads_restart_and_invalidation(
             assert response.status_code == 200
             assert response.json() == before
         await check_read()
+        # POST admission must resolve the real native Program on this thread
+        # too. The old synchronous gate panicked before readiness was checked.
+        monkeypatch.setattr('solslot_api.collection_generation_recovery.read_record_receipt', lambda _: {})
+        monkeypatch.setattr('solslot_api.collection_generation_media_recovery.read_media_receipt', lambda _: {
+            'inventorySha256': sha256(b'[]').hexdigest()})
+        response = await client.post('/admin/collections/' + cid + '/seal', json={}, headers={'If-Match':'"1"'})
+        assert response.status_code == 422, response.text  # Incomplete fixture, never a native-thread failure.
+        assert response.json()['detail']['message'] == 'collection is not ready to seal'
+        assert store.get(cid) == before
+        assert store.mint_treasury == treasury
         await asyncio.gather(*(check_read() for _ in range(5)))
         assert store.mint_treasury == treasury
         assert store.audit_events(cid) == audit

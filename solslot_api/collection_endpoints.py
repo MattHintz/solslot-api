@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_vali
 from .admin_auth import AdminClaims, require_admin_jwt
 from .test_collection_metadata import TestPropertyDraftV1
 from solslot_puzzles.property_metadata import commit_metadata
-from .admin_operations import require_admin_operation
+from .admin_operations import require_admin_operation, get_operation_store, OperationStore
 from .collection_display_units import (
     DisplayUnitError,
     allocate_par_mojos,
@@ -207,7 +207,7 @@ def _signed_governance_threshold(settings: Settings) -> int:
     return threshold
 
 
-def require_collection_metadata(
+async def require_collection_metadata(
     request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> None:
@@ -220,11 +220,11 @@ def require_collection_metadata(
     require_preparation_step(request, settings)
 
 
-def require_collection_minting(
+async def require_collection_minting(
     request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> None:
-    require_collection_metadata(request, settings)
+    await require_collection_metadata(request, settings)
     if not settings.collection_minting_enabled:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -668,24 +668,35 @@ async def collection_readiness(
 @router.post(
     "/admin/collections/{collection_id}/seal",
     dependencies=[
-        Depends(require_admin_operation("collection.seal")),
+        Depends(require_admin_operation("collection.seal", defer_consume=True, reconcile_seal=True)),
         Depends(require_collection_metadata),
     ],
 )
 async def seal_collection(
     collection_id: str,
+    request: Request,
     response: Response,
     claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     store: Annotated[CollectionStore, Depends(get_collection_store)],
+    operations: Annotated[OperationStore, Depends(get_operation_store)],
     if_match: Annotated[Optional[str], Header(alias="If-Match")] = None,
 ) -> dict[str, Any]:
+    operation = getattr(request.state, 'admin_operation', None)
+    consume = getattr(request.state, 'admin_operation_consume', None)
     payload = _store_call(
         lambda: store.seal(
             collection_id,
             expected_revision=_expected_revision(if_match),
             actor_subject=claims.sub,
+            operation_id=operation['operation_id'] if operation else None,
+            payload_hash=operation['payload_hash'] if operation else None,
         )
     )
+    if consume is not None:
+        # The collection's atomic audit receipt makes this recoverable if the
+        # process stops between the metadata commit and approval consumption.
+        operations.consume(**consume,
+            now=request.state.admin_operation_authorized_at, reconcile_seal=True)
     return _with_etag(response, payload)
 
 
