@@ -14,6 +14,7 @@ from .generation_operations import canonical
 from .generation_chain_evidence import resolve_generation_chain, current_evidence_unchanged, public_bill
 from .generation_coin_evidence import read_confirmed_coin
 from .generation_mint_reviews import h, revalidate_mint_review, reviewed_mint_edition
+from .generation_mint_checks import checked_mint_chain_cache
 
 
 def mint_request_key(identity):return 'mint:'+identity
@@ -35,7 +36,7 @@ class MintExecutionRequest(Model):
 
 
 async def prepare_mint_execution(body, *, settings, collections, reviews, journal, anchor, provider,
-                                 faucet, funding_guard, clock=time.time):
+                                 faucet, funding_guard, clock=time.time, index=None):
     body=MintExecutionRequest.model_validate_json(body.model_dump_json(by_alias=True))
     if (settings.network!='testnet11' or body.generation_id!=settings.deployment_generation_id
             or body.generation_id!=reviews.generation_id or body.generation_id!=journal.generation_id
@@ -48,11 +49,12 @@ async def prepare_mint_execution(body, *, settings, collections, reviews, journa
     if saved:
         reviews.record_execution(body.source_review_id,saved['operationId'])
         return saved  # Recover even after the input is spent, without a signer.
-    async with asyncio.timeout(60), funding_guard:
+    async with asyncio.timeout(50), funding_guard:
         saved=journal.reviewed_request(key,digest)
         if saved:
             reviews.record_execution(body.source_review_id,saved['operationId']);return saved
-        chain=await resolve_generation_chain(anchor,provider=provider)
+        chain=await checked_mint_chain_cache(anchor,provider=provider,index=index)
+        if chain is None:chain=await resolve_generation_chain(anchor,provider=provider)
         for name in ('registry','governance','holdings'):
             if h(getattr(chain,name).current.coin.name())!=getattr(body.expected_inputs,name):
                 raise ValueError('confirmed mint inputs changed')

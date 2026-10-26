@@ -9,6 +9,7 @@ from hashlib import sha256
 from pathlib import Path
 import asyncio
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -22,6 +23,7 @@ from solslot_puzzles.property_metadata import commit_metadata
 from solslot_puzzles.property_registry_driver import canonicalise_property_id
 from .collection_generation_mint import build_sealed_test_mint
 from .generation_chain_evidence import resolve_generation_chain, current_evidence_unchanged
+from .generation_mint_checks import checked_mint_chain_cache, primary_mint_coin_records
 from .generation_coin_evidence import read_confirmed_coin
 from .generation_context import generation_bytes
 from .generation_execution import Hash, Model
@@ -31,6 +33,15 @@ from .test_collection_metadata import TestPropertyDossierV1
 
 
 def h(value): return '0x'+value.hex()
+
+
+logger = logging.getLogger(__name__)
+
+
+class MintReviewTimeout(TimeoutError):
+    def __init__(self, stage):
+        super().__init__('mint review preparation timed out')
+        self.stage = stage
 
 
 class MintReviewRequest(Model):
@@ -213,70 +224,93 @@ class GenerationMintReviewStore:
         return {'receipt':receipt,'lastCheckedAt':link['last_checked'] if link else None,'errorCode':link['error_code'] if link else None}
 
 
-async def prepare_mint_review(request, *, settings, collections, anchor, provider, faucet, store, funding_guard, clock=time.time):
+async def prepare_mint_review(request, *, settings, collections, anchor, provider, faucet, store, funding_guard, clock=time.time, index=None):
     request = MintReviewRequest.model_validate_json(request.model_dump_json(by_alias=True))
     if (settings.network != 'testnet11' or settings.deployment_generation_id != request.generation_id
             or h(anchor.issuance.generation) != request.generation_id):
         raise ValueError('mint review requires the exact Testnet11 generation')
     saved = store.reviewed_request(request)
     if saved: return saved  # Lost response/restart must not choose new parents.
-    async with asyncio.timeout(60), funding_guard:
-        saved = store.reviewed_request(request)
-        if saved: return saved
-        chain = await resolve_generation_chain(anchor, provider=provider)
-        gov, registry = chain.governance.state, chain.registry.state
-        if registry.pause_mask & 3 or registry.pending:
-            raise ValueError('new mint preparation is paused or an upgrade is pending')
-        history = next((v for v in chain.economic_components.values()
-                        if isinstance(v.state, GenerationMint) and v.state.launcher_id == gov.mint_id), None)
-        if history is None or history.state.component() not in registry.components:
-            raise ValueError('the supported current mint authority is unavailable')
-        mint = history.state
-        snapshot = collections.sealed_test_mint_snapshot(request.collection_id)
-        dossier = TestPropertyDossierV1.model_validate(snapshot['canonicalMetadata'])
-        if (dossier.revision != request.revision or snapshot['metadataRoot'] != request.metadata_root
-                or snapshot['previewHash'] != request.preview_hash):
-            raise ValueError('the sealed revision or approved preview changed')
-        # Selection occurs only here, on an explicit action. Primary reads may
-        # not silently fall back to an advisory provider for funding authority.
-        records = await provider.get_coin_records_by_puzzle_hash_primary(faucet.address_hex, include_spent=False)
-        if not isinstance(records, list) or len(records)>4096: raise ValueError('funding catalog exceeds its review bound')
-        reserved = faucet.reserved_coin_ids() | {bytes32.from_hexstr(v) for v in store.reserved_input_coin_ids()}
-        candidates = {}
-        for raw in records:
-            try: coin = Coin.from_json_dict(raw['coin'])
-            except (KeyError, TypeError, AttributeError, ValueError) as exc:
-                raise ValueError('primary launcher funding evidence is malformed') from exc
-            rec = read_confirmed_coin(raw, coin.name())
-            if (not rec.spent_height and coin.puzzle_hash == faucet.address_puzzle_hash
-                    and coin.name() not in reserved and 1<=coin.amount<=settings.faucet_max_spend_mojos):
-                if coin.name() in candidates: raise ValueError('duplicate funding record')
-                candidates[coin.name()] = rec
-        selected = sorted(candidates.values(), key=lambda v:(v.coin.amount,v.coin.name()))[:len(dossier.deed_allocation)]
-        if len(selected) != len(dossier.deed_allocation): raise ValueError('not enough distinct confirmed launcher parents; operator funding preparation is required')
-        edition = build_sealed_test_mint(collections, settings, mint, request.collection_id, tuple(v.coin.name() for v in selected))
-        inventories = mint.inventories(edition)
-        for rec in selected:
-            current = read_confirmed_coin(await provider.get_coin_record_by_name_primary(h(rec.coin.name())), rec.coin.name())
-            if current != rec: raise ValueError('launcher funding changed during review')
-        if not await current_evidence_unchanged(chain, provider=provider): raise ValueError('mint authority changed during review')
-        # Recheck public source and all shared holds after external awaits.
-        if collections.sealed_test_mint_snapshot(request.collection_id) != snapshot:
-            raise ValueError('sealed source changed during review')
-        if any(v.coin.name() in faucet.reserved_coin_ids() for v in selected): raise ValueError('launcher funding was retained by another operation')
-        document = {'generationId': request.generation_id, 'network':'testnet11', 'purpose':'TEST_ONLY',
-            'stage':'SOURCE_REVIEWED', 'publicationReady':False, 'createdAt':int(clock()),
-            'request':request.model_dump(mode='json',by_alias=True), 'requestDigest':request.digest,
-            'canonicalMetadata':snapshot['canonicalMetadata'], 'editionProgram':h(bytes(Program.to(edition.program()))),
-            'editionHash':h(edition.commitment), 'billHash':h(edition.bill().get_tree_hash()),
-            'collectionCommitment':h(edition.collection), 'mintAuthority':{'componentId':h(mint.component_id),
-                'launcherId':h(mint.launcher_id), 'coinId':h(history.current.coin.name()), 'moduleHash':h(mint.logic_hash()),
-                'version':mint.version},
-            'funding':[{'coinId':h(rec.coin.name()), 'coin':rec.coin.to_json_dict(), 'confirmedHeight':rec.confirmed_height,
-                'launcherId':h(item.launcher_spend.coin.name()), 'inventoryCoinId':h(item.coin.name())}
-                for rec,item in zip(selected,inventories,strict=True)],
-            'nextAction':'Your sealed edition and its fixed launcher funding are saved. Review publication separately.'}
-        return store.save(request, document)
+    stage = 'WAITING_FOR_FUNDING_GUARD'
+    logger.info('mint_review stage=%s request=%s', stage, request.digest)
+    try:
+        async with asyncio.timeout(50), funding_guard:
+            saved = store.reviewed_request(request)
+            if saved: return saved
+            stage = 'VERIFYING_AUTHORITY'
+            logger.info('mint_review stage=%s request=%s', stage, request.digest)
+            chain = await checked_mint_chain_cache(anchor, provider=provider, index=index)
+            if chain is None:
+                chain = await resolve_generation_chain(anchor, provider=provider)
+            gov, registry = chain.governance.state, chain.registry.state
+            if registry.pause_mask & 3 or registry.pending:
+                raise ValueError('new mint preparation is paused or an upgrade is pending')
+            history = next((v for v in chain.economic_components.values()
+                            if isinstance(v.state, GenerationMint) and v.state.launcher_id == gov.mint_id), None)
+            if history is None or history.state.component() not in registry.components:
+                raise ValueError('the supported current mint authority is unavailable')
+            mint = history.state
+            stage = 'CHECKING_SEALED_SOURCE'
+            logger.info('mint_review stage=%s request=%s', stage, request.digest)
+            snapshot = collections.sealed_test_mint_snapshot(request.collection_id)
+            dossier = TestPropertyDossierV1.model_validate(snapshot['canonicalMetadata'])
+            if (dossier.revision != request.revision or snapshot['metadataRoot'] != request.metadata_root
+                    or snapshot['previewHash'] != request.preview_hash):
+                raise ValueError('the sealed revision or approved preview changed')
+            # Selection occurs only here, on an explicit action. Primary reads may
+            # not silently fall back to an advisory provider for funding authority.
+            stage = 'READING_FUNDING'
+            logger.info('mint_review stage=%s request=%s', stage, request.digest)
+            records = await provider.get_coin_records_by_puzzle_hash_primary(faucet.address_hex, include_spent=False)
+            if not isinstance(records, list) or len(records)>4096: raise ValueError('funding catalog exceeds its review bound')
+            reserved = faucet.reserved_coin_ids() | {bytes32.from_hexstr(v) for v in store.reserved_input_coin_ids()}
+            candidates = {}
+            for raw in records:
+                try: coin = Coin.from_json_dict(raw['coin'])
+                except (KeyError, TypeError, AttributeError, ValueError) as exc:
+                    raise ValueError('primary launcher funding evidence is malformed') from exc
+                rec = read_confirmed_coin(raw, coin.name())
+                if (not rec.spent_height and coin.puzzle_hash == faucet.address_puzzle_hash
+                        and coin.name() not in reserved and 1<=coin.amount<=settings.faucet_max_spend_mojos):
+                    if coin.name() in candidates: raise ValueError('duplicate funding record')
+                    candidates[coin.name()] = rec
+            selected = sorted(candidates.values(), key=lambda v:(v.coin.amount,v.coin.name()))[:len(dossier.deed_allocation)]
+            if len(selected) != len(dossier.deed_allocation): raise ValueError('not enough distinct confirmed launcher parents; operator funding preparation is required')
+            edition = build_sealed_test_mint(collections, settings, mint, request.collection_id, tuple(v.coin.name() for v in selected))
+            inventories = mint.inventories(edition)
+            stage = 'VERIFYING_FUNDING'
+            logger.info('mint_review stage=%s request=%s', stage, request.digest)
+            observed = await primary_mint_coin_records((h(rec.coin.name()) for rec in selected), provider=provider)
+            for rec, raw in zip(selected, observed, strict=True):
+                current = read_confirmed_coin(raw, rec.coin.name())
+                if current != rec: raise ValueError('launcher funding changed during review')
+            stage = 'RECHECKING_AUTHORITY'
+            logger.info('mint_review stage=%s request=%s', stage, request.digest)
+            if not await current_evidence_unchanged(chain, provider=provider): raise ValueError('mint authority changed during review')
+            # Recheck public source and all shared holds after external awaits.
+            if collections.sealed_test_mint_snapshot(request.collection_id) != snapshot:
+                raise ValueError('sealed source changed during review')
+            if any(v.coin.name() in faucet.reserved_coin_ids() for v in selected): raise ValueError('launcher funding was retained by another operation')
+            document = {'generationId': request.generation_id, 'network':'testnet11', 'purpose':'TEST_ONLY',
+                'stage':'SOURCE_REVIEWED', 'publicationReady':False, 'createdAt':int(clock()),
+                'request':request.model_dump(mode='json',by_alias=True), 'requestDigest':request.digest,
+                'canonicalMetadata':snapshot['canonicalMetadata'], 'editionProgram':h(bytes(Program.to(edition.program()))),
+                'editionHash':h(edition.commitment), 'billHash':h(edition.bill().get_tree_hash()),
+                'collectionCommitment':h(edition.collection), 'mintAuthority':{'componentId':h(mint.component_id),
+                    'launcherId':h(mint.launcher_id), 'coinId':h(history.current.coin.name()), 'moduleHash':h(mint.logic_hash()),
+                    'version':mint.version},
+                'funding':[{'coinId':h(rec.coin.name()), 'coin':rec.coin.to_json_dict(), 'confirmedHeight':rec.confirmed_height,
+                    'launcherId':h(item.launcher_spend.coin.name()), 'inventoryCoinId':h(item.coin.name())}
+                    for rec,item in zip(selected,inventories,strict=True)],
+                'nextAction':'Your sealed edition and its fixed launcher funding are saved. Review publication separately.'}
+            stage = 'SAVING_REVIEW'
+            logger.info('mint_review stage=%s request=%s', stage, request.digest)
+            result = store.save(request, document)
+            logger.info('mint_review stage=SOURCE_REVIEWED request=%s', request.digest)
+            return result
+    except TimeoutError as exc:
+        logger.warning('mint_review timeout stage=%s request=%s', stage, request.digest)
+        raise MintReviewTimeout(stage) from exc
 
 
 def reviewed_mint_edition(review):
@@ -351,9 +385,10 @@ async def revalidate_mint_review(identity, *, settings, collections, store, chai
         tuple(r.launcher_parent for r in original.rows))
     if edition != original: raise ValueError('native edition differs from current sealed source')
     records = []
-    for row, inventory in zip(review['funding'], mint.inventories(edition), strict=True):
+    observed = await primary_mint_coin_records((row['coinId'] for row in review['funding']), provider=provider)
+    for row, inventory, raw in zip(review['funding'], mint.inventories(edition), observed, strict=True):
         coin = Coin.from_json_dict(row['coin'])
-        actual = read_confirmed_coin(await provider.get_coin_record_by_name_primary(row['coinId']), coin.name())
+        actual = read_confirmed_coin(raw, coin.name())
         if (actual.coin != coin or h(coin.name()) != row['coinId'] or actual.confirmed_height != row['confirmedHeight']
                 or actual.spent_height or h(inventory.launcher_spend.coin.name()) != row['launcherId']
                 or h(inventory.coin.name()) != row['inventoryCoinId']):

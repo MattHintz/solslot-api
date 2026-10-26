@@ -51,7 +51,7 @@ async def prepare_review(body:ConsentRequest,request:Request,settings:Annotated[
     try:
         if body.proposal_kind=='MINT_TEST_ONLY':
             source={'settings':settings,'collections':get_collection_store(settings),
-                'mint_reviews':getattr(request.app.state,'generation_mint_reviews',None)}
+                'mint_reviews':getattr(request.app.state,'generation_mint_reviews',None),'index':index}
         return await prepare_consent(body,anchor=index.anchor,provider=provider,store=store,**source)
     except (ValueError,CollectionStoreError,OSError,TimeoutError,RuntimeError,sqlite3.Error) as exc:raise _failure(exc) from exc
 

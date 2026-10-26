@@ -38,6 +38,7 @@ from .generation_operations import canonical
 from .generation_registry_evidence import _program
 from .generation_storage import connect_generation_sqlite, generation_path, admit_retained_bytes
 from .generation_mint_reviews import revalidate_mint_review
+from .generation_mint_checks import checked_mint_chain_cache
 
 
 def h(value): return '0x'+value.hex()
@@ -282,15 +283,16 @@ async def consent_inputs_unchanged(document,provider):
         raise ValueError('an unrelated consent cannot contain redemption funding evidence')
 
 
-async def prepare_consent(request,*,anchor,provider,store,clock=time.time,settings=None,collections=None,mint_reviews=None):
+async def prepare_consent(request,*,anchor,provider,store,clock=time.time,settings=None,collections=None,mint_reviews=None,index=None):
     request=ConsentRequest.model_validate_json(request.model_dump_json(by_alias=True))
     if request.generation_id!=store.generation_id or bytes32.from_hexstr(request.generation_id)!=anchor.issuance.generation:
         raise ValueError('consent belongs to another generation')
     saved=store.reviewed_request(request,int(clock()))
     if saved:return saved # Explicit retry recovers the original clock even offline.
     if anchor.administrator is None:raise ValueError('frozen administrator anchor is unavailable')
-    async with asyncio.timeout(60):
-        chain=await resolve_generation_chain(anchor,provider=provider)
+    async with asyncio.timeout(50 if request.proposal_kind=='MINT_TEST_ONLY' else 60):
+        chain=await checked_mint_chain_cache(anchor,provider=provider,index=index) if request.proposal_kind=='MINT_TEST_ONLY' else None
+        if chain is None:chain=await resolve_generation_chain(anchor,provider=provider)
         admins=await resolve_generation_administrators(anchor.administrator,provider=provider)
         gov,registry=chain.governance.state,chain.registry.state
         for name in ('registry','governance','holdings'):

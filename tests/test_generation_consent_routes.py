@@ -96,10 +96,10 @@ def test_test_mint_publication_loads_only_the_saved_generation_source(monkeypatc
         response=client.post('/admin/generation/consents/prepare',json=body)
         assert response.status_code==200
         assert c.prepare.call_args.kwargs=={'anchor':c.index.anchor,'provider':c.provider,'store':c.store,
-            'settings':c.settings,'collections':collections,'mint_reviews':mint_reviews}
+            'settings':c.settings,'collections':collections,'mint_reviews':mint_reviews,'index':c.index}
         getter.assert_called_once_with(c.settings)
         for mutation in ({'mintReviewId':None},{'mintReviewId':True},{'editionProgram':'0x80'},
-                         {'funding':[PACKAGE]}, {'canonicalMetadata':{}}, {'scope':2}):
+                         {'funding':[PACKAGE]}, {'canonicalMetadata':{}}, {'scope':2}, {'index':{'verified':True}}):
             assert client.post('/admin/generation/consents/prepare',json={**body,**mutation}).status_code==422
         assert c.prepare.await_count==1;c.sign.assert_not_called();c.pause.assert_not_called()
 

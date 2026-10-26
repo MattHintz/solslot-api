@@ -7,7 +7,7 @@ from pydantic import Field
 from .admin_auth import require_admin_jwt
 from .config import Settings, get_settings
 from .collection_store import get_collection_store, CollectionNotFound, CollectionStoreError
-from .generation_mint_reviews import MintReviewRequest, prepare_mint_review
+from .generation_mint_reviews import MintReviewRequest, prepare_mint_review, MintReviewTimeout
 from .generation_storage import GenerationRetentionFull
 from .generation_execution import Model, Hash
 from .generation_mint_execution import MintExecutionRequest, prepare_mint_execution, mint_request_key
@@ -26,6 +26,10 @@ def _store(request, settings):
 
 def _error(exc):
     from .collection_generation_mint import MintTreasuryMismatch
+    if isinstance(exc, MintReviewTimeout):
+        return HTTPException(503, detail={'code':'GENERATION_MINT_REVIEW_TIMEOUT','stage':exc.stage,
+            'message':'Your sealed edition is saved. Node checks took too long. Recover this same batch to retain any saved funding; do not prepare a replacement.'},
+            headers={'Retry-After':'5'})
     if isinstance(exc,MintTreasuryMismatch):
         return HTTPException(409,detail={'code':'GENERATION_MINT_TREASURY_MISMATCH',
             'message':'This sealed edition uses a fee destination from another generation. Create a corrected revision in Financials, then preview, review and seal it. No mint batch or funding holds were saved.'})
@@ -53,7 +57,7 @@ async def prepare(body:MintReviewRequest, request:Request, settings:Annotated[Se
             if saved: return saved
             raise HTTPException(503, detail={'code':'GENERATION_MINT_FUNDING_NOT_READY'})
         return await prepare_mint_review(body, settings=settings, collections=get_collection_store(settings),
-            anchor=index.anchor, provider=provider, faucet=faucet, store=store, funding_guard=submitter.funding_guard)
+            anchor=index.anchor, provider=provider, faucet=faucet, store=store, funding_guard=submitter.funding_guard, index=index)
     except CollectionNotFound as exc: raise HTTPException(404, detail={'code':'COLLECTION_NOT_FOUND'}) from exc
     except (ValueError, CollectionStoreError, OSError, TimeoutError, RuntimeError, sqlite3.Error) as exc: raise _error(exc) from exc
 
@@ -104,7 +108,7 @@ async def prepare_execution(body:MintExecutionRequest,identity:Annotated[str,Pat
         if body.source_review_id!=identity or submitter.policy.maximum_mojos>body.fee_cap_mojos:
             raise ValueError('mint source or fee ceiling differs from this review')
         await prepare_mint_execution(body,settings=settings,collections=get_collection_store(settings),reviews=store,
-            journal=journal,anchor=index.anchor,provider=provider,faucet=faucet,funding_guard=submitter.funding_guard)
+            journal=journal,anchor=index.anchor,provider=provider,faucet=faucet,funding_guard=submitter.funding_guard,index=index)
         return execution_status(identity,request,settings)
     except (ValueError,CollectionStoreError,OSError,TimeoutError,RuntimeError,sqlite3.Error) as exc:raise _error(exc) from exc
 
