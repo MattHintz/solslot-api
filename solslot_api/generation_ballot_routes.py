@@ -136,7 +136,7 @@ async def assemble(request:Request,identity:Annotated[str,Path(pattern=r'^0x[0-9
     journal=getattr(request.app.state,'generation_operations',None)
     if journal is None or journal.generation_id!=store.generation_id:raise HTTPException(503,detail={'code':'GENERATION_OPERATIONS_NOT_READY'})
     try:return await assemble_holder_ballot(identity,anchor=index.anchor,provider=provider,store=store,
-        consents=getattr(request.app.state,'generation_consents',None),journal=journal)
+        consents=getattr(request.app.state,'generation_consents',None),journal=journal,index=index)
     except (ValueError,OSError,TimeoutError,RuntimeError,sqlite3.Error) as exc:raise _failure(exc) from exc
 
 

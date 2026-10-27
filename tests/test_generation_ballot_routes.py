@@ -118,6 +118,7 @@ def test_assembly_keeps_generation_journal_and_does_not_sign(monkeypatch):
         url='/admin/generation/ballots/'+PACKAGE+'/assemble'
         assert client.post(url).json()=={'stage':'PREPARED'}
         assert c.assemble.call_args.kwargs['journal'] is c.app.state.generation_operations
+        assert c.assemble.call_args.kwargs['index'] is c.index
         c.app.state.generation_operations.generation_id='0x'+'49'*32
         assert client.post(url).status_code==503 and c.assemble.await_count==1
         c.sign.assert_not_called();c.prepare.assert_not_called()

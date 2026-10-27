@@ -340,7 +340,7 @@ def _saved_authorizations(document,store,identity):
     return tuple(result),AugSchemeMPL.aggregate(bls)
 
 
-async def assemble_holder_ballot(identity,*,anchor,provider,store,consents,journal,clock=time.time):
+async def assemble_holder_ballot(identity,*,anchor,provider,store,consents,journal,index=None,clock=time.time):
     doc=store.document(identity);request=HolderBallotRequest.model_validate(doc['request'])
     if journal.generation_id!=store.generation_id or anchor.issuance.generation!=bytes32.from_hexstr(store.generation_id):
         raise ValueError('ballot assembly has another deployment generation')
@@ -353,8 +353,13 @@ async def assemble_holder_ballot(identity,*,anchor,provider,store,consents,journ
     saved=journal.reviewed_request(review['requestKey'],digest)
     if saved:return saved
     if store.status(identity,int(clock()))['stage']!='READY':raise ValueError('all selected holder signatures must be recorded before expiry')
-    async with asyncio.timeout(60):
-        await ballot_inputs_unchanged(doc,provider);chain=await resolve_generation_chain(anchor,provider=provider)
+    # Reuse only the process's verified native proof, with fresh primary checks.
+    # The same final input checks still apply before the write-once journal save.
+    from .generation_mint_checks import checked_mint_chain_cache
+    async with asyncio.timeout(40):
+        await ballot_inputs_unchanged(doc,provider)
+        chain=await checked_mint_chain_cache(anchor,provider=provider,index=index)
+        if chain is None:chain=await resolve_generation_chain(anchor,provider=provider)
         gov,reg=chain.governance.state,chain.registry.state;tree,seq=chain.holdings.state
         govtip=chain.governance.verified_tip(reg.governance_id,gov.inner());regtip=chain.registry.verified_tip(reg.launcher_id,reg.inner())
         holdings=CurrentHoldings(gov.sgt,tree,seq,chain.holdings.verified_tip(gov.sgt.ledger_launcher_id,ledger_inner(gov.sgt,tree,seq)))

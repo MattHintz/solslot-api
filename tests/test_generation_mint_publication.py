@@ -42,7 +42,7 @@ def consent_kwargs(ctx,c,store,now):
 
 
 @pytest.mark.asyncio
-async def test_exact_native_mint_publication_and_holder_vote_preserve_the_source(core,tmp_path):
+async def test_exact_native_mint_publication_and_holder_vote_preserve_the_source(core,tmp_path,monkeypatch):
     c=core;ctx=await context(c,tmp_path);now=int(c.sim.timestamp)-1
     source=await prepare_mint_review(ctx.request,**{**ctx.kwargs,'clock':lambda:now})
     original=reviewed_mint_edition(source)
@@ -74,6 +74,21 @@ async def test_exact_native_mint_publication_and_holder_vote_preserve_the_source
     operation=await assemble_holder_ballot(ballot['packageId'],anchor=ctx.kwargs['anchor'],provider=c.provider,
         store=ballots,consents=consents,journal=journal,clock=lambda:now)
     assert operation['kind']=='OPEN_PROPOSAL' and operation['transactionId'] is None
+    # The live assembly route can reuse the same fully reconstructed native view,
+    # while preserving every byte of the cold-built signed transaction.
+    from solslot_api.generation_index import GenerationIndexReconciler, GenerationIndexStore
+    import solslot_api.generation_holder_ballots as implementation
+    index=GenerationIndexReconciler(ctx.kwargs['anchor'],GenerationIndexStore(tmp_path/'index.db',c.prep.generation_id,'0x'+'11'*32),c.provider)
+    await index.run_once();assert index.verified
+    cached_journal=GenerationOperationJournal(tmp_path/'cached-operations.db',c.prep.generation_id)
+    async def forbidden(*a,**k):raise AssertionError('verified fresh cache must not replay chain history')
+    with monkeypatch.context() as patch:
+        patch.setattr(implementation,'resolve_generation_chain',forbidden)
+        cached=await assemble_holder_ballot(ballot['packageId'],anchor=ctx.kwargs['anchor'],provider=c.provider,
+            store=ballots,consents=consents,journal=cached_journal,index=index,clock=lambda:now)
+    assert cached['operationId']==operation['operationId']
+    assert bytes(cached_journal.protocol_bundle(cached['operationId']))==bytes(journal.protocol_bundle(operation['operationId']))
+    assert cached['feeCapMojos']==operation['feeCapMojos']
     assert await c.client.push_tx(journal.protocol_bundle(operation['operationId']))==(MempoolInclusionStatus.SUCCESS,None)
     await c.sim.farm_block()
     chain=await resolve_generation_chain(ctx.kwargs['anchor'],provider=c.provider)
