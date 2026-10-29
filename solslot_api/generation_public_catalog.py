@@ -51,8 +51,7 @@ def confirmed_catalog_entry(identifier, *, collections, reviews, journal, genera
             'code': 'PRIMARY_OFFERING_STATUS_UNAVAILABLE', 'reason': 'Mint confirmation is verified. Purchase availability could not be checked for this edition.'}}
 
 
-@router.get('/collections')
-def public_catalog(request: Request, response: Response, settings: Settings = Depends(get_settings)):
+def _bound_context(request: Request, settings: Settings):
     reviews = getattr(request.app.state, 'generation_mint_reviews', None)
     journal = getattr(request.app.state, 'generation_operations', None)
     index = getattr(request.app.state, 'generation_index', None)
@@ -61,11 +60,26 @@ def public_catalog(request: Request, response: Response, settings: Settings = De
             or journal is None or index is None
             or reviews.generation_id != generation or journal.generation_id != generation):
         raise HTTPException(503, detail={'code': 'PUBLIC_GENERATION_NOT_READY'})
+    return reviews, journal, index, generation
+
+
+async def _catalog_settings(request: Request, settings: Settings = Depends(get_settings)):
+    # Reject an unbound feed before opening a store or resolving native state.
+    _bound_context(request, settings)
+    return settings
+
+
+@router.get('/collections')
+def public_catalog(request: Request, response: Response,
+                   settings: Settings = Depends(_catalog_settings),
+                   collections = Depends(get_collection_store)):
+    reviews, journal, index, generation = _bound_context(request, settings)
     try:
         status = index.store.status(int(time.time()), verified_in_process=index.verified)
         if status['status'] != 'READY' or status['generationId'] != generation:
             raise ValueError('current generation evidence unavailable')
-        collections = get_collection_store(settings)
+        # The existing store dependency resolves native authority on the event
+        # loop and passes only plain values into this synchronous read worker.
         entries = [confirmed_catalog_entry(identity, collections=collections, reviews=reviews,
             journal=journal, generation=generation) for identity in reviews.confirmed_collection_ids()]
         response.headers['Cache-Control'] = 'public, max-age=5, must-revalidate'

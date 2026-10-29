@@ -70,7 +70,7 @@ def test_public_route_is_read_only_and_unavailable_evidence_is_not_an_empty_cata
     app=FastAPI();app.include_router(module.router)
     app.state.generation_mint_reviews=kwargs['reviews'];app.state.generation_operations=kwargs['journal']
     app.state.generation_index=SimpleNamespace(verified=True,store=SimpleNamespace(status=lambda *a,**kw:state))
-    monkeypatch.setattr(module,'get_collection_store',lambda _:kwargs['collections'])
+    app.dependency_overrides[module.get_collection_store]=lambda:kwargs['collections']
     app.dependency_overrides[get_settings]=lambda:SimpleNamespace(network='testnet11',deployment_generation_id=GEN)
     client=TestClient(app)
     response=client.get('/public/generation/collections')
@@ -82,3 +82,16 @@ def test_public_route_is_read_only_and_unavailable_evidence_is_not_an_empty_cata
     response=client.get('/public/generation/collections')
     assert response.status_code==503
     assert response.json()['detail']['code']=='PUBLIC_GENERATION_EVIDENCE_UNAVAILABLE'
+
+
+def test_unbound_catalog_rejects_before_opening_store_or_native_authority():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    import solslot_api.generation_public_catalog as module
+    from solslot_api.config import get_settings
+    app=FastAPI();app.include_router(module.router)
+    app.dependency_overrides[get_settings]=lambda:SimpleNamespace(network='testnet11',deployment_generation_id=None)
+    app.dependency_overrides[module.get_collection_store]=lambda:pytest.fail('Unbound reads must not open a store')
+    response=TestClient(app).get('/public/generation/collections')
+    assert response.status_code==503
+    assert response.json()['detail']['code']=='PUBLIC_GENERATION_NOT_READY'
