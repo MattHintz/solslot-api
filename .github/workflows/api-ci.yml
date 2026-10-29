@@ -16,7 +16,7 @@ env:
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
   # Exact deployed Testnet11 generation protocol source.
   # Deployment environment pins remain separately governed.
-  PROTOCOL_REF: dfd41258afde986b817ee95f9dbf3943966c7778
+  PROTOCOL_REF: 031901d53702329853d548d0a5aaabd0a4b8db1a
 
 jobs:
   verify:
@@ -54,6 +54,9 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+
+      - name: Verify CI matches the approved runtime
+        run: python scripts/check_runtime_lock.py
 
       - name: Install
         run: |
@@ -98,4 +101,4 @@ jobs:
       - name: Secret scan
         run: >-
           python scripts/check_secrets.py --paths
-          solslot_api tests scripts .github pyproject.toml constraints.lock
+          solslot_api tests scripts .github ci pyproject.toml constraints.lock
