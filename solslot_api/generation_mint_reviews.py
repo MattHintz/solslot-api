@@ -103,6 +103,14 @@ class GenerationMintReviewStore:
             row = db.execute('SELECT package_id FROM generation_mint_reviews WHERE collection_id=?', (collection_id,)).fetchone()
         return self.status(row[0]) if row else None
 
+    def confirmed_collection_ids(self):
+        """Enumerate only completed public editions; never expose private drafts."""
+        with self._db() as db:
+            return [row[0] for row in db.execute(
+                'SELECT r.collection_id FROM generation_mint_reviews r '
+                'JOIN generation_mint_inventory_receipts i ON i.package_id=r.package_id '
+                'ORDER BY r.collection_id')]
+
     def reviewed_request(self, request):
         if request.generation_id != self.generation_id: raise ValueError('mint review belongs to another generation')
         saved = self.for_collection(request.collection_id)

@@ -156,3 +156,29 @@ async def test_confirmed_saved_submission_does_not_broadcast_again(tmp_path):
     assert result["status"] == "CONFIRMED" and result["confirmedHeight"] == 50
     assert provider.submitted is None
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_large_mint_observation_is_bounded_and_verifies_every_exact_spend():
+    import asyncio
+    from chia.types.coin_spend import make_spend
+    from chia.types.blockchain_format.program import Program
+    puzzle=Program.to((1, []))
+    bundle=SpendBundle([make_spend(Coin(bytes([n])*32,bytes(puzzle.get_tree_hash()),10),puzzle,Program.to(0))
+        for n in range(1,55)],G2Element())
+    class BoundedNode(ObservationRpc):
+        active=0
+        maximum=0
+        observed=set()
+        async def get_puzzle_and_solution(self,coin_id,height):
+            self.active+=1;self.maximum=max(self.maximum,self.active)
+            try:
+                await asyncio.sleep(.001)
+                self.observed.add(coin_id)
+                return await super().get_puzzle_and_solution(coin_id,height)
+            finally:self.active-=1
+    node=BoundedNode(bundle)
+    result=await ChiaProvider(node,FakeRpc(),config()).observe_exact_protocol_bundle(bundle.to_json_dict())
+    assert result['status']=='CONFIRMED'
+    assert len(node.observed)==54
+    assert 1<node.maximum<=6

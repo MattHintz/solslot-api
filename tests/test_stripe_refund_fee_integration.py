@@ -92,7 +92,7 @@ async def test_receipt_cannot_be_relabelled_as_another_refund(field):
 
 @pytest.mark.asyncio
 async def test_total_fee_above_cap_is_rejected_even_with_receipt_credit():
-    with pytest.raises(ProtocolSubmissionError, match='cap'):
+    with pytest.raises(ProtocolSubmissionError, match=r'required fee 101 exceeds the existing limit 100'):
         await execute(fixture(), fee=101)
 
 

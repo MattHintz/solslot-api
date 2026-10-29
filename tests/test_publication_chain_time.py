@@ -1,5 +1,7 @@
 """Primary-clock timelocks are checked before any funding reservation or push."""
 from types import SimpleNamespace
+from pathlib import Path
+from tests.historical_guard_fixture import isolated_guard
 import time
 
 import pytest
@@ -9,7 +11,6 @@ from chia.types.condition_opcodes import ConditionOpcode
 from chia_rs import Coin, G2Element, SpendBundle
 from fastapi import HTTPException
 
-from solslot_api import governance_endpoints as endpoints
 from solslot_api.faucet import Faucet
 from solslot_api.protocol_admission import admission_conditions, require_absolute_admission
 from solslot_api.protocol_funding_store import ProtocolFundingStore
@@ -62,33 +63,53 @@ async def test_future_start_never_selects_or_reserves_funding(tmp_path):
     assert provider.submitted is None
 
 
-@pytest.mark.asyncio
-async def test_stale_primary_clock_cannot_rebuild_or_submit(monkeypatch):
-    class Node:
-        async def get_fee_estimate(self, **kwargs):
-            assert kwargs == {'target_times':[60], 'cost':1, 'require_primary':True}
-            return admission_quote(peak_time=1)
-    queue = SimpleNamespace(get=lambda _: SimpleNamespace(publication_approval_expires_at=int(time.time())+3600),
-        publication_dispatch=lambda _:None)
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(coinset=Node())))
-    settings = SimpleNamespace(protocol_medium_fee_target_seconds=60)
-    monkeypatch.setattr(endpoints, 'require_sgt_allocation_drafts', lambda _:None)
-    def reject(*args, **kwargs):
-        raise AssertionError('Invalid primary clock must precede building or submitting')
-    monkeypatch.setattr(endpoints, '_publication_build', reject)
-    with pytest.raises(HTTPException) as error:
-        await endpoints.submit_publication('test', SimpleNamespace(coadmin_slot=1), request,
-            settings, None, queue, SimpleNamespace(authority_slot=0))
-    assert error.value.status_code == 503
-    assert 'stale' in error.value.detail
+# AE203's source implements these pre-pause publication admission cases.
+# Current reserve-sponsored publication intentionally fails earlier (AE205);
+# live pause rejection is exercised by test_governance_sponsorship_containment.
+HELD_PUBLICATION_API = '69547ae5cb2cbba0486e02e16b50f3779db3c292'
+HELD_ENDPOINT_SHA256 = 'dd38d45b47d05550cf038332046b92073ea486bfc9270f0ef36fe1469ad0de85'
+ROOT = Path(__file__).resolve().parents[1]
+PRELUDE = """
+import asyncio,hashlib,time
+from pathlib import Path
+from types import SimpleNamespace
+from fastapi import HTTPException
+from solslot_api import governance_endpoints as endpoints
+assert hashlib.sha256(Path(endpoints.__file__).read_bytes()).hexdigest() == 'dd38d45b47d05550cf038332046b92073ea486bfc9270f0ef36fe1469ad0de85'
+endpoints.require_sgt_allocation_drafts=lambda _:None
+"""
 
 
-@pytest.mark.asyncio
-async def test_saved_dispatch_is_reported_without_expensive_clock_or_build(monkeypatch):
-    monkeypatch.setattr(endpoints, 'require_sgt_allocation_drafts', lambda _:None)
-    queue = SimpleNamespace(publication_dispatch=lambda _: {'bundle_id':'saved'})
-    with pytest.raises(HTTPException) as error:
-        await endpoints.submit_publication('test', SimpleNamespace(coadmin_slot=1), None,
-            None, None, queue, SimpleNamespace(authority_slot=0))
-    assert error.value.status_code == 409
-    assert 'Check saved submission' in error.value.detail
+def test_stale_primary_clock_cannot_rebuild_or_submit():
+    quote=admission_quote(peak_time=1)
+    isolated_guard(ROOT, PRELUDE + 'quote='+repr(quote)+'\n' + r"""
+class Node:
+ async def get_fee_estimate(self,**kwargs):
+  assert kwargs == {'target_times':[60], 'cost':1, 'require_primary':True}
+  return quote
+queue=SimpleNamespace(get=lambda _:SimpleNamespace(publication_approval_expires_at=int(time.time())+3600),publication_dispatch=lambda _:None)
+request=SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(coinset=Node())))
+settings=SimpleNamespace(protocol_medium_fee_target_seconds=60)
+def reject(*args,**kwargs):raise AssertionError('Invalid primary clock must precede building or submitting')
+endpoints._publication_build=reject
+async def check():
+ try:
+  await endpoints.submit_publication('test',SimpleNamespace(coadmin_slot=1),request,settings,None,queue,SimpleNamespace(authority_slot=0))
+ except HTTPException as error:
+  assert error.status_code==503 and 'stale' in error.detail
+ else:raise AssertionError('Stale primary clock accepted')
+asyncio.run(check())
+""", HELD_PUBLICATION_API)
+
+
+def test_saved_dispatch_is_reported_without_expensive_clock_or_build():
+    isolated_guard(ROOT, PRELUDE + r"""
+queue=SimpleNamespace(publication_dispatch=lambda _:{'bundle_id':'saved'})
+async def check():
+ try:
+  await endpoints.submit_publication('test',SimpleNamespace(coadmin_slot=1),None,None,None,queue,SimpleNamespace(authority_slot=0))
+ except HTTPException as error:
+  assert error.status_code==409 and 'Check saved submission' in error.detail
+ else:raise AssertionError('Saved dispatch was rebuilt')
+asyncio.run(check())
+""", HELD_PUBLICATION_API)

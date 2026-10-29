@@ -395,6 +395,10 @@ class ChiaProvider:
         estimate_args = {"spend_bundle": spend_bundle} if spend_bundle is not None else {"cost": cost}
         from .chia_snapshot import active_snapshot
         snapshot = active_snapshot()
+        if snapshot is not None:
+            # Admission uses a new raw quote, but it must still belong to this
+            # snapshot's exact provider, node and network before/after awaits.
+            snapshot._check(self)
         if snapshot is not None and not require_primary:
             return await snapshot.read(self, "get_fee_estimate", lambda client: client.get_fee_estimate(
                 target_times=target_times, **estimate_args,
@@ -404,11 +408,15 @@ class ChiaProvider:
                 raise ChiaProviderError(
                     "local Chia full node is required for protocol fee estimation"
                 )
+            if snapshot is not None:
+                snapshot._check(self)
             try:
                 result = await self.primary.get_fee_estimate(
                     target_times=target_times,
                     **estimate_args,
                 )
+                if snapshot is not None:
+                    snapshot._check(self)
                 self._last_primary_success_at = _utc_now()
                 return result
             except Exception as exc:
@@ -616,13 +624,17 @@ class ChiaProvider:
                 raise ChiaProviderError("saved protocol bundle has no persistent inputs")
             records = {}
             pending = False
-            for spend in persistent:
-                coin_id = "0x" + spend.coin.name().hex()
-                items = await node.get_mempool_items_by_coin_name(coin_id)
+            reads = asyncio.Semaphore(6)
+            async def read_input(spend):
+                async with reads:
+                    coin_id = "0x" + spend.coin.name().hex()
+                    items = await node.get_mempool_items_by_coin_name(coin_id)
+                    record = await node.get_coin_record_by_name(coin_id)
+                    return spend, coin_id, items, record
+            for spend, coin_id, items, record in await asyncio.gather(*(read_input(s) for s in persistent)):
                 if any(not _mempool_item_matches_bundle(item, bundle_id) for item in items):
                     raise ChiaProviderError("saved protocol input has a conflicting pending transaction")
                 pending = pending or bool(items)
-                record = await node.get_coin_record_by_name(coin_id)
                 if (not record or Coin.from_json_dict(record["coin"]) != spend.coin
                         or type(record.get("confirmed_block_index")) is not int
                         or not 0 < record["confirmed_block_index"] <= initial_peak[0]
@@ -636,10 +648,13 @@ class ChiaProvider:
                 if 0 in heights or len(heights) != 1 or pending:
                     raise ChiaProviderError("saved protocol inputs have inconsistent settlement")
                 confirmed_height = next(iter(heights))
-                for spend in bundle.coin_spends:
-                    coin_id = "0x" + spend.coin.name().hex()
-                    record = records.get(coin_id) or await node.get_coin_record_by_name(coin_id)
-                    actual = await node.get_puzzle_and_solution(coin_id, confirmed_height)
+                async def read_spend(spend):
+                    async with reads:
+                        coin_id = "0x" + spend.coin.name().hex()
+                        record = records.get(coin_id) or await node.get_coin_record_by_name(coin_id)
+                        actual = await node.get_puzzle_and_solution(coin_id, confirmed_height)
+                        return spend, record, actual
+                for spend, record, actual in await asyncio.gather(*(read_spend(s) for s in bundle.coin_spends)):
                     if (not record or Coin.from_json_dict(record["coin"]) != spend.coin
                             or record.get("spent_block_index") != confirmed_height
                             or not actual or CoinSpend.from_json_dict(actual) != spend):

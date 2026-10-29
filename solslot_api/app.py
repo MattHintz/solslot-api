@@ -52,6 +52,7 @@ from .generation_sols_batch_routes import router as generation_sols_batch_router
 from .generation_consent_routes import router as generation_consent_router
 from .generation_ballot_routes import router as generation_ballot_router
 from .generation_mint_review_routes import router as generation_mint_review_router
+from .generation_public_catalog import router as generation_public_catalog_router
 from .admin_auth import (
     router as admin_auth_router,
     validate_admin_config_at_startup,
@@ -844,6 +845,7 @@ app.include_router(generation_sols_batch_router)
 app.include_router(generation_consent_router)
 app.include_router(generation_ballot_router)
 app.include_router(generation_mint_review_router)
+app.include_router(generation_public_catalog_router)
 
 # Post-genesis admin desk: wallet-signed JWT auth backed only by verified
 # records committed by the current admin-authority singleton.

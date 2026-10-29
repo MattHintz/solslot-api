@@ -182,6 +182,10 @@ async def assert_native_mint_lifecycle(core,tmp_path,monkeypatch,genesis_mode,*,
         for row in receipt['inventory']:
             record=await c.client.get_coin_record_by_name(bytes32.from_hexstr(row['coinId']))
             assert record and not record.spent and record.coin.amount==1
+        from solslot_api.generation_public_catalog import confirmed_catalog_entry
+        public=confirmed_catalog_entry(ctx.request.collection_id,collections=ctx.collections,reviews=ctx.kwargs['store'],journal=journal,generation=c.prep.generation_id)
+        assert public['metadataRoot']==receipt['metadataRoot'] and public['mint']['deedCount']==25
+        assert public['sale']['status']=='UNAVAILABLE' and public['canonicalMetadata']['purpose']=='TEST_ONLY'
         # A confirmed retry is read-only even with node and signer unusable.
         class Never:
             def __getattr__(self,name):raise AssertionError('cached status contacted node or signer')

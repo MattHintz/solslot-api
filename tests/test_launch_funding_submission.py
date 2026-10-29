@@ -83,7 +83,7 @@ def funding(tmp_path):
     submitter = ProtocolBundleSubmitter(provider=provider, faucet=faucet, policy=policy, funding_store=journal)
     app = SimpleNamespace(state=SimpleNamespace(faucet=faucet, coinset=provider, protocol_submitter=submitter))
     values = SimpleNamespace(request=Request({"type": "http", "app": app}),
-        settings=SimpleNamespace(alpha_writes_enabled=True, ceremony_mode_enabled=True),
+        settings=SimpleNamespace(alpha_writes_enabled=True, ceremony_mode_enabled=True, deployment_generation_id=None),
         session=LaunchSession("test-funding-ceremony", 1, "0x"+"12"*20, False, 2_000_000_000),
         store=store, journal=journal, provider=provider, faucet=faucet, source=source, fee_coin=fee_coin, policy=policy)
     yield values
