@@ -5,16 +5,17 @@ import subprocess
 import sys
 
 import pytest
+from tests.historical_guard_fixture import isolated_guard
 
 
 ROOT = Path(__file__).resolve().parents[1]
 PRELUDE = r'''
-import hashlib, importlib.util, json, sys
+import hashlib, importlib.util, json, sys, os
 from pathlib import Path
 from types import SimpleNamespace
 from starlette.applications import Starlette
 sys.dont_write_bytecode = True
-root = Path.cwd()
+root = Path(os.environ['SOLSLOT_TEST_GUARD_ROOT'])
 ops = root / 'ops/sgt-chain-time-AE203'
 sys.path.insert(0, str(ops))
 def load(name, path):
@@ -27,18 +28,13 @@ pins = json.loads((fixtures / 'pins.json').read_text())
 for name, digest in pins.items():
     assert hashlib.sha256((fixtures / name).read_bytes()).hexdigest() == digest
 factory = load('factory203', ops / 'solslot_chain_time_AE203.py')
-factory.RELEASE = root.parent
+factory.RELEASE = Path.cwd().parent
 admission = load('held_admission', fixtures / 'AE178/api/solslot_stamp_fee_admission_AE178.py')
 '''
 
 
 def isolated(code):
-    result = subprocess.run(
-        [sys.executable, '-c', PRELUDE + code], cwd=ROOT,
-        env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
-        capture_output=True, text=True, timeout=40,
-    )
-    assert result.returncode == 0, result.stderr
+    isolated_guard(ROOT, PRELUDE + code, '69547ae5cb2cbba0486e02e16b50f3779db3c292')
 
 
 def test_held_guard_rejects_old_pin_then_full_guard_composition_succeeds():

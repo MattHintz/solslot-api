@@ -395,6 +395,10 @@ class ChiaProvider:
         estimate_args = {"spend_bundle": spend_bundle} if spend_bundle is not None else {"cost": cost}
         from .chia_snapshot import active_snapshot
         snapshot = active_snapshot()
+        if snapshot is not None:
+            # Admission uses a new raw quote, but it must still belong to this
+            # snapshot's exact provider, node and network before/after awaits.
+            snapshot._check(self)
         if snapshot is not None and not require_primary:
             return await snapshot.read(self, "get_fee_estimate", lambda client: client.get_fee_estimate(
                 target_times=target_times, **estimate_args,
@@ -404,11 +408,15 @@ class ChiaProvider:
                 raise ChiaProviderError(
                     "local Chia full node is required for protocol fee estimation"
                 )
+            if snapshot is not None:
+                snapshot._check(self)
             try:
                 result = await self.primary.get_fee_estimate(
                     target_times=target_times,
                     **estimate_args,
                 )
+                if snapshot is not None:
+                    snapshot._check(self)
                 self._last_primary_success_at = _utc_now()
                 return result
             except Exception as exc:

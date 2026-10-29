@@ -1,4 +1,9 @@
-"""Exercise the production publication builder against a freshly farmed chain."""
+"""Historical paused publisher: downstream consensus compatibility only.
+
+The test-only historical fixture isolates the policy pause; live containment
+remains covered without that fixture in test_governance_sponsorship_containment.
+"""
+from tests.historical_reserve_fixture import historical_reserve_native_only
 from types import SimpleNamespace
 
 import pytest
@@ -45,7 +50,7 @@ class SimProvider:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("renewal", [False, True])
-async def test_production_publisher_spends_fresh_issuance_and_statutes(monkeypatch, renewal, tmp_path):
+async def test_production_publisher_spends_fresh_issuance_and_statutes(monkeypatch, renewal, tmp_path, historical_reserve_native_only):
     async with SpendSim.managed(None, defaults=CONSTANTS) as sim:
         client = SimClient(sim)
         world = await fresh_genesis(sim, client)

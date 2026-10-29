@@ -227,8 +227,10 @@ async def test_fee_replay_ignores_clock_telemetry_but_not_quote(changed_fee):
     p.primary.get_fee_estimate = estimate
     async def prepare():
         async with PrimaryReadSnapshot(p, 'testnet11') as s:
-            quote = await p.get_fee_estimate(target_times=[60], cost=100, require_primary=True)
-            assert set(quote) == {'estimates', 'target_times'}
+            from solslot_api.sols_swap_funding import estimate_swap_fee
+            fee = await estimate_swap_fee(SimpleNamespace(provider=p,
+                policy=SimpleNamespace(target_seconds=60,minimum_mojos=0,maximum_mojos=1000)))
+            assert fee == 100 + (1 if changed_fee else 0)
             return await s.finish([('vault', COIN)], binding())
     if changed_fee:
         with pytest.raises(ChiaProviderError, match='observation changed'): await prepare()
@@ -269,3 +271,17 @@ async def test_persistent_input_limit_still_rejects_oversized_snapshot():
     async with PrimaryReadSnapshot(p, 'testnet11') as snapshot:
         with pytest.raises(ChiaProviderError, match='distinct persistent inputs'):
             await snapshot.finish(inputs, binding())
+
+
+@pytest.mark.parametrize('change', ['node', 'network'])
+async def test_fresh_admission_quote_rechecks_snapshot_identity_after_await(change):
+    from dataclasses import replace
+    p=provider()
+    async def estimate(**kwargs):
+        if change=='node':p.primary=Node()
+        else:p.config=replace(p.config,network='mainnet')
+        return {'estimates':[100],'target_times':kwargs['target_times']}
+    p.primary.get_fee_estimate=estimate
+    async with PrimaryReadSnapshot(p,'testnet11'):
+        with pytest.raises(ChiaProviderError,match='provider or lifecycle changed'):
+            await p.get_fee_estimate(target_times=[60],cost=100,require_primary=True)

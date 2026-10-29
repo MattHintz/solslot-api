@@ -14,9 +14,9 @@ concurrency:
 
 env:
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
-  # Exact combined Authority V4 and Base-mainnet alpha protocol source.
+  # Exact deployed Testnet11 generation protocol source.
   # Deployment environment pins remain separately governed.
-  PROTOCOL_REF: 108ac023d836cf0198775eebd377880d0f8d6aef
+  PROTOCOL_REF: dfd41258afde986b817ee95f9dbf3943966c7778
 
 jobs:
   verify:
@@ -26,6 +26,9 @@ jobs:
     steps:
       - name: Checkout API
         uses: actions/checkout@v4
+        with:
+          # Retained operational-guard tests verify exact historical releases.
+          fetch-depth: 0
 
       - name: Require exact protocol commit
         shell: bash
@@ -55,8 +58,8 @@ jobs:
       - name: Install
         run: |
           python -m pip install pip==26.2.1 wheel==0.47.0
-          # Chia 2.7.x requires the yanked zstd 1.5.7.3 wheel exactly.
-          python -m pip install -c constraints.lock zstd==1.5.7.3
+          # Match the approved Chia 2.7.4 runtime and constraints.lock exactly.
+          python -m pip install -c constraints.lock zstd==1.5.7.2
           python -m pip install -c constraints.lock -e solslot-protocol -e '.[dev]'
 
       - name: Dependency audit

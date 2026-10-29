@@ -1,4 +1,5 @@
 """Exercise the production publication builder against a freshly farmed chain."""
+from tests.historical_reserve_fixture import historical_reserve_native_only
 from types import SimpleNamespace
 
 import pytest
@@ -23,7 +24,7 @@ from tests.test_alpha_governance_publisher import SimProvider
 @pytest.mark.asyncio
 @pytest.mark.parametrize("auth_type", [1, 3], ids=["bls", "evm"])
 @pytest.mark.parametrize("deadline_release", [False, True])
-async def test_production_governance_can_resume_and_repeat(monkeypatch, auth_type, deadline_release):
+async def test_production_governance_can_resume_and_repeat(monkeypatch, auth_type, deadline_release, historical_reserve_native_only):
     async with SpendSim.managed(None, defaults=CONSTANTS) as sim:
         client = SimClient(sim)
         world = await fresh_genesis(sim, client)

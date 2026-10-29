@@ -5,6 +5,7 @@ leaves the private hold until that hold is atomically promoted to a signed
 execution. This permits expiry of an unsealed hold, never of an execution.
 """
 from __future__ import annotations
+from .chia_snapshot import active_snapshot
 
 from dataclasses import asdict
 import hashlib
@@ -175,8 +176,10 @@ async def reserve_funding(submitter, store, evidence, binding, operation, expire
 
 async def estimate_swap_fee(submitter):
     # Never disclose a signed bundle to an estimation RPC before promotion.
+    # A review snapshot already enforces the primary node and replays its quote.
+    # Outside that scope, require a fresh primary-only quote explicitly.
     response = await submitter.provider.get_fee_estimate(target_times=[submitter.policy.target_seconds],
-        cost=COST_UPPER_BOUND, require_primary=True)
+        cost=COST_UPPER_BOUND, require_primary=active_snapshot() is None)
     estimates = response.get("estimates")
     if (response.get("target_times") != [submitter.policy.target_seconds]
             or not isinstance(estimates, list) or len(estimates) != 1
