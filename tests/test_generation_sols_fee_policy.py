@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from solslot_api import generation_sols_policy
 from solslot_api.config import get_settings
 from solslot_api.generation_sols_batch_routes import router
 from solslot_api.generation_sols_policy import REVIEWED_FEES,current_fee_policy,require_order_policy
@@ -11,8 +12,11 @@ from tests.test_generation_sols_orders import GEN,DEST,book,offer
 
 
 @pytest.mark.parametrize('fault',['missing','stale','future','generation','changed','missing-policy'])
-def test_new_orders_require_fresh_same_generation_exact_fee_review(tmp_path,fault):
+def test_new_orders_require_fresh_same_generation_exact_fee_review(tmp_path,fault,monkeypatch):
     b=book(tmp_path);now=int(time.time())
+    # Both direct policy and HTTP checks observe the same instant. A future
+    # timestamp must not become current merely because native setup took a second.
+    monkeypatch.setattr(generation_sols_policy, 'time', SimpleNamespace(time=lambda:now))
     catalog={'generationId':GEN,'lastCheckedAt':now,'ready':True,'feePolicy':dict(REVIEWED_FEES)}
     if fault=='stale':catalog['lastCheckedAt']=now-46
     if fault=='future':catalog['lastCheckedAt']=now+1
