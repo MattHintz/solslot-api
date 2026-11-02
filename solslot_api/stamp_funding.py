@@ -89,12 +89,13 @@ def continue_stamp(bundle, vault_coin_id, timestamp):
 
 class StampFundingStore:
     """Separate journal; rolling back code never requires rewriting credentials."""
-    def __init__(self, path):
+    def __init__(self, path, *, generation_id=None):
         self.path = str(path)
         self.lock = threading.RLock()
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.db = connect_generation_sqlite(self.path, isolation_level=None, check_same_thread=False)
+        self.db = connect_generation_sqlite(self.path, generation_id=generation_id,
+            isolation_level=None, check_same_thread=False)
         if self.path != ":memory:":os.chmod(self.path,0o600)
         self.db.row_factory = sqlite3.Row
         self.db.execute('PRAGMA synchronous=FULL')
@@ -150,6 +151,9 @@ class StampFundingStore:
         with self.lock:
             rows = self.db.execute("SELECT document FROM stamp_submissions WHERE status NOT IN ('confirmed','superseded')").fetchall()
         return {json.loads(r[0])['feeCoinId'] for r in rows}
+
+    def close(self):
+        with self.lock:self.db.close()
 
 
 def bind_store(submitter, store):

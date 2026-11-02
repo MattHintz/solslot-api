@@ -1499,6 +1499,21 @@ class Settings(BaseSettings):
     generation_sols_batch_enabled: bool=False
     generation_sols_orders_db_path: str='./state/generation-sols-orders.sqlite3'
     generation_execution_enabled: bool = False
+    generation_customer_enabled: bool = False
+    generation_customer_db_path: str = './state/generation-customers.sqlite3'
+    generation_customer_public_origin: str = 'https://solslot.com'
+    generation_customer_policy_path: str = ''
+    generation_customer_policy_hash: str = ''
+    generation_customer_signer_key_path: str = ''
+    generation_customer_fee_db_path: str = './state/customer-fees.sqlite3'
+    generation_customer_identity_enabled: bool = False
+    generation_customer_identity_profile_path: str = ''
+    generation_customer_identity_profile_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
+    generation_customer_identity_authority_path: str = ''
+    generation_customer_identity_authority_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
+    generation_customer_identity_fee_signer_key_path: str = ''
+    generation_customer_identity_relayer_key_path: str = ''
+    generation_customer_identity_funding_db_path: str = './state/customer-identity-funding.sqlite3'
     vault_registry_path: str = "./state/vault_registry_v2.db"
     test_collection_editions_enabled: bool = False
     collection_source_archive_db_path: Optional[str] = None
@@ -1590,7 +1605,16 @@ class Settings(BaseSettings):
 
     @model_validator(mode='after')
     def isolate_generation_runtime(self):
+        from urllib.parse import urlsplit
+        origin=urlsplit(self.generation_customer_public_origin)
+        if (origin.scheme!='https' or not origin.hostname or origin.username or origin.password
+                or origin.path or origin.query or origin.fragment
+                or self.generation_customer_public_origin != f'https://{origin.netloc}'
+                or origin.netloc != origin.netloc.lower()):
+            raise ValueError('customer registration requires an exact HTTPS origin')
         if self.deployment_generation_id is None:
+            if self.generation_customer_enabled:
+                raise ValueError('customer registration requires a separate Testnet generation')
             if self.generation_recovery_storage_enabled:
                 raise ValueError('generation recovery storage requires a separate Testnet generation')
             if self.generation_launch_enabled:
@@ -1607,7 +1631,7 @@ class Settings(BaseSettings):
         # private documents, recovery locations or the read-only old archive.
         for field in ('genesis_db_path','zkpassport_ledger_db_path','payment_purchase_db_path',
             'stripe_delivery_db_path','admin_db_path','generation_preparation_db_path','generation_index_db_path','generation_operations_db_path','generation_consents_db_path','generation_ballots_db_path','generation_mint_reviews_db_path',
-            'generation_launch_db_path','generation_sols_orders_db_path',
+            'generation_launch_db_path','generation_sols_orders_db_path','generation_customer_db_path','generation_customer_fee_db_path','generation_customer_identity_funding_db_path',
             'vault_registry_path','sols_capability_operations_path','challenge_store_path',
             'genesis_output_dir','deployment_manifest_path','public_artifact_path','bootstrap_manifest_path'):
             setattr(self,field,generation_path(getattr(self,field),self.deployment_generation_id))

@@ -269,11 +269,18 @@ class ServerHardeningMiddleware:
         if str(scope.get("method", "")).upper() != "POST":
             return False
         path = str(scope.get("path", "")).rstrip("/")
+        root = str(scope.get('root_path','')).rstrip('/')
+        if root and path.startswith(root+'/'):
+            path=path[len(root):]
         if path == "/auth/challenge":
             return True
         if path in {'/sols/batches/review','/sols/batches/orders'}:
             # Native offer inspection has a cost bound and also needs the
             # existing per-source budget before parsing any submitted puzzle.
+            return True
+        if path == '/customer/registration/reviews' or path.startswith('/customer/registration/reviews/'):
+            # Bound malformed requests too, before puzzle, signature or body
+            # parsing. Status GETs consume no mutation budget.
             return True
         parts = path.split("/")
         # Count before route/path/body validation. Canonical ASGI paths are

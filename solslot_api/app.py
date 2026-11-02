@@ -696,6 +696,19 @@ async def lifespan(app: FastAPI):
     app.state.generation_index = configured_generation_index(settings, app.state.coinset)
     if app.state.generation_index is not None and app.state.generation_operations is None:
         raise RuntimeError('generation index started without its durable operation journal')
+    from .generation_customer_factory import configured_generation_customers
+    from .state import get_registry
+    app.state.generation_customers = configured_generation_customers(settings,
+        index=app.state.generation_index,provider=app.state.coinset,
+        journal=app.state.generation_operations,
+        registry=get_registry() if getattr(settings,'generation_customer_enabled',False) else None)
+    generation_customer_task = (
+        asyncio.create_task(app.state.generation_customers.run(),name='generation-customer-observer')
+        if app.state.generation_customers is not None else None)
+    from .generation_customer_identity_factory import configured_current_customer_identity
+    app.state.generation_customer_identity=configured_current_customer_identity(settings,app.state.generation_customers)
+    generation_customer_identity_task=(asyncio.create_task(app.state.generation_customer_identity.run(),
+        name='generation-customer-identity-observer') if app.state.generation_customer_identity is not None else None)
     from .generation_recipient_execution import GenerationRecipientObserver
     recipient_observer = (GenerationRecipientObserver(app.state.generation_preparation,
         app.state.generation_operations, app.state.coinset) if app.state.generation_preparation is not None else None)
@@ -735,6 +748,17 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if generation_customer_identity_task is not None:
+            generation_customer_identity_task.cancel()
+            with suppress(asyncio.CancelledError):await generation_customer_identity_task
+        if app.state.generation_customer_identity is not None:app.state.generation_customer_identity.close()
+        app.state.generation_customer_identity=None
+        if generation_customer_task is not None:
+            generation_customer_task.cancel()
+            with suppress(asyncio.CancelledError):await generation_customer_task
+        if app.state.generation_customers is not None:
+            app.state.generation_customers.close()
+        app.state.generation_customers=None
         if generation_admission_task is not None:
             generation_admission_task.cancel()
             with suppress(asyncio.CancelledError):await generation_admission_task
@@ -875,6 +899,11 @@ app.include_router(sols_swaps_router)
 
 # zkPassport vault bridge enrollment index (public receipt material only).
 app.include_router(zkpassport_enrollments_router)
+from .generation_customer_routes import router as generation_customer_router, session_router as generation_customer_session_router
+app.include_router(generation_customer_router)
+app.include_router(generation_customer_session_router)
+from .generation_customer_identity_routes import router as current_customer_identity_router
+app.include_router(current_customer_identity_router)
 
 # zkPassport gasless relayer (ERC-2771 meta-tx; 503 when relayer key is unset).
 app.include_router(zkpassport_relay_router)

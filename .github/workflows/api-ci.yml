@@ -3,7 +3,7 @@ name: Solslot API CI
 on:
   pull_request:
   push:
-    branches: [main, staging]
+    branches: [main, staging, release/current-testnet-AE328]
 
 permissions:
   contents: read
@@ -16,7 +16,7 @@ env:
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
   # Exact deployed Testnet11 generation protocol source.
   # Deployment environment pins remain separately governed.
-  PROTOCOL_REF: 031901d53702329853d548d0a5aaabd0a4b8db1a
+  PROTOCOL_REF: 0b7dc594f5f6d8144340faa5e910d904fcad916c
 
 jobs:
   verify:

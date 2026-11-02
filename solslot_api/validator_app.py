@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from .base_inventory_hold import BaseHoldClaim
 from .validator_base_inventory_hold import sign_base_inventory_hold
@@ -26,8 +26,10 @@ from .validator_quorum import (
     PrimaryPurchaseClaim,
     StripeSettlementClaim,
     ValidatorClaim,
+    CurrentIdentityClaim,
     PermitValidatorClaim,
     ValidatorSignatureResponse,
+    ValidatorHealthResponse,
     VoucherIssuanceClaim,
     VoucherSeriesPhaseClaim,
     VoucherTransitionClaim,
@@ -54,6 +56,12 @@ class ValidatorSignRequest(BaseModel):
 
     claim: PermitValidatorClaim | ValidatorClaim
     claimHash: str
+
+
+class CurrentIdentitySignRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    claim: CurrentIdentityClaim
+    claimHash: str = Field(pattern=r'^0x[0-9a-f]{64}$')
 
 
 from .generation_sols_batch_execution import PrimaryBatchClaim
@@ -154,24 +162,6 @@ class VoucherSeriesPhaseSignRequest(BaseModel):
     claimHash: str
 
 
-class ValidatorHealthResponse(BaseModel):
-    status: str
-    signerIndex: int
-    validatorPubkey: str
-    apiCommit: str
-    protocolCommit: str
-    network: str
-    bridgePolicyHash: str
-    evmAddresses: dict[str, str]
-    artifactHash: str | None
-    artifactReady: bool
-    ledgerReady: bool
-    evmChainId: int = 11155111
-    enrollmentActivation: dict[str, Any] | None = None
-    identityDeploymentRevision: int = 0
-    identityDeploymentHash: str | None = None
-
-
 def create_validator_app(
     *,
     settings: ValidatorSettings | None = None,
@@ -203,7 +193,7 @@ def create_validator_app(
         identity_provider = None
         application.state.identity_deployment = None
         application.state.identity_provider = None
-        if Path(signer_settings.public_artifact_path).is_file():
+        if Path(signer_settings.public_artifact_path).is_file() and not signer_settings.generation_customer_identity_enabled:
             artifact, _release = load_validator_artifact(signer_settings)
             identity_provider = create_chia_provider(
                 ChiaProviderConfig(
@@ -225,18 +215,25 @@ def create_validator_app(
             )
         application.state.generation_provider=None
         generation_provider=None
-        if signer_settings.generation_sols_batch_enabled:
+        if signer_settings.generation_sols_batch_enabled or signer_settings.generation_customer_identity_enabled:
             from .generation_sols_batch_validators import generation_settings
             from .generation_index import load_generation_read_anchor
             load_generation_read_anchor(generation_settings(signer_settings))
             if not signer_settings.generation_primary_url:
                 raise RuntimeError('generation delivery requires an independent primary node')
-            generation_provider=create_chia_provider(ChiaProviderConfig(network='testnet11',
+            if signer_settings.generation_primary_readonly_gateway:
+                from .generation_primary_reader import private_primary_reader
+                generation_provider = private_primary_reader(signer_settings)
+            else:
+                generation_provider=create_chia_provider(ChiaProviderConfig(network='testnet11',
                 primary_url=signer_settings.generation_primary_url,fallback_url=signer_settings.coinset_base_url,primary_required=True,
                 primary_ca_cert_path=signer_settings.generation_primary_ca_cert_path,
                 primary_client_cert_path=signer_settings.generation_primary_client_cert_path,
                 primary_client_key_path=signer_settings.generation_primary_client_key_path))
             await generation_provider.start();application.state.generation_provider=generation_provider
+        if signer_settings.generation_customer_identity_enabled:
+            from .generation_customer_identity_validators import selected_current_identity_profile
+            selected_current_identity_profile(signer_settings)
         try:
             yield
         finally:
@@ -254,6 +251,31 @@ def create_validator_app(
         openapi_url=None,
         lifespan=lifespan,
     )
+
+    @application.middleware('http')
+    async def current_signer_scope(request, call_next):
+        from fastapi.responses import JSONResponse
+        if getattr(current_settings(), 'generation_customer_identity_enabled', False):
+            permitted = {('GET', '/health'), ('POST', '/v1/generation/identity/sign')}
+            if (request.method, request.url.path) not in permitted:
+                return JSONResponse({'detail': 'CURRENT_SIGNER_ACTION_DISABLED'}, status_code=404)
+        return await call_next(request)
+
+    @application.post('/v1/generation/identity/sign', response_model=ValidatorSignatureResponse)
+    async def sign_generation_identity(body: CurrentIdentitySignRequest):
+        import asyncio
+        from .generation_customer_identity_validators import sign_current_identity
+        settings = current_settings()
+        provider = getattr(application.state, 'generation_provider', None)
+        if not settings.generation_customer_identity_enabled or provider is None:
+            raise HTTPException(503, detail='CURRENT_ID_SIGNER_NOT_READY')
+        try:
+            async with asyncio.timeout(45):
+                return await sign_current_identity(settings, application.state.validator_ledger,
+                    body.claim, body.claimHash, provider=provider)
+        except Exception as exc:
+            # Proofs, provider payloads and signatures must not appear in errors.
+            raise HTTPException(409, detail='CURRENT_ID_INDEPENDENT_EVIDENCE_REJECTED') from exc
 
     @application.post('/v1/generation/primary-sols/sign',response_model=ValidatorSignatureResponse)
     async def sign_generation_primary(body:PrimaryBatchSignRequest):
@@ -280,7 +302,7 @@ def create_validator_app(
                 raise HTTPException(status_code=503, detail="permit health release does not match the reviewed activation")
         artifact_hash: str | None = None
         artifact_ready = False
-        if Path(signer_settings.public_artifact_path).is_file():
+        if Path(signer_settings.public_artifact_path).is_file() and not signer_settings.generation_customer_identity_enabled:
             try:
                 artifact, _ = load_validator_artifact(signer_settings)
                 artifact_hash = str(artifact["artifactHash"])
@@ -288,6 +310,15 @@ def create_validator_app(
             except ValidatorEvidenceError as exc:
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
         active_ledger: ValidatorLedger = application.state.validator_ledger
+        current_profile = None
+        if signer_settings.generation_customer_identity_enabled:
+            from .generation_customer_identity_validators import selected_current_identity_profile
+            try:
+                current_profile = selected_current_identity_profile(signer_settings)
+                if getattr(application.state, 'generation_provider', None) is None:
+                    raise ValueError('current primary provider missing')
+            except (ValueError, OSError) as exc:
+                raise HTTPException(503, detail='CURRENT_ID_SIGNER_NOT_READY') from exc
         return ValidatorHealthResponse(
             status="healthy",
             signerIndex=signer_settings.signer_index,
@@ -304,6 +335,9 @@ def create_validator_app(
             artifactHash=artifact_hash,
             artifactReady=artifact_ready,
             ledgerReady=active_ledger.healthcheck(),
+            currentIdentityGeneration=current_profile.generation_id if current_profile else None,
+            currentIdentityProfileHash=current_profile.commitment if current_profile else None,
+            currentIdentityConfigured=current_profile is not None,
             evmChainId=signer_settings.evm_chain_id,
             enrollmentActivation=signer_settings.enrollment_activation,
             identityDeploymentRevision=(

@@ -44,6 +44,9 @@ class ValidatorSettings(BaseSettings):
     identity_network_plan_hash: str = ""
 
     generation_sols_batch_enabled:bool=False
+    generation_customer_identity_enabled:bool=False
+    generation_customer_identity_profile_path:str=''
+    generation_customer_identity_profile_hash:str=Field(default='', pattern=r'^(|0x[0-9a-f]{64})$')
     deployment_generation_id:str|None=Field(default=None,pattern=r'^0x[0-9a-f]{64}$')
     generation_preparation_path:str|None=None
     generation_preparation_hash:str|None=None
@@ -53,6 +56,7 @@ class ValidatorSettings(BaseSettings):
     generation_primary_ca_cert_path:str|None=None
     generation_primary_client_cert_path:str|None=None
     generation_primary_client_key_path:str|None=None
+    generation_primary_readonly_gateway:bool=False
 
     network: Literal["testnet11"] = "testnet11"
     coinset_base_url: str = "https://testnet11.api.coinset.org"
@@ -122,6 +126,23 @@ class ValidatorSettings(BaseSettings):
 
     @model_validator(mode="after")
     def _permit_deployment(self) -> "ValidatorSettings":
+        if self.generation_primary_readonly_gateway:
+            from .generation_primary_reader import PRIMARY_READER_URL
+            if (not self.generation_customer_identity_enabled
+                    or self.generation_primary_url != PRIMARY_READER_URL
+                    or not self.generation_primary_ca_cert_path
+                    or self.generation_primary_client_cert_path
+                    or self.generation_primary_client_key_path):
+                raise ValueError('private native reader must use its exact TLS and generation boundary')
+        if self.generation_customer_identity_enabled:
+            if (self.enrollment_activation is not None or self.evm_chain_id != 8453
+                    or not all((self.deployment_generation_id, self.generation_preparation_path,
+                        self.generation_preparation_hash, self.generation_chain_anchor_path,
+                        self.generation_chain_anchor_hash, self.generation_primary_url,
+                        self.generation_customer_identity_profile_path,
+                        self.generation_customer_identity_profile_hash))):
+                raise ValueError('current identity signer requires an exact profile and independent native generation source')
+            return self
         if self.enrollment_activation is None:
             if self.evm_chain_id != 11155111:
                 # This is only a completeness check. Startup and every identity

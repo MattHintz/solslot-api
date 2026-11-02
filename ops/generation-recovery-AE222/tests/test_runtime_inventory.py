@@ -30,7 +30,7 @@ async def test_actual_startup_and_lazy_journals_have_recoverable_paths(tmp_path,
     fields=['genesis_db_path','zkpassport_ledger_db_path','payment_purchase_db_path','stripe_delivery_db_path',
         'admin_db_path','generation_preparation_db_path','generation_launch_db_path','generation_index_db_path',
         'generation_operations_db_path','generation_consents_db_path','generation_ballots_db_path',
-        'generation_mint_reviews_db_path','generation_sols_orders_db_path','vault_registry_path',
+        'generation_mint_reviews_db_path','generation_sols_orders_db_path','generation_customer_db_path','generation_customer_fee_db_path','generation_customer_identity_funding_db_path','vault_registry_path',
         'sols_capability_operations_path','challenge_store_path']
     paths={name:str(base/Path(getattr(defaults,name)).name) for name in fields}
     preparation={};identity=GEN

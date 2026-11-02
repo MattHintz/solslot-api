@@ -25,7 +25,7 @@ from .protocol_submission import PreparedProtocolBundle, ProtocolSubmissionError
 
 KINDS = frozenset({'ANCHOR_VOTE', 'FINALIZE_VOTE', 'RATIFY_UPGRADE', 'ACTIVATE_UPGRADE',
                    'RATIFY_REOPENING', 'REOPEN_OPERATIONS', 'OPEN_PROPOSAL', 'CAST_VOTE', 'UNLOCK_STAKES',
-                   'APPLY_PARAMETERS', 'APPLY_STATUTES', 'FUND_REDEMPTION', 'CLOSE_REWARD_EPOCH', 'ADVANCE_SGT_REWARDS','CLAIM_SGT_REWARD', 'CREATE_RECIPIENT_VAULT', 'INITIALIZE_GENERATION', 'PROVE_STATE', 'PAUSE_NEW_OPERATIONS', 'MINT_COLLECTION', 'PRIMARY_SOLS_BATCH'})
+                   'APPLY_PARAMETERS', 'APPLY_STATUTES', 'FUND_REDEMPTION', 'CLOSE_REWARD_EPOCH', 'ADVANCE_SGT_REWARDS','CLAIM_SGT_REWARD', 'CREATE_RECIPIENT_VAULT', 'CREATE_CUSTOMER_VAULT', 'INITIALIZE_GENERATION', 'PROVE_STATE', 'PAUSE_NEW_OPERATIONS', 'MINT_COLLECTION', 'PRIMARY_SOLS_BATCH'})
 # Native mint/allocation builders do not become publicly submit-able merely
 # because they exist. Add a journal kind only with its sealed-source review,
 # exact UI lifecycle, funding holds, admission and reconciliation integration.
@@ -130,6 +130,13 @@ class GenerationOperationJournal:
         if request_digest is not None:
             generation_bytes(request_digest)
         document=None
+        if operation.kind=='CREATE_CUSTOMER_VAULT':
+            from .generation_customer_execution import validate_customer_bundle
+            _,_,output=validate_customer_bundle(protocol,request_document)
+            if (len(operation.successors)!=1 or operation.successors[0].coin!=output
+                    or operation.auxiliary_outputs):
+                raise ValueError('customer creation requires its exact native custody output')
+            operation.successors[0].validate()
         if operation.kind=='MINT_COLLECTION' and (request_document is None or len(operation.successors)!=3
                 or not 1<=len(operation.auxiliary_outputs)<=100
                 or len(operation.spends)!=3+2*len(operation.auxiliary_outputs)):

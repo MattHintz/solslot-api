@@ -73,13 +73,12 @@ def base_settlement_evidence_hash(evidence: dict[str, Any]) -> str:
     return "0x" + hashlib.sha256(encoded).hexdigest()
 
 
-class ValidatorClaim(BaseModel):
+class IdentityAttestationEvidence(BaseModel):
     """All public evidence a signer must independently revalidate."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     network: str
-    artifact_hash: str
     vault_launcher_id: str
     current_vault_coin_id: str
     owner_key: str
@@ -105,7 +104,6 @@ class ValidatorClaim(BaseModel):
     validator_message: str
 
     @field_validator(
-        "artifact_hash",
         "vault_launcher_id",
         "current_vault_coin_id",
         "owner_authorization_hash",
@@ -151,6 +149,33 @@ class ValidatorClaim(BaseModel):
             + bytes.fromhex(self.bridge_coin_id[2:])
             + additional_data
         )
+
+
+class ValidatorClaim(IdentityAttestationEvidence):
+    """Legacy signed-artifact claim; its canonical wire hash is unchanged."""
+
+    artifact_hash: str
+
+    @field_validator('artifact_hash')
+    @classmethod
+    def _artifact_hash(cls, value: str) -> str:
+        return _hex(value, 32, 'artifact_hash')
+
+
+class CurrentIdentityClaim(IdentityAttestationEvidence):
+    """Fresh generation evidence never masquerades as a signed genesis."""
+
+    claim_version: Literal['solslot.current-customer-identity-claim.v1']
+    generation_id: str
+    identity_profile_hash: str
+
+    @field_validator('generation_id', 'identity_profile_hash')
+    @classmethod
+    def _current_hash(cls, value: str, info) -> str:
+        result = _hex(value, 32, info.field_name)
+        if result == '0x' + '00' * 32:
+            raise ValueError('current identity bindings must be nonzero')
+        return result
 
 
 class PermitValidatorClaim(ValidatorClaim):
@@ -1083,6 +1108,11 @@ class ValidatorHealthResponse(BaseModel):
     ledgerReady: bool
     evmChainId: int = 11155111
     enrollmentActivation: dict[str, Any] | None = None
+    identityDeploymentRevision: int = Field(default=0,ge=0)
+    identityDeploymentHash: str | None = Field(default=None,pattern=r'^0x[0-9a-f]{64}$')
+    currentIdentityGeneration: str | None = Field(default=None,pattern=r'^0x[0-9a-f]{64}$')
+    currentIdentityProfileHash: str | None = Field(default=None,pattern=r'^0x[0-9a-f]{64}$')
+    currentIdentityConfigured: bool = False
 
 
 @dataclass(frozen=True)
@@ -1273,7 +1303,7 @@ async def probe_validator_health(
 
 async def collect_validator_quorum(
     settings: Settings,
-    claim: ValidatorClaim,
+    claim: ValidatorClaim | CurrentIdentityClaim,
     *,
     client: httpx.AsyncClient | None = None,
 ) -> ValidatorQuorumResult:
@@ -1291,7 +1321,8 @@ async def collect_validator_quorum(
         client = _private_validator_client(settings)
 
     async def request_signature(index: int, url: str) -> tuple[int, G2Element] | None:
-        endpoint = url.rstrip("/") + "/v1/zkpassport/sign"
+        endpoint = url.rstrip("/") + ('/v1/generation/identity/sign'
+            if isinstance(claim, CurrentIdentityClaim) else '/v1/zkpassport/sign')
         try:
             response = await client.post(
                 endpoint,

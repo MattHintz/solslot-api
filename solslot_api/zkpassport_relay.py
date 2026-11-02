@@ -152,7 +152,29 @@ _EMITTER_SECURITY_ABI = [
 
 
 def _load_settings() -> Settings:
+    from .generation_customer_identity_scope import current_identity_scope
+    selected=current_identity_scope()
+    if selected is not None:return selected.settings
     return Settings()
+
+
+def _require_relay_writes(settings):
+    from .generation_customer_identity_scope import current_identity_scope
+    selected=current_identity_scope(settings)
+    if selected is None:return require_alpha_writes(settings)
+    try:selected.runtime.require_relay(selected)
+    except (ValueError,AttributeError) as exc:
+        raise HTTPException(503,detail='CURRENT_ID_RELAY_NOT_AUTHORIZED') from exc
+
+
+def _current_relay_live(settings):
+    from .generation_customer_identity_scope import current_identity_scope
+    try:
+        selected=current_identity_scope(settings)
+        if selected is None:return False
+        selected.runtime.require_relay(selected)
+        return True
+    except (ValueError,AttributeError):return False
 
 
 @cache
@@ -198,6 +220,18 @@ def _decode_enrollment_calldata(data: bytes) -> tuple[str, str, int]:
 def _validate_relay_permit(settings, enrollment, session, data: bytes, *, live=False,
         identity_deployment=None):
     from .enrollment_permit_runtime import require_calldata_record, require_private_age_query
+    from .generation_customer_identity_scope import current_identity_scope
+    scope=current_identity_scope(settings,enrollment.get('vaultLauncherId'))
+    if scope is not None:
+        from .generation_customer_identity_evm import require_current_identity_query
+        try:
+            scope.require_record(enrollment)
+            require_calldata_record(data,enrollment,None)
+            require_current_identity_query(data,scope.profile,launcher=scope.launcher)
+            if live:_require_relay_writes(settings)
+        except ValueError as exc:
+            raise HTTPException(409,detail='CURRENT_ID_RELAY_QUERY_REJECTED') from exc
+        return None
     selected = bool(settings.enrollment_permit_release_identity or enrollment.get("enrollmentPermit"))
     permit = _record_permit(settings, enrollment, owner_auth_type=session.vault_record.auth_type,
         owner_key=session.owner_key, now=int(time.time()) if live else None) if selected else None
@@ -220,6 +254,19 @@ def _validate_relay_permit(settings, enrollment, session, data: bytes, *, live=F
 
 
 def _require_relayer_account(settings: Settings):
+    from .generation_customer_identity_scope import current_identity_scope
+    current = current_identity_scope(settings)
+    if current is not None:
+        _require_relay_writes(settings)
+        if getattr(settings, 'generation_customer_identity_relayer_key_path', ''):
+            if settings.zkpassport_relayer_private_key_hex:
+                raise HTTPException(503, detail='CURRENT_ID_RELAYER_SOURCE_AMBIGUOUS')
+            from .generation_customer_identity_credentials import current_relayer_account
+            try:
+                return current_relayer_account(settings.generation_customer_identity_relayer_key_path,
+                    current.profile.trusted_direct_relayer)
+            except (ValueError, OSError):
+                raise HTTPException(503, detail='CURRENT_ID_RELAYER_CREDENTIAL_UNAVAILABLE') from None
     key = settings.zkpassport_relayer_private_key_hex
     if not key:
         raise HTTPException(
@@ -331,6 +378,22 @@ def _verify_emitter_deployment(
     expected_forwarder: str | None = None,
     expected_direct_relayer: str | None = None,
 ) -> None:
+    from .generation_customer_identity_scope import current_identity_scope
+    scope=current_identity_scope(settings)
+    if scope is not None:
+        from .generation_customer_identity_evm import verify_current_identity_contracts
+        try:
+            height=int(w3.eth.block_number)-settings.zkpassport_evm_min_confirmations+1
+            before=w3.eth.get_block(height)
+            addresses=verify_current_identity_contracts(w3,scope.profile,height)
+            if (emitter_address.lower()!=addresses['attestationEmitter']
+                    or (expected_forwarder and expected_forwarder.lower()!=addresses['forwarder'])
+                    or (expected_direct_relayer and expected_direct_relayer.lower()!=scope.profile.trusted_direct_relayer)
+                    or w3.eth.get_block(height)['hash']!=before['hash']):
+                raise ValueError('current identity deployment changed')
+        except Exception as exc:
+            raise HTTPException(503,detail='CURRENT_ID_EMITTER_EVIDENCE_REJECTED') from exc
+        return
     if settings.enrollment_permit_release_identity:
         from .enrollment_permit_runtime import verify_selected_emitter
         artifact = _active_genesis_artifact(settings)
@@ -382,7 +445,9 @@ class RelayRecoveryResponse(BaseModel):
 def _relay_context(settings, enrollment, session):
     # The full authenticated artifact is bound, including additive activation
     # evidence. No mutable environment value can substitute for its identity.
-    artifact = _active_genesis_artifact(settings)
+    from .generation_customer_identity_scope import current_identity_scope
+    scope=current_identity_scope(settings,enrollment['vaultLauncherId'])
+    artifact = scope.enrollment_binding if scope is not None else _active_genesis_artifact(settings)
     return dict(environment=settings.runtime_environment, network=settings.network,
         chainId=settings.zkpassport_evm_chain_id, emitter=settings.zkpassport_emitter_address.lower(),
         forwarder=(settings.zkpassport_forwarder_address or '').lower(),
@@ -456,7 +521,7 @@ def _relay_receipt_state(w3, settings, saved, enrollment, session):
 
 
 def _dispatch_saved(w3,settings,saved,session,*,identity_deployment=None):
-    require_alpha_writes(settings)
+    _require_relay_writes(settings)
     if getattr(session, 'scope', 'vault') != 'vault':
         raise HTTPException(status_code=403, detail='Reconnect for full vault authorization before resubmitting the retained transaction.')
     ledger=get_credential_ledger(settings)
@@ -518,7 +583,7 @@ def _resume_saved(settings,enrollment,session,saved,*,dispatch,identity_deployme
             raise HTTPException(status_code=409,detail='Enrollment has advanced; check its receipt without submitting again.')
         _dispatch_saved(w3,settings,saved,session,identity_deployment=identity_deployment)
     return RelayRecoveryResponse(vaultLauncherId=enrollment['vaultLauncherId'],status='pending',txHash=saved['tx_hash'],
-        canResubmit=enrollment['status']=='reserved' and settings.alpha_writes_enabled)
+        canResubmit=enrollment['status']=='reserved' and (settings.alpha_writes_enabled or _current_relay_live(settings)))
 
 
 def _recovery_inputs(settings,request,vault_launcher_id):
@@ -668,7 +733,7 @@ def relay(req: RelayRequest, request: Request) -> RelayResponse:
 
     request_tuple = (signer, to, value, gas, req.deadline, data_bytes, sig_bytes)
 
-    require_alpha_writes(settings)
+    _require_relay_writes(settings)
     account = _require_relayer_account(settings)
     context = _relay_context(settings,enrollment,verified_owner)
     w3 = _w3(settings.zkpassport_evm_rpc_url)

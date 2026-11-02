@@ -30,6 +30,9 @@ FIELDS={
     'generation_ballots_db_path':'generation-ballots.sqlite3',
     'generation_mint_reviews_db_path':'generation-mint-reviews.sqlite3',
     'generation_sols_orders_db_path':'generation-sols-orders.sqlite3',
+    'generation_customer_db_path':'generation-customers.sqlite3',
+    'generation_customer_fee_db_path':'customer-fees.sqlite3',
+    'generation_customer_identity_funding_db_path':'customer-identity-funding.sqlite3',
 }
 DERIVED={'zkpassport_v2.db.protocol-funding.sqlite3',
     'zkpassport_v2.db.stamp-funding.sqlite3','protocol-submissions.sqlite3',
@@ -155,6 +158,7 @@ def prepare_recovery_journals(settings,preparation_store):
     from .generation_launch import GenerationLaunchStore
     from .generation_index import GenerationIndexStore
     from .generation_sols_batches import GenerationSolsOrderBook
+    from .generation_customer_store import GenerationCustomerStore
 
     GenesisStore(settings.genesis_db_path,generation_id=generation,network='testnet11')
     with closing(CredentialLedger(settings.zkpassport_ledger_db_path,generation_id=generation)):pass
@@ -177,6 +181,9 @@ def prepare_recovery_journals(settings,preparation_store):
     GenerationLaunchStore.initialize_storage(settings.generation_launch_db_path,generation)
     GenerationIndexStore.initialize_storage(settings.generation_index_db_path,generation)
     GenerationSolsOrderBook.initialize_storage(settings.generation_sols_orders_db_path,generation)
+    GenerationCustomerStore(settings.generation_customer_db_path,generation)
+    with closing(ProtocolFundingStore(settings.generation_customer_fee_db_path)):pass
+    with closing(StampFundingStore(settings.generation_customer_identity_funding_db_path,generation_id=generation)):pass
     # Publish a complete phase in every journal before setting any READY bit.
     # A crash during READY publication can resume only with all21 marked files.
     for name in sorted(DATABASES):_mark(root/name,generation,'INITIALIZING')

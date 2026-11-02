@@ -76,7 +76,7 @@ async def submit_operation(body:SubmitOperation,request:Request,
     if submitter is None:raise HTTPException(503,detail={'code':'GENERATION_SUBMITTER_UNAVAILABLE'})
     try:
         saved=journal.status(identity)
-        if saved['kind'] in ('CREATE_RECIPIENT_VAULT','MINT_COLLECTION','INITIALIZE_GENERATION','PRIMARY_SOLS_BATCH'):
+        if saved['kind'] in ('CREATE_RECIPIENT_VAULT','CREATE_CUSTOMER_VAULT','MINT_COLLECTION','INITIALIZE_GENERATION','PRIMARY_SOLS_BATCH'):
             raise ValueError('recipient/mint execution requires its exact source-scoped action')
         if (body.generation_id!=journal.generation_id or body.intent_hash!=saved['intentHash']
                 or body.fee_cap_mojos!=int(saved['feeCapMojos'])):

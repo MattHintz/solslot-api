@@ -28,6 +28,7 @@ DATABASES = frozenset({
     'generation-index.sqlite3', 'generation-operations.sqlite3',
     'generation-consents.sqlite3', 'generation-ballots.sqlite3',
     'generation-mint-reviews.sqlite3', 'generation-sols-orders.sqlite3',
+    'generation-customers.sqlite3','customer-fees.sqlite3','customer-identity-funding.sqlite3',
 })
 MAX_DATABASE = 256 * 1024**2
 MAX_TOTAL = 512 * 1024**2

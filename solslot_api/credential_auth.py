@@ -366,7 +366,21 @@ def require_vault_record(vault_launcher_id: str) -> VaultRecord:
     return record
 
 
-def _require_credential_action(settings: Settings, action: str, vault: str) -> None:
+def _require_credential_action(settings: Settings, action: str, vault: str, *, current_customer_session=False) -> None:
+    if action == 'relay':
+        from .generation_customer_identity_scope import current_identity_scope
+        scope=current_identity_scope(settings,vault)
+        if scope is not None:
+            try:scope.runtime.require_relay(scope)
+            except (ValueError,AttributeError) as exc:
+                raise HTTPException(503,detail='CURRENT_ID_RELAY_NOT_AUTHORIZED') from exc
+            return
+    # Only the current-customer route opts in, after proving its registration
+    # and live native ancestry. This authorizes sign-in, never relay or spending.
+    if (current_customer_session and action=='session_login' and
+            getattr(settings,'generation_customer_enabled',False) and
+            settings.network=='testnet11' and settings.deployment_generation_id):
+        return
     if action == 'session_login' and not settings.alpha_writes_enabled:
         # A write freeze must not lock an owner out of an existing receipt.
         # The login route issues a restricted recovery session in this state.
@@ -381,9 +395,10 @@ def issue_owner_challenge(
     *,
     vault_launcher_id: str,
     request: OwnerChallengeRequest,
+    current_customer_session: bool = False,
 ) -> OwnerChallengeResponse:
     vault = normalize_hex32(vault_launcher_id, "vaultLauncherId")
-    _require_credential_action(settings, request.action, vault)
+    _require_credential_action(settings, request.action, vault,current_customer_session=current_customer_session)
     record = require_vault_record(vault)
     if record.auth_type == AUTH_TYPE_SECP256K1 and record.owner_evm_address:
         auth_type: Literal["evm", "chia_bls"] = "evm"
@@ -430,9 +445,10 @@ def verify_owner_auth(
     action: CredentialAction,
     payload: dict[str, Any],
     owner_auth: OwnerAuth,
+    current_customer_session: bool = False,
 ) -> VerifiedOwner:
     vault = normalize_hex32(vault_launcher_id, "vaultLauncherId")
-    _require_credential_action(settings, action, vault)
+    _require_credential_action(settings, action, vault,current_customer_session=current_customer_session)
     record = require_vault_record(vault)
     payload_hash = credential_payload_hash(action, vault, payload)
     ledger = get_credential_ledger(settings)
