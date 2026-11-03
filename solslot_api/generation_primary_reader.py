@@ -15,7 +15,7 @@ from .chia_provider import ChiaProvider, ChiaProviderConfig, ChiaProviderError
 from .coinset_client import CoinsetClient
 
 
-PRIMARY_READER_URL = 'https://10.77.0.10:9543/v1/generation/chain'
+PRIMARY_READER_URL = 'https://10.77.0.10:19544/v1/generation/chain'
 HEX32 = re.compile(r'^0x[0-9a-f]{64}$')
 READ_METHODS = frozenset(('get_network_info', 'get_blockchain_state',
     'get_coin_record_by_name', 'get_puzzle_and_solution', 'get_block_record'))

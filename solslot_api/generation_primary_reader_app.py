@@ -1,6 +1,6 @@
 """Restricted public-chain reads on the retained Testnet11 node host only.
 
-Deployment binds TLS to WireGuard 10.77.0.10:9543 and permits only the three
+Deployment pins TLS to the reviewed private WireGuard endpoint and permits only the three
 private signer IPs. Full-node RPC credentials stay in this dedicated reader.
 No signing key, submission method or coordinator database is available here.
 """

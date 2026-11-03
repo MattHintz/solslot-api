@@ -3,7 +3,7 @@ name: Solslot API CI
 on:
   pull_request:
   push:
-    branches: [main, staging, release/current-testnet-AE328]
+    branches: [main, staging, release/current-testnet-AE328, release/private-reader-AE335]
 
 permissions:
   contents: read

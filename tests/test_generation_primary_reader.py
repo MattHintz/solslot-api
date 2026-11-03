@@ -149,3 +149,20 @@ async def test_current_signer_cannot_expose_legacy_signing_routes_without_readin
         for path in ('/v1/zkpassport/sign', '/v1/generation/primary-sols/sign', '/docs', '/openapi.json'):
             response = await client.post(path, json={})
             assert response.status_code == 404 and response.json()['detail'] == 'CURRENT_SIGNER_ACTION_DISABLED'
+
+
+@pytest.mark.parametrize('endpoint', [
+    'https://10.77.0.10:9543/v1/generation/chain',
+    'https://10.77.0.10:19543/v1/generation/chain',
+    'https://10.77.0.11:19544/v1/generation/chain',
+    'http://10.77.0.10:19544/v1/generation/chain',
+])
+def test_retired_conflicting_or_unbound_reader_endpoint_is_rejected(endpoint):
+    settings=SimpleNamespace(network='testnet11',generation_primary_url=endpoint,
+        generation_primary_ca_cert_path='/ca',generation_primary_client_key_path=None,
+        generation_primary_client_cert_path=None)
+    with pytest.raises(ValueError,match='EXACT_PRIVATE'):private_primary_reader(settings)
+
+
+def test_dedicated_reader_endpoint_is_exact_and_stays_private():
+    assert PRIMARY_READER_URL=='https://10.77.0.10:19544/v1/generation/chain'
