@@ -94,5 +94,5 @@ def check_base_dispatch(settings: Any, w3: Any, quote: Mapping[str, Any]) -> Non
         raise RelayFeeUnavailable('Network fees exceed the saved transaction limit. The original proof transaction is preserved.')
     if auxiliary_fee(w3, maximum_signed_bytes=quote['maximumSignedBytes'], gas=quote['gas']) > quote['auxiliaryFeeBudgetWei']:
         raise RelayFeeUnavailable('Network auxiliary fees exceed the reviewed allowance. The original proof transaction is preserved.')
-    if int(w3.eth.get_balance(quote['relayer'], 'pending')) < quote['maximumFeeWei']:
+    if int(w3.eth.get_balance(Web3.to_checksum_address(quote['relayer']), 'pending')) < quote['maximumFeeWei']:
         raise RelayFeeUnavailable('Solslot identity fee funding is low. The original proof transaction is preserved for retry.')
