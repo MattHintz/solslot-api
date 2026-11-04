@@ -54,7 +54,7 @@ class CurrentCustomerIdentityProfile(PreparationModel):
     trusted_direct_relayer:Address=Field(alias='trustedDirectRelayer')
     contracts:tuple[IdentityContract,IdentityContract,IdentityContract,IdentityContract]
     source_identity_amendment:Hash=Field(alias='sourceIdentityAmendment')
-    accepted_proof_versions:tuple[Literal['0.20.0','0.21.0'],...]=Field(alias='acceptedProofVersions',min_length=1,max_length=2)
+    accepted_proof_versions:tuple[Literal['0.20.0','0.21.0','0.21.1'],...]=Field(alias='acceptedProofVersions',min_length=1,max_length=3)
     legacy_vaults_admitted:Literal[False]=Field(alias='legacyVaultsAdmitted')
     legacy_receipts_admitted:Literal[False]=Field(alias='legacyReceiptsAdmitted')
     requires_fresh_private_check:Literal[True]=Field(alias='requiresFreshPrivateCheck')
