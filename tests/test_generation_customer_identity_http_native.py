@@ -110,6 +110,14 @@ async def test_current_id_http_requires_fresh_vault_preserves_work_and_confirms_
             await p.index.run_once()
             await asyncio.sleep(2)
     observer=asyncio.create_task(observe_generation())
+    async def farm_observed_block():
+        # The in-memory Chia simulator uses SQLite shared-cache tables. A
+        # second task must not retain a read transaction while farm_block
+        # writes those same tables. Real primary-node RPC has its own DB
+        # synchronization; serialize only this simulator's writer with the
+        # test observer, retaining the normal live polling assertions.
+        async with p.index._lock:
+            await p.c.sim.farm_block()
     try:
         current_path=ID+'/enrollments/'+launcher
         foreign=await p.client.post(current_path,json={'generationId':'0x'+'91'*32});assert foreign.status_code==409
@@ -206,7 +214,7 @@ async def test_current_id_http_requires_fresh_vault_preserves_work_and_confirms_
         prepared=await p.client.post(current_path+'/stamp/prepare',json={'generationId':generation})
         assert prepared.status_code==200,prepared.text
         owner_signature='0x'+Account.sign_message(encode_typed_data(full_message=prepared.json()['typedData']),secret.key).signature.hex()
-        p.c.sim.pass_time(max(0,int(time.time())-int(p.c.sim.timestamp)));await p.c.sim.farm_block()
+        p.c.sim.pass_time(max(0,int(time.time())-int(p.c.sim.timestamp)));await farm_observed_block()
         before_pushes=p.node.pushes
         posted=await p.client.post(current_path+'/stamp/submit',json={'generationId':generation,'signature':owner_signature})
         assert posted.status_code==200,posted.text
@@ -214,7 +222,7 @@ async def test_current_id_http_requires_fresh_vault_preserves_work_and_confirms_
         repeated=await p.client.post(current_path+'/stamp/submit',json={'generationId':generation,'signature':owner_signature})
         assert repeated.status_code==200,repeated.text
         assert repeated.json()['spendBundleId']==txid and p.node.pushes==before_pushes+1
-        await p.c.sim.farm_block();await p.index.run_once();p.now[0]=int(time.time())
+        await farm_observed_block();await p.index.run_once();p.now[0]=int(time.time())
         synced=await p.client.post(current_path+'/stamp/sync',json={'generationId':generation})
         assert synced.status_code==200,synced.text
         assert synced.json()['enrollment']['status']=='chia_confirmed'
