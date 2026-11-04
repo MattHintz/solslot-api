@@ -97,6 +97,9 @@ async def test_current_id_http_requires_fresh_vault_preserves_work_and_confirms_
     import solslot_api.generation_customer_identity_runtime as runtime_module
     ledger=auth.get_credential_ledger(p.settings)
     for module in (enroll,runtime_module):monkeypatch.setattr(module,'get_credential_ledger',lambda _:ledger)
+    monkeypatch.setattr(runtime_module,'read_current_identity_compatibility',lambda settings,pins,now:{
+        'status':'READY','checkedAt':now,'profileHash':pins.commitment,
+        'proofVersions':list(pins.accepted_proof_versions),'blockNumber':100})
     monkeypatch.setattr(enroll,'get_registry',lambda:p.registry)
     p.runtime.clock=time.time
     service=configured_current_customer_identity(p.settings,p.runtime,clock=time.time)

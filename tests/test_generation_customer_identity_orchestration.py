@@ -102,10 +102,17 @@ async def test_current_identity_get_is_pure_and_mutations_require_exact_generati
     service.cached=lambda _:dict(vaultLauncherId=launcher,status='reserved')
     def forbidden(*a,**kw):raise AssertionError('GET status must not reconcile, sign or submit')
     service.request_reads=forbidden;service.reserve=forbidden
+    service.refresh_compatibility=forbidden
     monkeypatch.setattr(routes,'owner',lambda *a,**kw:SimpleNamespace(owner_key='0x'+'83'*20))
     app=FastAPI();app.include_router(router);app.state.generation_customers=customers;app.state.generation_customer_identity=service
     app.dependency_overrides[get_settings]=lambda:settings
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='https://test',headers={'Origin':'https://test'}) as client:
+        assert (await client.get('/customer/identity/profile')).json()['enrollmentEnabled'] is False
+        service.compatibility={'status':'READY','checkedAt':1000,'profileHash':pins.commitment,
+            'proofVersions':list(pins.accepted_proof_versions),'blockNumber':123}
+        assert (await client.get('/customer/identity/profile')).json()['enrollmentEnabled'] is True
+        service.compatibility['checkedAt']=939
+        assert (await client.get('/customer/identity/profile')).json()['enrollmentEnabled'] is False
         for _ in range(3):
             got=await client.get('/customer/identity/enrollments/'+launcher)
             assert got.status_code==200 and got.json()['status']=='reserved'

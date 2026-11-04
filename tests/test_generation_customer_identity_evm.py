@@ -7,7 +7,7 @@ from web3 import Web3
 from solslot_api.generation_customer_identity_context import CurrentCustomerIdentityProfile
 from solslot_api.generation_customer_identity_evm import (
     require_current_identity_query, verify_current_identity_transaction, FORWARD_ABI,
-    FORWARD_SELECTOR, PROOF_VERSIONS,
+    FORWARD_SELECTOR, PROOF_VERSIONS, verify_current_identity_contracts, read_current_identity_compatibility,
 )
 from solslot_api.enrollment_permit_runtime import BINDING_ABI, PROOF_PARAMS_ABI, LEGACY_SELECTOR
 from tests.test_generation_customer_identity_context import profile
@@ -43,12 +43,43 @@ def evidence(*,forwarded=False):
     calls={bytes(Web3.keccak(text=name))[:4]:value for name,value in values.items()}
     class Eth:
         chain_id=8453
+        supported_versions={PROOF_VERSIONS[v] for v in pins.accepted_proof_versions}
         def get_block(self,height):assert height==123;return {'hash':receipt['blockHash']}
         def get_code(self,address,block_identifier):assert block_identifier==123;return code[address.lower()]
-        def call(self,request,block_identifier):assert block_identifier==123;return calls[bytes.fromhex(request['data'][2:])[:4]]
+        def call(self,request,block_identifier):
+            assert block_identifier==123
+            raw=bytes.fromhex(request['data'][2:])
+            if request['to'].lower()==addresses['verifierAdapter']:
+                assert raw[:4]==bytes(Web3.keccak(text='supportsProofVersion(bytes32)'))[:4]
+                return bytes(31)+bytes([raw[4:] in self.supported_versions])
+            return calls[raw[:4]]
         def get_transaction(self,digest):assert digest==receipt['transactionHash'];return tx
     w3=SimpleNamespace(eth=Eth())
     return pins,w3,receipt,tx,code,calls
+
+
+def test_matching_upstream_and_adapter_code_cannot_admit_an_unsupported_patch():
+    pins,w3,receipt,*_=evidence()
+    document=pins.model_dump(mode='json',by_alias=True)
+    document['acceptedProofVersions'].append('0.21.1')
+    amended=CurrentCustomerIdentityProfile.model_validate(document)
+    with pytest.raises(ValueError,match='CURRENT_ID_EVM_PROOF_VERSION_UNSUPPORTED'):
+        verify_current_identity_contracts(w3,amended,receipt['blockNumber'])
+    w3.eth.supported_versions={*w3.eth.supported_versions,PROOF_VERSIONS['0.21.1']}
+    assert verify_current_identity_contracts(w3,amended,receipt['blockNumber'])['verifierAdapter']
+
+
+def test_compatibility_uses_the_separate_identity_rpc_without_loading_a_signer(monkeypatch):
+    import solslot_api.zkpassport_relay as relay
+    pins,w3,receipt,*_=evidence();w3.eth.block_number=receipt['blockNumber'];urls=[]
+    settings=SimpleNamespace(zkpassport_base_evm_rpc_url='https://base.example.invalid',
+        zkpassport_evm_rpc_url='https://different-network.example.invalid')
+    settings.model_copy=lambda *,update:SimpleNamespace(**{**vars(settings),**update})
+    monkeypatch.setattr(relay,'_w3',lambda url:(urls.append(url),w3)[1])
+    result=read_current_identity_compatibility(settings,pins,1000)
+    assert urls==['https://base.example.invalid']
+    assert result=={'status':'READY','profileHash':pins.commitment,'checkedAt':1000,
+        'blockNumber':123,'proofVersions':list(pins.accepted_proof_versions)}
 
 
 @pytest.mark.parametrize('version',['0.20.0','0.21.0'])
