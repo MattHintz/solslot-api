@@ -16,6 +16,7 @@ from .generation_customer_identity_context import load_current_identity_profile
 from .generation_customer_identity_scope import current_identity_request, current_identity_settings
 from .generation_customer_execution import saved_customer_operation, validate_customer_bundle
 from .vault_chain_evidence import read_vault_coin
+from .generation_customer_identity_evm import read_current_identity_compatibility
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,38 @@ class CurrentCustomerIdentityRuntime:
         self.ledger=get_credential_ledger(settings)
         self.relay_observations={}
         self.health={'status':'RECONCILING','lastCheckedAt':None,'pendingCount':0}
+        self.compatibility={'status':'NOT_CHECKED','checkedAt':None}
+
+    def compatibility_ready(self, profile):
+        value=getattr(self,'compatibility',{})
+        checked=value.get('checkedAt')
+        return (value.get('status')=='READY' and value.get('profileHash')==profile.commitment
+            and value.get('proofVersions')==list(profile.accepted_proof_versions)
+            and type(checked)is int and 0<=int(self.clock())-checked<=60)
+
+    async def refresh_compatibility(self):
+        if not hasattr(self,'_compatibility_lock'):self._compatibility_lock=asyncio.Lock()
+        async with self._compatibility_lock:
+            await self._refresh_compatibility()
+
+    async def _refresh_compatibility(self):
+        profile=self.profile();value=getattr(self,'compatibility',{})
+        checked=value.get('checkedAt')
+        if (value.get('profileHash')==profile.commitment and type(checked)is int
+                and 0<=int(self.clock())-checked<30):
+            if self.compatibility_ready(profile):return
+            if value.get('status')=='UNAVAILABLE':raise ValueError(value['code'])
+        try:
+            self.compatibility=await run_in_threadpool(read_current_identity_compatibility,
+                self.settings,profile,int(self.clock()))
+            if not self.compatibility_ready(profile):raise ValueError('CURRENT_ID_COMPATIBILITY_UNAVAILABLE')
+        except Exception as exc:
+            code=('CURRENT_ID_EVM_PROOF_VERSION_UNSUPPORTED'
+                if isinstance(exc,ValueError) and str(exc)=='CURRENT_ID_EVM_PROOF_VERSION_UNSUPPORTED'
+                else 'CURRENT_ID_COMPATIBILITY_UNAVAILABLE')
+            self.compatibility={'status':'UNAVAILABLE','checkedAt':int(self.clock()),
+                'profileHash':profile.commitment,'code':code}
+            raise ValueError(code) from exc
 
     def profile(self):
         profile=load_current_identity_profile(self.settings,self.customers.index,now=int(self.clock()))
@@ -141,6 +174,9 @@ class CurrentCustomerIdentityRuntime:
 
     async def reserve(self, launcher, owner):
         from .zkpassport_enrollments import EnrollmentRecord, _public_record, _bridge_coin_candidates
+        # This runs before QR/proof creation. Incompatible or stale service
+        # configuration cannot ask a customer to scan a document or sign.
+        await self.refresh_compatibility()
         reads,native=await self.request_reads(launcher,include_event=False,all_bridges=True)
         if native.identity_verified:raise ValueError('CURRENT_ID_ALREADY_CONFIRMED')
         with current_identity_request(self.settings,reads.profile,launcher,self.customers,runtime=reads,clock=self.clock) as scope:
@@ -241,9 +277,12 @@ class CurrentCustomerIdentityRuntime:
 
     async def run_once(self):
         self.profile()
+        compatibility_failed=False
+        try:await self.refresh_compatibility()
+        except ValueError:compatibility_failed=True
         records=self.ledger.all_enrollments()
         pending=[key for key,row in records.items() if row.get('status') in ('reserved','stamp_pending','receipt_syncing')]
-        failures=0
+        failures=int(compatibility_failed)
         start=getattr(self,'_cursor',0)%max(1,len(pending))
         batch=(pending[start:]+pending[:start])[:16]
         self._cursor=start+len(batch)
@@ -253,7 +292,8 @@ class CurrentCustomerIdentityRuntime:
                 else:await self.sync(key)
             except Exception:failures+=1
         self.health={'status':'READY' if not failures else 'DEGRADED','lastCheckedAt':int(self.clock()),
-            'pendingCount':len(pending),'failedChecks':failures}
+            'pendingCount':len(pending),'failedChecks':failures,
+            'compatibility':copy.deepcopy(getattr(self,'compatibility',{}))}
 
     async def run(self):
         while True:

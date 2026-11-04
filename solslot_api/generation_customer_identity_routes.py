@@ -54,10 +54,22 @@ def failure(exc):
     detail=exc.detail if isinstance(exc,HTTPException) else None
     code=detail.get('code') if isinstance(detail,dict) else str(exc)
     safe=code if isinstance(code,str) and re.fullmatch(r'CURRENT_ID_[A-Z_]{1,80}',code) else 'CURRENT_ID_STEP_UNAVAILABLE'
+    message='Your saved check is preserved. Check progress before trying this step again.'
+    if (safe=='CURRENT_ID_EVM_PROOF_VERSION_UNSUPPORTED' or
+            isinstance(exc,HTTPException) and 'UnsupportedProofVersion' in str(detail)):
+        safe='CURRENT_ID_EVM_PROOF_VERSION_UNSUPPORTED'
+        message='The identity verifier needs a compatibility update. Your vault is saved; please wait before starting another scan.'
+    elif isinstance(exc,HTTPException) and isinstance(detail,str):
+        if detail=='ForwardRequest signature/nonce/deadline is invalid.':
+            safe='CURRENT_ID_OWNER_AUTHORIZATION_REJECTED'
+            message='The wallet approval is no longer valid. Reconnect your vault and use the newest wallet request.'
+        elif detail.startswith('Simulation reverted:'):
+            safe='CURRENT_ID_RELAY_SIMULATION_REJECTED'
+            message='The identity contract could not accept this proof. Your vault is saved; please wait before starting another scan.'
     logger.warning('current_identity_step_failed code=%s exception_type=%s',safe,type(exc).__name__)
     if isinstance(exc,HTTPException) and isinstance(detail,dict) and safe==code:return exc
     return HTTPException(exc.status_code if isinstance(exc,HTTPException) else 409,detail={'code':safe,
-        'message':'Your saved check is preserved. Check progress before trying this step again.'})
+        'message':message})
 
 
 @router.get('/profile')
@@ -66,12 +78,13 @@ async def profile(request:Request,response:Response,settings:Configured):
     try:
         service=runtime(request,settings);pins=service.profile();enabled=False
         if service.authority is not None:
-            try:service.authority.require_live(pins,int(service.clock()));enabled=True
+            try:service.authority.require_live(pins,int(service.clock()));enabled=service.compatibility_ready(pins)
             except ValueError:pass
         return {'schema':'solslot.current-customer-identity-runtime.v1','profileHash':pins.commitment,
             'profile':pins.model_dump(mode='json',by_alias=True),'enrollmentEnabled':enabled,
             'stampEnabled':enabled and service.fee_submitter is not None,
             'authorityExpiresAt':service.authority.expires_at if service.authority else None,
+            'compatibility':getattr(service,'compatibility',{}),
             'observer':service.health}
     except Exception as exc:raise failure(exc) from exc
 
@@ -196,7 +209,14 @@ async def submit_relay(body,request,response,settings,*,bls):
             reads.require_relay(scope)
             inner=(BlsRelayRequest if bls else RelayRequest).model_validate(body.model_dump(exclude={'generation_id'},by_alias=True))
             return await run_in_threadpool(relay_bls if bls else relay,inner,request)
-    except Exception as exc:raise failure(exc) from exc
+    except Exception as exc:
+        safe=failure(exc)
+        # Existing relay clients render detail as text. Keep this boundary
+        # readable without returning raw provider errors or proof bytes.
+        if isinstance(safe.detail,dict):
+            raise HTTPException(safe.status_code,detail=safe.detail['message'],
+                headers={'X-Solslot-Error-Code':safe.detail['code']}) from exc
+        raise safe from exc
 
 
 @router.post('/relay')

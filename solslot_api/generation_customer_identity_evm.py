@@ -90,4 +90,27 @@ def verify_current_identity_contracts(w3, profile, height):
             or call('trustedDirectRelayer()') != bytes(12) + bytes.fromhex(profile.trusted_direct_relayer[2:])
             or call('isTrustedForwarder(address)', bytes(12) + bytes.fromhex(addresses['forwarder'][2:])) != bytes(31) + b'\x01'):
         raise ValueError('CURRENT_ID_EVM_TRUST_BINDING_CHANGED')
+    selector = bytes(Web3.keccak(text='supportsProofVersion(bytes32)'))[:4]
+    for version in profile.accepted_proof_versions:
+        # A matching upstream verifier bytecode does not establish that our
+        # own immutable adapter admits the same circuit version.
+        accepted = bytes(w3.eth.call({
+            'to': Web3.to_checksum_address(addresses['verifierAdapter']),
+            'data': Web3.to_hex(selector + PROOF_VERSIONS[version]),
+        }, block_identifier=height))
+        if accepted != bytes(31) + b'\x01':
+            raise ValueError('CURRENT_ID_EVM_PROOF_VERSION_UNSUPPORTED')
     return addresses
+
+
+def read_current_identity_compatibility(settings, profile, now):
+    """Public chain reads only; never opens a wallet or loads signing keys."""
+    from .zkpassport_relay import _w3
+    from .generation_customer_identity_scope import current_identity_settings
+    selected = current_identity_settings(settings, profile)
+    w3 = _w3(selected.zkpassport_evm_rpc_url)
+    height = int(w3.eth.block_number)
+    verify_current_identity_contracts(w3, profile, height)
+    return {'status': 'READY', 'profileHash': profile.commitment,
+            'checkedAt': now, 'blockNumber': height,
+            'proofVersions': list(profile.accepted_proof_versions)}
