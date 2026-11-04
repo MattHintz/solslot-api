@@ -58,6 +58,28 @@ def test_only_the_profiled_private_real_document_query_is_allowed(version):
     assert result.vault==LAUNCHER and result.amount==1 and result.permit is None
 
 
+def test_patch_version_requires_explicit_profile_approval_and_preserves_query_boundaries():
+    original = CurrentCustomerIdentityProfile.model_validate(profile()[0])
+    encoded = calldata(original, version='0.21.1')
+    with pytest.raises(ValueError, match='PRIVATE_QUERY_REJECTED'):
+        require_current_identity_query(encoded, original, launcher=LAUNCHER)
+    amended = original.model_dump(mode='json', by_alias=True)
+    amended['acceptedProofVersions'].append('0.21.1')
+    pins = CurrentCustomerIdentityProfile.model_validate(amended)
+    assert pins.commitment != original.commitment
+    assert require_current_identity_query(encoded, pins, launcher=LAUNCHER).vault == LAUNCHER
+    for changes in ({'dev':True}, {'domain':'other.invalid'}, {'query':bytes.fromhex('0100021200')}):
+        with pytest.raises(ValueError, match='PRIVATE_QUERY_REJECTED'):
+            require_current_identity_query(calldata(pins, version='0.21.1', **changes), pins, launcher=LAUNCHER)
+    # A valid canonical envelope with a different patch remains unsupported.
+    params = (bytes.fromhex('000000150002' + '00' * 26), (bytes(32), b'synthetic-proof', []), INPUTS,
+        (604800, 'solslot.com', 'vault:' + LAUNCHER, False))
+    unknown = LEGACY_SELECTOR + encode([BINDING_ABI, 'bytes'], [(bytes.fromhex(LAUNCHER[2:]),
+        bytes.fromhex(pins.bridge_coins[0].parent_id[2:]), 1), encode([PROOF_PARAMS_ABI], [params])])
+    with pytest.raises(ValueError, match='PRIVATE_QUERY_REJECTED'):
+        require_current_identity_query(unknown, pins, launcher=LAUNCHER)
+
+
 @pytest.mark.parametrize('changes',[{'query':bytes.fromhex('0100021200')},{'query':INPUTS+b'extra'},
     {'domain':'other.invalid'},{'scope':'vault:'+'0x'+'91'*32},{'dev':True},{'parent':'0x'+'92'*32}])
 def test_disclosure_weakened_query_wrong_scope_or_other_bridge_is_rejected(changes):

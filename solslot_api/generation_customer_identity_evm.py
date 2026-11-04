@@ -14,6 +14,7 @@ FORWARD_SELECTOR = bytes(Web3.keccak(text='execute(' + FORWARD_ABI + ')'))[:4]
 PROOF_VERSIONS = {
     '0.20.0': bytes.fromhex('000000140000' + '00' * 26),
     '0.21.0': bytes.fromhex('000000150000' + '00' * 26),
+    '0.21.1': bytes.fromhex('000000150001' + '00' * 26),
 }
 
 
