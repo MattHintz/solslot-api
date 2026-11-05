@@ -14,6 +14,14 @@ from .evm_auth import normalize_evm_address
 
 logger=logging.getLogger(__name__)
 
+def customer_binding_profile(generation,b):
+    """Fingerprint the native bindings already validated for this read."""
+    fields={'generationId':generation,'preparationManifest':'0x'+b.preparation_manifest.hex(),
+        'poolLauncherId':'0x'+b.pool_launcher.hex(),'bridgePolicyHash':'0x'+b.bridge_policy.hex(),
+        'vaultModuleHash':'0x'+b.vault_module.hex(),'network':'testnet11'}
+    digest='0x'+hashlib.sha256(json.dumps(fields,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    return fields,digest
+
 def normalized_owner(owner,auth_type):
     if auth_type=='evm':return normalize_evm_address(owner)
     if auth_type!='chia_bls' or not isinstance(owner,str):raise ValueError('unsupported customer wallet')
@@ -72,10 +80,7 @@ class GenerationCustomerRuntime:
             'pollAfterSeconds':30}
         try:
             b=current_customer_launch_bindings(self.settings,self.index,now=int(self.clock()))
-            fields={'generationId':generation,'preparationManifest':'0x'+b.preparation_manifest.hex(),
-                'poolLauncherId':'0x'+b.pool_launcher.hex(),'bridgePolicyHash':'0x'+b.bridge_policy.hex(),
-                'vaultModuleHash':'0x'+b.vault_module.hex(),'network':'testnet11'}
-            digest='0x'+hashlib.sha256(json.dumps(fields,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+            fields,digest=customer_binding_profile(generation,b)
             enabled=bool(getattr(self.settings,'generation_customer_enabled',False) and self.faucet is not None
                 and self.policy is not None and self.submitter is not None)
             if enabled:
@@ -238,7 +243,7 @@ class GenerationCustomerRuntime:
             'generationId':self.store.generation_id,'network':'testnet11',
             'owner':consent.owner,'authType':consent.auth_type,
             'ownerPublicKey':'0x'+owner_pubkey.hex(),
-            'registrationId':identity,'profileHash':self.profile()['profileHash'],
+            'registrationId':identity,'profileHash':customer_binding_profile(self.store.generation_id,bindings)[1],
             'p2VaultPuzzleHash':'0x'+puzzle_for_p2_vault(consent.vault_launcher_id).get_tree_hash().hex(),
             'pollAfterSeconds':30}
 

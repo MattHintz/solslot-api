@@ -380,6 +380,13 @@ class ValidatorLedger(BaseLifecycleLedgerMixin, BaseInventoryHoldLedgerMixin, In
                 self._conn.execute('ROLLBACK')
                 raise
 
+    def read_existing_identity_signature(self, *, claim_hash: str) -> tuple[str,str] | None:
+        """Read an exact retained identity signature without signing or changing state."""
+        with self._lock:
+            row=self._conn.execute('SELECT canonical_claim,signature FROM signatures WHERE claim_hash=?',
+                (claim_hash,)).fetchone()
+            return (str(row['canonical_claim']),str(row['signature'])) if row is not None else None
+
     def record_or_recover(
         self,
         *,

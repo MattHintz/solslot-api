@@ -88,6 +88,7 @@ async def test_current_quorum_uses_separate_route_and_rejects_foreign_response()
     keys=[AugSchemeMPL.key_gen(bytes([i])*32) for i in (31,32,33)];settings=_settings(keys)
     async def handle(request):
         assert request.url.path=='/v1/generation/identity/sign'
+        assert request.extensions['timeout']['read']==55.0
         body=json.loads(request.content);assert 'artifact_hash' not in body['claim']
         index=int(request.url.host.split('-')[1].split('.')[0])
         return httpx.Response(200,json={'claimHash':claim.canonical_hash() if index!=2 else '0x'+'99'*32,

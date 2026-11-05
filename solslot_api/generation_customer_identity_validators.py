@@ -184,3 +184,36 @@ async def sign_current_identity(settings, ledger, claim, claim_hash, *, provider
         evm_transaction_hash=claim.evm_transaction_hash, signature=signature)
     return ValidatorSignatureResponse(claimHash=claim_hash, signerIndex=settings.signer_index,
         validatorPubkey='0x' + bytes(private.get_g1()).hex(), signature=signature)
+
+
+async def recover_existing_current_identity_signature(settings,ledger,*,original_claim_hash,refreshed_claim,
+        refreshed_claim_hash,provider,clock=time.time):
+    """Revalidate a fresh EVM claim and return only this signer's existing signature.
+
+    The separately gated recovery route never loads a private key and cannot
+    issue a signature for a new authorization subject.
+    """
+    from chia_rs import AugSchemeMPL,G1Element,G2Element
+    from .generation_identity_signature_recovery import require_matching_recovery_subject
+    if (not isinstance(original_claim_hash,str) or len(original_claim_hash)!=66
+            or not original_claim_hash.startswith('0x') or not isinstance(refreshed_claim,CurrentIdentityClaim)
+            or refreshed_claim.canonical_hash()!=refreshed_claim_hash):
+        raise ValueError('CURRENT_ID_RECOVERY_REQUEST_INVALID')
+    saved=ledger.read_existing_identity_signature(claim_hash=original_claim_hash)
+    if saved is None:raise ValueError('CURRENT_ID_RECOVERY_SIGNATURE_NOT_FOUND')
+    original=CurrentIdentityClaim.model_validate_json(saved[0])
+    if original.canonical_hash()!=original_claim_hash:
+        raise ValueError('CURRENT_ID_RECOVERY_LEDGER_CHANGED')
+    require_matching_recovery_subject(original=original,refreshed=refreshed_claim,now=int(clock()))
+    await verify_current_identity_claim(settings,refreshed_claim,refreshed_claim_hash,provider=provider,clock=clock)
+    require_matching_recovery_subject(original=original,refreshed=refreshed_claim,now=int(clock()))
+    slot=settings.signer_index
+    if type(slot)is not int or slot not in (0,1,2):raise ValueError('CURRENT_ID_RECOVERY_ROSTER_CHANGED')
+    try:
+        public=G1Element.from_bytes(bytes.fromhex(settings.roster_pubkeys[slot].removeprefix('0x')))
+        signature=G2Element.from_bytes(bytes.fromhex(saved[1].removeprefix('0x')))
+    except (ValueError,TypeError,IndexError) as exc:raise ValueError('CURRENT_ID_RECOVERY_LEDGER_INVALID') from exc
+    if not AugSchemeMPL.verify(public,refreshed_claim.signature_message(),signature):
+        raise ValueError('CURRENT_ID_RECOVERY_SIGNATURE_INVALID')
+    return ValidatorSignatureResponse(claimHash=original_claim_hash,signerIndex=slot,
+        validatorPubkey=settings.roster_pubkeys[slot],signature=saved[1])

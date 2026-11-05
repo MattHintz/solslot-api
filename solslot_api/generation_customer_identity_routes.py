@@ -1,5 +1,6 @@
 """Native customer ID lifecycle. No administrator login or legacy admission."""
 from typing import Annotated
+import json
 import logging
 import re
 from fastapi import APIRouter,Depends,HTTPException,Request,Response
@@ -54,7 +55,11 @@ def failure(exc):
     detail=exc.detail if isinstance(exc,HTTPException) else None
     code=detail.get('code') if isinstance(detail,dict) else str(exc)
     safe=code if isinstance(code,str) and re.fullmatch(r'CURRENT_ID_[A-Z_]{1,80}',code) else 'CURRENT_ID_STEP_UNAVAILABLE'
-    message='Your saved check is preserved. Check progress before trying this step again.'
+    message={
+        'CURRENT_ID_UNAVAILABLE':'Current Testnet ID setup is not ready yet.',
+        'CURRENT_ID_OWNER_CHANGED':'Reconnect the owner wallet for this vault before continuing your saved check.',
+        'CURRENT_ID_RUNTIME_CHANGED':'ID setup is updating. Your vault and saved check are preserved; try again shortly.',
+    }.get(safe,'Your saved check is preserved. Check progress before trying this step again.')
     if (safe=='CURRENT_ID_EVM_PROOF_VERSION_UNSUPPORTED' or
             isinstance(exc,HTTPException) and 'UnsupportedProofVersion' in str(detail)):
         safe='CURRENT_ID_EVM_PROOF_VERSION_UNSUPPORTED'
@@ -67,9 +72,25 @@ def failure(exc):
             safe='CURRENT_ID_RELAY_SIMULATION_REJECTED'
             message='The identity contract could not accept this proof. Your vault is saved; please wait before starting another scan.'
     logger.warning('current_identity_step_failed code=%s exception_type=%s',safe,type(exc).__name__)
-    if isinstance(exc,HTTPException) and isinstance(detail,dict) and safe==code:return exc
     return HTTPException(exc.status_code if isinstance(exc,HTTPException) else 409,detail={'code':safe,
-        'message':message})
+        'message':message},headers=exc.headers if isinstance(exc,HTTPException) else None)
+
+
+def saved_stamp_recovery_available(service,settings,launcher,record,verified):
+    """Read-only hint, never a quorum, funding or transaction authorization."""
+    if (not getattr(settings,'generation_customer_identity_recovery_enabled',False)
+            or verified.auth_type!='evm' or record is None or record.get('status')!='evm_confirmed'):
+        return False
+    try:
+        from .validator_quorum import CurrentIdentityClaim
+        row=service.ledger.get_stamp_attempt(launcher)
+        if (not row or row['bundle_hex'] is not None or row['dispatch_status']!='not_submitted'
+                or row['dispatch_count']!=0):return False
+        claim=CurrentIdentityClaim.model_validate(json.loads(row['claim_json']))
+        return (claim.canonical_hash()==row['claim_hash'] and claim.vault_launcher_id==launcher
+            and claim.generation_id==settings.deployment_generation_id and claim.owner_auth_type==3
+            and int(service.clock())-claim.current_timestamp>90)
+    except (ValueError,KeyError,TypeError):return False
 
 
 @router.get('/profile')
@@ -102,8 +123,10 @@ async def session(launcher:Identity,request:Request,response:Response,settings:C
 async def enrollment(launcher:Identity,request:Request,response:Response,settings:Configured):
     response.headers['Cache-Control']='no-store'
     try:
-        service=runtime(request,settings);owner(request,settings,launcher);record=service.cached(launcher)
+        service=runtime(request,settings);verified=owner(request,settings,launcher);record=service.cached(launcher)
         if record is None:raise HTTPException(404,detail={'code':'CURRENT_ID_NOT_STARTED'})
+        if saved_stamp_recovery_available(service,settings,launcher,record,verified):
+            return {**record,'stampRecoveryAvailable':True}
         return record
     except Exception as exc:raise failure(exc) from exc
 
@@ -193,6 +216,27 @@ async def stamp_sync(launcher:Identity,body:CurrentGeneration,request:Request,re
     try:
         service=runtime(request,settings);owner(request,settings,launcher)
         return {'enrollment':await service.sync(launcher)}
+    except Exception as exc:raise failure(exc) from exc
+
+
+@router.post('/enrollments/{launcher}/stamp/recover')
+async def stamp_recover(launcher:Identity,body:CurrentGeneration,request:Request,response:Response,settings:Configured):
+    """Resume only a saved unbroadcast EVM stamp; disabled without a release flag."""
+    mutation(request,settings,body);response.headers['Cache-Control']='no-store'
+    if not getattr(settings,'generation_customer_identity_recovery_enabled',False):
+        raise HTTPException(503,detail={'code':'CURRENT_ID_RECOVERY_UNAVAILABLE',
+            'message':'Your saved check is preserved while recovery is prepared.'})
+    try:
+        service=runtime(request,settings);owner(request,settings,launcher)
+        reads,native=await service.request_reads(launcher)
+        if native.identity_verified:
+            record=await service.sync(launcher)
+            return {'enrollment':record,'spendBundleId':record.receipt.chiaSpendBundleId,
+                'expectedVaultCoinId':record.receipt.chiaStampCoinId}
+        from .zkpassport_enrollments import submit_evm_chia_stamp
+        with current_identity_request(settings,reads.profile,launcher,service.customers,runtime=reads,clock=service.clock) as scope:
+            reads.require_stamp(scope)
+            return await submit_evm_chia_stamp(launcher,SubmitChiaStampRequest(signature=''),request,recover_retained=True)
     except Exception as exc:raise failure(exc) from exc
 
 

@@ -64,6 +64,16 @@ class CurrentIdentitySignRequest(BaseModel):
     claimHash: str = Field(pattern=r'^0x[0-9a-f]{64}$')
 
 
+class CurrentIdentityRecoveryRequest(CurrentIdentitySignRequest):
+    originalClaimHash:str=Field(pattern=r'^0x[0-9a-f]{64}$')
+
+
+def _identity_recovery_window_open(settings):
+    import time
+    deadline=getattr(settings,'generation_customer_identity_recovery_expires_at',0)
+    return type(deadline) is int and 0 < int(time.time()) < deadline
+
+
 from .generation_sols_batch_execution import PrimaryBatchClaim
 
 class PrimaryBatchSignRequest(BaseModel):
@@ -257,6 +267,8 @@ def create_validator_app(
         from fastapi.responses import JSONResponse
         if getattr(current_settings(), 'generation_customer_identity_enabled', False):
             permitted = {('GET', '/health'), ('POST', '/v1/generation/identity/sign')}
+            if getattr(current_settings(),'generation_customer_identity_recovery_enabled',False):
+                permitted.add(('POST','/v1/generation/identity/recover'))
             if (request.method, request.url.path) not in permitted:
                 return JSONResponse({'detail': 'CURRENT_SIGNER_ACTION_DISABLED'}, status_code=404)
         return await call_next(request)
@@ -276,6 +288,25 @@ def create_validator_app(
         except Exception as exc:
             # Proofs, provider payloads and signatures must not appear in errors.
             raise HTTPException(409, detail='CURRENT_ID_INDEPENDENT_EVIDENCE_REJECTED') from exc
+
+    @application.post('/v1/generation/identity/recover', response_model=ValidatorSignatureResponse)
+    async def recover_generation_identity(body:CurrentIdentityRecoveryRequest):
+        import asyncio
+        from .generation_customer_identity_validators import recover_existing_current_identity_signature
+        settings=current_settings();provider=getattr(application.state,'generation_provider',None)
+        if (not getattr(settings,'generation_customer_identity_recovery_enabled',False)
+                or not _identity_recovery_window_open(settings) or provider is None):
+            raise HTTPException(503,detail='CURRENT_ID_RECOVERY_NOT_READY')
+        try:
+            async with asyncio.timeout(45):
+                recovered = await recover_existing_current_identity_signature(settings,application.state.validator_ledger,
+                    original_claim_hash=body.originalClaimHash,refreshed_claim=body.claim,
+                    refreshed_claim_hash=body.claimHash,provider=provider)
+        except Exception as exc:
+            raise HTTPException(409,detail='CURRENT_ID_RECOVERY_EVIDENCE_REJECTED') from exc
+        if not _identity_recovery_window_open(settings):
+            raise HTTPException(503,detail='CURRENT_ID_RECOVERY_NOT_READY')
+        return recovered
 
     @application.post('/v1/generation/primary-sols/sign',response_model=ValidatorSignatureResponse)
     async def sign_generation_primary(body:PrimaryBatchSignRequest):

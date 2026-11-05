@@ -1507,6 +1507,7 @@ class Settings(BaseSettings):
     generation_customer_signer_key_path: str = ''
     generation_customer_fee_db_path: str = './state/customer-fees.sqlite3'
     generation_customer_identity_enabled: bool = False
+    generation_customer_identity_recovery_enabled: bool = False
     generation_customer_identity_profile_path: str = ''
     generation_customer_identity_profile_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
     generation_customer_identity_authority_path: str = ''

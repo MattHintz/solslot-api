@@ -45,6 +45,8 @@ class ValidatorSettings(BaseSettings):
 
     generation_sols_batch_enabled:bool=False
     generation_customer_identity_enabled:bool=False
+    generation_customer_identity_recovery_enabled:bool=False
+    generation_customer_identity_recovery_expires_at:int=Field(default=0,ge=0)
     generation_customer_identity_profile_path:str=''
     generation_customer_identity_profile_hash:str=Field(default='', pattern=r'^(|0x[0-9a-f]{64})$')
     deployment_generation_id:str|None=Field(default=None,pattern=r'^0x[0-9a-f]{64}$')
@@ -126,6 +128,10 @@ class ValidatorSettings(BaseSettings):
 
     @model_validator(mode="after")
     def _permit_deployment(self) -> "ValidatorSettings":
+        if self.generation_customer_identity_recovery_enabled and not self.generation_customer_identity_enabled:
+            raise ValueError('identity signature recovery requires the current identity boundary')
+        if self.generation_customer_identity_recovery_enabled and not self.generation_customer_identity_recovery_expires_at:
+            raise ValueError('identity signature recovery requires a finite expiry')
         if self.generation_primary_readonly_gateway:
             from .generation_primary_reader import PRIMARY_READER_URL
             if (not self.generation_customer_identity_enabled
