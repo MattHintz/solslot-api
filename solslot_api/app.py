@@ -902,6 +902,8 @@ app.include_router(zkpassport_enrollments_router)
 from .generation_customer_routes import router as generation_customer_router, session_router as generation_customer_session_router
 app.include_router(generation_customer_router)
 app.include_router(generation_customer_session_router)
+from .generation_customer_portfolio_routes import router as generation_customer_portfolio_router
+app.include_router(generation_customer_portfolio_router)
 from .generation_customer_identity_routes import router as current_customer_identity_router
 app.include_router(current_customer_identity_router)
 

@@ -283,6 +283,27 @@ async def test_native_current_checkout_delivery_and_fee_boundaries(core,tmp_path
     assert delivered.amount==1
     assert delivered.puzzle_hash==SINGLETON_MOD.curry(structure,puzzle_for_p2_vault(vault.launcher)).get_tree_hash()
     assert (await c.client.get_coin_record_by_name(delivered.name())).spent is False
+    # The customer dashboard follows the actual confirmed current-generation
+    # mint/delivery lineage, including its custom DID launcher and ephemeral
+    # offer outputs. A wallet match or an old collection row is not ownership.
+    from solslot_api.generation_customer_portfolio import read_current_portfolio
+    from solslot_api.generation_chain_evidence import resolve_generation_chain
+    async def primary_parents(ids, *, include_spent=False):
+        return [r.to_json_dict() for r in await c.client.get_coin_records_by_parent_ids(
+            [bytes32.from_hexstr(value) for value in ids], include_spent_coins=include_spent)]
+    c.provider.get_coin_records_by_parent_ids_primary = primary_parents
+    portfolio = await read_current_portfolio(
+        snapshot={'generationId':h(bindings.generation),'network':'testnet11','authType':'chia_bls',
+            'vault':vault.public()},
+        evidence=await resolve_generation_chain(built.anchor,provider=c.provider),
+        sgt_bindings=built.anchor.issuance.bindings(),provider=c.provider,
+        metadata_for_edition=lambda found: source['canonicalMetadata'] if found.commitment==edition.commitment else None)
+    assert len(portfolio['holdings'])==1
+    assert portfolio['holdings'][0]['deedCoinId']==h(delivered.name())
+    assert portfolio['holdings'][0]['sharePpm']==terms.share_ppm
+    assert portfolio['verification']['mintedDeedsChecked']==25
+    assert portfolio['vault']['identityConfirmed']
+    assert not portfolio['capabilities']['primaryPurchase']['available']
     print("native: verify fee outputs",flush=True);fee_candidates=[coin for spend in full.coin_spends for coin in compute_additions(spend) if coin.puzzle_hash==terms.protocol_treasury_puzzle_hash]
     import json,os
     from pathlib import Path
