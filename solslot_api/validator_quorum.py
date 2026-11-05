@@ -1324,10 +1324,13 @@ async def collect_validator_quorum(
         endpoint = url.rstrip("/") + ('/v1/generation/identity/sign'
             if isinstance(claim, CurrentIdentityClaim) else '/v1/zkpassport/sign')
         try:
-            response = await client.post(
-                endpoint,
-                json={"claim": claim.model_dump(mode="json"), "claimHash": claim_hash},
-            )
+            options = {"json": {"claim": claim.model_dump(mode="json"), "claimHash": claim_hash}}
+            # Current-generation signers independently reconstruct the native
+            # chain and allow 45 seconds. The old eight-second client deadline
+            # could lose already-durable signatures before they are returned.
+            if isinstance(claim, CurrentIdentityClaim):
+                options['timeout'] = 55.0
+            response = await client.post(endpoint, **options)
             response.raise_for_status()
             parsed = ValidatorSignatureResponse.model_validate(response.json())
             if parsed.claimHash.lower() != claim_hash:

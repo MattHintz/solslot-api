@@ -46,7 +46,8 @@ ID='/protocol-api/next/customer/identity'
 
 
 @pytest.mark.asyncio
-async def test_current_id_http_requires_fresh_vault_preserves_work_and_confirms_native_stamp(customer,tmp_path,monkeypatch):
+@pytest.mark.parametrize('recover',[False,True])
+async def test_current_id_http_requires_fresh_vault_preserves_work_and_confirms_native_stamp(customer,tmp_path,monkeypatch,recover):
     p=customer;generation=p.settings.deployment_generation_id
     defaults=Settings(_env_file=None,runtime_environment='test',alpha_writes_enabled=False).model_dump()
     original=dict(vars(p.settings));p.settings.__dict__.update(defaults);p.settings.__dict__.update(original)
@@ -103,6 +104,12 @@ async def test_current_id_http_requires_fresh_vault_preserves_work_and_confirms_
     monkeypatch.setattr(enroll,'get_registry',lambda:p.registry)
     p.runtime.clock=time.time
     service=configured_current_customer_identity(p.settings,p.runtime,clock=time.time)
+    import solslot_api.generation_customer_identity_routes as identity_routes
+    diagnostics=[];original_failure=identity_routes.failure
+    def capture_failure(exc):
+        diagnostics.append((type(exc).__name__,getattr(exc,'detail',str(exc))))
+        return original_failure(exc)
+    monkeypatch.setattr(identity_routes,'failure',capture_failure)
     app=next(r.app for r in p.app.routes if getattr(r,'path',None)=='/protocol-api/next')
     app.include_router(identity_router);app.state.generation_customer_identity=service;app.state.coinset=p.node
     async def observe_generation():
@@ -127,11 +134,12 @@ async def test_current_id_http_requires_fresh_vault_preserves_work_and_confirms_
         assert (await p.client.post(current_path,json={'generationId':generation})).json()==record
         reads_before=p.node.selections
         async def forbidden(*a,**kw):raise AssertionError('GET must not read a node or sign')
-        with monkeypatch.context() as patch:
-            patch.setattr(p.node,'get_coin_record_by_name_primary',forbidden)
-            assert (await p.client.get(current_path)).json()==record
+        async with p.index._lock:
+            with monkeypatch.context() as patch:
+                patch.setattr(p.node,'get_coin_record_by_name_primary',forbidden)
+                assert (await p.client.get(current_path)).json()==record
         assert p.node.selections==reads_before
-        proof_time=int(time.time());att=ZkPassportAttestation(vault_launcher_id=bytes32.from_hexstr(launcher),
+        proof_time=int(time.time())-(120 if recover else 0);att=ZkPassportAttestation(vault_launcher_id=bytes32.from_hexstr(launcher),
             scoped_nullifier=bytes32(b'n'*32),nullifier_type=1,service_scope_hash=bytes32(b's'*32),
             service_subscope_hash=bytes32(b'u'*32),proof_timestamp=proof_time,policy_version=2)
         root=compute_attestation_root([att.leaf_hash]);message=compute_attestation_bridge_message(
@@ -185,8 +193,12 @@ async def test_current_id_http_requires_fresh_vault_preserves_work_and_confirms_
             # Real signer validation runs in clean private contexts, never
             # borrowing the coordinator's request-local evidence cache.
             tasks=[contextvars.Context().run(asyncio.create_task,sign_current_identity(config,led,claim,
-                claim.canonical_hash(),provider=p.node)) for config,led in zip(signer_settings,signer_ledgers)]
+                claim.canonical_hash(),provider=p.node,clock=(lambda:int(time.time())-120) if recover else time.time))
+                for config,led in zip(signer_settings,signer_ledgers)]
             signed=await asyncio.gather(*tasks)
+            if recover:
+                from solslot_api.validator_quorum import ValidatorQuorumError
+                raise ValidatorQuorumError('synthetic lost responses after signing')
             return ValidatorQuorumResult((0,1),AugSchemeMPL.aggregate([
                 G2Element.from_bytes(bytes.fromhex(row.signature[2:])) for row in signed]),claim.canonical_hash())
         monkeypatch.setattr(enroll,'collect_validator_quorum',quorum)
@@ -216,8 +228,35 @@ async def test_current_id_http_requires_fresh_vault_preserves_work_and_confirms_
         owner_signature='0x'+Account.sign_message(encode_typed_data(full_message=prepared.json()['typedData']),secret.key).signature.hex()
         p.c.sim.pass_time(max(0,int(time.time())-int(p.c.sim.timestamp)));await farm_observed_block()
         before_pushes=p.node.pushes
-        posted=await p.client.post(current_path+'/stamp/submit',json={'generationId':generation,'signature':owner_signature})
-        assert posted.status_code==200,posted.text
+        if recover:
+            p.settings.generation_customer_identity_recovery_enabled=True
+            with monkeypatch.context() as patch:
+                patch.setattr(enroll,'time',SimpleNamespace(time=lambda:time.time()-120))
+                failed=await p.client.post(current_path+'/stamp/submit',json={'generationId':generation,'signature':owner_signature})
+            assert failed.status_code==503,failed.text
+            attempt=ledger.get_stamp_attempt(launcher)
+            assert attempt['bundle_hex'] is None and attempt['dispatch_count']==0 and p.node.pushes==before_pushes
+            hint=await p.client.get(current_path)
+            assert hint.status_code==200 and hint.json()['stampRecoveryAvailable'] is True
+            original_hash=attempt['claim_hash']
+            from solslot_api.generation_customer_identity_validators import recover_existing_current_identity_signature
+            from solslot_api.generation_identity_signature_recovery import verify_recovered_signatures_only
+            import solslot_api.generation_identity_recovery_quorum as recovery_quorum
+            async def recover_quorum(settings,old,fresh,**kwargs):
+                assert old.canonical_hash()==original_hash
+                tasks=[contextvars.Context().run(asyncio.create_task,recover_existing_current_identity_signature(config,led,
+                    original_claim_hash=old.canonical_hash(),refreshed_claim=fresh,
+                    refreshed_claim_hash=fresh.canonical_hash(),provider=p.node))
+                    for config,led in zip(signer_settings,signer_ledgers)]
+                responses=await asyncio.gather(*tasks)
+                return verify_recovered_signatures_only(original=old,refreshed=fresh,
+                    responses=[r.model_dump() for r in responses],
+                    validator_pubkeys=[bytes.fromhex(k[2:]) for k in pins.validator_public_keys],now=int(time.time()))
+            monkeypatch.setattr(recovery_quorum,'collect_retained_identity_quorum',recover_quorum)
+            posted=await p.client.post(current_path+'/stamp/recover',json={'generationId':generation})
+        else:
+            posted=await p.client.post(current_path+'/stamp/submit',json={'generationId':generation,'signature':owner_signature})
+        assert posted.status_code==200,(posted.text,diagnostics[-1:] )
         txid=posted.json()['spendBundleId'];assert p.node.pushes==before_pushes+1
         repeated=await p.client.post(current_path+'/stamp/submit',json={'generationId':generation,'signature':owner_signature})
         assert repeated.status_code==200,repeated.text

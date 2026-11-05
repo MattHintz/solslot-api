@@ -2023,9 +2023,15 @@ async def submit_evm_chia_stamp(
     vault_launcher_id: VaultLauncherPath,
     req: SubmitChiaStampRequest,
     request: Request,
+    *, recover_retained: bool = False,
 ) -> SubmitChiaStampResponse:
     settings = _settings()
     key = _normalize_hex32(vault_launcher_id, "vaultLauncherId")
+    if recover_retained:
+        from .generation_customer_identity_scope import current_identity_scope
+        if (not getattr(settings,'generation_customer_identity_recovery_enabled',False)
+                or current_identity_scope(settings,key) is None):
+            raise HTTPException(status_code=503,detail='CURRENT_ID_RECOVERY_UNAVAILABLE')
     verified_owner = verify_vault_session(settings, request, key)
     existing = get_credential_ledger(settings).get_enrollment(key)
     if not existing:
@@ -2036,6 +2042,10 @@ async def submit_evm_chia_stamp(
     record = EnrollmentRecord.model_validate(existing)
     _require_enrollment_bridge_policy(settings, existing, execution=True)
     attempt = get_credential_ledger(settings).get_stamp_attempt(key)
+    if recover_retained and (attempt is None or attempt['bundle_hex'] is not None
+            or attempt['dispatch_status'] != 'not_submitted' or attempt['dispatch_count'] != 0
+            or record.status != 'evm_confirmed'):
+        raise HTTPException(status_code=409,detail='Saved stamp must be reconciled before recovery.')
     retained_claim = json.loads(attempt["claim_json"]) if attempt else None
     if retained_claim:
         req = SubmitChiaStampRequest(signature=retained_claim["owner_authorization"],
@@ -2102,6 +2112,8 @@ async def submit_evm_chia_stamp(
 
     launcher = bytes32.fromhex(key.removeprefix("0x"))
     vault_record = verified_owner.vault_record
+    if recover_retained and vault_record.auth_type != 3:
+        raise HTTPException(status_code=409,detail='This recovery requires the original EVM vault owner.')
     if vault_record.auth_type == AUTH_TYPE_BLS:
         if req.currentTimestamp is None:
             raise HTTPException(
@@ -2248,8 +2260,10 @@ async def submit_evm_chia_stamp(
             detail="The configured validator quorum does not match the vault bridge policy.",
         )
 
+    # Preserve the original frozen bundle clock. The separately journaled
+    # funded-stamp path already reconstructs a fresh, chain-checked child.
     current_timestamp = retained_claim["current_timestamp"] if retained_claim else int(time.time())
-    if abs(int(time.time()) - current_timestamp) > 90:
+    if not recover_retained and abs(int(time.time()) - current_timestamp) > 90:
         raise HTTPException(status_code=409,
             detail="The retained stamp submission window expired. Check the existing attempt before recovery.")
     try:
@@ -2317,9 +2331,18 @@ async def submit_evm_chia_stamp(
         owner_authorization=req.signature,
         current_timestamp=current_timestamp,
     )
-    _freeze_stamp_attempt(settings, claim, expected_vault_coin)
     try:
-        quorum = await collect_validator_quorum(settings, claim)
+        if recover_retained:
+            from .generation_identity_recovery_quorum import collect_retained_identity_quorum
+            from .validator_quorum import CurrentIdentityClaim
+            original=CurrentIdentityClaim.model_validate(retained_claim)
+            if original.canonical_hash()!=attempt['claim_hash'] or original.model_dump(mode='json')!=claim.model_dump(mode='json'):
+                raise ValueError('saved identity authorization differs')
+            refreshed=original.model_copy(update={'current_timestamp':int(time.time())})
+            quorum=await collect_retained_identity_quorum(settings,original,refreshed)
+        else:
+            _freeze_stamp_attempt(settings, claim, expected_vault_coin)
+            quorum = await collect_validator_quorum(settings, claim)
     except ValidatorQuorumError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if quorum.signer_indices != (0, 1):
