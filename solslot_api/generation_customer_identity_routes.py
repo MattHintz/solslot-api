@@ -59,6 +59,7 @@ def failure(exc):
         'CURRENT_ID_UNAVAILABLE':'Current Testnet ID setup is not ready yet.',
         'CURRENT_ID_OWNER_CHANGED':'Reconnect the owner wallet for this vault before continuing your saved check.',
         'CURRENT_ID_RUNTIME_CHANGED':'ID setup is updating. Your vault and saved check are preserved; try again shortly.',
+        'CURRENT_ID_FEE_CAP_EXCEEDED':'Chia Testnet11 is busy and the required fee exceeds the approved limit. Your approval is saved; resume it when fees fall. No transaction was sent.',
     }.get(safe,'Your saved check is preserved. Check progress before trying this step again.')
     if (safe=='CURRENT_ID_EVM_PROOF_VERSION_UNSUPPORTED' or
             isinstance(exc,HTTPException) and 'UnsupportedProofVersion' in str(detail)):
@@ -215,7 +216,8 @@ async def stamp_sync(launcher:Identity,body:CurrentGeneration,request:Request,re
     mutation(request,settings,body);response.headers['Cache-Control']='no-store'
     try:
         service=runtime(request,settings);owner(request,settings,launcher)
-        return {'enrollment':await service.sync(launcher)}
+        await service.sync(launcher)
+        return {'enrollment':service.cached(launcher)}
     except Exception as exc:raise failure(exc) from exc
 
 

@@ -131,6 +131,11 @@ class CurrentCustomerIdentityRuntime:
                 if (not native['identityVerified'] or receipt.get('identityAttestRoot')!=native['identityAttestRoot']
                         or receipt.get('chiaVaultCoinId')!=native['currentCoinId']):
                     record={**record,'status':'receipt_syncing'}
+            if record is not None and record['status']=='stamp_pending':
+                from .generation_customer_identity_progress import saved_stamp_progress
+                progress=saved_stamp_progress(record,self.ledger.get_stamp_attempt(launcher),
+                    self.funding_store.latest(launcher) if self.funding_store is not None else None)
+                record={**record,'stampProgress':progress}
             return copy.deepcopy(record)
 
     async def request_reads(self, launcher, *, include_event=True, all_bridges=False, transaction_hash=None):

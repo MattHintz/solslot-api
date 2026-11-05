@@ -1923,6 +1923,8 @@ async def _push_chia_stamp_and_mark_pending(
             funded = await submit_funded_stamp(submitter=fee_submitter, store=fee_store,
                 ledger=ledger, key=key, original=spend_bundle, expected_coin=expected_vault_coin)
         except (ProtocolSubmissionError, ChiaProviderError, ValueError) as exc:
+            if getattr(exc,'code',None)=='FEE_CAP_EXCEEDED':
+                raise HTTPException(status_code=503,detail={'code':'CURRENT_ID_FEE_CAP_EXCEEDED'}) from exc
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         updated = pending.model_dump(mode='json')
         updated['receipt']['chiaSpendBundleId'] = funded['spendBundleId']
