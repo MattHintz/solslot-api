@@ -313,6 +313,15 @@ class ChiaProvider:
             ),
         )
 
+    async def get_coin_records_by_parent_ids_primary(
+        self, parent_ids: list[str], *, include_spent: bool = False
+    ) -> list[dict[str, Any]]:
+        """Native ancestry reads must not switch to an advisory provider."""
+        return await self._primary_read(
+            'generation portfolio singleton ancestry',
+            lambda client: client.get_coin_records_by_parent_ids(parent_ids, include_spent=include_spent),
+        )
+
     async def get_coin_records_by_puzzle_hashes(
         self,
         puzzle_hashes: list[str],
