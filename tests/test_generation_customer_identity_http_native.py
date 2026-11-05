@@ -253,7 +253,23 @@ async def test_current_id_http_requires_fresh_vault_preserves_work_and_confirms_
                     responses=[r.model_dump() for r in responses],
                     validator_pubkeys=[bytes.fromhex(k[2:]) for k in pins.validator_public_keys],now=int(time.time()))
             monkeypatch.setattr(recovery_quorum,'collect_retained_identity_quorum',recover_quorum)
-            posted=await p.client.post(current_path+'/stamp/recover',json={'generationId':generation})
+            # Reproduce the live failure: signed bytes were saved, but a busy
+            # mempool prevented funding. Status must expose resume rather than
+            # pretend that a transaction has been sent or renew authorization.
+            from solslot_api.protocol_submission import ProtocolBundleSubmitter,ProtocolSubmissionError
+            async def busy_fee(*args,**kwargs):
+                raise ProtocolSubmissionError('synthetic approved fee cap reached',code='FEE_CAP_EXCEEDED')
+            with monkeypatch.context() as patch:
+                patch.setattr(ProtocolBundleSubmitter,'_estimate_fee',busy_fee)
+                blocked=await p.client.post(current_path+'/stamp/recover',json={'generationId':generation})
+            assert blocked.status_code==503 and blocked.json()['detail']['code']=='CURRENT_ID_FEE_CAP_EXCEEDED'
+            assert p.node.pushes==before_pushes and ledger.get_stamp_attempt(launcher)['bundle_hex'] is not None
+            held=await p.client.get(current_path)
+            assert held.json()['stampProgress']=={'state':'READY_TO_RESUME','broadcastState':'NOT_SENT','resumeAvailable':True}
+            checked=await p.client.post(current_path+'/stamp/sync',json={'generationId':generation})
+            assert checked.status_code==200 and checked.json()['enrollment']['stampProgress']['broadcastState']=='NOT_SENT'
+            assert p.node.pushes==before_pushes
+            posted=await p.client.post(current_path+'/stamp/submit',json={'generationId':generation,'signature':''})
         else:
             posted=await p.client.post(current_path+'/stamp/submit',json={'generationId':generation,'signature':owner_signature})
         assert posted.status_code==200,(posted.text,diagnostics[-1:] )

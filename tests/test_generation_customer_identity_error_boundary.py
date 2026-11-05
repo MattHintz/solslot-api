@@ -19,6 +19,14 @@ def test_approved_code_never_reflects_arbitrary_provider_fields():
     assert 'SYNTHETIC_PRIVATE'not in str(error.detail)
 
 
+def test_fee_cap_rejection_explains_that_authorization_is_saved_and_nothing_was_sent():
+    error=routes.failure(HTTPException(503,detail={'code':'CURRENT_ID_FEE_CAP_EXCEEDED'}))
+    assert error.status_code==503
+    assert error.detail['code']=='CURRENT_ID_FEE_CAP_EXCEEDED'
+    assert 'No transaction was sent' in error.detail['message']
+    assert 'approval is saved' in error.detail['message']
+
+
 @pytest.mark.asyncio
 async def test_relay_keeps_original_error_status_and_text_instead_of_key_error(monkeypatch):
     import solslot_api.enrollment_permit_runtime as permits
