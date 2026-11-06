@@ -1635,7 +1635,7 @@ class Settings(BaseSettings):
         if self.generation_customer_purchase_funding_enabled and not self.generation_customer_purchase_enabled:
             raise ValueError('purchase fees require the separately enabled current checkout')
         if self.generation_customer_purchase_worker_enabled and (not self.generation_customer_purchase_funding_enabled
-                or self.zkpassport_validator_urls!=['https://10.77.0.10:9443','https://10.77.0.11:9443','https://10.77.0.12:9443']):
+                or self.zkpassport_validator_urls!=['https://10.77.0.10:9544','https://10.77.0.11:9544','https://10.77.0.12:9544']):
             raise ValueError('automatic delivery requires finite Testnet purchase funding and the existing private signers')
         if self.generation_customer_purchase_enabled and (
                 self.network!='testnet11' or not self.deployment_generation_id or self.alpha_writes_enabled
