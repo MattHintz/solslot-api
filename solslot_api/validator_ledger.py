@@ -538,6 +538,12 @@ class ValidatorLedger(BaseLifecycleLedgerMixin, BaseInventoryHoldLedgerMixin, In
             row = self._conn.execute("PRAGMA quick_check").fetchone()
         return bool(row and row[0] == "ok")
 
+    def primary_purchase_authorization(self,claim_hash:str)->dict|None:
+        """Read the exact saved delivery signature; never allocate or sign."""
+        with self._lock:
+            row=self._conn.execute('SELECT * FROM primary_purchase_signatures WHERE claim_hash=?',(claim_hash,)).fetchone()
+            return dict(row)if row is not None else None
+
     def record_primary_purchase_or_recover(
         self,
         *,

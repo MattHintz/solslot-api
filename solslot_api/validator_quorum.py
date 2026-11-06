@@ -1113,6 +1113,9 @@ class ValidatorHealthResponse(BaseModel):
     currentIdentityGeneration: str | None = Field(default=None,pattern=r'^0x[0-9a-f]{64}$')
     currentIdentityProfileHash: str | None = Field(default=None,pattern=r'^0x[0-9a-f]{64}$')
     currentIdentityConfigured: bool = False
+    currentPurchaseConfigured:bool=False
+    currentPurchasePolicyHash:str|None=Field(default=None,pattern=r'^0x[0-9a-f]{64}$')
+    currentPurchaseExpiresAt:int|None=Field(default=None,ge=1)
 
 
 @dataclass(frozen=True)

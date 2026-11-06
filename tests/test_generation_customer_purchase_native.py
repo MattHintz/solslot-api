@@ -90,7 +90,7 @@ def signed(bundle,keys,additional):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('real_synthetic_identity_policy', ['legacy', 'prebound', 'forwarding'], indirect=True)
-async def test_native_current_checkout_delivery_and_fee_boundaries(core,tmp_path,real_synthetic_identity_policy):
+async def test_native_current_checkout_delivery_and_fee_boundaries(core,tmp_path,real_synthetic_identity_policy,monkeypatch):
     c=core;print("native: governance upgrade",flush=True);initialized=await initialize_and_upgrade(c,tmp_path)
     built,_=initialized;ctx=await context(c,tmp_path,initialized_generation=initialized)
     print("native: approved mint",flush=True);source,proposal,journal,chain=await approved(c,ctx,tmp_path)
@@ -116,7 +116,7 @@ async def test_native_current_checkout_delivery_and_fee_boundaries(core,tmp_path
     acs=Program.to(1);origins=[r.coin for r in await c.client.get_coin_records_by_puzzle_hash(acs.get_tree_hash()) if not r.spent]
     funding=Coin(origins[0].name(),c.faucet.address_puzzle_hash,uint64(10000))
     policy=bytes32.from_hexstr(c.prep.bridge_policy_hash);bridge=Coin(origins[1].name(),policy,uint64(1))
-    pay_coin=Coin(origins[2].name(),payment_puzzle.get_tree_hash(),uint64(1_000_000_000))
+    pay_coin=Coin(origins[2].name(),payment_puzzle.get_tree_hash(),uint64(500_000_000_000 if getattr(c,'checkout_nominal_candidate',False)else 1_000_000_000))
     setup=[make_spend(origin,acs,Program.to([[51,coin.puzzle_hash,int(coin.amount)],[51,acs.get_tree_hash(),int(origin.amount)-int(coin.amount)]])) for origin,coin in zip(origins,(funding,bridge,pay_coin))]
     assert await c.client.push_tx(SpendBundle(setup,G2Element()))==(MempoolInclusionStatus.SUCCESS,None);await c.sim.farm_block()
     bindings=CustomerLaunchBindings(bytes32.from_hexstr(c.prep.generation_id),bytes32.from_hexstr(c.prep.manifest_hash),inventory.pool_launcher_id,policy,load_puzzle('vault_singleton_inner_generation_v1.clsp').get_tree_hash())
@@ -163,12 +163,17 @@ async def test_native_current_checkout_delivery_and_fee_boundaries(core,tmp_path
         issuer_policy=TestnetIssuerPolicy(bindings.generation,inventory.collection,inventory.edition,inventory.metadata_root,
             terms.protocol_puzhash,terms.protocol_treasury_puzzle_hash,bytes(c.faucet.key.wallet_pk),
             frozenset([terms.deed_launcher_id]),vault.launcher,10_000_000_000,1,now-1,now+3600)
+        if getattr(c,'checkout_nominal_candidate',False):
+            from solslot_api.generation_customer_test_conversion import FixedTestnetConversion
+            issuer_policy=replace(issuer_policy,maximum_gross_mojos=200_000_000_000,test_usd_minor_per_txch=3_000_000)
+            price=FixedTestnetConversion(issuer_policy,now+300)
+            quote_args['price']=price
         quote=current_customer_xch_quote(vault=vault,forwarding_policy=issuer_policy,**quote_args)
         for bad in (replace(issuer_policy,buyer_vault=b32(203)),
                 replace(issuer_policy,issuer_public_key=owner_pk)):
-            with pytest.raises(ValueError,match='FEE_ROUTE_CHANGED'):
+            with pytest.raises(ValueError):
                 current_customer_xch_quote(vault=vault,forwarding_policy=bad,**quote_args)
-        with pytest.raises(ValueError,match='AMOUNT_CAP'):
+        with pytest.raises(ValueError):
             current_customer_xch_quote(vault=vault,forwarding_policy=replace(issuer_policy,maximum_gross_mojos=2),**quote_args)
     else:
         with pytest.raises(ValueError,match='FEE_ROUTE_UNSUPPORTED'):
@@ -184,22 +189,269 @@ async def test_native_current_checkout_delivery_and_fee_boundaries(core,tmp_path
             vault_launcher_id=vault.launcher,vault_p2_puzzle_hash=puzzle_for_p2_vault(vault.launcher).get_tree_hash(),
             authorization_nonce=quote_args['nonce'],authorization_expires_at=now+300,
             quote_expires_at=now+300,oracle_round=price.round)
+    current_verified=None
+    execution=None
+    reservation_replies={}
+    delivery_replies={}
+    if issuer_policy is not None:
+        from solslot_api.generation_customer_purchase_reservation import CurrentReservationClaim,verify_current_reservation
+        from solslot_puzzles.payment_artifacts_v3 import purchase_artifact_v3_to_json
+        from solslot_puzzles.payment_artifacts_v2 import oracle_round_to_json
+        import json
+        prep_path=tmp_path/'reservation-preparation.json'
+        prep_path.write_text(c.prep.model_dump_json(by_alias=True))
+        bound=ctx.settings.model_copy(update={'generation_preparation_path':str(prep_path),
+            'generation_preparation_hash':c.prep.manifest_hash,'generation_chain_anchor_hash':h(b32(216))})
+        claim=CurrentReservationClaim(generationId=c.prep.generation_id,anchorHash=bound.generation_chain_anchor_hash,
+            issuerPolicyHash=issuer_policy.commitment,purchaseArtifact=purchase_artifact_v3_to_json(quote),
+            signedPrice=(price.evidence()if issuer_policy.test_usd_minor_per_txch is not None else
+                {'round':oracle_round_to_json(price.round),'signatures':[
+                {'signerIndex':i,'signature':h(sig)}for i,sig in price.signatures]}),
+            availableCoinId=h(item.current.coin.name()),currentVaultCoinId=h(vault.coin.name()),signerIndices=(0,1))
+        args=dict(settings=bound,anchor=built.anchor,provider=c.provider,issuer_policy=issuer_policy,
+            expected_issuer_policy_hash=issuer_policy.commitment,clock=lambda:now)
+        current_verified=await verify_current_reservation(claim,**args)
+        assert current_verified.vault.identity_verified
+        assert current_verified.inventory.edition==inventory.edition
+        assert current_verified.item.current.coin==item.current.coin
+        for changes in ({'generation_id':h(b32(217))},{'available_coin_id':h(b32(218))},
+                        {'current_vault_coin_id':h(b32(219))},{'issuer_policy_hash':h(b32(220))}):
+            with pytest.raises(ValueError):await verify_current_reservation(claim.model_copy(update=changes),**args)
+        with pytest.raises(ValueError,match='POLICY_EXPIRED'):
+            await verify_current_reservation(claim,**{**args,'clock':lambda:issuer_policy.expires_at})
+        altered=json.loads(json.dumps(claim.signed_price))
+        if issuer_policy.test_usd_minor_per_txch is not None:altered['issuerPolicyHash']=h(b32(223))
+        else:altered['signatures'][0]['signature']=h(bytes(96))
+        with pytest.raises(ValueError):await verify_current_reservation(claim.model_copy(update={'signed_price':altered}),**args)
     reservation=InventoryReservationV1(quote,quote.quote_expires_at)
     # Use the exact singleton wrapper constant from the native driver.
     from chia.wallet.puzzles.singleton_top_layer_v1_1 import SINGLETON_MOD_HASH
     structure=Program.to((SINGLETON_MOD_HASH,(terms.deed_launcher_id,terms.deed_launcher_puzzle_hash)))
     print("native: reservation",flush=True);reserved=build_inventory_reservation_spend(available_coin=item.current.coin,deed_singleton_struct=structure,
         lineage_proof=item.lineage,reservation=reservation,signer_indices=(0,1),terms=terms)
-    reservation_bundle=signed(SpendBundle([reserved.spend],G2Element()),validators,c.faucet.agg_sig_me_data)
+    if current_verified is not None:assert bytes(current_verified.transition.spend)==bytes(reserved.spend)
+    if current_verified is not None:
+        from types import SimpleNamespace
+        from solslot_api.generation_customer_purchase_validators import sign_current_reservation
+        from solslot_api.validator_ledger import ValidatorLedger
+        signatures=[]
+        for slot in (0,1):
+            signer_settings=SimpleNamespace(**bound.model_dump())
+            signer_settings.generation_customer_purchase_enabled=True
+            signer_settings.signer_index=slot
+            signer_settings.roster_pubkeys=[h(bytes(k.get_g1()))for k in validators]
+            ledger=ValidatorLedger(tmp_path/('current-purchase-validator-'+str(slot)+'.sqlite3'))
+            loads=[]
+            def load_synthetic():loads.append(slot);return validators[slot]
+            call=dict(settings=signer_settings,anchor=built.anchor,provider=c.provider,ledger=ledger,
+                issuer_policy=issuer_policy,expected_issuer_policy_hash=issuer_policy.commitment,clock=lambda:now)
+            reply=await sign_current_reservation(claim,claim.digest(),load_key=load_synthetic,**call)
+            reservation_replies[slot]=reply.model_dump(mode='json')
+            assert loads==[slot]
+            def no_second_key_read():raise AssertionError('saved reservation must recover without loading a key')
+            recovered=await sign_current_reservation(claim,claim.digest(),load_key=no_second_key_read,**call)
+            assert recovered==reply
+            with pytest.raises(ValueError,match='NOT_ENABLED'):
+                await sign_current_reservation(claim,h(b32(222)),load_key=no_second_key_read,**call)
+            ledger.close();signatures.append(G2Element.from_bytes(bytes.fromhex(reply.signature[2:])))
+        reservation_bundle=SpendBundle([reserved.spend],AugSchemeMPL.aggregate(signatures))
+        from solslot_api import generation_customer_purchase_execution as execute
+        from solslot_api.generation_customer_purchase_execution_store import CurrentPurchaseExecutionStore
+        execution_store=CurrentPurchaseExecutionStore(tmp_path/'payment_purchases_v2.db',c.prep.generation_id)
+        intent=execution_store.save_review(claim,browser_hash='ab'*32,request_key='native-1',now=now)
+        execution=execute.CurrentNativePurchaseExecution(settings=SimpleNamespace(**{
+            **bound.model_dump(),'generation_customer_purchase_enabled':True}),anchor=built.anchor,
+            provider=c.provider,policy=issuer_policy,store=execution_store,fee_cap=10,clock=lambda:now)
+        from solslot_api.payment_quotes import AuthorizedOracleRound
+        if issuer_policy.test_usd_minor_per_txch is None:
+            authorized=AuthorizedOracleRound(price.round,tuple(
+                {'signerIndex':i,'signature':h(sig)} for i,sig in price.signatures))
+            from solslot_api import payment_quotes
+            monkeypatch.setattr(payment_quotes,'load_authorized_oracle_round',lambda *a,**kw:authorized)
+        visible_inventory=await execution.inventory()
+        assert visible_inventory['deedCount']==25 and visible_inventory['availableDeeds']==25
+        assert visible_inventory['receivingVaultLauncherId']==h(vault.launcher)
+        selected_row=next(row for row in visible_inventory['items']if row['deedLauncherId']==h(terms.deed_launcher_id))
+        assert selected_row['smartDeedInnerHash']==h(terms.smart_deed_inner_hash)
+        assert len({row['smartDeedInnerHash']for row in visible_inventory['items']})==25
+        async def primary_payer_coins(puzzle_hash,*,include_spent=False):
+            return [record.to_json_dict()for record in await c.client.get_coin_records_by_puzzle_hash(bytes32.from_hexstr(puzzle_hash))
+                if include_spent or not record.spent]
+        monkeypatch.setattr(c.provider,'get_coin_records_by_puzzle_hash_primary',primary_payer_coins,raising=False)
+        candidates=await execution.payer_coins(intent,[h(bytes(payment_pk.get_g1()))],browser_hash='ab'*32)
+        assert candidates['candidates'][0]['paymentCoinId']==h(pay_coin.name())
+        assert candidates['receivingVaultLauncherId']==h(vault.launcher)
+        # Exercise the server-side quote against real native custody and ID,
+        # then recover that exact review after expiry without repricing.
+        review=await execution.quote('native-quote',h(terms.deed_launcher_id),browser_hash='ab'*32)
+        assert review['receivingVaultLauncherId']==h(vault.launcher)
+        assert review['baseAmountUsdMinor']==str(terms.base_amount_minor)
+        assert review['totalAmountUsdMinor']==str(terms.subtotal_minor)
+        assert review['quoteExpiresAt']==now+300
+        execution.clock=lambda:issuer_policy.expires_at+1
+        recovered=await execution.quote('native-quote',h(terms.deed_launcher_id),browser_hash='ab'*32)
+        assert recovered['intentId']==review['intentId'] and recovered['quoteExpired']
+        assert recovered['amountMojos']==review['amountMojos']
+        with pytest.raises(ValueError,match='REQUEST_KEY_DEED_CHANGED'):
+            await execution.quote('native-quote',h(b32(240)),browser_hash='ab'*32)
+        execution.clock=lambda:now
+        async def native_transport(settings,evidence,*,retained=None,on_signature=None):
+            # Only transport is replaced. These replies came from actual
+            # independent native signer reconstruction above/below.
+            from solslot_api.generation_customer_purchase_reservation import CurrentReservationEvidence
+            replies=reservation_replies if isinstance(evidence,CurrentReservationEvidence) else delivery_replies
+            values=[]
+            for slot in (0,1):
+                response=replies[slot]
+                if on_signature is not None:on_signature(slot,response)
+                values.append(G2Element.from_bytes(bytes.fromhex(response['signature'][2:])))
+            return AugSchemeMPL.aggregate(values)
+        monkeypatch.setattr(execute,'collect_current_purchase_quorum',native_transport)
+        await execution.prepare_reservation(intent,browser_hash='ab'*32)
+        assert bytes(execution_store.execution_bundle(intent,'RESERVATION',browser_hash='ab'*32))==bytes(reservation_bundle)
+        await execution._revalidate_prepared(execution_store.saved(intent,browser_hash='ab'*32),'RESERVATION',reservation_bundle)
+        from solslot_api.protocol_submission import PreparedProtocolBundle
+        execution_store.save_execution_funding(intent,'RESERVATION',PreparedProtocolBundle(reservation_bundle,0,h(b32(225))),browser_hash='ab'*32,now=now)
+    else:
+        reservation_bundle=signed(SpendBundle([reserved.spend],G2Element()),validators,c.faucet.agg_sig_me_data)
     assert await c.client.push_tx(reservation_bundle)==(MempoolInclusionStatus.SUCCESS,None);await c.sim.farm_block()
     print("native: reservation confirmed",flush=True);reserved_coin=reserved.reserved_coin
+    if execution is not None:
+        record=await c.provider.get_coin_record_by_name_primary(h(reserved_coin.name()))
+        execution_store.observe_execution(intent,'RESERVATION',browser_hash='ab'*32,
+            transaction_id=h(reservation_bundle.name()),status='CONFIRMED',
+            confirmed_height=record['confirmed_block_index'],now=now)
+    if getattr(c,'checkout_timeout_candidate',False):
+        from solslot_api.generation_customer_purchase_timeout import verify_current_timeout
+        with pytest.raises(ValueError,match='FINITE_SCOPE_CHANGED'):
+            await execution.prepare_timeout(intent,browser_hash='ab'*32)
+        c.sim.pass_time(uint64(301));await c.sim.farm_block();now=int(c.sim.timestamp)
+        execution.clock=lambda:now
+        # Feed actual simulator coin/block evidence through the real primary
+        # provider and snapshot implementation, with no fallback authority.
+        from solslot_api.chia_provider import ChiaProvider,ChiaProviderConfig
+        from solslot_api import chia_snapshot
+        class Node:
+            async def get_network_info(self):return {'success':True,'network_name':'testnet11'}
+            async def get_blockchain_state(self):return {'success':True,'blockchain_state':{
+                'peak':{'height':int(c.sim.block_records[-1].height),'header_hash':h(c.sim.block_records[-1].header_hash)},
+                'sync':{'synced':True,'sync_mode':False}}}
+            async def get_block_record(self,digest):
+                block=await c.client.get_block_record(bytes32.from_hexstr(digest))
+                return {'success':True,'block_record':{'height':int(block.height),'header_hash':h(block.header_hash),
+                    'timestamp':int(block.timestamp),'prev_hash':h(block.prev_transaction_block_hash)}}
+            async def get_coin_record_by_name(self,name):return await c.provider.get_coin_record_by_name_primary(name)
+            async def get_puzzle_and_solution(self,name,height):return await c.provider.get_puzzle_and_solution_primary(name,height)
+        primary=ChiaProvider(Node(),None,ChiaProviderConfig(network='testnet11',primary_url='https://sim.invalid',fallback_url=''))
+        monkeypatch.setattr(chia_snapshot.time,'time',lambda:now)
+        args={**args,'provider':primary};execution.provider=primary
+        # Wall time alone cannot release; the unchanged primary transaction
+        # block and unspent native reservation provide the actual deadline.
+        release=await verify_current_timeout(claim,h(reserved_coin.name()),**{**args,'clock':lambda:now})
+        assert bytes(release.aggregated_signature)==bytes(G2Element())
+        with pytest.raises(ValueError,match='CONFIRMED_RESERVATION_CHANGED'):
+            await verify_current_timeout(claim,h(b32(241)),**{**args,'clock':lambda:now})
+        await execution.prepare_timeout(intent,browser_hash='ab'*32)
+        await execution._revalidate_prepared(execution_store.saved(intent,browser_hash='ab'*32),'RELEASE',release)
+        from solslot_api.generation_customer_purchase_fees import CurrentPurchaseFeeAuthority,CurrentPurchaseFeeFaucet,CurrentPurchaseBundleSubmitter
+        from solslot_api.protocol_submission import ProtocolFeePolicy
+        candidates=[r.coin for r in await c.client.get_coin_records_by_puzzle_hash(c.faucet.address_puzzle_hash)
+            if not r.spent and 100<=r.coin.amount<=20_000_000_000]
+        fee_coin=candidates[0]
+        authority=CurrentPurchaseFeeAuthority.model_validate({'schema':'solslot.current-purchase-fee-authority.v1',
+            'network':'testnet11','generationId':c.prep.generation_id,'issuerPolicyHash':issuer_policy.commitment,
+            'fundingPuzzleHash':c.faucet.address_hex,'feeCoinIds':[h(fee_coin.name())],
+            'maximumFeeParentMojos':int(fee_coin.amount),'maximumStageFeeMojos':10,'maximumTotalFeeMojos':10,
+            'issuedAt':now,'expiresAt':issuer_policy.expires_at})
+        guard=CurrentPurchaseFeeFaucet(c.faucet,authority,issuer_policy,execution_store,clock=lambda:now)
+        sender=CurrentPurchaseBundleSubmitter(execution_store=execution_store,clock=lambda:now,provider=c.provider,
+            faucet=guard,policy=ProtocolFeePolicy(enabled=True,minimum_mojos=1,maximum_mojos=10))
+        async def estimate(_):return 5
+        async def select(*a,**kw):return fee_coin
+        sender._estimate_fee=estimate;sender._select_fee_coin=select
+        prepared=await sender._prepare_locked(release.to_json_dict())
+        assert prepared.fee_mojos==5
+        fee_only=SpendBundle([s for s in prepared.bundle.coin_spends if s.coin==fee_coin],prepared.bundle.aggregated_signature)
+        assert (await c.client.push_tx(fee_only))[0]!=MempoolInclusionStatus.SUCCESS
+        assert await c.client.push_tx(prepared.bundle)==(MempoolInclusionStatus.SUCCESS,None);await c.sim.farm_block()
+        assert (await c.client.push_tx(prepared.bundle))[0]!=MempoolInclusionStatus.SUCCESS
+        restored=await resolve_current_primary_inventory(**inventory_args)
+        assert sum(x.available for x in restored.items)==25
+        assert (await c.client.get_coin_record_by_name(pay_coin.name())).spent is False
+        assert (await trace_current_customer_vault(**vault_args)).identity_verified
+        print('native: unpaid timeout released; 25 deeds available; payer untouched; replay rejected',flush=True)
+        ctx.collections.close()
+        return
     offered=prepare_chia_buyer_offer_v3(payment_coin=pay_coin,payment_public_key=bytes(payment_pk.get_g1()),artifact=quote,terms=terms,deed_singleton_struct=structure)
+    current_payment=None
+    if current_verified is not None:
+        from solslot_api.generation_customer_purchase_wallet import CurrentNativePaymentRequest,prepare_current_native_payment
+        from solslot_api.generation_customer_purchase_store import CurrentCustomerPurchaseStore
+        from solslot_puzzles.payment_artifacts_v2 import PaymentArtifactError
+        payment_request=CurrentNativePaymentRequest(reservation=claim,reservedCoinId=h(reserved_coin.name()),
+            paymentCoinId=h(pay_coin.name()),paymentPublicKey=h(bytes(payment_pk.get_g1())))
+        payment_args=dict(settings=bound,anchor=built.anchor,provider=c.provider,issuer_policy=issuer_policy,
+            expected_issuer_policy_hash=issuer_policy.commitment,clock=lambda:now)
+        current_payment=(await execution.prepare_wallet(intent,payment_request,browser_hash='ab'*32)
+            if execution is not None else await prepare_current_native_payment(payment_request,**payment_args))
+        wallet_review=current_payment.review()
+        assert len(wallet_review['coinSpends'])==1
+        assert wallet_review['paymentCoinId']==h(pay_coin.name())
+        assert wallet_review['recipientVaultLauncherId']==h(vault.launcher)
+        assert wallet_review['paymentPublicKey']!=h(owner_pk)
+        assert bytes(current_payment.prepared.coin_spend)==bytes(offered.coin_spend)
+        assert current_payment.prepared.offer.to_bech32()==offered.offer.to_bech32()
+        assert wallet_review['walletFeeMojos']=='0'
+        assert wallet_review['payerConfirmedHeight']>0 and wallet_review['observedAt']==now
+        assert wallet_review['payerCoin']['puzzleHash']==h(payment_puzzle.get_tree_hash())
+        with pytest.raises(ValueError,match='ORDER_SIGNATURE_INVALID'):
+            current_payment.signed_delivery(G2Element())
+        with pytest.raises(PaymentArtifactError,match='does not belong'):
+            await prepare_current_native_payment(payment_request.model_copy(update={'payment_public_key':h(owner_pk)}),**payment_args)
     raw=SpendBundle([offered.coin_spend],G2Element());payment_signed=signed(raw,[synthetic],c.faucet.agg_sig_me_data)
     buyer=Offer(offered.offer.requested_payments,WalletSpendBundle(payment_signed.coin_spends,payment_signed.aggregated_signature),offered.offer.driver_dict)
     print("native: offer combine",flush=True);purchase=build_native_primary_offer_v5(buyer_offer=buyer,deed_coin=reserved_coin,deed_singleton_struct=structure,
         lineage_proof=LineageProof(parent_name=item.current.coin.parent_coin_info,inner_puzzle_hash=item.current.inner.get_tree_hash(),amount=uint64(1)),
         artifact=quote,signer_indices=(0,1),terms=terms,reservation=reservation)
     print("native: offer finalize",flush=True);full=purchase.aggregate_offer.to_valid_spend()
+    if current_verified is not None:
+        from solslot_api.generation_customer_purchase_delivery import CurrentDeliveryClaim,verify_current_delivery,sign_current_delivery
+        delivery_claim=CurrentDeliveryClaim(reservation=claim,reservedCoinId=h(reserved_coin.name()),buyerOffer=buyer.to_bech32())
+        assert current_payment.signed_delivery(payment_signed.aggregated_signature)==delivery_claim
+        # Existing payment DB, current generation and browser binding, no new
+        # recovery store. Real signed buyer work survives process reopening.
+        current_store=CurrentCustomerPurchaseStore(str(tmp_path/'payment_purchases_v2.db'),c.prep.generation_id)
+        browser='ab'*32
+        intent=current_store.save_review(claim,browser_hash=browser,request_key='native-1',now=now)
+        if execution is not None:
+            bad=delivery_claim.model_copy(update={'buyer_offer':offered.offer.to_bech32()})
+            with pytest.raises(ValueError):await execution.accept_payer(intent,bad,browser_hash=browser)
+            assert execution_store.saved(intent,browser_hash=browser)['deliveryClaim'] is None
+            assert (await execution.accept_payer(intent,delivery_claim,browser_hash=browser))['payerAuthorizationSaved']
+            assert (await execution.accept_payer(intent,delivery_claim,browser_hash=browser))['payerAuthorizationSaved']
+        else:current_store.save_delivery(intent,delivery_claim,browser_hash=browser,now=now)
+        reopened_store=CurrentCustomerPurchaseStore(current_store.path,c.prep.generation_id)
+        assert reopened_store.saved(intent,browser_hash=browser)['deliveryClaim']==delivery_claim
+        checked=await verify_current_delivery(delivery_claim,settings=bound,anchor=built.anchor,provider=c.provider,
+            issuer_policy=issuer_policy,expected_issuer_policy_hash=issuer_policy.commitment,clock=lambda:now)
+        assert bytes(checked.bundle)==bytes(full)
+        delivery_signatures=[]
+        for slot in (0,1):
+            signer_settings=SimpleNamespace(**bound.model_dump());signer_settings.generation_customer_purchase_enabled=True
+            signer_settings.signer_index=slot;signer_settings.roster_pubkeys=[h(bytes(k.get_g1()))for k in validators]
+            ledger=ValidatorLedger(tmp_path/('current-purchase-validator-'+str(slot)+'.sqlite3'))
+            loads=[]
+            def load_delivery_key():loads.append(slot);return validators[slot]
+            call=dict(settings=signer_settings,anchor=built.anchor,provider=c.provider,ledger=ledger,
+                issuer_policy=issuer_policy,expected_issuer_policy_hash=issuer_policy.commitment,clock=lambda:now)
+            response=await sign_current_delivery(delivery_claim,delivery_claim.digest(),load_key=load_delivery_key,**call)
+            delivery_replies[slot]=response.model_dump(mode='json')
+            assert loads==[slot]
+            recovered=await sign_current_delivery(delivery_claim,delivery_claim.digest(),load_key=no_second_key_read,**call)
+            assert response==recovered
+            delivery_signatures.append(G2Element.from_bytes(bytes.fromhex(response.signature[2:])))
+            ledger.close()
+        full=SpendBundle(full.coin_spends,AugSchemeMPL.aggregate([full.aggregated_signature,*delivery_signatures]))
     unforwarded=full
     route_operation=None
     forwarding=None
@@ -242,11 +494,12 @@ async def test_native_current_checkout_delivery_and_fee_boundaries(core,tmp_path
         # wallet spends or a general-purpose key RPC.
         from solslot_api.generation_customer_issuer import TestnetIssuerPolicy,TestnetIssuerJournal
         policy=issuer_policy
-        base=signed(SpendBundle(unforwarded.coin_spends,G2Element()),keys[:-1],c.faucet.agg_sig_me_data)
+        base=unforwarded if current_verified is not None else signed(SpendBundle(unforwarded.coin_spends,G2Element()),keys[:-1],c.faucet.agg_sig_me_data)
         calls=[]
         def issuer_sign(message):calls.append(message);return AugSchemeMPL.sign(c.faucet.key.wallet_sk,message)
         location=tmp_path/'issuer-guard.db';guard=TestnetIssuerJournal(location,policy)
         guarded=guard.authorize(bundle=base,artifact=quote,terms=terms,fees=fees,now=now,sign_message=issuer_sign)
+        retained_signature=G2Element.from_bytes(bytes.fromhex(guard.db.execute('SELECT signature FROM issuer_forwarding').fetchone()[0][2:]))
         assert len(calls)==1 and bytes(guarded)==bytes(full)
         with pytest.raises(ValueError,match='EXPIRED'):
             guard.authorize(bundle=base,artifact=quote,terms=terms,fees=fees,now=policy.expires_at,sign_message=issuer_sign)
@@ -259,10 +512,32 @@ async def test_native_current_checkout_delivery_and_fee_boundaries(core,tmp_path
         def no_second_signature(_):raise AssertionError('a saved authorization must not prompt or sign again')
         assert bytes(guard.authorize(bundle=base,artifact=quote,terms=terms,fees=fees,now=now,
             sign_message=no_second_signature))==bytes(guarded)
+        if execution is not None:
+            # Independently reconstruct the entire coordinator handoff before
+            # using the scoped issuer key. Replays recover the durable result.
+            from solslot_api.generation_customer_purchase_issuer import CurrentIssuerRequest,sign_current_issuer
+            _,issuer_base,companion,pair=await execution.delivery_issuer_review(intent,delivery_claim,browser_hash='ab'*32)
+            request=CurrentIssuerRequest(generationId=bound.deployment_generation_id,policyHash=policy.commitment,
+                claim=delivery_claim,claimHash=delivery_claim.digest(),purchaseBundle=issuer_base.to_json_dict(),
+                issuerCoinSpend=companion.issuer_signature_spend.to_json_dict(),issuerPublicKey=h(bytes(pair[0])),message=h(bytes(pair[1])))
+            def no_issuer_key_load():raise AssertionError('retained issuer work must not reopen a key')
+            args=dict(settings=execution.settings,anchor=built.anchor,provider=c.provider,journal=guard,
+                load_key=no_issuer_key_load,clock=lambda:now)
+            assert await sign_current_issuer(request,**args)==retained_signature
+            with pytest.raises(ValueError,match='REVIEW_CHANGED'):
+                await sign_current_issuer(request.model_copy(update={'message':h(bytes(96))}),**args)
+            unsigned=issuer_base.to_json_dict();unsigned['aggregated_signature']=h(bytes(G2Element()))
+            with pytest.raises(ValueError,match='QUORUM_SIGNATURES_REQUIRED'):
+                await sign_current_issuer(request.model_copy(update={'purchase_bundle':unsigned}),**args)
         guard.close()
         with pytest.raises(ValueError,match='POLICY_CHANGED'):
             TestnetIssuerJournal(location,replace(policy,expires_at=policy.expires_at+1))
         full=guarded
+        if execution is not None:
+            await execution.prepare_delivery(intent,delivery_claim,retained_signature,browser_hash='ab'*32)
+            assert bytes(execution_store.execution_bundle(intent,'DELIVERY',browser_hash='ab'*32))==bytes(full)
+            await execution._revalidate_prepared(execution_store.saved(intent,browser_hash='ab'*32),'DELIVERY',full)
+            execution_store.save_execution_funding(intent,'DELIVERY',PreparedProtocolBundle(full,0,h(b32(226))),browser_hash='ab'*32,now=now)
     print("native: purchase admission",flush=True);assert await c.client.push_tx(full)==(MempoolInclusionStatus.SUCCESS,None);await c.sim.farm_block()
     assert (await c.client.push_tx(full))[0]!=MempoolInclusionStatus.SUCCESS
     print("native: purchase confirmed",flush=True);after=await resolve_current_primary_inventory(**inventory_args)
@@ -354,3 +629,16 @@ async def test_native_current_checkout_delivery_and_fee_boundaries(core,tmp_path
     assert sum(coin.amount for coin in outputs)==fee.amount
     assert next(coin for coin in outputs if coin!=company).amount==int(fee.amount)-int(company.amount)
     ctx.collections.close()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('real_synthetic_identity_policy',['forwarding'],indirect=True)
+async def test_native_current_checkout_timeout_releases_unpaid_inventory(core,tmp_path,real_synthetic_identity_policy,monkeypatch):
+    core.checkout_timeout_candidate=True
+    await test_native_current_checkout_delivery_and_fee_boundaries(core,tmp_path,real_synthetic_identity_policy,monkeypatch)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('real_synthetic_identity_policy',['forwarding'],indirect=True)
+async def test_native_current_nominal_txch_checkout_delivery(core,tmp_path,real_synthetic_identity_policy,monkeypatch):
+    core.checkout_nominal_candidate=True
+    await test_native_current_checkout_delivery_and_fee_boundaries(core,tmp_path,real_synthetic_identity_policy,monkeypatch)

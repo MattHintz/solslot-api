@@ -1507,6 +1507,19 @@ class Settings(BaseSettings):
     generation_customer_signer_key_path: str = ''
     generation_customer_fee_db_path: str = './state/customer-fees.sqlite3'
     generation_customer_identity_enabled: bool = False
+    # Separate Testnet-only price demand worker. Disabled until explicitly configured.
+    generation_customer_pricing_enabled: bool = False
+    generation_customer_pricing_socket: str = '/run/solslot-price-demand/input.sock'
+    generation_customer_pricing_socket_gid: int = Field(default=-1,ge=-1)
+    # Separate finite Testnet purchase policy; no legacy write gate enables it.
+    generation_customer_purchase_enabled: bool = False
+    generation_customer_purchase_funding_enabled: bool = False
+    generation_customer_purchase_worker_enabled: bool = False
+    generation_customer_purchase_policy_path: str = ''
+    generation_customer_purchase_policy_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
+    generation_customer_purchase_fee_authority_path: str = ''
+    generation_customer_purchase_fee_authority_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
+    generation_customer_purchase_fee_signer_key_path: str = ''
     generation_customer_identity_recovery_enabled: bool = False
     generation_customer_identity_profile_path: str = ''
     generation_customer_identity_profile_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
@@ -1613,6 +1626,25 @@ class Settings(BaseSettings):
                 or self.generation_customer_public_origin != f'https://{origin.netloc}'
                 or origin.netloc != origin.netloc.lower()):
             raise ValueError('customer registration requires an exact HTTPS origin')
+        if self.generation_customer_pricing_enabled and (
+                self.network!='testnet11' or not self.deployment_generation_id
+                or not self.generation_customer_identity_enabled
+                or self.generation_customer_pricing_socket!='/run/solslot-price-demand/input.sock'
+                or self.generation_customer_pricing_socket_gid<0):
+            raise ValueError('Testnet price demand requires the current identity context and exact local socket')
+        if self.generation_customer_purchase_funding_enabled and not self.generation_customer_purchase_enabled:
+            raise ValueError('purchase fees require the separately enabled current checkout')
+        if self.generation_customer_purchase_worker_enabled and (not self.generation_customer_purchase_funding_enabled
+                or self.zkpassport_validator_urls!=['https://10.77.0.10:9443','https://10.77.0.11:9443','https://10.77.0.12:9443']):
+            raise ValueError('automatic delivery requires finite Testnet purchase funding and the existing private signers')
+        if self.generation_customer_purchase_enabled and (
+                self.network!='testnet11' or not self.deployment_generation_id or self.alpha_writes_enabled
+                or not self.generation_customer_enabled or not self.generation_customer_identity_enabled
+                or not all((self.generation_customer_purchase_policy_path,self.generation_customer_purchase_policy_hash,
+                    self.generation_customer_purchase_fee_authority_path,self.generation_customer_purchase_fee_authority_hash))
+                or (self.generation_customer_purchase_funding_enabled
+                    and not self.generation_customer_purchase_fee_signer_key_path)):
+            raise ValueError('current checkout requires exact Testnet custody and finite policy files')
         if self.deployment_generation_id is None:
             if self.generation_customer_enabled:
                 raise ValueError('customer registration requires a separate Testnet generation')

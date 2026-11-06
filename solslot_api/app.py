@@ -709,6 +709,26 @@ async def lifespan(app: FastAPI):
     app.state.generation_customer_identity=configured_current_customer_identity(settings,app.state.generation_customers)
     generation_customer_identity_task=(asyncio.create_task(app.state.generation_customer_identity.run(),
         name='generation-customer-identity-observer') if app.state.generation_customer_identity is not None else None)
+    from .generation_price_demand_factory import configured_price_demand
+    app.state.generation_price_demand=configured_price_demand(settings,customers=app.state.generation_customers,
+        identity=app.state.generation_customer_identity)
+    generation_price_stop=asyncio.Event()
+    generation_price_task=(asyncio.create_task(app.state.generation_price_demand.run(generation_price_stop),
+        name='generation-price-demand') if app.state.generation_price_demand is not None else None)
+    from .generation_customer_purchase_factory import configured_current_customer_purchase
+    app.state.generation_customer_purchase=configured_current_customer_purchase(settings,
+        customers=app.state.generation_customers,funding_store=app.state.protocol_funding_store)
+    from .generation_customer_purchase_observer import CurrentPurchaseObserver
+    app.state.generation_customer_purchase_observer=(CurrentPurchaseObserver(app.state.generation_customer_purchase)
+        if app.state.generation_customer_purchase is not None else None)
+    generation_purchase_stop=asyncio.Event()
+    generation_purchase_task=(asyncio.create_task(app.state.generation_customer_purchase_observer.run(generation_purchase_stop),
+        name='generation-current-purchase-observer') if app.state.generation_customer_purchase_observer is not None else None)
+    from .generation_customer_purchase_factory import configured_current_purchase_worker
+    app.state.generation_customer_purchase_worker=configured_current_purchase_worker(settings,app.state.generation_customer_purchase)
+    generation_delivery_stop=asyncio.Event()
+    generation_delivery_task=(asyncio.create_task(app.state.generation_customer_purchase_worker.run(generation_delivery_stop),
+        name='generation-current-purchase-delivery') if app.state.generation_customer_purchase_worker is not None else None)
     from .generation_recipient_execution import GenerationRecipientObserver
     recipient_observer = (GenerationRecipientObserver(app.state.generation_preparation,
         app.state.generation_operations, app.state.coinset) if app.state.generation_preparation is not None else None)
@@ -748,11 +768,26 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if generation_delivery_task is not None:
+            generation_delivery_stop.set();generation_delivery_task.cancel()
+            with suppress(asyncio.CancelledError):await generation_delivery_task
+        app.state.generation_customer_purchase_worker=None
+        if generation_purchase_task is not None:
+            generation_purchase_stop.set()
+            generation_purchase_task.cancel()
+            with suppress(asyncio.CancelledError):await generation_purchase_task
+        app.state.generation_customer_purchase_observer=None
+        if generation_price_task is not None:
+            generation_price_stop.set()
+            generation_price_task.cancel()
+            with suppress(asyncio.CancelledError):await generation_price_task
+        app.state.generation_price_demand=None
         if generation_customer_identity_task is not None:
             generation_customer_identity_task.cancel()
             with suppress(asyncio.CancelledError):await generation_customer_identity_task
         if app.state.generation_customer_identity is not None:app.state.generation_customer_identity.close()
         app.state.generation_customer_identity=None
+        app.state.generation_customer_purchase=None
         if generation_customer_task is not None:
             generation_customer_task.cancel()
             with suppress(asyncio.CancelledError):await generation_customer_task
@@ -906,6 +941,10 @@ from .generation_customer_portfolio_routes import router as generation_customer_
 app.include_router(generation_customer_portfolio_router)
 from .generation_customer_identity_routes import router as current_customer_identity_router
 app.include_router(current_customer_identity_router)
+from .generation_customer_price_routes import router as current_customer_price_router
+app.include_router(current_customer_price_router)
+from .generation_customer_purchase_routes import router as current_customer_purchase_router
+app.include_router(current_customer_purchase_router)
 
 # zkPassport gasless relayer (ERC-2771 meta-tx; 503 when relayer key is unset).
 app.include_router(zkpassport_relay_router)

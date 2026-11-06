@@ -31,7 +31,9 @@ from .xch_price_feed import (
 )
 
 MAX_INPUT_BYTES = 32_768
-MAX_TEST_WINDOW_SECONDS = 172_800
+# Demand-driven collection remains bounded by each role's monthly call ledger.
+# A longer Testnet authorization avoids a manual policy renewal every two days.
+MAX_TEST_WINDOW_SECONDS = 30 * 24 * 60 * 60
 MONTHLY_CALLS_PER_ROLE = 3_000
 
 
@@ -108,13 +110,12 @@ def validate_test_window(path: Path, *, now: int) -> int:
     return end
 
 
-def reserve_provider_call(path: Path, *, now: int) -> None:
-    """Count attempts before requesting; three roles stay below Demo's 10k cap.
-
-    Requires the enclosing process lock. Never reset a corrupt or future ledger.
-    """
+def read_provider_usage(path: Path, *, now: int) -> dict[str, Any]:
+    """Read the effective UTC-period count without resetting or writing it."""
+    if type(now) is not int or now <= 0:
+        raise PriceFeedError("provider usage clock is invalid")
     month = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m")
-    value = read_json(path) if path.exists() else {"month": month, "calls": 0}
+    value = read_json(path) if path.exists() or path.is_symlink() else {"month": month, "calls": 0}
     if not isinstance(value, dict) or set(value) != {"month", "calls"}:
         raise PriceFeedError("provider usage ledger is invalid")
     previous, count = value["month"], value["calls"]
@@ -126,6 +127,16 @@ def reserve_provider_call(path: Path, *, now: int) -> None:
         raise PriceFeedError("provider usage ledger is invalid")
     if previous != month:
         count = 0
+    return {"month": month, "calls": count}
+
+
+def reserve_provider_call(path: Path, *, now: int) -> None:
+    """Count attempts before requesting; three roles stay below Demo's 10k cap.
+
+    Requires the enclosing process lock. Never reset a corrupt or future ledger.
+    """
+    usage = read_provider_usage(path, now=now)
+    month, count = usage["month"], usage["calls"]
     if count >= MONTHLY_CALLS_PER_ROLE:
         raise PriceFeedError("free provider monthly request budget is exhausted")
     _atomic_public_json(path, {"month": month, "calls": count + 1})
@@ -155,7 +166,9 @@ def _prior_sequence(settings: Settings) -> int:
     return prior[1].round.sequence if prior else 0
 
 
-async def collect(args: argparse.Namespace) -> dict[str, Any]:
+async def collect(args: argparse.Namespace, *, minimum_validity: int = 120) -> dict[str, Any]:
+    if type(minimum_validity) is not int or not 120 <= minimum_validity <= 300:
+        raise PriceFeedError("quote validity requirement is invalid")
     roster, keys = read_roster(args.roster)
     settings = settings_for(roster, args.snapshot)
     _check_config_owner(args.attestors)
@@ -170,6 +183,8 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
     observations = await permitted_observations(args, now=now)
     sequence = max(prior_sequence + 1, now)
     candidate = candidate_round(observations=observations, pubkeys=keys, sequence=sequence, now=now)
+    if int(candidate['validUntil']) < now + minimum_validity:
+        raise PriceFeedError("source prices do not cover the requested quote window")
     encoded = json.dumps(candidate, sort_keys=True, separators=(",", ":"))
 
     async def attest(command: list[str]) -> dict[str, Any]:
@@ -206,6 +221,34 @@ async def collect(args: argparse.Namespace) -> dict[str, Any]:
 
     signatures = await asyncio.gather(*(attest(command) for command in commands))
     return publish_snapshot(settings, {"round": candidate, "signatures": signatures}, now=int(time.time()))
+
+
+def demand_status(args: argparse.Namespace) -> dict[str, Any]:
+    """Read signed-round and quota state with no provider or signer activity."""
+    from .xch_price_feed_status import price_refresh_status
+    roster, _keys = read_roster(args.roster)
+    settings = settings_for(roster,args.snapshot)
+    now = int(time.time())
+    return price_refresh_status(settings,snapshot=args.snapshot,usage=args.usage_state,
+        policy=args.policy,now=now,required_until=now+300)
+
+
+async def collect_on_demand(args: argparse.Namespace) -> dict[str, Any]:
+    """Reuse a live five-minute round or run the existing fixed collector once.
+
+    The enclosing CLI holds the existing nonblocking collector lock. The client
+    cannot supply source URLs, credentials, signer commands, price or terms.
+    """
+    value = demand_status(args)
+    if value['canQuote']:
+        return {'state':'SIGNED_PRICE_READY','sequence':value['sequence'],'validUntil':value['validUntil'],'providerCalls':0}
+    if not value['canRefresh']:
+        raise PriceFeedError('signed price refresh is currently unavailable')
+    await collect(args,minimum_validity=300)
+    value = demand_status(args)
+    if not value['canQuote']:
+        raise PriceFeedError('signed price does not cover the complete quote window')
+    return {'state':'SIGNED_PRICE_READY','sequence':value['sequence'],'validUntil':value['validUntil']}
 
 
 async def sign(args: argparse.Namespace) -> dict[str, Any]:
@@ -256,7 +299,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("bridge")
-    for name in ("collect", "sign", "health"):
+    for name in ("collect", "sign", "health", "demand"):
         command = commands.add_parser(name)
         command.add_argument("--roster", type=Path, required=True)
         command.add_argument("--lock", type=Path, required=True)
@@ -266,22 +309,30 @@ def main() -> int:
             command.add_argument("--index", type=int, required=True, choices=(0, 1, 2))
         else:
             command.add_argument("--snapshot", type=Path, required=True)
-        if name == "collect":
+        if name in ("collect", "demand"):
             command.add_argument("--attestors", type=Path, required=True)
-        if name in ("collect", "sign"):
+        if name in ("collect", "sign", "demand"):
             command.add_argument("--policy", type=Path, required=True)
             command.add_argument("--provider-credentials", type=Path, required=True)
             command.add_argument("--usage-state", type=Path, required=True)
     args = parser.parse_args()
     descriptor: int | None = None
     try:
+        demand_request = None
         if args.command == "bridge":
             result = bridge()
         else:
-            descriptor = os.open(args.lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if args.command == "demand":
+                demand_request = sys.stdin.buffer.read(33)
+                if demand_request not in (b'{"op":"refresh"}',b'{"op":"status"}'):
+                    raise PriceFeedError("unsupported price refresh request")
+            if demand_request != b'{"op":"status"}':
+                descriptor = os.open(args.lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if args.command == "collect":
             result = asyncio.run(collect(args))
+        elif args.command == "demand":
+            result = demand_status(args) if demand_request == b'{"op":"status"}' else asyncio.run(collect_on_demand(args))
         elif args.command == "sign":
             result = asyncio.run(sign(args))
         elif args.command == "health":

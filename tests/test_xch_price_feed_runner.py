@@ -126,6 +126,10 @@ def test_test_window_and_free_quota_never_silently_extend_or_reset(tmp_path, mon
     for now in (NOW-1, NOW+172800):
         with pytest.raises(PriceFeedError, match='window'):
             runner.validate_test_window(path, now=now)
+    # A reviewed demand-driven Testnet window can span the launch test week;
+    # the original per-role monthly call ledger remains the hard call bound.
+    policy['expiresAt'] = NOW + 30 * 24 * 60 * 60; path.write_text(json.dumps(policy))
+    runner.validate_test_window(path, now=NOW)
     policy['expiresAt'] += 1; path.write_text(json.dumps(policy))
     with pytest.raises(PriceFeedError, match='window'):
         runner.validate_test_window(path, now=NOW)

@@ -11,6 +11,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import sqlite3
+import threading
 
 from chia.consensus.condition_tools import conditions_dict_for_solution,pkm_pairs_for_conditions_dict
 from chia_rs import AugSchemeMPL,G1Element,G2Element,SpendBundle
@@ -39,9 +40,11 @@ class TestnetIssuerPolicy:
     maximum_purchases:int
     issued_at:int
     expires_at:int
+    # A finite, explicitly approved Testnet conversion; never a market feed.
+    test_usd_minor_per_txch:int|None=None
 
     def public(self):
-        return {'schema':'solslot.testnet-issuer-forwarding-policy.v1','network':'testnet11',
+        value={'schema':'solslot.testnet-issuer-forwarding-policy.v1','network':'testnet11',
             'generationId':h(self.generation),'collectionHash':h(self.collection),'editionHash':h(self.edition),
             'metadataRoot':h(self.metadata_root),'proceedsPuzzleHash':h(self.proceeds_puzzle),
             'feePuzzleHash':h(self.fee_puzzle),'issuerPublicKey':h(self.issuer_public_key),
@@ -50,6 +53,10 @@ class TestnetIssuerPolicy:
             'maximumPurchases':self.maximum_purchases,'issuedAt':self.issued_at,'expiresAt':self.expires_at,
             'technologyFeeBps':100,'companyShareOfFeeBps':7000,'sgtShareOfFeeBps':3000,
             'scope':'NEW_EPHEMERAL_PRIMARY_PROCEEDS_ONLY','masterKeyExportAuthorized':False}
+        if self.test_usd_minor_per_txch is not None:
+            value.update(schema='solslot.testnet-issuer-forwarding-policy.v2',
+                pricing={'mode':'FIXED_TESTNET_CONVERSION','usdMinorPerTxch':str(self.test_usd_minor_per_txch)})
+        return value
 
     def validate(self):
         fields=(self.generation,self.collection,self.edition,self.metadata_root,self.proceeds_puzzle,
@@ -61,6 +68,8 @@ class TestnetIssuerPolicy:
                 or type(self.issued_at)is not int or type(self.expires_at)is not int
                 or not 0<self.issued_at<self.expires_at<=self.issued_at+172800
                 or not isinstance(self.issuer_public_key,bytes) or len(self.issuer_public_key)!=48
+                or (self.test_usd_minor_per_txch is not None and
+                    (type(self.test_usd_minor_per_txch)is not int or not 1<=self.test_usd_minor_per_txch<=10**15))
                 or G1Element.from_bytes(self.issuer_public_key)==G1Element()):
             raise ValueError('CURRENT_ISSUER_POLICY_INVALID')
         return self
@@ -93,10 +102,32 @@ class TestnetIssuerJournal:
     """
     def __init__(self,path,policy):
         self.policy=policy.validate()
+        self._lock=threading.RLock()
         self.path=str(path)
         Path(path).parent.mkdir(parents=True,exist_ok=True)
         self.db=connect_generation_sqlite(self.path,generation_id=h(policy.generation),
             generation_network='testnet11',isolation_level=None,check_same_thread=False)
+        self._shared=False
+        self._bind_policy()
+
+    @classmethod
+    def in_validator_journal(cls,ledger,policy):
+        """Add issuer checkpoints to the already recovered signer journal.
+
+        No generation rebinding, credential copying or new backup database.
+        The caller holds the validator lock for synchronous authorization.
+        """
+        from .validator_ledger import ValidatorLedger
+        if not isinstance(ledger,ValidatorLedger) or ledger.path==':memory:':
+            raise ValueError('CURRENT_ISSUER_DURABLE_VALIDATOR_JOURNAL_REQUIRED')
+        value=cls.__new__(cls);value.policy=policy.validate();value.path=ledger.path
+        value.db=ledger._conn;value._shared=True
+        value._lock=ledger._lock
+        with ledger._lock:value._bind_policy()
+        return value
+
+    def _bind_policy(self):
+        policy=self.policy
         self.db.row_factory=sqlite3.Row
         self.db.execute('CREATE TABLE IF NOT EXISTS issuer_policy (id INTEGER PRIMARY KEY CHECK(id=1), commitment TEXT NOT NULL)')
         self.db.execute('''CREATE TABLE IF NOT EXISTS issuer_forwarding (
@@ -111,9 +142,15 @@ class TestnetIssuerJournal:
             self.db.execute('INSERT OR IGNORE INTO issuer_policy(id,commitment) VALUES(1,?)',(policy.commitment,))
             self.db.execute('COMMIT')
         except BaseException:
-            self.db.execute('ROLLBACK');self.db.close();raise
+            self.db.execute('ROLLBACK')
+            if not self._shared:self.db.close()
+            raise
 
     def authorize(self,*,bundle,artifact,terms,fees,now,sign_message):
+        with self._lock:
+            return self._authorize(bundle=bundle,artifact=artifact,terms=terms,fees=fees,now=now,sign_message=sign_message)
+
+    def _authorize(self,*,bundle,artifact,terms,fees,now,sign_message):
         """Sign only one native-derived AGG_SIG_ME message; never arbitrary RPC.
 
         Caller first independently proves the buyer's current identity, signed
@@ -174,4 +211,5 @@ class TestnetIssuerJournal:
         return SpendBundle([*bundle.coin_spends,*companion.operation.spends],
             AugSchemeMPL.aggregate([bundle.aggregated_signature,signature]))
 
-    def close(self):self.db.close()
+    def close(self):
+        if not self._shared:self.db.close()

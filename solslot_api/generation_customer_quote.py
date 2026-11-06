@@ -12,6 +12,7 @@ from solslot_puzzles.payment_artifacts_v3 import build_xch_purchase_artifact
 from solslot_puzzles.vault_driver import puzzle_for_p2_vault
 from .generation_customer_inventory import CurrentPrimaryInventory
 from .generation_customer_vault import CurrentCustomerVault
+from .generation_customer_test_conversion import FixedTestnetConversion
 
 
 def current_customer_xch_quote(*,inventory:CurrentPrimaryInventory,vault:CurrentCustomerVault,
@@ -42,11 +43,15 @@ def current_customer_xch_quote(*,inventory:CurrentPrimaryInventory,vault:Current
         raise ValueError('CURRENT_PURCHASE_STATUTES_UNAVAILABLE')
     if inventory.evidence.registry.state.pause_mask & 8:
         raise ValueError('CURRENT_PRIMARY_PURCHASES_PAUSED')
-    if not isinstance(price,SignedPrimaryPrice) or not price.round.valid_from<=now:
-        raise ValueError('CURRENT_PURCHASE_PRICE_UNAVAILABLE')
-    operators=tuple(value.as_atom() for value in bindings[7].as_iter())
-    price.verify(operators,asset=bytes32.zeros,decimals=12,expires_at=expires_at,
-        maximum_age=statutes[0].values[1])
+    if isinstance(price,FixedTestnetConversion):
+        price.verify_policy(forwarding_policy,now=now,expires_at=expires_at)
+    else:
+        if (not isinstance(price,SignedPrimaryPrice)or not price.round.valid_from<=now
+                or getattr(forwarding_policy,'test_usd_minor_per_txch',None)is not None):
+            raise ValueError('CURRENT_PURCHASE_PRICE_UNAVAILABLE')
+        operators=tuple(value.as_atom() for value in bindings[7].as_iter())
+        price.verify(operators,asset=bytes32.zeros,decimals=12,expires_at=expires_at,
+            maximum_age=statutes[0].values[1])
     if terms.technology_fee_bps!=100:
         raise ValueError('CURRENT_PURCHASE_FEE_REVIEW_REQUIRED')
     # Native acceptance exposed a historical route that pays gross to a wallet
