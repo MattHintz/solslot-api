@@ -144,7 +144,8 @@ def test_server_certificate_hostname_validation_is_not_disabled(monkeypatch):
 @pytest.mark.asyncio
 async def test_current_signer_cannot_expose_legacy_signing_routes_without_reading_key():
     from solslot_api.validator_app import create_validator_app
-    app = create_validator_app(settings=SimpleNamespace(generation_customer_identity_enabled=True))
+    app = create_validator_app(settings=SimpleNamespace(generation_customer_identity_enabled=True,
+        generation_customer_purchase_enabled=False, generation_customer_purchase_issuer_enabled=False))
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='https://signer') as client:
         for path in ('/v1/zkpassport/sign', '/v1/generation/primary-sols/sign', '/docs', '/openapi.json'):
             response = await client.post(path, json={})

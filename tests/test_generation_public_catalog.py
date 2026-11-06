@@ -7,6 +7,37 @@ from solslot_api.generation_public_catalog import confirmed_catalog_entry
 
 GEN='0x'+'11'*32
 
+@pytest.mark.asyncio
+async def test_sale_projection_uses_read_only_health_and_inventory_then_caches(monkeypatch):
+    from solslot_api import generation_public_catalog as module
+    calls=[];clock=[1000];monkeypatch.setattr(module.time,'time',lambda:clock[0])
+    async def inventory():
+        calls.append('inventory');return {'purchaseWindowOpen':True,'editionHash':'e','metadataRoot':'m',
+            'items':[{'status':'AVAILABLE','withinTestPolicy':True},{'status':'NOT_AVAILABLE','withinTestPolicy':True}]}
+    async def issuer(*a,**kw):calls.append('issuer-status');return {'canSign':True}
+    async def price():calls.append('price-status');return {'price':{'canQuote':False,'canRefresh':True}}
+    service=SimpleNamespace(_funding_context=lambda:calls.append('public-funding-check'),inventory=inventory,
+        policy=SimpleNamespace(expires_at=2000),store=SimpleNamespace(generation_id=GEN))
+    worker=SimpleNamespace(service=service,issuer_sign=SimpleNamespace(status=issuer),health=lambda:{'status':'HEALTHY'})
+    state=SimpleNamespace(generation_mint_reviews=SimpleNamespace(generation_id=GEN),
+        generation_operations=SimpleNamespace(generation_id=GEN),generation_index=object(),
+        generation_customer_purchase=service,generation_customer_purchase_worker=worker,
+        generation_price_demand=SimpleNamespace(status=price))
+    request=SimpleNamespace(app=SimpleNamespace(state=state),state=SimpleNamespace())
+    settings=SimpleNamespace(network='testnet11',deployment_generation_id=GEN)
+    await module._catalog_settings(request,settings)
+    assert request.state.current_sale['sale']['status']=='OPEN'
+    assert request.state.current_sale['sale']['availableDeeds']==1
+    assert calls==['public-funding-check','inventory','issuer-status','price-status']
+    await module._catalog_settings(request,settings);assert len(calls)==4
+    clock[0]+=31;worker.health=lambda:{'status':'STALE'}
+    await module._catalog_settings(request,settings)
+    assert request.state.current_sale['sale']['status']=='NOT_OPEN'
+    async def offline():raise OSError('private provider response is not public')
+    service.inventory=offline;clock[0]+=31
+    await module._catalog_settings(request,settings)
+    assert request.state.current_sale is None
+
 
 def fixture():
     metadata={'purpose':'TEST_ONLY','network':'testnet11','generationId':GEN,'revision':14,

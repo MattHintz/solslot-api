@@ -5,6 +5,7 @@ automatic sale opening. A confirmed mint and an executable sale are separate.
 """
 import time
 import sqlite3
+import asyncio
 from solslot_puzzles.property_metadata import commit_metadata
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -66,6 +67,48 @@ def _bound_context(request: Request, settings: Settings):
 async def _catalog_settings(request: Request, settings: Settings = Depends(get_settings)):
     # Reject an unbound feed before opening a store or resolving native state.
     _bound_context(request, settings)
+    request.state.current_sale=None
+    service=getattr(request.app.state,'generation_customer_purchase',None)
+    worker=getattr(request.app.state,'generation_customer_purchase_worker',None)
+    pricing=getattr(request.app.state,'generation_price_demand',None)
+    fixed=getattr(getattr(service,'policy',None),'test_usd_minor_per_txch',None)is not None
+    if service is not None and worker is not None and worker.service is service and (pricing is not None or fixed):
+        # This read-only projection never requests prices or invokes a signer.
+        # Cache only recent independently reconstructed inventory and private
+        # readiness, with one in-flight refresh per application process.
+        lock=getattr(request.app.state,'current_sale_lock',None)
+        if lock is None:
+            lock=asyncio.Lock();request.app.state.current_sale_lock=lock
+        try:
+            async with asyncio.timeout(25):
+                async with lock:
+                    now=int(time.time());cached=getattr(request.app.state,'current_sale_projection',None)
+                    if cached is None or cached['checkedAt']+30<=now:
+                        service._funding_context()
+                        inventory=await service.inventory()
+                        issuer=await worker.issuer_sign.status(service.policy,now=int(time.time()))
+                        if fixed:
+                            from .generation_customer_test_conversion import status
+                            price=status(service.policy,now=int(time.time()))
+                        else:price=await pricing.status()
+                        count=sum(i['status']=='AVAILABLE'and i['withinTestPolicy']for i in inventory['items'])
+                        health=worker.health()
+                        opened=(health is not None and health['status']=='HEALTHY'
+                            and inventory['purchaseWindowOpen']and issuer['canSign']and count>0
+                            and (price['price']['canQuote']or price['price']['canRefresh']))
+                        cached={'checkedAt':int(time.time()),'generationId':service.store.generation_id,
+                            'editionHash':inventory['editionHash'],'metadataRoot':inventory['metadataRoot'],
+                            'sale':{'status':'OPEN'if opened else'NOT_OPEN','availableDeeds':count,
+                            'code':'LIMITED_TEST_PURCHASES_OPEN'if opened else'LIMITED_TEST_WINDOW_NOT_OPEN',
+                            'reason':'Limited Testnet purchase window. A verified receiving vault and fresh quote are required.'if opened else'The finite test purchase window is not currently ready.',
+                            'limitedTest':True,'paymentRails':['CHIA_XCH']if opened else[],
+                            'checkedAt':int(time.time()),'expiresAt':service.policy.expires_at}}
+                        request.app.state.current_sale_projection=cached
+                    request.state.current_sale=cached
+        except Exception:
+            # An outage is unknown availability, never an empty inventory or
+            # permission to buy. Keep the confirmed mint visible.
+            request.state.current_sale=None
     return settings
 
 
@@ -82,6 +125,11 @@ def public_catalog(request: Request, response: Response,
         # loop and passes only plain values into this synchronous read worker.
         entries = [confirmed_catalog_entry(identity, collections=collections, reviews=reviews,
             journal=journal, generation=generation) for identity in reviews.confirmed_collection_ids()]
+        sale=getattr(request.state,'current_sale',None)
+        if sale is not None and sale['generationId']==generation and int(time.time())-sale['checkedAt']<=30:
+            for entry in entries:
+                if entry is not None and entry['mint']['editionHash']==sale['editionHash']and entry['metadataRoot']==sale['metadataRoot']:
+                    entry['sale']=sale['sale']
         response.headers['Cache-Control'] = 'public, max-age=5, must-revalidate'
         return {'schemaVersion': 1, 'generationId': generation, 'network': 'testnet11',
             'status': 'READY', 'lastCheckedAt': status['lastCheckedAt'], 'pollAfterSeconds': 30,

@@ -82,6 +82,20 @@ class PrimaryBatchSignRequest(BaseModel):
     claimHash:str
 
 
+from .generation_customer_purchase_reservation import CurrentReservationClaim
+from .generation_customer_purchase_delivery import CurrentDeliveryClaim
+from .generation_customer_purchase_issuer import CurrentIssuerRequest
+
+class CurrentReservationSignRequest(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    claim:CurrentReservationClaim
+    claimHash:str=Field(pattern=r'^0x[0-9a-f]{64}$')
+
+class CurrentDeliverySignRequest(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    claim:CurrentDeliveryClaim
+    claimHash:str=Field(pattern=r'^0x[0-9a-f]{64}$')
+
 class PrimaryPurchaseSignRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -244,6 +258,19 @@ def create_validator_app(
         if signer_settings.generation_customer_identity_enabled:
             from .generation_customer_identity_validators import selected_current_identity_profile
             selected_current_identity_profile(signer_settings)
+        if signer_settings.generation_customer_purchase_enabled:
+            from .generation_customer_purchase_policy import selected_purchase_policy
+            selected_purchase_policy(signer_settings)
+        application.state.current_issuer=None
+        if signer_settings.generation_customer_purchase_issuer_enabled:
+            import time
+            from .generation_customer_issuer import TestnetIssuerJournal
+            from .generation_customer_purchase_issuer import load_fixed_issuer_key
+            policy=selected_purchase_policy(signer_settings)
+            if policy.issued_at<=int(time.time())<policy.expires_at:
+                if bytes(load_fixed_issuer_key(signer_settings).get_g1())!=policy.issuer_public_key:
+                    raise RuntimeError('CURRENT_ISSUER_FIXED_KEY_CHANGED')
+                application.state.current_issuer=TestnetIssuerJournal.in_validator_journal(active_ledger,policy)
         try:
             yield
         finally:
@@ -269,9 +296,80 @@ def create_validator_app(
             permitted = {('GET', '/health'), ('POST', '/v1/generation/identity/sign')}
             if getattr(current_settings(),'generation_customer_identity_recovery_enabled',False):
                 permitted.add(('POST','/v1/generation/identity/recover'))
+            if current_settings().generation_customer_purchase_enabled:
+                permitted|={('POST','/v1/generation/purchase/reservation/sign'),('POST','/v1/generation/purchase/delivery/sign')}
+            if current_settings().generation_customer_purchase_issuer_enabled:
+                permitted.add(('POST','/v1/generation/purchase/issuer/sign'))
+                permitted.add(('GET','/v1/generation/purchase/issuer/status'))
             if (request.method, request.url.path) not in permitted:
                 return JSONResponse({'detail': 'CURRENT_SIGNER_ACTION_DISABLED'}, status_code=404)
         return await call_next(request)
+
+    async def current_purchase_response(body,*,delivery=False):
+        import asyncio
+        from .generation_customer_purchase_policy import selected_purchase_policy
+        from .generation_customer_purchase_validators import sign_current_reservation
+        from .generation_customer_purchase_delivery import sign_current_delivery
+        from .generation_sols_batch_validators import generation_settings
+        from .generation_index import load_generation_read_anchor
+        configured=current_settings()
+        if not configured.generation_customer_purchase_enabled:
+            raise HTTPException(404,detail='CURRENT_PURCHASE_ACTION_DISABLED')
+        provider=getattr(application.state,'generation_provider',None)
+        if provider is None:raise HTTPException(503,detail='CURRENT_PURCHASE_SIGNER_NOT_READY')
+        try:
+            policy=selected_purchase_policy(configured)
+            anchor=load_generation_read_anchor(generation_settings(configured))
+            signer=sign_current_delivery if delivery else sign_current_reservation
+            async with asyncio.timeout(45):
+                return await signer(body.claim,body.claimHash,settings=configured,anchor=anchor,
+                    provider=provider,ledger=application.state.validator_ledger,issuer_policy=policy,
+                    expected_issuer_policy_hash=policy.commitment)
+        except Exception as exc:
+            raise HTTPException(409,detail='CURRENT_PURCHASE_INDEPENDENT_EVIDENCE_REJECTED')from exc
+
+    @application.post('/v1/generation/purchase/reservation/sign',response_model=ValidatorSignatureResponse)
+    async def sign_current_purchase_reservation(body:CurrentReservationSignRequest):
+        return await current_purchase_response(body)
+
+    @application.post('/v1/generation/purchase/delivery/sign',response_model=ValidatorSignatureResponse)
+    async def sign_current_purchase_delivery(body:CurrentDeliverySignRequest):
+        return await current_purchase_response(body,delivery=True)
+
+    @application.post('/v1/generation/purchase/issuer/sign')
+    async def current_issuer_response(body:CurrentIssuerRequest):
+        import asyncio
+        from .generation_customer_purchase_issuer import sign_current_issuer,load_fixed_issuer_key
+        from .generation_sols_batch_validators import generation_settings
+        from .generation_index import load_generation_read_anchor
+        configured=current_settings()
+        if not configured.generation_customer_purchase_issuer_enabled or configured.signer_index!=2:
+            raise HTTPException(404,detail='CURRENT_ISSUER_ACTION_DISABLED')
+        journal=getattr(application.state,'current_issuer',None)
+        provider=getattr(application.state,'generation_provider',None)
+        if journal is None or provider is None:raise HTTPException(503,detail='CURRENT_ISSUER_NOT_READY')
+        try:
+            async with asyncio.timeout(40):
+                signature=await sign_current_issuer(body,settings=configured,
+                    anchor=load_generation_read_anchor(generation_settings(configured)),provider=provider,
+                    journal=journal,load_key=lambda:load_fixed_issuer_key(configured),
+                    journal_lock=application.state.validator_ledger._lock)
+            return {'generationId':body.generation_id,'policyHash':body.policy_hash,
+                'claimHash':body.claim_hash,'signature':'0x'+bytes(signature).hex()}
+        except Exception as exc:raise HTTPException(409,detail='CURRENT_ISSUER_INDEPENDENT_EVIDENCE_REJECTED')from exc
+
+    @application.get('/v1/generation/purchase/issuer/status')
+    async def current_issuer_status():
+        import time
+        journal=getattr(application.state,'current_issuer',None)
+        if not current_settings().generation_customer_purchase_issuer_enabled or current_settings().signer_index!=2 or journal is None:
+            raise HTTPException(404,detail='CURRENT_ISSUER_ACTION_DISABLED')
+        with application.state.validator_ledger._lock:
+            used=journal.db.execute('SELECT count(*) FROM issuer_forwarding').fetchone()[0]
+        now=int(time.time());p=journal.policy
+        return {'generationId':'0x'+p.generation.hex(),'policyHash':p.commitment,'checkedAt':now,
+            'expiresAt':p.expires_at,'remainingPurchases':max(0,p.maximum_purchases-used),
+            'canSign':p.issued_at<=now<p.expires_at and used<p.maximum_purchases}
 
     @application.post('/v1/generation/identity/sign', response_model=ValidatorSignatureResponse)
     async def sign_generation_identity(body: CurrentIdentitySignRequest):
@@ -350,6 +448,11 @@ def create_validator_app(
                     raise ValueError('current primary provider missing')
             except (ValueError, OSError) as exc:
                 raise HTTPException(503, detail='CURRENT_ID_SIGNER_NOT_READY') from exc
+        purchase_policy=None
+        if signer_settings.generation_customer_purchase_enabled:
+            from .generation_customer_purchase_policy import selected_purchase_policy
+            try:purchase_policy=selected_purchase_policy(signer_settings)
+            except (ValueError,OSError)as exc:raise HTTPException(503,detail='CURRENT_PURCHASE_SIGNER_NOT_READY')from exc
         return ValidatorHealthResponse(
             status="healthy",
             signerIndex=signer_settings.signer_index,
@@ -369,6 +472,9 @@ def create_validator_app(
             currentIdentityGeneration=current_profile.generation_id if current_profile else None,
             currentIdentityProfileHash=current_profile.commitment if current_profile else None,
             currentIdentityConfigured=current_profile is not None,
+            currentPurchaseConfigured=purchase_policy is not None,
+            currentPurchasePolicyHash=purchase_policy.commitment if purchase_policy else None,
+            currentPurchaseExpiresAt=purchase_policy.expires_at if purchase_policy else None,
             evmChainId=signer_settings.evm_chain_id,
             enrollmentActivation=signer_settings.enrollment_activation,
             identityDeploymentRevision=(

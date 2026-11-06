@@ -1,0 +1,240 @@
+"""Durable execution checkpoints in the current checkout's recovered database.
+
+This store grants no signing, fee-selection or broadcast authority. Callers
+must reconstruct the typed current reservation/delivery before saving a bundle.
+Saved funded bytes survive expiry, reconnects and an uncertain broadcast.
+"""
+import json
+
+from chia_rs import SpendBundle
+
+from .generation_customer_purchase_store import CurrentCustomerPurchaseStore
+from .generation_operations import canonical, bundle_id
+from .protocol_submission import PreparedProtocolBundle
+
+
+class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
+    MAX_EXECUTION_BYTES = 4 * 1024 * 1024
+
+    def __init__(self, path, generation_id):
+        super().__init__(path, generation_id)
+        with self._connect() as db:
+            db.execute('''CREATE TABLE IF NOT EXISTS current_purchase_execution_policies (
+                policy_hash TEXT PRIMARY KEY, maximum_purchases INTEGER NOT NULL,
+                fee_cap INTEGER NOT NULL)''')
+            db.execute('''CREATE TABLE IF NOT EXISTS current_purchase_executions (
+                intent_id TEXT NOT NULL, phase TEXT NOT NULL,
+                protocol_bundle BLOB NOT NULL, original_id TEXT NOT NULL UNIQUE,
+                claim_hash TEXT NOT NULL, fee_cap INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL, stage TEXT NOT NULL,
+                funded_document TEXT, transaction_id TEXT,
+                confirmed_height INTEGER, error_code TEXT, updated_at INTEGER NOT NULL,
+                PRIMARY KEY(intent_id,phase),
+                CHECK(phase IN ('RESERVATION','DELIVERY','RELEASE')),
+                FOREIGN KEY(intent_id) REFERENCES current_customer_purchase_reviews(intent_id))''')
+            # Preserve every old checkpoint byte for byte when admitting the
+            # native timeout phase. No journal or financial cap is reset.
+            sql=db.execute("SELECT sql FROM sqlite_master WHERE name='current_purchase_executions'").fetchone()[0]
+            if "'RELEASE'" not in sql:
+                expected="CHECK(phase IN ('RESERVATION','DELIVERY'))"
+                if expected not in sql:raise ValueError('CURRENT_EXECUTION_UNKNOWN_SCHEMA')
+                db.execute('BEGIN IMMEDIATE')
+                try:
+                    db.execute(sql.replace('current_purchase_executions','current_purchase_executions_next',1).replace(expected,"CHECK(phase IN ('RESERVATION','DELIVERY','RELEASE'))"))
+                    db.execute('INSERT INTO current_purchase_executions_next SELECT * FROM current_purchase_executions')
+                    db.execute('DROP TABLE current_purchase_executions')
+                    db.execute('ALTER TABLE current_purchase_executions_next RENAME TO current_purchase_executions')
+                    db.commit()
+                except BaseException:db.rollback();raise
+
+    def bind_execution_policy(self, policy_hash, maximum_purchases, fee_cap):
+        import re
+        if (re.fullmatch(r'0x[0-9a-f]{64}', policy_hash or '') is None
+                or type(maximum_purchases) is not int or not 1 <= maximum_purchases <= 25
+                or type(fee_cap) is not int or not 0 <= fee_cap <= 1_000_000_000):
+            raise ValueError('CURRENT_EXECUTION_FINITE_POLICY_REQUIRED')
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                row = db.execute('SELECT * FROM current_purchase_execution_policies WHERE policy_hash=?',
+                                 (policy_hash,)).fetchone()
+                if row is not None:
+                    if row['maximum_purchases'] != maximum_purchases or row['fee_cap'] != fee_cap:
+                        raise ValueError('CURRENT_EXECUTION_POLICY_LIMIT_IMMUTABLE')
+                else:
+                    self._execution_capacity(db, 512)
+                    db.execute('INSERT INTO current_purchase_execution_policies VALUES (?,?,?)',
+                               (policy_hash, maximum_purchases, fee_cap))
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+
+    def _execution(self, db, identity, phase, browser_hash):
+        self._row(db, identity, browser_hash)
+        if phase not in ('RESERVATION', 'DELIVERY', 'RELEASE'):
+            raise ValueError('CURRENT_EXECUTION_PHASE_INVALID')
+        row = db.execute('SELECT * FROM current_purchase_executions WHERE intent_id=? AND phase=?',
+                         (identity, phase)).fetchone()
+        if row is None:
+            raise ValueError('CURRENT_EXECUTION_UNAVAILABLE')
+        bundle = SpendBundle.from_bytes(row['protocol_bundle'])
+        if bytes(bundle) != row['protocol_bundle'] or bundle_id(bundle) != row['original_id']:
+            raise ValueError('CURRENT_EXECUTION_SAVED_BYTES_CHANGED')
+        return row, bundle
+
+    def _execution_capacity(self, db, additional):
+        used = db.execute('''SELECT coalesce(sum(length(protocol_bundle)+
+            coalesce(length(CAST(funded_document AS BLOB)),0)+512),0)
+            FROM current_purchase_executions''').fetchone()[0]
+        if used + additional > self.MAX_CURRENT_RETAINED_BYTES:
+            raise ValueError('CURRENT_EXECUTION_RETENTION_FULL')
+        self._admit(db, used + additional)
+
+    def prepare_execution(self, identity, phase, bundle, *, browser_hash, claim_hash,
+                          fee_cap, expires_at, now):
+        if (not isinstance(bundle, SpendBundle) or phase not in ('RESERVATION', 'DELIVERY', 'RELEASE')
+                or type(fee_cap) is not int or not 0 <= fee_cap <= 1_000_000_000
+                or type(now) is not int or type(expires_at) is not int
+                or not 0 < now < expires_at or not 1 <= len(bundle.coin_spends) <= 32
+                or len({s.coin.name() for s in bundle.coin_spends}) != len(bundle.coin_spends)):
+            raise ValueError('CURRENT_EXECUTION_BOUNDS_INVALID')
+        raw = bytes(bundle)
+        if len(raw) > self.MAX_EXECUTION_BYTES:
+            raise ValueError('CURRENT_EXECUTION_TOO_LARGE')
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                _, reservation = self._row(db, identity, browser_hash)
+                limit = db.execute('SELECT * FROM current_purchase_execution_policies WHERE policy_hash=?',
+                                   (reservation.issuer_policy_hash,)).fetchone()
+                if limit is None or fee_cap != limit['fee_cap']:
+                    raise ValueError('CURRENT_EXECUTION_BOUND_FEE_POLICY_REQUIRED')
+                if phase == 'RESERVATION':
+                    expected_claim = reservation.digest()
+                elif phase == 'DELIVERY':
+                    prior = db.execute('SELECT claim_hash FROM current_customer_purchase_delivery WHERE intent_id=?',
+                                       (identity,)).fetchone()
+                    if prior is None:
+                        raise ValueError('CURRENT_EXECUTION_SAVED_BUYER_REQUIRED')
+                    expected_claim = prior['claim_hash']
+                    confirmed = db.execute('SELECT stage FROM current_purchase_executions WHERE intent_id=? AND phase=?',
+                                           (identity, 'RESERVATION')).fetchone()
+                    if confirmed is None or confirmed['stage'] != 'CONFIRMED':
+                        raise ValueError('CURRENT_EXECUTION_CONFIRMED_RESERVATION_REQUIRED')
+                else:
+                    expected_claim=reservation.digest()
+                    confirmed=db.execute("SELECT stage FROM current_purchase_executions WHERE intent_id=? AND phase='RESERVATION'",(identity,)).fetchone()
+                    if confirmed is None or confirmed['stage']!='CONFIRMED':
+                        raise ValueError('CURRENT_EXECUTION_CONFIRMED_RESERVATION_REQUIRED')
+                    delivered=db.execute("SELECT stage FROM current_purchase_executions WHERE intent_id=? AND phase='DELIVERY'",(identity,)).fetchone()
+                    if delivered is not None and delivered['stage']=='CONFIRMED':
+                        raise ValueError('CURRENT_EXECUTION_ALREADY_DELIVERED')
+                if claim_hash != expected_claim:
+                    raise ValueError('CURRENT_EXECUTION_REVIEW_CHANGED')
+                row = db.execute('SELECT * FROM current_purchase_executions WHERE intent_id=? AND phase=?',
+                                 (identity, phase)).fetchone()
+                if row is not None:
+                    if (row['protocol_bundle'] != raw or row['claim_hash'] != claim_hash
+                            or row['fee_cap'] != fee_cap or row['expires_at'] != expires_at):
+                        raise ValueError('CURRENT_EXECUTION_REPLACEMENT_REJECTED')
+                else:
+                    if phase == 'RESERVATION':
+                        from .generation_customer_purchase_reservation import CurrentReservationClaim
+                        rows = db.execute('''SELECT r.canonical_claim FROM current_purchase_executions e
+                            JOIN current_customer_purchase_reviews r ON r.intent_id=e.intent_id
+                            WHERE e.phase='RESERVATION' ''').fetchall()
+                        used = sum(CurrentReservationClaim.model_validate_json(r[0]).issuer_policy_hash
+                                   == reservation.issuer_policy_hash for r in rows)
+                        if used >= limit['maximum_purchases']:
+                            raise ValueError('CURRENT_EXECUTION_POLICY_CAPACITY_EXHAUSTED')
+                    self._execution_capacity(db, len(raw) + 512)
+                    db.execute('''INSERT INTO current_purchase_executions
+                        (intent_id,phase,protocol_bundle,original_id,claim_hash,fee_cap,
+                         expires_at,stage,updated_at) VALUES (?,?,?,?,?,?,?,?,?)''',
+                        (identity, phase, raw, bundle_id(bundle), claim_hash, fee_cap,
+                         expires_at, 'PREPARED', now))
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        return self.execution_status(identity, phase, browser_hash=browser_hash)
+
+    def execution_bundle(self, identity, phase, *, browser_hash):
+        with self._connect() as db:
+            return self._execution(db, identity, phase, browser_hash)[1]
+
+    def save_execution_funding(self, identity, phase, prepared, *, browser_hash, now):
+        if not isinstance(prepared, PreparedProtocolBundle) or type(now) is not int or now <= 0:
+            raise ValueError('CURRENT_EXECUTION_TYPED_FUNDING_REQUIRED')
+        document = canonical(prepared.to_json())
+        if len(document.encode()) > self.MAX_EXECUTION_BYTES:
+            raise ValueError('CURRENT_EXECUTION_FUNDING_TOO_LARGE')
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                row, original = self._execution(db, identity, phase, browser_hash)
+                final = {s.coin.name(): bytes(s) for s in prepared.bundle.coin_spends}
+                if (len(final) != len(prepared.bundle.coin_spends) or prepared.backing_mojos != 0
+                        or not 0 <= prepared.fee_mojos <= row['fee_cap']
+                        or any(final.get(s.coin.name()) != bytes(s) for s in original.coin_spends)):
+                    raise ValueError('CURRENT_EXECUTION_FUNDING_CHANGED_PROTOCOL_OR_CAP')
+                if row['funded_document'] is not None:
+                    if row['funded_document'] != document:
+                        raise ValueError('CURRENT_EXECUTION_FUNDED_BYTES_IMMUTABLE')
+                else:
+                    # Retain the submitter's already reserved bytes even when
+                    # its callback arrives after expiry. This method cannot
+                    # select fees or broadcast. The dispatcher checks the live
+                    # deadline again after this checkpoint and before push.
+                    if row['stage'] != 'PREPARED':
+                        raise ValueError('CURRENT_EXECUTION_ALREADY_FINAL')
+                    self._execution_capacity(db, len(document.encode()))
+                    db.execute('''UPDATE current_purchase_executions SET funded_document=?,
+                        transaction_id=?,stage='RECONCILING',updated_at=? WHERE intent_id=? AND phase=?''',
+                        (document, prepared.spend_bundle_id, now, identity, phase))
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+
+    def execution_funding(self, identity, phase, *, browser_hash):
+        with self._connect() as db:
+            row, _ = self._execution(db, identity, phase, browser_hash)
+            if row['funded_document'] is None:
+                return None
+            result = json.loads(row['funded_document'])
+            bundle = SpendBundle.from_json_dict(result['spendBundle'])
+            if bundle_id(bundle) != row['transaction_id'] or result['spendBundleId'] != row['transaction_id']:
+                raise ValueError('CURRENT_EXECUTION_FUNDED_ID_CHANGED')
+            return result
+
+    def observe_execution(self, identity, phase, *, browser_hash, transaction_id,
+                          status, confirmed_height=None, now):
+        if status not in ('MEMPOOL', 'CONFIRMED', 'RECONCILING') or type(now) is not int or now <= 0:
+            raise ValueError('CURRENT_EXECUTION_OBSERVATION_INVALID')
+        if status == 'CONFIRMED' and (type(confirmed_height) is not int or confirmed_height <= 0):
+            raise ValueError('CURRENT_EXECUTION_CONFIRMED_HEIGHT_REQUIRED')
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                row, _ = self._execution(db, identity, phase, browser_hash)
+                if row['transaction_id'] is None or transaction_id != row['transaction_id']:
+                    raise ValueError('CURRENT_EXECUTION_EXACT_SAVED_TRANSACTION_REQUIRED')
+                if row['stage'] != 'CONFIRMED':
+                    db.execute('''UPDATE current_purchase_executions SET stage=?,confirmed_height=?,
+                        updated_at=?,error_code=NULL WHERE intent_id=? AND phase=?''',
+                        (status, confirmed_height if status == 'CONFIRMED' else None, now, identity, phase))
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        return self.execution_status(identity, phase, browser_hash=browser_hash)
+
+    def execution_status(self, identity, phase, *, browser_hash):
+        with self._connect() as db:
+            row, _ = self._execution(db, identity, phase, browser_hash)
+        return {'intentId': identity, 'phase': phase, 'stage': row['stage'],
+                'transactionId': row['transaction_id'], 'originalBundleId': row['original_id'],
+                'feeCapMojos': str(row['fee_cap']), 'expiresAt': row['expires_at'],
+                'confirmedHeight': row['confirmed_height'], 'updatedAt': row['updated_at']}

@@ -46,6 +46,11 @@ class ValidatorSettings(BaseSettings):
     generation_sols_batch_enabled:bool=False
     generation_customer_identity_enabled:bool=False
     generation_customer_identity_recovery_enabled:bool=False
+    generation_customer_purchase_enabled:bool=False
+    generation_customer_purchase_issuer_enabled:bool=False
+    generation_customer_purchase_issuer_key_path:str=''
+    generation_customer_purchase_policy_path:str=''
+    generation_customer_purchase_policy_hash:str=Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
     generation_customer_identity_recovery_expires_at:int=Field(default=0,ge=0)
     generation_customer_identity_profile_path:str=''
     generation_customer_identity_profile_hash:str=Field(default='', pattern=r'^(|0x[0-9a-f]{64})$')
@@ -134,12 +139,20 @@ class ValidatorSettings(BaseSettings):
             raise ValueError('identity signature recovery requires a finite expiry')
         if self.generation_primary_readonly_gateway:
             from .generation_primary_reader import PRIMARY_READER_URL
-            if (not self.generation_customer_identity_enabled
+            if (not (self.generation_customer_identity_enabled or self.generation_customer_purchase_enabled)
                     or self.generation_primary_url != PRIMARY_READER_URL
                     or not self.generation_primary_ca_cert_path
                     or self.generation_primary_client_cert_path
                     or self.generation_primary_client_key_path):
                 raise ValueError('private native reader must use its exact TLS and generation boundary')
+        if self.generation_customer_purchase_enabled:
+            if (not self.generation_customer_identity_enabled or self.enrollment_activation is not None
+                    or not all((self.generation_customer_purchase_policy_path,self.generation_customer_purchase_policy_hash))):
+                raise ValueError('current purchase signing requires the current identity boundary and frozen finite issuer policy')
+        if self.generation_customer_purchase_issuer_enabled and (
+                not self.generation_customer_purchase_enabled or self.signer_index!=2
+                or not self.generation_customer_purchase_issuer_key_path.startswith('/run/')):
+            raise ValueError('finite issuer forwarding requires private signer two and its fixed runtime credential')
         if self.generation_customer_identity_enabled:
             if (self.enrollment_activation is not None or self.evm_chain_id != 8453
                     or not all((self.deployment_generation_id, self.generation_preparation_path,

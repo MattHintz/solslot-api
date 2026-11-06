@@ -128,7 +128,7 @@ class CheckoutLifecycleStoreMixin:
             return dict(payment=json.loads(row['candidate_json']), binding=json.loads(row['binding_json'])) if row else None
 
     def claim_checkout_job(self, lane, *, owner, now, lease_seconds=60):
-        if lane not in ('renewal', 'terminal'):
+        if lane not in ('renewal', 'terminal', 'price-refresh'):
             raise ValueError('unknown lifecycle lane')
         with self._connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -139,10 +139,19 @@ class CheckoutLifecycleStoreMixin:
                 'AND lease_until<=? ORDER BY due_at,purchase_id LIMIT 1', (lane, now, now)).fetchone()
             if row is None:
                 return None
+            if lane == 'price-refresh' and row['attempts'] >= 3:
+                # A worker can disappear after the provider call but before
+                # finish. Persist the attempt at claim time, so restarts cannot
+                # silently reset the three-attempt demand budget.
+                db.execute("UPDATE payment_checkout_jobs SET done=1,status='INTERRUPTED',due_at=?,"
+                    "owner=NULL,lease_until=0,observed_at=? WHERE purchase_id=? AND lane=?",
+                    (now+120,now,row['purchase_id'],lane))
+                db.execute('COMMIT')
+                return None
             db.execute('INSERT INTO payment_checkout_worker_leases VALUES (?,?,?) ON CONFLICT(lane) '
                 'DO UPDATE SET owner=excluded.owner,lease_until=excluded.lease_until', (lane, owner, now+lease_seconds))
-            db.execute('UPDATE payment_checkout_jobs SET owner=?,lease_until=? WHERE purchase_id=? AND lane=?',
-                (owner, now+lease_seconds, row['purchase_id'], lane))
+            db.execute('UPDATE payment_checkout_jobs SET owner=?,lease_until=?,attempts=attempts+? WHERE purchase_id=? AND lane=?',
+                (owner, now+lease_seconds, 1 if lane=='price-refresh' else 0, row['purchase_id'], lane))
             db.execute('COMMIT')
             return dict(row)
 
@@ -152,7 +161,8 @@ class CheckoutLifecycleStoreMixin:
             row = db.execute('SELECT attempts FROM payment_checkout_jobs WHERE purchase_id=? AND lane=? AND owner=?',
                 (purchase_id, lane, owner)).fetchone()
             if row:
-                attempts = min(row[0]+1, 10) if status in ('UNAVAILABLE', 'TIMED_OUT', 'INTERRUPTED', 'REVIEW_REQUIRED') else 0
+                attempts = (row[0] if lane=='price-refresh' else
+                    min(row[0]+1, 10) if status in ('UNAVAILABLE', 'TIMED_OUT', 'INTERRUPTED', 'REVIEW_REQUIRED') else 0)
                 delay = min(300, 15 * 2**min(attempts, 4))
                 db.execute('UPDATE payment_checkout_jobs SET owner=NULL,lease_until=0,due_at=?,attempts=?,status=?,done=?,observed_at=? '
                     'WHERE purchase_id=? AND lane=? AND owner=?', (now+delay, attempts, status, int(done), now, purchase_id, lane, owner))
