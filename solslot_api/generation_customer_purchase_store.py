@@ -14,6 +14,8 @@ from .generation_operations import canonical
 from .generation_storage import generation_path, admit_retained_bytes
 from .generation_customer_purchase_reservation import CurrentReservationClaim
 from .generation_customer_purchase_delivery import CurrentDeliveryClaim
+from .generation_customer_purchase_batch import (CurrentReservationBatch, CurrentDeliveryBatch,
+    reservation_from_json, delivery_from_json)
 from .payment_purchase_store import PaymentPurchaseStore
 from .validator_quorum import ValidatorSignatureResponse
 
@@ -51,6 +53,9 @@ class CurrentCustomerPurchaseStore(PaymentPurchaseStore):
                     canonical_claim TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
                     FOREIGN KEY(intent_id) REFERENCES current_customer_purchase_reviews(intent_id));
+                CREATE TABLE IF NOT EXISTS current_customer_reservation_requests (
+                    intent_id TEXT PRIMARY KEY, requested_at INTEGER NOT NULL,
+                    FOREIGN KEY(intent_id) REFERENCES current_customer_purchase_reviews(intent_id));
                 CREATE TABLE IF NOT EXISTS current_customer_purchase_signatures (
                     intent_id TEXT NOT NULL,
                     phase TEXT NOT NULL CHECK(phase IN ('reservation','delivery')),
@@ -67,7 +72,8 @@ class CurrentCustomerPurchaseStore(PaymentPurchaseStore):
             (SELECT coalesce(sum(length(CAST(canonical_claim AS BLOB))+512),0)
                 FROM current_customer_purchase_delivery) +
             (SELECT coalesce(sum(length(CAST(canonical_reply AS BLOB))+128),0)
-                FROM current_customer_purchase_signatures)''').fetchone()[0]
+                FROM current_customer_purchase_signatures) +
+            (SELECT count(*)*128 FROM current_customer_reservation_requests)''').fetchone()[0]
         admit_retained_bytes(db, retained, additional, self.MAX_CURRENT_RETAINED_BYTES)
 
     def _row(self, db, identity, browser_hash):
@@ -78,20 +84,20 @@ class CurrentCustomerPurchaseStore(PaymentPurchaseStore):
             (identity, self.generation_id, browser_hash)).fetchone()
         if row is None:
             raise ValueError('CURRENT_CHECKOUT_REVIEW_UNAVAILABLE')
-        claim = CurrentReservationClaim.model_validate_json(row['canonical_claim'])
+        claim = reservation_from_json(row['canonical_claim'])
         if claim.generation_id != self.generation_id or claim.digest() != row['claim_hash']:
             raise ValueError('CURRENT_CHECKOUT_SAVED_REVIEW_CHANGED')
         return row, claim
 
     def save_review(self, claim, *, browser_hash, request_key, now):
-        if (not isinstance(claim, CurrentReservationClaim)
+        if (not isinstance(claim, (CurrentReservationClaim,CurrentReservationBatch))
                 or claim.generation_id != self.generation_id
                 or re.fullmatch(r'[0-9a-f]{64}', browser_hash or '') is None
                 or not isinstance(request_key, str)
                 or re.fullmatch(r'[A-Za-z0-9_:-]{1,128}', request_key) is None
                 or type(now) is not int or now <= 0):
             raise ValueError('CURRENT_CHECKOUT_REVIEW_BINDING_INVALID')
-        claim = CurrentReservationClaim.model_validate_json(claim.model_dump_json(by_alias=True))
+        claim = reservation_from_json(claim.model_dump_json(by_alias=True))
         document, digest = claim.canonical(), claim.digest()
         identity = '0x' + sha256(canonical([
             self.generation_id, browser_hash, request_key]).encode()).hexdigest()
@@ -118,9 +124,9 @@ class CurrentCustomerPurchaseStore(PaymentPurchaseStore):
         return identity
 
     def save_delivery(self, identity, claim, *, browser_hash, now):
-        if not isinstance(claim, CurrentDeliveryClaim) or type(now) is not int or now <= 0:
+        if not isinstance(claim, (CurrentDeliveryClaim,CurrentDeliveryBatch)) or type(now) is not int or now <= 0:
             raise ValueError('CURRENT_CHECKOUT_TYPED_DELIVERY_REQUIRED')
-        claim = CurrentDeliveryClaim.model_validate_json(claim.model_dump_json(by_alias=True))
+        claim = delivery_from_json(claim.model_dump_json(by_alias=True))
         document, digest = claim.canonical(), claim.digest()
         with self._connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -182,7 +188,7 @@ class CurrentCustomerPurchaseStore(PaymentPurchaseStore):
         with self._connect() as db:
             row, reservation = self._row(db, identity, browser_hash)
             delivery = db.execute('SELECT * FROM current_customer_purchase_delivery WHERE intent_id=?', (identity,)).fetchone()
-            parsed = CurrentDeliveryClaim.model_validate_json(delivery['canonical_claim']) if delivery else None
+            parsed = delivery_from_json(delivery['canonical_claim']) if delivery else None
             if parsed and (parsed.digest() != delivery['claim_hash'] or parsed.reservation.canonical() != reservation.canonical()):
                 raise ValueError('CURRENT_CHECKOUT_SAVED_DELIVERY_CHANGED')
             responses = {'reservation': {}, 'delivery': {}}

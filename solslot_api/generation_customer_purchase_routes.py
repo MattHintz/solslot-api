@@ -13,7 +13,7 @@ from typing import Annotated
 from chia_rs import G2Element
 from chia_rs.sized_bytes import bytes32
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import Field
+from pydantic import Field,model_validator
 
 from .config import Settings, get_settings
 from .generation_operations import canonical
@@ -22,6 +22,7 @@ from .generation_customer_routes import CurrentGeneration, Identity, _origin
 from .generation_customer_purchase_execution import CurrentNativePurchaseExecution, h
 from .generation_customer_purchase_wallet import CurrentNativePaymentRequest
 from .generation_customer_purchase_delivery import CurrentDeliveryClaim
+from .generation_customer_purchase_batch import CurrentReservationBatch,CurrentDeliveryBatch,CurrentBatchPaymentRequest
 
 router=APIRouter(prefix='/customer/purchases',tags=['current-customer-purchases'])
 Configured=Annotated[Settings,Depends(get_settings)]
@@ -29,7 +30,16 @@ Configured=Annotated[Settings,Depends(get_settings)]
 
 class QuoteBody(CurrentGeneration):
     request_key:str=Field(alias='requestKey',pattern=r'^[A-Za-z0-9_:-]{1,128}$')
-    deed_launcher_id:Identity=Field(alias='deedLauncherId')
+    deed_launcher_id:Identity|None=Field(default=None,alias='deedLauncherId')
+    deed_launcher_ids:list[Identity]|None=Field(default=None,alias='deedLauncherIds',min_length=1,max_length=25)
+
+    @model_validator(mode='after')
+    def exact_selection(self):
+        if (self.deed_launcher_id is None)==(self.deed_launcher_ids is None):
+            raise ValueError('CURRENT_PURCHASE_EXACT_SELECTION_REQUIRED')
+        if self.deed_launcher_ids is not None and len(set(self.deed_launcher_ids))!=len(self.deed_launcher_ids):
+            raise ValueError('CURRENT_PURCHASE_DUPLICATE_DEED_REJECTED')
+        return self
 
 
 class PaymentBody(CurrentGeneration):
@@ -110,7 +120,7 @@ async def quote(launcher:Identity,body:QuoteBody,request:Request,response:Respon
     mutation(request,settings,body);response.headers['Cache-Control']='no-store'
     try:
         service,binding=context(request,settings,launcher)
-        result=await service.quote(body.request_key,body.deed_launcher_id,browser_hash=binding)
+        result=await service.quote(body.request_key,body.deed_launcher_ids if body.deed_launcher_ids is not None else body.deed_launcher_id,browser_hash=binding)
         unchanged(request,settings,launcher,service,binding)
         return result
     except Exception as exc:raise failure(exc) from exc
@@ -161,9 +171,17 @@ async def reserve(launcher:Identity,identity:Identity,body:CurrentGeneration,
     try:
         service,binding=context(request,settings,launcher)
         service._funding_context()
+        if isinstance(service._saved(identity,binding)['reservationClaim'],CurrentReservationBatch):
+            from .generation_customer_purchase_batch_execution import request_reservation
+            result=request_reservation(service,identity,binding)
+            unchanged(request,settings,launcher,service,binding)
+            return result
         await service.prepare_reservation(identity,browser_hash=binding)
         unchanged(request,settings,launcher,service,binding)
-        return await service.dispatch(identity,'RESERVATION',browser_hash=binding)
+        result=await service.dispatch(identity,'RESERVATION',browser_hash=binding)
+        if isinstance(service._saved(identity,binding)['reservationClaim'],CurrentReservationBatch):
+            result={**result,'reservedCoinIds':list(service.reserved_coin_id(identity,browser_hash=binding))}
+        return result
     except Exception as exc:raise failure(exc) from exc
 
 
@@ -174,7 +192,11 @@ async def payment(launcher:Identity,identity:Identity,body:PaymentBody,
     try:
         service,binding=context(request,settings,launcher)
         saved=service._saved(identity,binding)
-        operation=CurrentNativePaymentRequest(reservation=saved['reservationClaim'],
+        if isinstance(saved['reservationClaim'],CurrentReservationBatch):
+            operation=CurrentBatchPaymentRequest(reservation=saved['reservationClaim'],
+                reservedCoinIds=service.reserved_coin_id(identity,browser_hash=binding),
+                paymentCoinId=body.payment_coin_id,paymentPublicKey=body.payment_public_key)
+        else:operation=CurrentNativePaymentRequest(reservation=saved['reservationClaim'],
             reservedCoinId=service.reserved_coin_id(identity,browser_hash=binding),
             paymentCoinId=body.payment_coin_id,paymentPublicKey=body.payment_public_key)
         result=(await service.prepare_wallet(identity,operation,browser_hash=binding)).review()
@@ -185,6 +207,9 @@ async def payment(launcher:Identity,identity:Identity,body:PaymentBody,
 
 def payer_claim(service,binding,identity,body):
     saved=service._saved(identity,binding)
+    if isinstance(saved['reservationClaim'],CurrentReservationBatch):
+        return CurrentDeliveryBatch(reservation=saved['reservationClaim'],
+            reservedCoinIds=service.reserved_coin_id(identity,browser_hash=binding),buyerOffer=body.buyer_offer)
     return CurrentDeliveryClaim(reservation=saved['reservationClaim'],
         reservedCoinId=service.reserved_coin_id(identity,browser_hash=binding),buyerOffer=body.buyer_offer)
 
@@ -211,10 +236,13 @@ async def issuer_review(launcher:Identity,identity:Identity,body:PayerBody,
         claim=payer_claim(service,binding,identity,body)
         _,signed,companion,pair=await service.delivery_issuer_review(identity,claim,browser_hash=binding)
         unchanged(request,settings,launcher,service,binding)
-        return {'schema':'solslot.current-testnet-issuer-review.v1','generationId':settings.deployment_generation_id,
+        from .generation_customer_purchase_worker import issuer_message
+        public,message=issuer_message(pair)
+        return {'schema':'solslot.current-testnet-issuer-review.v2'if isinstance(claim,CurrentDeliveryBatch)else'solslot.current-testnet-issuer-review.v1','generationId':settings.deployment_generation_id,
             'intentId':identity,'policyHash':service.policy.commitment,'deliveryClaimHash':claim.digest(),
-            'issuerPublicKey':h(pair[0]),'message':h(pair[1]),'purchaseBundle':signed.to_json_dict(),
-            'issuerCoinSpend':companion.issuer_signature_spend.to_json_dict(),
+            'issuerPublicKey':public,'message':message,'purchaseBundle':signed.to_json_dict(),
+            'issuerCoinSpend':([spend.to_json_dict()for spend in companion.issuer_signature_spends]
+                if hasattr(companion,'issuer_signature_spends')else companion.issuer_signature_spend.to_json_dict()),
             'scope':'NEW_EPHEMERAL_PRIMARY_PROCEEDS_ONLY','transactionSubmitted':False}
     except Exception as exc:raise failure(exc) from exc
 

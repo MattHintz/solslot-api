@@ -111,10 +111,10 @@ class CurrentPurchaseFeeFaucet:
             rows=db.execute('''SELECT e.*,r.canonical_claim FROM current_purchase_executions e
                 JOIN current_customer_purchase_reviews r ON r.intent_id=e.intent_id
                 WHERE r.generation_id=?''',(self.store.generation_id,)).fetchall()
-        from .generation_customer_purchase_reservation import CurrentReservationClaim
+        from .generation_customer_purchase_batch import reservation_from_json
         matched=False
         for row in rows:
-            claim=CurrentReservationClaim.model_validate_json(row['canonical_claim'])
+            claim=reservation_from_json(row['canonical_claim'])
             if claim.issuer_policy_hash!=self.policy.commitment or int(self.clock())>=row['expires_at']:continue
             original=SpendBundle.from_bytes(row['protocol_bundle'])
             # Native reservation and timeout control paths emit no

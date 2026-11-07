@@ -102,6 +102,10 @@ async def _confirmed_reservation_source(original,identity,provider):
 
 async def verify_current_delivery(claim,*,settings,anchor,provider,issuer_policy,
         expected_issuer_policy_hash,clock=time.time):
+    from .generation_customer_purchase_batch import CurrentDeliveryBatch, verify_current_batch_delivery
+    if isinstance(claim,CurrentDeliveryBatch):
+        return await verify_current_batch_delivery(claim,settings=settings,anchor=anchor,provider=provider,
+            issuer_policy=issuer_policy,expected_issuer_policy_hash=expected_issuer_policy_hash,clock=clock)
     if not isinstance(claim,CurrentDeliveryClaim):raise ValueError('CURRENT_DELIVERY_TYPED_CLAIM_REQUIRED')
     claim=CurrentDeliveryClaim.model_validate_json(claim.model_dump_json(by_alias=True))
     checked=await resolve_current_reserved_purchase(claim.reservation,claim.reserved_coin_id,
@@ -132,7 +136,7 @@ async def verify_current_delivery(claim,*,settings,anchor,provider,issuer_policy
 
 
 async def resolve_current_reserved_purchase(r,reserved_coin_id,*,settings,anchor,provider,issuer_policy,
-        expected_issuer_policy_hash,clock=time.time):
+        expected_issuer_policy_hash,clock=time.time,_current=None):
     """Prove the receiving vault and reservation before asking a payer to sign.
 
     Shared by wallet preparation and independent private delivery verification;
@@ -153,8 +157,8 @@ async def resolve_current_reserved_purchase(r,reserved_coin_id,*,settings,anchor
             or purchase.metadata_root!=issuer_policy.metadata_root or purchase.vault_launcher_id!=issuer_policy.buyer_vault
             or purchase.deed_launcher_id not in issuer_policy.deed_launchers
             or not issuer_policy.issued_at<=now<issuer_policy.expires_at):raise ValueError('CURRENT_DELIVERY_FINITE_SCOPE_CHANGED')
-    inventory=await resolve_current_primary_inventory(settings=settings,anchor=anchor,provider=provider,
-        collection=issuer_policy.collection,edition_hash=issuer_policy.edition,metadata_root=issuer_policy.metadata_root)
+    inventory=(_current[0]if _current is not None else await resolve_current_primary_inventory(settings=settings,anchor=anchor,provider=provider,
+        collection=issuer_policy.collection,edition_hash=issuer_policy.edition,metadata_root=issuer_policy.metadata_root))
     matches=[x for x in inventory.items if x.original.terms.deed_launcher_id==purchase.deed_launcher_id]
     if len(matches)!=1:raise ValueError('CURRENT_DELIVERY_MINT_MISSING')
     original=matches[0].original;terms=original.terms
@@ -167,8 +171,10 @@ async def resolve_current_reserved_purchase(r,reserved_coin_id,*,settings,anchor
         raise ValueError('CURRENT_DELIVERY_CONFIRMED_RESERVATION_CHANGED')
     reserved=await unspent(provider,transition.reserved_coin)
     if reserved.confirmed_height!=record.spent_height:raise ValueError('CURRENT_DELIVERY_RESERVATION_HEIGHT_CHANGED')
-    bindings=customer_bindings_from_evidence(read_generation_preparation(settings),anchor,inventory.evidence)
-    vault=await resolve_native_identity_vault(bindings=bindings,launcher=purchase.vault_launcher_id,provider=provider)
+    if _current is None:
+        bindings=customer_bindings_from_evidence(read_generation_preparation(settings),anchor,inventory.evidence)
+        vault=await resolve_native_identity_vault(bindings=bindings,launcher=purchase.vault_launcher_id,provider=provider)
+    else:vault=_current[1]
     if h(vault.coin.name())!=r.current_vault_coin_id:raise ValueError('CURRENT_DELIVERY_RECIPIENT_CHANGED')
     # Reconstruct the exact still-live sealed quote from the proved historical
     # AVAILABLE source; it is not represented as currently for sale.
@@ -186,6 +192,11 @@ async def resolve_current_reserved_purchase(r,reserved_coin_id,*,settings,anchor
 
 async def sign_current_delivery(claim,claim_hash,*,settings,anchor,provider,ledger,
         issuer_policy,expected_issuer_policy_hash,clock=time.time,load_key=None):
+    from .generation_customer_purchase_batch_signing import sign_batch_delivery
+    from .generation_customer_purchase_batch import CurrentDeliveryBatch
+    if isinstance(claim,CurrentDeliveryBatch):
+        return await sign_batch_delivery(claim,claim_hash,settings=settings,anchor=anchor,provider=provider,ledger=ledger,
+            issuer_policy=issuer_policy,expected_issuer_policy_hash=expected_issuer_policy_hash,clock=clock,load_key=load_key)
     if (getattr(settings,'generation_customer_purchase_enabled',False)is not True
             or not isinstance(claim,CurrentDeliveryClaim)or claim.digest()!=claim_hash
             or settings.signer_index not in claim.reservation.signer_indices

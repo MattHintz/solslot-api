@@ -62,7 +62,7 @@ class CurrentReservationEvidence:
 
 
 async def verify_current_reservation(claim,*,settings,anchor,provider,issuer_policy,
-        expected_issuer_policy_hash,clock=time.time):
+        expected_issuer_policy_hash,clock=time.time,_current=None):
     """Reconstruct custody, ID, price and reservation without legacy records.
 
     This checks the same confirmed mint and two-source/two-signer price as the
@@ -88,13 +88,15 @@ async def verify_current_reservation(claim,*,settings,anchor,provider,issuer_pol
             or purchase.metadata_root!=issuer_policy.metadata_root or purchase.vault_launcher_id!=issuer_policy.buyer_vault
             or purchase.deed_launcher_id not in issuer_policy.deed_launchers):
         raise ValueError('CURRENT_PURCHASE_FINITE_SCOPE_CHANGED')
-    inventory=await resolve_current_primary_inventory(settings=settings,anchor=anchor,provider=provider,
-        collection=issuer_policy.collection,edition_hash=issuer_policy.edition,metadata_root=issuer_policy.metadata_root)
+    inventory=(_current[0]if _current is not None else await resolve_current_primary_inventory(settings=settings,anchor=anchor,provider=provider,
+        collection=issuer_policy.collection,edition_hash=issuer_policy.edition,metadata_root=issuer_policy.metadata_root))
     item=inventory.require_available(purchase.deed_launcher_id)
     if h(item.current.coin.name())!=claim.available_coin_id:raise ValueError('CURRENT_PURCHASE_INVENTORY_INPUT_CHANGED')
-    preparation=read_generation_preparation(settings)
-    bindings=customer_bindings_from_evidence(preparation,anchor,inventory.evidence)
-    vault=await resolve_native_identity_vault(bindings=bindings,launcher=purchase.vault_launcher_id,provider=provider)
+    if _current is None:
+        preparation=read_generation_preparation(settings)
+        bindings=customer_bindings_from_evidence(preparation,anchor,inventory.evidence)
+        vault=await resolve_native_identity_vault(bindings=bindings,launcher=purchase.vault_launcher_id,provider=provider)
+    else:vault=_current[1]
     if h(vault.coin.name())!=claim.current_vault_coin_id:raise ValueError('CURRENT_PURCHASE_VAULT_INPUT_CHANGED')
     rebuilt=current_customer_xch_quote(inventory=inventory,vault=vault,deed_launcher=purchase.deed_launcher_id,
         price=claim_price(claim.signed_price,issuer_policy),nonce=purchase.authorization_nonce,now=now,

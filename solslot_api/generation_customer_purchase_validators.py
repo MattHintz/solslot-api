@@ -88,6 +88,11 @@ def previous_transition(previous,current,*,issuer_policy,roster,signer_index):
 
 async def sign_current_reservation(claim,claim_hash,*,settings,anchor,provider,ledger,
         issuer_policy,expected_issuer_policy_hash,clock=time.time,load_key=None):
+    from .generation_customer_purchase_batch import CurrentReservationBatch
+    from .generation_customer_purchase_batch_signing import sign_batch_reservation
+    if isinstance(claim,CurrentReservationBatch):
+        return await sign_batch_reservation(claim,claim_hash,settings=settings,anchor=anchor,provider=provider,ledger=ledger,
+            issuer_policy=issuer_policy,expected_issuer_policy_hash=expected_issuer_policy_hash,clock=clock,load_key=load_key)
     if (getattr(settings,'generation_customer_purchase_enabled',False)is not True
             or not isinstance(claim,CurrentReservationClaim)or claim.digest()!=claim_hash
             or settings.signer_index not in claim.signer_indices
@@ -95,6 +100,18 @@ async def sign_current_reservation(claim,claim_hash,*,settings,anchor,provider,l
         raise ValueError('CURRENT_RESERVATION_SIGNER_NOT_ENABLED')
     evidence=await verify_current_reservation(claim,settings=settings,anchor=anchor,provider=provider,
         issuer_policy=issuer_policy,expected_issuer_policy_hash=expected_issuer_policy_hash,clock=clock)
+    return await sign_verified_current_reservation(evidence,settings=settings,provider=provider,ledger=ledger,
+        issuer_policy=issuer_policy,clock=clock,load_key=load_key)
+
+
+async def sign_verified_current_reservation(evidence,*,settings,provider,ledger,issuer_policy,clock,load_key):
+    """Internal batch reuse of an independently reconstructed child snapshot."""
+    from .generation_customer_purchase_reservation import CurrentReservationEvidence
+    if not isinstance(evidence,CurrentReservationEvidence):raise ValueError('CURRENT_RESERVATION_NATIVE_EVIDENCE_REQUIRED')
+    claim=evidence.claim;claim_hash=claim.digest()
+    if (claim.issuer_policy_hash!=issuer_policy.commitment or settings.signer_index not in claim.signer_indices
+            or claim.generation_id!=settings.deployment_generation_id or not settings.generation_customer_purchase_enabled):
+        raise ValueError('CURRENT_RESERVATION_SIGNER_NOT_ENABLED')
     roster=tuple(bytes.fromhex(k.removeprefix('0x'))for k in settings.roster_pubkeys)
     messages=native_messages(claim,evidence.transition,evidence.item.original.terms,roster)
     index=settings.signer_index;retirement=None

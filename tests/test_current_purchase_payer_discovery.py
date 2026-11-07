@@ -25,7 +25,7 @@ def setup(monkeypatch):
     monkeypatch.setattr(execution,'purchase_artifact_v3_from_json',lambda value:SimpleNamespace(rail_amount=500,quote_expires_at=400))
     async def call(keys=None):return await service.payer_coins('0x'+'02'*32,
         ['0x'+bytes(public).hex()]if keys is None else keys,browser_hash='synthetic')
-    return SimpleNamespace(state=state,call=call,coin=coin,raw=raw,public='0x'+bytes(public).hex())
+    return SimpleNamespace(state=state,call=call,coin=coin,raw=raw,public='0x'+bytes(public).hex(),service=service)
 
 @pytest.mark.asyncio
 async def test_primary_confirmed_coin_is_public_only_and_no_transaction_prepared(setup):
@@ -33,6 +33,20 @@ async def test_primary_confirmed_coin_is_public_only_and_no_transaction_prepared
     assert value['candidates']==[{'paymentCoinId':'0x'+s.coin.name().hex(),'paymentPublicKey':s.public,
         'amountMojos':'1000','confirmedHeight':10}]
     assert value['receivingVaultLauncherId']!='0x'+s.coin.name().hex()
+    assert s.state.reads==1
+
+@pytest.mark.asyncio
+async def test_batch_requires_one_coin_covering_every_selected_deed(setup,monkeypatch):
+    from solslot_api.generation_customer_purchase_batch import CurrentReservationBatch
+    s=setup
+    # The existing payer reader sees an already validated saved batch. Its
+    # public coin query must use the full total, never the first child's price.
+    claim=CurrentReservationBatch.model_construct()
+    monkeypatch.setattr(execution,'artifacts',lambda _:tuple(SimpleNamespace(
+        rail_amount=600,quote_expires_at=400)for _ in range(2)))
+    s.service._saved=lambda *a:{'reservationClaim':claim}
+    value=await s.call()
+    assert value['amountMojos']=='1200'and value['candidates']==[]
     assert s.state.reads==1
 
 @pytest.mark.asyncio

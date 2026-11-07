@@ -15,9 +15,27 @@ from chia_rs import AugSchemeMPL, G2Element
 from solslot_puzzles.payment_artifacts_v3 import purchase_artifact_v3_from_json
 from .generation_customer_purchase_execution import CurrentNativePurchaseExecution, h
 from .generation_operations import canonical
+from .generation_customer_purchase_batch import artifacts,CurrentReservationBatch
+
+
+def issuer_pairs(pair):
+    return pair if isinstance(pair[0],tuple)else (pair,)
+
+
+def issuer_message(pair):
+    pairs=issuer_pairs(pair)
+    if len({bytes(p[0])for p in pairs})!=1:raise ValueError('CURRENT_EXECUTION_ISSUER_KEY_CHANGED')
+    return h(pairs[0][0]),h(pairs[0][1])if len(pairs)==1 else [h(p[1])for p in pairs]
+
+
+def issuer_valid(signature,pair):
+    pairs=issuer_pairs(pair)
+    return isinstance(signature,G2Element)and AugSchemeMPL.aggregate_verify([p[0]for p in pairs],[p[1]for p in pairs],signature)
 
 
 class CurrentPurchaseWorker:
+    ACTION_TIMEOUT_SECONDS=90
+    LEASE_SECONDS_PER_ACTION=95
     def __init__(self,service,*,issuer_sign,batch_size=2,interval=10,clock=time.time):
         if (not isinstance(service,CurrentNativePurchaseExecution) or not callable(issuer_sign)
                 or service.settings.network!='testnet11' or type(batch_size)is not int or not 1<=batch_size<=4
@@ -43,7 +61,7 @@ class CurrentPurchaseWorker:
                 or value.get('generationId')!=self.store.generation_id
                 or type(value.get('checkedAt'))is not int or type(value.get('cycles'))is not int):
             raise ValueError('CURRENT_PURCHASE_WORKER_HEALTH_CHANGED')
-        if int(self.clock())-value['checkedAt']>self.batch_size*50+2*self.interval:
+        if int(self.clock())-value['checkedAt']>self.batch_size*self.LEASE_SECONDS_PER_ACTION+2*self.interval:
             return {**value,'status':'STALE'}
         return value
 
@@ -52,10 +70,12 @@ class CurrentPurchaseWorker:
         with self.store._connect() as db:
             db.execute('BEGIN IMMEDIATE')
             rows=db.execute('''SELECT r.intent_id,r.browser_hash FROM current_customer_purchase_reviews r
-                JOIN current_purchase_executions e ON e.intent_id=r.intent_id AND e.phase='RESERVATION'
+                LEFT JOIN current_purchase_executions e ON e.intent_id=r.intent_id AND e.phase='RESERVATION'
+                LEFT JOIN current_customer_reservation_requests q ON q.intent_id=r.intent_id
                 LEFT JOIN current_customer_purchase_delivery d ON d.intent_id=r.intent_id
                 LEFT JOIN current_purchase_executions f ON f.intent_id=r.intent_id AND f.phase='DELIVERY'
                 WHERE r.generation_id=?
+                AND (e.intent_id IS NOT NULL OR q.intent_id IS NOT NULL)
                 AND (f.stage IS NULL OR f.stage!='CONFIRMED') ORDER BY r.created_at,r.intent_id LIMIT 129''',
                 (self.store.generation_id,)).fetchall()
             if len(rows)>128:raise ValueError('CURRENT_PURCHASE_WORKER_CAPACITY_EXCEEDED')
@@ -68,16 +88,17 @@ class CurrentPurchaseWorker:
                     db.execute("UPDATE current_purchase_worker_jobs SET state='REVIEW_REQUIRED' WHERE intent_id=?",(row['intent_id'],));continue
                 token=secrets.token_hex(16)
                 db.execute('UPDATE current_purchase_worker_jobs SET lease_token=?,lease_until=?,attempts=attempts+1 WHERE intent_id=?',
-                    (token,now+50*self.batch_size+5,row['intent_id']))
+                    (token,now+self.LEASE_SECONDS_PER_ACTION*self.batch_size+5,row['intent_id']))
                 selected.append((row['intent_id'],row['browser_hash'],token))
                 if len(selected)==self.batch_size:break
             db.commit()
         return selected
 
     def _save_issuer(self,identity,token,claim,signature,pair):
-        if not isinstance(signature,G2Element) or not AugSchemeMPL.verify(pair[0],pair[1],signature):
+        if not issuer_valid(signature,pair):
             raise ValueError('CURRENT_EXECUTION_ISSUER_SIGNATURE_INVALID')
-        document=canonical({'claimHash':claim.digest(),'publicKey':h(pair[0]),'message':h(pair[1]),'signature':h(signature)})
+        public,message=issuer_message(pair)
+        document=canonical({'claimHash':claim.digest(),'publicKey':public,'message':message,'signature':h(signature)})
         with self.store._connect() as db:
             db.execute('BEGIN IMMEDIATE')
             job=db.execute('SELECT * FROM current_purchase_worker_jobs WHERE intent_id=?',(identity,)).fetchone()
@@ -95,14 +116,21 @@ class CurrentPurchaseWorker:
             row=db.execute('SELECT issuer_document FROM current_purchase_worker_jobs WHERE intent_id=?',(identity,)).fetchone()
         if row is None or row[0] is None:return None
         document=json.loads(row[0]);signature=G2Element.from_bytes(bytes.fromhex(document['signature'][2:]))
-        if (document.get('claimHash')!=claim.digest() or document.get('publicKey')!=h(pair[0])
-                or document.get('message')!=h(pair[1]) or not AugSchemeMPL.verify(pair[0],pair[1],signature)):
+        public,message=issuer_message(pair)
+        if (document.get('claimHash')!=claim.digest() or document.get('publicKey')!=public
+                or document.get('message')!=message or not issuer_valid(signature,pair)):
             raise ValueError('CURRENT_PURCHASE_WORKER_SAVED_ISSUER_CHANGED')
         return signature
 
     async def _advance(self,identity,binding,token):
         s=self.service;saved=s._saved(identity,binding)
-        artifact=purchase_artifact_v3_from_json(saved['reservationClaim'].purchase_artifact)
+        claim=saved['reservationClaim']
+        artifact=(artifacts(claim)[0]if isinstance(claim,CurrentReservationBatch)
+            else purchase_artifact_v3_from_json(claim.purchase_artifact))
+        if s._existing(identity,'RESERVATION',binding)is None:
+            if int(self.clock())>=min(artifact.quote_expires_at,s.policy.expires_at):return 'CLOSED'
+            s._funding_context()
+            await s.prepare_reservation(identity,browser_hash=binding)
         # Reconciliation always precedes a new signature or dispatch, including
         # after expiry. Uncertain broadcasts use the original saved funding.
         status=await s.reconcile(identity,'RESERVATION',browser_hash=binding)
@@ -129,7 +157,7 @@ class CurrentPurchaseWorker:
         if claim is None or current is not None and current['stage']=='MEMPOOL':return 'WAITING'
         s._funding_context()
         if current is None:
-            _,signed,companion,pair=await s.delivery_issuer_review(identity,claim,browser_hash=binding)
+            checked,signed,companion,pair=await s.delivery_issuer_review(identity,claim,browser_hash=binding)
             signature=self._retained_issuer(identity,claim,pair)
             if signature is None:
                 # The transport receives only exact public evidence. The
@@ -137,9 +165,16 @@ class CurrentPurchaseWorker:
                 signature=await self.issuer_sign({'generationId':self.store.generation_id,
                     'policyHash':s.policy.commitment,'claim':claim.model_dump(mode='json',by_alias=True),
                     'claimHash':claim.digest(),'purchaseBundle':signed.to_json_dict(),
-                    'issuerCoinSpend':companion.issuer_signature_spend.to_json_dict(),
-                    'issuerPublicKey':h(pair[0]),'message':h(pair[1])})
+                    'issuerCoinSpend':([spend.to_json_dict()for spend in companion.issuer_signature_spends]
+                        if hasattr(companion,'issuer_signature_spends')else companion.issuer_signature_spend.to_json_dict()),
+                    'issuerPublicKey':issuer_message(pair)[0],'message':issuer_message(pair)[1]})
                 self._save_issuer(identity,token,claim,signature,pair)
+            if isinstance(saved['reservationClaim'],CurrentReservationBatch):
+                from .generation_customer_purchase_batch_execution import save_reviewed_delivery
+                await save_reviewed_delivery(s,identity,claim,signature,binding,checked,signed,companion,pair)
+                # A separate durable cycle funds and dispatches this exact
+                # checkpoint. Do not repeat the slow private quorum review.
+                return 'WAITING'
             await s.prepare_delivery(identity,claim,signature,browser_hash=binding)
         await s.dispatch(identity,'DELIVERY',browser_hash=binding)
         return 'WAITING'
@@ -152,7 +187,9 @@ class CurrentPurchaseWorker:
             for identity,binding,token in rows:
                 error=None
                 try:
-                    async with asyncio.timeout(45):state=await self._advance(identity,binding,token)
+                    # Finite native batch reconstruction can exceed the scalar
+                    # path; the durable lease covers this explicit upper bound.
+                    async with asyncio.timeout(self.ACTION_TIMEOUT_SECONDS):state=await self._advance(identity,binding,token)
                     complete+=state=='COMPLETE'
                 except asyncio.CancelledError:raise
                 except Exception as exc:

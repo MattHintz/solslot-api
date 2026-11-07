@@ -91,12 +91,49 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
             raise ValueError('CURRENT_EXECUTION_RETENTION_FULL')
         self._admit(db, used + additional)
 
+    def _purchase_capacity(self,db,identity,reservation,maximum):
+        from .generation_customer_purchase_batch import reservation_from_json,CurrentReservationBatch
+        quantity=lambda c:len(c.children)if isinstance(c,CurrentReservationBatch)else 1
+        rows=db.execute('''SELECT r.canonical_claim FROM current_customer_purchase_reviews r
+            WHERE r.intent_id!=? AND (EXISTS(SELECT 1 FROM current_purchase_executions e
+                WHERE e.intent_id=r.intent_id AND e.phase='RESERVATION') OR
+                EXISTS(SELECT 1 FROM current_customer_reservation_requests q WHERE q.intent_id=r.intent_id))''',(identity,)).fetchall()
+        claims=[reservation_from_json(r[0])for r in rows]
+        used=sum(quantity(c)for c in claims if c.issuer_policy_hash==reservation.issuer_policy_hash)
+        if used+quantity(reservation)>maximum:raise ValueError('CURRENT_EXECUTION_POLICY_CAPACITY_EXHAUSTED')
+
+    def reservation_request(self,identity,*,browser_hash):
+        with self._connect()as db:
+            self._row(db,identity,browser_hash)
+            row=db.execute('SELECT requested_at FROM current_customer_reservation_requests WHERE intent_id=?',(identity,)).fetchone()
+        return row[0]if row else None
+
+    def request_reservation(self,identity,*,browser_hash,now):
+        """Explicit durable customer intent; reads never enqueue work."""
+        from .generation_customer_purchase_batch import CurrentReservationBatch,artifacts
+        with self._connect()as db:
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                _,claim=self._row(db,identity,browser_hash)
+                if not isinstance(claim,CurrentReservationBatch):raise ValueError('CURRENT_PURCHASE_BATCH_REQUIRED')
+                row=db.execute('SELECT requested_at FROM current_customer_reservation_requests WHERE intent_id=?',(identity,)).fetchone()
+                if row is not None:
+                    db.commit();return row[0]
+                if type(now)is not int or not 0<now<artifacts(claim)[0].quote_expires_at:
+                    raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_CLOSED')
+                limit=db.execute('SELECT maximum_purchases FROM current_purchase_execution_policies WHERE policy_hash=?',(claim.issuer_policy_hash,)).fetchone()
+                if limit is None:raise ValueError('CURRENT_EXECUTION_BOUND_FEE_POLICY_REQUIRED')
+                self._purchase_capacity(db,identity,claim,limit[0]);self._execution_capacity(db,128)
+                db.execute('INSERT INTO current_customer_reservation_requests VALUES(?,?)',(identity,now))
+                db.commit();return now
+            except BaseException:db.rollback();raise
+
     def prepare_execution(self, identity, phase, bundle, *, browser_hash, claim_hash,
                           fee_cap, expires_at, now):
         if (not isinstance(bundle, SpendBundle) or phase not in ('RESERVATION', 'DELIVERY', 'RELEASE')
                 or type(fee_cap) is not int or not 0 <= fee_cap <= 1_000_000_000
                 or type(now) is not int or type(expires_at) is not int
-                or not 0 < now < expires_at or not 1 <= len(bundle.coin_spends) <= 32
+                or not 0 < now < expires_at or not 1 <= len(bundle.coin_spends) <= 256
                 or len({s.coin.name() for s in bundle.coin_spends}) != len(bundle.coin_spends)):
             raise ValueError('CURRENT_EXECUTION_BOUNDS_INVALID')
         raw = bytes(bundle)
@@ -140,14 +177,7 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
                         raise ValueError('CURRENT_EXECUTION_REPLACEMENT_REJECTED')
                 else:
                     if phase == 'RESERVATION':
-                        from .generation_customer_purchase_reservation import CurrentReservationClaim
-                        rows = db.execute('''SELECT r.canonical_claim FROM current_purchase_executions e
-                            JOIN current_customer_purchase_reviews r ON r.intent_id=e.intent_id
-                            WHERE e.phase='RESERVATION' ''').fetchall()
-                        used = sum(CurrentReservationClaim.model_validate_json(r[0]).issuer_policy_hash
-                                   == reservation.issuer_policy_hash for r in rows)
-                        if used >= limit['maximum_purchases']:
-                            raise ValueError('CURRENT_EXECUTION_POLICY_CAPACITY_EXHAUSTED')
+                        self._purchase_capacity(db,identity,reservation,limit['maximum_purchases'])
                     self._execution_capacity(db, len(raw) + 512)
                     db.execute('''INSERT INTO current_purchase_executions
                         (intent_id,phase,protocol_bundle,original_id,claim_hash,fee_cap,

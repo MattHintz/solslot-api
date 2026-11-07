@@ -5,7 +5,7 @@ treasury, message, fee or spend. The existing issuer journal bounds the number
 of purchases and preserves the first signature before it can be returned.
 """
 import time
-from pydantic import Field
+from pydantic import Field,model_validator
 from chia.consensus.condition_tools import conditions_dict_for_solution,pkm_pairs_for_conditions_dict
 from chia_rs import AugSchemeMPL,SpendBundle
 from solslot_puzzles.payment_artifacts_v3 import purchase_artifact_v3_from_json
@@ -14,6 +14,7 @@ from solslot_puzzles.generation_statutes import GenerationStatutes
 from .generation_execution import Model,Hash
 from .generation_customer_issuer import TestnetIssuerJournal
 from .generation_customer_purchase_delivery import CurrentDeliveryClaim,verify_current_delivery
+from .generation_customer_purchase_batch import CurrentDeliveryBatch
 from .generation_chain_evidence import current_evidence_unchanged
 from .generation_sols_batch_execution import unspent
 from .faucet import AGG_SIG_ME_DATA
@@ -22,15 +23,27 @@ from .faucet import AGG_SIG_ME_DATA
 class CurrentIssuerRequest(Model):
     generation_id:Hash=Field(alias='generationId')
     policy_hash:Hash=Field(alias='policyHash')
-    claim:CurrentDeliveryClaim
+    claim:CurrentDeliveryClaim|CurrentDeliveryBatch
     claim_hash:Hash=Field(alias='claimHash')
     purchase_bundle:dict=Field(alias='purchaseBundle')
-    issuer_coin_spend:dict=Field(alias='issuerCoinSpend')
+    issuer_coin_spend:dict|list[dict]=Field(alias='issuerCoinSpend')
     issuer_public_key:str=Field(alias='issuerPublicKey',pattern=r'^0x[0-9a-f]{96}$')
-    message:str=Field(pattern=r'^0x[0-9a-f]{1,2048}$')
+    message:str|list[str]
+
+    @model_validator(mode='after')
+    def bounded(self):
+        import re
+        messages=[self.message]if isinstance(self.message,str)else self.message
+        if not 1<=len(messages)<=25 or any(re.fullmatch(r'0x[0-9a-f]{1,2048}',m)is None for m in messages):
+            raise ValueError('CURRENT_ISSUER_EXACT_MESSAGES_REQUIRED')
+        return self
 
 
 async def sign_current_issuer(request,*,settings,anchor,provider,journal,load_key,clock=time.time,journal_lock=None):
+    if isinstance(request,CurrentIssuerRequest)and isinstance(request.claim,CurrentDeliveryBatch):
+        from .generation_customer_purchase_batch_issuer import sign_batch_issuer
+        return await sign_batch_issuer(request,settings=settings,anchor=anchor,provider=provider,journal=journal,
+            load_key=load_key,clock=clock,journal_lock=journal_lock)
     if (not isinstance(request,CurrentIssuerRequest) or not isinstance(journal,TestnetIssuerJournal)
             or not callable(load_key) or settings.network!='testnet11'
             or getattr(settings,'generation_customer_purchase_enabled',False)is not True

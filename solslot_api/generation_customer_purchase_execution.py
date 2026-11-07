@@ -39,6 +39,8 @@ from .generation_customer_vault import resolve_native_identity_vault
 from .generation_preparation import read_generation_preparation
 from .payment_quotes import load_authorized_oracle_round
 from .generation_customer_test_conversion import configured_price
+from .generation_customer_purchase_batch import CurrentReservationBatch,CurrentDeliveryBatch,CurrentBatchPaymentRequest,artifacts
+from . import generation_customer_purchase_batch_execution as batch_execution
 
 
 def h(value):
@@ -64,6 +66,9 @@ class CurrentNativePurchaseExecution:
         store.bind_execution_policy(policy.commitment, policy.maximum_purchases, fee_cap)
 
     async def quote(self, request_key, deed_launcher_id, *, browser_hash):
+        if isinstance(deed_launcher_id,(list,tuple)):
+            if len(deed_launcher_id)==1:deed_launcher_id=deed_launcher_id[0]
+            else:return await batch_execution.quote_batch(self,request_key,deed_launcher_id,browser_hash)
         deed = bytes32.from_hexstr(deed_launcher_id)
         prior = self.store.review_for_request(request_key, browser_hash=browser_hash)
         if prior is not None:
@@ -115,6 +120,8 @@ class CurrentNativePurchaseExecution:
 
     def _same_quote(self, identity, deed, browser_hash):
         saved = self._saved(identity, browser_hash)
+        if isinstance(saved['reservationClaim'],CurrentReservationBatch):
+            raise ValueError('CURRENT_EXECUTION_REQUEST_KEY_DEED_CHANGED')
         artifact = purchase_artifact_v3_from_json(saved['reservationClaim'].purchase_artifact)
         if artifact.deed_launcher_id != deed:
             raise ValueError('CURRENT_EXECUTION_REQUEST_KEY_DEED_CHANGED')
@@ -146,7 +153,11 @@ class CurrentNativePurchaseExecution:
         from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import puzzle_for_pk
         from .generation_coin_evidence import read_confirmed_coin
         saved = self._saved(identity, browser_hash)
-        artifact = purchase_artifact_v3_from_json(saved['reservationClaim'].purchase_artifact)
+        reservation=saved['reservationClaim']
+        selected=(artifacts(reservation)if isinstance(reservation,CurrentReservationBatch)
+            else (purchase_artifact_v3_from_json(reservation.purchase_artifact),))
+        artifact=selected[0]
+        amount=sum(a.rail_amount for a in selected)
         now = int(self.clock())
         if not self.policy.issued_at <= now < min(self.policy.expires_at, artifact.quote_expires_at):
             raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_CLOSED')
@@ -173,7 +184,7 @@ class CurrentNativePurchaseExecution:
                 record = read_confirmed_coin(raw,coin.name())
                 if record.coin.puzzle_hash != puzzle:
                     raise ValueError('CURRENT_PAYMENT_COIN_OWNER_CHANGED')
-                if not record.spent_height and artifact.rail_amount <= record.coin.amount <= 2**53-1:
+                if not record.spent_height and amount <= record.coin.amount <= 2**53-1:
                     candidates.append({'paymentCoinId':h(record.coin.name()),'paymentPublicKey':public,
                         'amountMojos':str(record.coin.amount),'confirmedHeight':record.confirmed_height})
             return candidates
@@ -185,12 +196,13 @@ class CurrentNativePurchaseExecution:
         unique = {r['paymentCoinId']:r for r in candidates}
         return {'schema':'solslot.current-payer-coins.v1','generationId':self.store.generation_id,
             'network':'testnet11','intentId':identity,'receivingVaultLauncherId':h(self.policy.buyer_vault),
-            'amountMojos':str(artifact.rail_amount),'lastCheckedAt':int(self.clock()),
+            'amountMojos':str(amount),'lastCheckedAt':int(self.clock()),
             'candidates':sorted(unique.values(),key=lambda r:(int(r['amountMojos']),r['paymentCoinId']))[:32]}
 
     def review(self, identity, *, browser_hash):
         saved = self._saved(identity, browser_hash)
         claim = saved['reservationClaim']
+        if isinstance(claim,CurrentReservationBatch):return batch_execution.review_batch(self,identity,saved,browser_hash)
         artifact = purchase_artifact_v3_from_json(claim.purchase_artifact)
         return {'intentId':identity, 'generationId':self.store.generation_id, 'network':'testnet11',
             'receivingVaultLauncherId':h(artifact.vault_launcher_id), 'deedLauncherId':h(artifact.deed_launcher_id),
@@ -205,6 +217,8 @@ class CurrentNativePurchaseExecution:
             'reservationClaimHash':claim.digest(), 'payerAuthorizationSaved':saved['deliveryClaim'] is not None}
 
     def reserved_coin_id(self, identity, *, browser_hash):
+        if isinstance(self._saved(identity,browser_hash)['reservationClaim'],CurrentReservationBatch):
+            return batch_execution.reserved_coins(self,identity,browser_hash)
         bundle = self.store.execution_bundle(identity, 'RESERVATION', browser_hash=browser_hash)
         if len(bundle.coin_spends) != 1:
             raise ValueError('CURRENT_EXECUTION_EXACT_RESERVATION_SPEND_REQUIRED')
@@ -237,6 +251,8 @@ class CurrentNativePurchaseExecution:
 
     async def prepare_reservation(self, identity, *, browser_hash):
         saved = self._saved(identity, browser_hash)
+        if isinstance(saved['reservationClaim'],CurrentReservationBatch):
+            return await batch_execution.prepare_reservation(self,identity,browser_hash)
         existing = self._existing(identity, 'RESERVATION', browser_hash)
         if existing is not None:
             return existing
@@ -264,6 +280,9 @@ class CurrentNativePurchaseExecution:
         status = self.store.execution_status(identity, 'RESERVATION', browser_hash=browser_hash)
         if status['stage'] != 'CONFIRMED':
             raise ValueError('CURRENT_EXECUTION_RESERVATION_NOT_CONFIRMED')
+        if isinstance(request,CurrentBatchPaymentRequest):
+            from .generation_customer_purchase_batch import prepare_current_batch_payment
+            return await prepare_current_batch_payment(request,**self._arguments())
         return await prepare_current_native_payment(request, **self._arguments())
 
     def _fees(self, evidence):
@@ -298,6 +317,7 @@ class CurrentNativePurchaseExecution:
         return self.review(identity, browser_hash=browser_hash)
 
     async def delivery_issuer_review(self, identity, claim, *, browser_hash):
+        if isinstance(claim,CurrentDeliveryBatch):return await batch_execution.issuer_review(self,identity,claim,browser_hash)
         await self.accept_payer(identity, claim, browser_hash=browser_hash)
         saved = self._saved(identity, browser_hash)
         checked = await verify_current_delivery(claim, **self._arguments())
@@ -323,6 +343,7 @@ class CurrentNativePurchaseExecution:
         return fresh, signed, companion, pairs[0]
 
     async def prepare_delivery(self, identity, claim, issuer_signature, *, browser_hash):
+        if isinstance(claim,CurrentDeliveryBatch):return await batch_execution.prepare_delivery(self,identity,claim,issuer_signature,browser_hash)
         existing = self._existing(identity, 'DELIVERY', browser_hash)
         if existing is not None:
             saved = self._saved(identity, browser_hash)
@@ -343,7 +364,9 @@ class CurrentNativePurchaseExecution:
             now=int(self.clock()))
 
     async def _revalidate_prepared(self, saved, phase, bundle):
-        if phase == 'RESERVATION':
+        if isinstance(saved['reservationClaim'],CurrentReservationBatch):
+            expected=await batch_execution.expected_spends(self,saved,phase)
+        elif phase == 'RESERVATION':
             evidence = await verify_current_reservation(saved['reservationClaim'], **self._arguments())
             expected = [evidence.transition.spend]
         elif phase == 'RELEASE':
@@ -377,7 +400,10 @@ class CurrentNativePurchaseExecution:
         delivered=self._existing(identity,'DELIVERY',browser_hash)
         if reserved['stage']!='CONFIRMED' or delivered is not None and delivered['stage']=='CONFIRMED':
             raise ValueError('CURRENT_TIMEOUT_UNDELIVERED_RESERVATION_REQUIRED')
-        bundle=await verify_current_timeout(saved['reservationClaim'],self.reserved_coin_id(identity,browser_hash=browser_hash),**self._arguments())
+        if isinstance(saved['reservationClaim'],CurrentReservationBatch):
+            spends=await batch_execution.expected_spends(self,saved,'RELEASE')
+            bundle=SpendBundle(spends,G2Element())
+        else:bundle=await verify_current_timeout(saved['reservationClaim'],self.reserved_coin_id(identity,browser_hash=browser_hash),**self._arguments())
         return self.store.prepare_execution(identity,'RELEASE',bundle,browser_hash=browser_hash,
             claim_hash=saved['reservationClaim'].digest(),fee_cap=self.fee_cap,
             expires_at=self.policy.expires_at,now=int(self.clock()))

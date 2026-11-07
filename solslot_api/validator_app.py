@@ -84,16 +84,17 @@ class PrimaryBatchSignRequest(BaseModel):
 
 from .generation_customer_purchase_reservation import CurrentReservationClaim
 from .generation_customer_purchase_delivery import CurrentDeliveryClaim
+from .generation_customer_purchase_batch import CurrentReservationBatch,CurrentDeliveryBatch
 from .generation_customer_purchase_issuer import CurrentIssuerRequest
 
 class CurrentReservationSignRequest(BaseModel):
     model_config=ConfigDict(extra='forbid')
-    claim:CurrentReservationClaim
+    claim:CurrentReservationClaim|CurrentReservationBatch
     claimHash:str=Field(pattern=r'^0x[0-9a-f]{64}$')
 
 class CurrentDeliverySignRequest(BaseModel):
     model_config=ConfigDict(extra='forbid')
-    claim:CurrentDeliveryClaim
+    claim:CurrentDeliveryClaim|CurrentDeliveryBatch
     claimHash:str=Field(pattern=r'^0x[0-9a-f]{64}$')
 
 class PrimaryPurchaseSignRequest(BaseModel):

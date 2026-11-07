@@ -150,7 +150,41 @@ class TestnetIssuerJournal:
         with self._lock:
             return self._authorize(bundle=bundle,artifact=artifact,terms=terms,fees=fees,now=now,sign_message=sign_message)
 
-    def _authorize(self,*,bundle,artifact,terms,fees,now,sign_message):
+    def authorize_batch(self,*,bundle,artifacts,terms,fees,now,sign_message):
+        """Reserve all original deed-budget slots before any key callback.
+
+        Reuses the original per-deed append-only rows, so a mixed single/batch
+        sequence, partial signer failure or restart cannot reset capacity.
+        """
+        if not 2<=len(artifacts)<=25 or len(artifacts)!=len(terms):
+            raise ValueError('CURRENT_ISSUER_BATCH_BOUNDS_INVALID')
+        with self._lock:
+            reviews=[self._review(bundle=bundle,artifact=a,terms=t,fees=fees,now=now)
+                for a,t in zip(artifacts,terms,strict=True)]
+            if len({r[2]for r in reviews})!=len(reviews):raise ValueError('CURRENT_ISSUER_BATCH_REPEATED_ARTIFACT')
+            self.db.execute('BEGIN IMMEDIATE')
+            try:
+                missing=[]
+                for companion,pair,identity,expected in reviews:
+                    row=self.db.execute('SELECT * FROM issuer_forwarding WHERE artifact_hash=?',(identity,)).fetchone()
+                    if row is None:missing.append((identity,expected))
+                    elif any(row[k]!=v for k,v in expected.items()):raise ValueError('CURRENT_ISSUER_SAVED_PURCHASE_CHANGED')
+                used=self.db.execute('SELECT COUNT(*) FROM issuer_forwarding').fetchone()[0]
+                if used+len(missing)>self.policy.maximum_purchases:raise ValueError('CURRENT_ISSUER_PURCHASE_BUDGET_EXHAUSTED')
+                for identity,expected in missing:
+                    self.db.execute('''INSERT INTO issuer_forwarding
+                        (artifact_hash,deed_id,gross_coin_id,purchase_bundle_hash,spend_hash,message,created_at)
+                        VALUES(?,?,?,?,?,?,?)''',(identity,*expected.values(),now))
+                self.db.execute('COMMIT')
+            except BaseException:self.db.execute('ROLLBACK');raise
+            for a,t in zip(artifacts,terms,strict=True):
+                self._authorize(bundle=bundle,artifact=a,terms=t,fees=fees,now=now,sign_message=sign_message)
+            signatures=[G2Element.from_bytes(bytes.fromhex(self.db.execute(
+                'SELECT signature FROM issuer_forwarding WHERE artifact_hash=?',(identity,)).fetchone()[0][2:]))for _,_,identity,_ in reviews]
+            return SpendBundle([*bundle.coin_spends,*[spend for companion,_,_,_ in reviews for spend in companion.operation.spends]],
+                AugSchemeMPL.aggregate([bundle.aggregated_signature,*signatures]))
+
+    def _review(self,*,bundle,artifact,terms,fees,now):
         """Sign only one native-derived AGG_SIG_ME message; never arbitrary RPC.
 
         Caller first independently proves the buyer's current identity, signed
@@ -177,6 +211,11 @@ class TestnetIssuerJournal:
         expected={'deed_id':h(terms.deed_launcher_id),'gross_coin_id':h(companion.gross_coin.name()),
             'purchase_bundle_hash':'0x'+sha256(bytes(bundle)).hexdigest(),
             'spend_hash':'0x'+sha256(bytes(spend)).hexdigest(),'message':h(message)}
+        return companion,(public,message),identity,expected
+
+    def _authorize(self,*,bundle,artifact,terms,fees,now,sign_message):
+        policy=self.policy
+        companion,(public,message),identity,expected=self._review(bundle=bundle,artifact=artifact,terms=terms,fees=fees,now=now)
         self.db.execute('BEGIN IMMEDIATE')
         try:
             row=self.db.execute('SELECT * FROM issuer_forwarding WHERE artifact_hash=?',(identity,)).fetchone()

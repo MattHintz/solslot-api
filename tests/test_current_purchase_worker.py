@@ -34,7 +34,7 @@ async def test_interrupted_reservation_is_reconciled_before_any_dispatch(recover
 async def test_durable_lease_excludes_another_worker_and_recovers_after_restart(recover):
  r=recover;a=CurrentPurchaseWorker(r.service,issuer_sign=no_issuer,clock=lambda:r.clock[0]);b=CurrentPurchaseWorker(r.service,issuer_sign=no_issuer,clock=lambda:r.clock[0])
  rows=a._claim();assert len(rows)==1 and b._claim()==[]
- r.clock[0]+=106
+ r.clock[0]+=a.LEASE_SECONDS_PER_ACTION*a.batch_size+6
  assert len(b._claim())==1
 
 @pytest.mark.asyncio
@@ -66,7 +66,9 @@ async def test_cancellation_holds_lease_and_restarts_without_duplicate_action(re
 @pytest.mark.asyncio
 async def test_stale_health_is_not_an_enabled_worker_claim(recover):
  r=recover;w=CurrentPurchaseWorker(r.service,issuer_sign=no_issuer,clock=lambda:r.clock[0]);await w.tick()
- r.clock[0]+=121;assert w.health()['status']=='STALE'
+ r.clock[0]+=w.batch_size*w.LEASE_SECONDS_PER_ACTION+2*w.interval
+ assert w.health()['status']=='HEALTHY'
+ r.clock[0]+=1;assert w.health()['status']=='STALE'
 
 @pytest.mark.asyncio
 async def test_confirmed_unpaid_reservation_is_selected_for_automatic_timeout(recover):

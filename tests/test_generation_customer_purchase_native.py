@@ -189,6 +189,11 @@ async def test_native_current_checkout_delivery_and_fee_boundaries(core,tmp_path
             vault_launcher_id=vault.launcher,vault_p2_puzzle_hash=puzzle_for_p2_vault(vault.launcher).get_tree_hash(),
             authorization_nonce=quote_args['nonce'],authorization_expires_at=now+300,
             quote_expires_at=now+300,oracle_round=price.round)
+    if getattr(c,'checkout_batch_quantity',None)is not None:
+        from tests.test_current_purchase_batch_native import exercise_batch
+        await exercise_batch(c,ctx,built,inventory,vault,pay_coin,payment_pk,synthetic,validators,issuer_policy,tmp_path,monkeypatch)
+        ctx.collections.close()
+        return
     current_verified=None
     execution=None
     reservation_replies={}
@@ -505,7 +510,9 @@ async def test_native_current_checkout_delivery_and_fee_boundaries(core,tmp_path
             guard.authorize(bundle=base,artifact=quote,terms=terms,fees=fees,now=policy.expires_at,sign_message=issuer_sign)
         with pytest.raises(ValueError,match='SCOPE_CHANGED'):
             guard.authorize(bundle=base,artifact=replace(quote,vault_launcher_id=b32(211)),terms=terms,fees=fees,now=now,sign_message=issuer_sign)
-        with pytest.raises(ValueError,match='BUDGET_EXHAUSTED'):
+        # Changing the nonce while retaining the old bundle changes both
+        # child commitments. Reject that mismatch before journal admission.
+        with pytest.raises(ValueError,match='one exact newly delivered offer proceeds coin'):
             guard.authorize(bundle=base,artifact=replace(quote,authorization_nonce=b32(212)),terms=terms,fees=fees,now=now,sign_message=issuer_sign)
         assert len(calls)==1
         guard.close();guard=TestnetIssuerJournal(location,policy)

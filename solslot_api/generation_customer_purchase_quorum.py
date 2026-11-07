@@ -17,7 +17,16 @@ from .faucet import AGG_SIG_ME_DATA
 
 async def collect_current_purchase_quorum(settings,evidence,*,client=None,retained=None,on_signature=None):
     roster=configured_validator_pubkeys(settings)
-    if isinstance(evidence,CurrentReservationEvidence):
+    from .generation_customer_purchase_batch import CurrentBatchEvidence,CurrentReservationBatch
+    from .generation_customer_purchase_batch_signing import batch_messages
+    multi=isinstance(evidence,CurrentBatchEvidence)
+    if multi:
+        claim=evidence.claim
+        reserve=isinstance(claim,CurrentReservationBatch)
+        indices=claim.signer_indices if reserve else claim.reservation.signer_indices
+        messages=batch_messages(evidence,tuple(roster))
+        route='/v1/generation/purchase/'+('reservation'if reserve else'delivery')+'/sign'
+    elif isinstance(evidence,CurrentReservationEvidence):
         claim=evidence.claim;indices=claim.signer_indices
         messages=native_messages(claim,evidence.transition,evidence.item.original.terms,roster)
         route='/v1/generation/purchase/reservation/sign'
@@ -36,8 +45,9 @@ async def collect_current_purchase_quorum(settings,evidence,*,client=None,retain
     def checked(index,raw):
         reply=ValidatorSignatureResponse.model_validate(raw)
         signature=G2Element.from_bytes(bytes.fromhex(reply.signature.removeprefix('0x')))
-        if (reply.claimHash!=claim.digest()or reply.signerIndex!=index or reply.validatorPubkey!='0x'+roster[index].hex()
-                or not AugSchemeMPL.verify(G1Element.from_bytes(roster[index]),messages[index],signature)):
+        valid=(AugSchemeMPL.aggregate_verify([G1Element.from_bytes(roster[index])]*len(messages[index]),messages[index],signature)
+            if multi else AugSchemeMPL.verify(G1Element.from_bytes(roster[index]),messages[index],signature))
+        if (reply.claimHash!=claim.digest()or reply.signerIndex!=index or reply.validatorPubkey!='0x'+roster[index].hex()or not valid):
             raise ValueError('CURRENT_QUORUM_SIGNATURE_INVALID')
         return reply,signature
     kept={i:checked(i,value)[1]for i,value in (retained or {}).items()}

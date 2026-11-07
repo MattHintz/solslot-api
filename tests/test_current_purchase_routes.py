@@ -51,6 +51,7 @@ def checkout(monkeypatch):
     service.inventory=inventory;service.payer_coins=payer_coins
     service._funding_context=lambda:None
     service.dispatch=dispatch;service.reconcile=reconcile;service._existing=lambda *a:None
+    service._saved=lambda *a:{'reservationClaim':None}
     app=FastAPI();app.include_router(routes.router);app.state.generation_customer_purchase=service
     app.dependency_overrides[get_settings]=lambda:settings
     with TestClient(app) as client:
@@ -59,6 +60,27 @@ def checkout(monkeypatch):
 
 def url(suffix=''):
     return '/customer/purchases/'+VAULT+'/'+INTENT+suffix
+
+
+@pytest.mark.parametrize('quantity',[2,3])
+def test_quantity_reaches_one_current_order_without_single_order_loop(checkout,quantity):
+    c=checkout;ids=['0x'+f'{i:02x}'*32 for i in range(10,10+quantity)]
+    reply=c.client.post('/customer/purchases/'+VAULT+'/quotes',json={
+        'generationId':GEN,'requestKey':'one-batch','deedLauncherIds':ids},headers=ORIGIN)
+    assert reply.status_code==200
+    assert len(c.events)==1 and c.events[0][0:3]==('quote','one-batch',ids)
+
+
+@pytest.mark.parametrize('selection',[
+    {},{'deedLauncherId':DEED,'deedLauncherIds':[DEED]},
+    {'deedLauncherIds':[]},{'deedLauncherIds':[DEED,DEED]},
+    {'deedLauncherIds':['0x'+f'{i:02x}'*32 for i in range(26)]},
+])
+def test_invalid_batch_selection_cannot_create_partial_orders(checkout,selection):
+    c=checkout
+    reply=c.client.post('/customer/purchases/'+VAULT+'/quotes',json={
+        'generationId':GEN,'requestKey':'one-batch',**selection},headers=ORIGIN)
+    assert reply.status_code==422 and c.events==[]
 
 
 def test_owner_session_failure_precedes_every_service_read(checkout):
