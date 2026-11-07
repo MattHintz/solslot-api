@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from .base_inventory_hold import BaseHoldClaim
 from .validator_base_inventory_hold import sign_base_inventory_hold
@@ -26,8 +26,10 @@ from .validator_quorum import (
     PrimaryPurchaseClaim,
     StripeSettlementClaim,
     ValidatorClaim,
+    CurrentIdentityClaim,
     PermitValidatorClaim,
     ValidatorSignatureResponse,
+    ValidatorHealthResponse,
     VoucherIssuanceClaim,
     VoucherSeriesPhaseClaim,
     VoucherTransitionClaim,
@@ -55,6 +57,45 @@ class ValidatorSignRequest(BaseModel):
     claim: PermitValidatorClaim | ValidatorClaim
     claimHash: str
 
+
+class CurrentIdentitySignRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    claim: CurrentIdentityClaim
+    claimHash: str = Field(pattern=r'^0x[0-9a-f]{64}$')
+
+
+class CurrentIdentityRecoveryRequest(CurrentIdentitySignRequest):
+    originalClaimHash:str=Field(pattern=r'^0x[0-9a-f]{64}$')
+
+
+def _identity_recovery_window_open(settings):
+    import time
+    deadline=getattr(settings,'generation_customer_identity_recovery_expires_at',0)
+    return type(deadline) is int and 0 < int(time.time()) < deadline
+
+
+from .generation_sols_batch_execution import PrimaryBatchClaim
+
+class PrimaryBatchSignRequest(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    claim:PrimaryBatchClaim
+    claimHash:str
+
+
+from .generation_customer_purchase_reservation import CurrentReservationClaim
+from .generation_customer_purchase_delivery import CurrentDeliveryClaim
+from .generation_customer_purchase_batch import CurrentReservationBatch,CurrentDeliveryBatch
+from .generation_customer_purchase_issuer import CurrentIssuerRequest
+
+class CurrentReservationSignRequest(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    claim:CurrentReservationClaim|CurrentReservationBatch
+    claimHash:str=Field(pattern=r'^0x[0-9a-f]{64}$')
+
+class CurrentDeliverySignRequest(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    claim:CurrentDeliveryClaim|CurrentDeliveryBatch
+    claimHash:str=Field(pattern=r'^0x[0-9a-f]{64}$')
 
 class PrimaryPurchaseSignRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -146,24 +187,6 @@ class VoucherSeriesPhaseSignRequest(BaseModel):
     claimHash: str
 
 
-class ValidatorHealthResponse(BaseModel):
-    status: str
-    signerIndex: int
-    validatorPubkey: str
-    apiCommit: str
-    protocolCommit: str
-    network: str
-    bridgePolicyHash: str
-    evmAddresses: dict[str, str]
-    artifactHash: str | None
-    artifactReady: bool
-    ledgerReady: bool
-    evmChainId: int = 11155111
-    enrollmentActivation: dict[str, Any] | None = None
-    identityDeploymentRevision: int = 0
-    identityDeploymentHash: str | None = None
-
-
 def create_validator_app(
     *,
     settings: ValidatorSettings | None = None,
@@ -194,7 +217,8 @@ def create_validator_app(
         )
         identity_provider = None
         application.state.identity_deployment = None
-        if Path(signer_settings.public_artifact_path).is_file():
+        application.state.identity_provider = None
+        if Path(signer_settings.public_artifact_path).is_file() and not signer_settings.generation_customer_identity_enabled:
             artifact, _release = load_validator_artifact(signer_settings)
             identity_provider = create_chia_provider(
                 ChiaProviderConfig(
@@ -204,6 +228,7 @@ def create_validator_app(
                 )
             )
             await identity_provider.start()
+            application.state.identity_provider = identity_provider
             coordinator = _coordinator_settings(signer_settings, artifact)
             application.state.identity_deployment = (
                 await load_effective_identity_deployment(
@@ -213,9 +238,44 @@ def create_validator_app(
             require_runtime_identity_bindings(
                 coordinator, application.state.identity_deployment
             )
+        application.state.generation_provider=None
+        generation_provider=None
+        if signer_settings.generation_sols_batch_enabled or signer_settings.generation_customer_identity_enabled:
+            from .generation_sols_batch_validators import generation_settings
+            from .generation_index import load_generation_read_anchor
+            load_generation_read_anchor(generation_settings(signer_settings))
+            if not signer_settings.generation_primary_url:
+                raise RuntimeError('generation delivery requires an independent primary node')
+            if signer_settings.generation_primary_readonly_gateway:
+                from .generation_primary_reader import private_primary_reader
+                generation_provider = private_primary_reader(signer_settings)
+            else:
+                generation_provider=create_chia_provider(ChiaProviderConfig(network='testnet11',
+                primary_url=signer_settings.generation_primary_url,fallback_url=signer_settings.coinset_base_url,primary_required=True,
+                primary_ca_cert_path=signer_settings.generation_primary_ca_cert_path,
+                primary_client_cert_path=signer_settings.generation_primary_client_cert_path,
+                primary_client_key_path=signer_settings.generation_primary_client_key_path))
+            await generation_provider.start();application.state.generation_provider=generation_provider
+        if signer_settings.generation_customer_identity_enabled:
+            from .generation_customer_identity_validators import selected_current_identity_profile
+            selected_current_identity_profile(signer_settings)
+        if signer_settings.generation_customer_purchase_enabled:
+            from .generation_customer_purchase_policy import selected_purchase_policy
+            selected_purchase_policy(signer_settings)
+        application.state.current_issuer=None
+        if signer_settings.generation_customer_purchase_issuer_enabled:
+            import time
+            from .generation_customer_issuer import TestnetIssuerJournal
+            from .generation_customer_purchase_issuer import load_fixed_issuer_key
+            policy=selected_purchase_policy(signer_settings)
+            if policy.issued_at<=int(time.time())<policy.expires_at:
+                if bytes(load_fixed_issuer_key(signer_settings).get_g1())!=policy.issuer_public_key:
+                    raise RuntimeError('CURRENT_ISSUER_FIXED_KEY_CHANGED')
+                application.state.current_issuer=TestnetIssuerJournal.in_validator_journal(active_ledger,policy)
         try:
             yield
         finally:
+            if generation_provider is not None:await generation_provider.close()
             if identity_provider is not None:
                 await identity_provider.close()
             if configured_ledger is None:
@@ -230,6 +290,135 @@ def create_validator_app(
         lifespan=lifespan,
     )
 
+    @application.middleware('http')
+    async def current_signer_scope(request, call_next):
+        from fastapi.responses import JSONResponse
+        if getattr(current_settings(), 'generation_customer_identity_enabled', False):
+            permitted = {('GET', '/health'), ('POST', '/v1/generation/identity/sign')}
+            if getattr(current_settings(),'generation_customer_identity_recovery_enabled',False):
+                permitted.add(('POST','/v1/generation/identity/recover'))
+            if current_settings().generation_customer_purchase_enabled:
+                permitted|={('POST','/v1/generation/purchase/reservation/sign'),('POST','/v1/generation/purchase/delivery/sign')}
+            if current_settings().generation_customer_purchase_issuer_enabled:
+                permitted.add(('POST','/v1/generation/purchase/issuer/sign'))
+                permitted.add(('GET','/v1/generation/purchase/issuer/status'))
+            if (request.method, request.url.path) not in permitted:
+                return JSONResponse({'detail': 'CURRENT_SIGNER_ACTION_DISABLED'}, status_code=404)
+        return await call_next(request)
+
+    async def current_purchase_response(body,*,delivery=False):
+        import asyncio
+        from .generation_customer_purchase_policy import selected_purchase_policy
+        from .generation_customer_purchase_validators import sign_current_reservation
+        from .generation_customer_purchase_delivery import sign_current_delivery
+        from .generation_sols_batch_validators import generation_settings
+        from .generation_index import load_generation_read_anchor
+        configured=current_settings()
+        if not configured.generation_customer_purchase_enabled:
+            raise HTTPException(404,detail='CURRENT_PURCHASE_ACTION_DISABLED')
+        provider=getattr(application.state,'generation_provider',None)
+        if provider is None:raise HTTPException(503,detail='CURRENT_PURCHASE_SIGNER_NOT_READY')
+        try:
+            policy=selected_purchase_policy(configured)
+            anchor=load_generation_read_anchor(generation_settings(configured))
+            signer=sign_current_delivery if delivery else sign_current_reservation
+            async with asyncio.timeout(45):
+                return await signer(body.claim,body.claimHash,settings=configured,anchor=anchor,
+                    provider=provider,ledger=application.state.validator_ledger,issuer_policy=policy,
+                    expected_issuer_policy_hash=policy.commitment)
+        except Exception as exc:
+            raise HTTPException(409,detail='CURRENT_PURCHASE_INDEPENDENT_EVIDENCE_REJECTED')from exc
+
+    @application.post('/v1/generation/purchase/reservation/sign',response_model=ValidatorSignatureResponse)
+    async def sign_current_purchase_reservation(body:CurrentReservationSignRequest):
+        return await current_purchase_response(body)
+
+    @application.post('/v1/generation/purchase/delivery/sign',response_model=ValidatorSignatureResponse)
+    async def sign_current_purchase_delivery(body:CurrentDeliverySignRequest):
+        return await current_purchase_response(body,delivery=True)
+
+    @application.post('/v1/generation/purchase/issuer/sign')
+    async def current_issuer_response(body:CurrentIssuerRequest):
+        import asyncio
+        from .generation_customer_purchase_issuer import sign_current_issuer,load_fixed_issuer_key
+        from .generation_sols_batch_validators import generation_settings
+        from .generation_index import load_generation_read_anchor
+        configured=current_settings()
+        if not configured.generation_customer_purchase_issuer_enabled or configured.signer_index!=2:
+            raise HTTPException(404,detail='CURRENT_ISSUER_ACTION_DISABLED')
+        journal=getattr(application.state,'current_issuer',None)
+        provider=getattr(application.state,'generation_provider',None)
+        if journal is None or provider is None:raise HTTPException(503,detail='CURRENT_ISSUER_NOT_READY')
+        try:
+            async with asyncio.timeout(40):
+                signature=await sign_current_issuer(body,settings=configured,
+                    anchor=load_generation_read_anchor(generation_settings(configured)),provider=provider,
+                    journal=journal,load_key=lambda:load_fixed_issuer_key(configured),
+                    journal_lock=application.state.validator_ledger._lock)
+            return {'generationId':body.generation_id,'policyHash':body.policy_hash,
+                'claimHash':body.claim_hash,'signature':'0x'+bytes(signature).hex()}
+        except Exception as exc:raise HTTPException(409,detail='CURRENT_ISSUER_INDEPENDENT_EVIDENCE_REJECTED')from exc
+
+    @application.get('/v1/generation/purchase/issuer/status')
+    async def current_issuer_status():
+        import time
+        journal=getattr(application.state,'current_issuer',None)
+        if not current_settings().generation_customer_purchase_issuer_enabled or current_settings().signer_index!=2 or journal is None:
+            raise HTTPException(404,detail='CURRENT_ISSUER_ACTION_DISABLED')
+        with application.state.validator_ledger._lock:
+            used=journal.db.execute('SELECT count(*) FROM issuer_forwarding').fetchone()[0]
+        now=int(time.time());p=journal.policy
+        return {'generationId':'0x'+p.generation.hex(),'policyHash':p.commitment,'checkedAt':now,
+            'expiresAt':p.expires_at,'remainingPurchases':max(0,p.maximum_purchases-used),
+            'canSign':p.issued_at<=now<p.expires_at and used<p.maximum_purchases}
+
+    @application.post('/v1/generation/identity/sign', response_model=ValidatorSignatureResponse)
+    async def sign_generation_identity(body: CurrentIdentitySignRequest):
+        import asyncio
+        from .generation_customer_identity_validators import sign_current_identity
+        settings = current_settings()
+        provider = getattr(application.state, 'generation_provider', None)
+        if not settings.generation_customer_identity_enabled or provider is None:
+            raise HTTPException(503, detail='CURRENT_ID_SIGNER_NOT_READY')
+        try:
+            async with asyncio.timeout(45):
+                return await sign_current_identity(settings, application.state.validator_ledger,
+                    body.claim, body.claimHash, provider=provider)
+        except Exception as exc:
+            # Proofs, provider payloads and signatures must not appear in errors.
+            raise HTTPException(409, detail='CURRENT_ID_INDEPENDENT_EVIDENCE_REJECTED') from exc
+
+    @application.post('/v1/generation/identity/recover', response_model=ValidatorSignatureResponse)
+    async def recover_generation_identity(body:CurrentIdentityRecoveryRequest):
+        import asyncio
+        from .generation_customer_identity_validators import recover_existing_current_identity_signature
+        settings=current_settings();provider=getattr(application.state,'generation_provider',None)
+        if (not getattr(settings,'generation_customer_identity_recovery_enabled',False)
+                or not _identity_recovery_window_open(settings) or provider is None):
+            raise HTTPException(503,detail='CURRENT_ID_RECOVERY_NOT_READY')
+        try:
+            async with asyncio.timeout(45):
+                recovered = await recover_existing_current_identity_signature(settings,application.state.validator_ledger,
+                    original_claim_hash=body.originalClaimHash,refreshed_claim=body.claim,
+                    refreshed_claim_hash=body.claimHash,provider=provider)
+        except Exception as exc:
+            raise HTTPException(409,detail='CURRENT_ID_RECOVERY_EVIDENCE_REJECTED') from exc
+        if not _identity_recovery_window_open(settings):
+            raise HTTPException(503,detail='CURRENT_ID_RECOVERY_NOT_READY')
+        return recovered
+
+    @application.post('/v1/generation/primary-sols/sign',response_model=ValidatorSignatureResponse)
+    async def sign_generation_primary(body:PrimaryBatchSignRequest):
+        import time
+        from .generation_sols_batch_validators import sign_primary_batch
+        if body.claim.digest()!=body.claimHash:raise HTTPException(409,detail='BATCH_CLAIM_CHANGED')
+        provider=getattr(application.state,'generation_provider',None)
+        if provider is None:raise HTTPException(503,detail='BATCH_SIGNER_NOT_READY')
+        try:return await sign_primary_batch(body.claim,settings=current_settings(),provider=provider,
+            ledger=application.state.validator_ledger,clock=time.time)
+        except (ValueError,RuntimeError) as exc:
+            raise HTTPException(409,detail='BATCH_INDEPENDENT_EVIDENCE_REJECTED') from exc
+
     @application.get("/health", response_model=ValidatorHealthResponse)
     def health() -> ValidatorHealthResponse:
         signer_settings = current_settings()
@@ -243,7 +432,7 @@ def create_validator_app(
                 raise HTTPException(status_code=503, detail="permit health release does not match the reviewed activation")
         artifact_hash: str | None = None
         artifact_ready = False
-        if Path(signer_settings.public_artifact_path).is_file():
+        if Path(signer_settings.public_artifact_path).is_file() and not signer_settings.generation_customer_identity_enabled:
             try:
                 artifact, _ = load_validator_artifact(signer_settings)
                 artifact_hash = str(artifact["artifactHash"])
@@ -251,6 +440,20 @@ def create_validator_app(
             except ValidatorEvidenceError as exc:
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
         active_ledger: ValidatorLedger = application.state.validator_ledger
+        current_profile = None
+        if signer_settings.generation_customer_identity_enabled:
+            from .generation_customer_identity_validators import selected_current_identity_profile
+            try:
+                current_profile = selected_current_identity_profile(signer_settings)
+                if getattr(application.state, 'generation_provider', None) is None:
+                    raise ValueError('current primary provider missing')
+            except (ValueError, OSError) as exc:
+                raise HTTPException(503, detail='CURRENT_ID_SIGNER_NOT_READY') from exc
+        purchase_policy=None
+        if signer_settings.generation_customer_purchase_enabled:
+            from .generation_customer_purchase_policy import selected_purchase_policy
+            try:purchase_policy=selected_purchase_policy(signer_settings)
+            except (ValueError,OSError)as exc:raise HTTPException(503,detail='CURRENT_PURCHASE_SIGNER_NOT_READY')from exc
         return ValidatorHealthResponse(
             status="healthy",
             signerIndex=signer_settings.signer_index,
@@ -267,6 +470,12 @@ def create_validator_app(
             artifactHash=artifact_hash,
             artifactReady=artifact_ready,
             ledgerReady=active_ledger.healthcheck(),
+            currentIdentityGeneration=current_profile.generation_id if current_profile else None,
+            currentIdentityProfileHash=current_profile.commitment if current_profile else None,
+            currentIdentityConfigured=current_profile is not None,
+            currentPurchaseConfigured=purchase_policy is not None,
+            currentPurchasePolicyHash=purchase_policy.commitment if purchase_policy else None,
+            currentPurchaseExpiresAt=purchase_policy.expires_at if purchase_policy else None,
             evmChainId=signer_settings.evm_chain_id,
             enrollmentActivation=signer_settings.enrollment_activation,
             identityDeploymentRevision=(
@@ -285,11 +494,26 @@ def create_validator_app(
         "/v1/zkpassport/sign",
         response_model=ValidatorSignatureResponse,
     )
-    def sign(request: ValidatorSignRequest) -> ValidatorSignatureResponse:
+    async def sign(request: ValidatorSignRequest) -> ValidatorSignatureResponse:
         signer_settings = current_settings()
         active_ledger: ValidatorLedger = application.state.validator_ledger
         try:
-            signature = sign_validator_claim(
+            if signer_settings.identity_deployment_amendment_path:
+                from .identity_deployment import (IdentityDeploymentError,
+                    load_effective_identity_deployment, require_runtime_identity_bindings)
+                provider = getattr(application.state, "identity_provider", None)
+                if provider is None:
+                    raise ValidatorEvidenceError("confirmed identity history provider is unavailable")
+                artifact, _release = load_validator_artifact(signer_settings)
+                coordinator = _coordinator_settings(signer_settings, artifact)
+                try:
+                    selected = await load_effective_identity_deployment(coordinator, provider=provider)
+                    require_runtime_identity_bindings(coordinator, selected)
+                except IdentityDeploymentError as exc:
+                    raise ValidatorEvidenceError(str(exc)) from exc
+            # Synchronous RPC and ledger work must not block the ASGI loop.
+            from starlette.concurrency import run_in_threadpool
+            signature = await run_in_threadpool(sign_validator_claim,
                 signer_settings,
                 active_ledger,
                 request.claim,

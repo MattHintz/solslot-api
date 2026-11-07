@@ -49,6 +49,7 @@ from .state import VaultRecord, get_registry
 from .vault_puzzle_hash import puzzle_hash_for_vault_full
 from .validator_quorum import (
     ValidatorClaim,
+    CurrentIdentityClaim,
     PermitValidatorClaim,
     ValidatorQuorumError,
     collect_validator_quorum,
@@ -112,6 +113,8 @@ class AttestationProof(BaseModel):
 
 
 class VaultCredentialReceipt(BaseModel):
+    generationId: Optional[str] = None
+    identityProfileHash: Optional[str] = None
     vaultLauncherId: str
     network: str
     policyVersion: int = Field(..., ge=1)
@@ -226,12 +229,18 @@ class SyncChiaStampResponse(BaseModel):
 
 
 def _settings() -> Settings:
+    from .generation_customer_identity_scope import current_identity_scope
+    selected=current_identity_scope()
+    if selected is not None:return selected.settings
     return Settings()
 
 
 def _current_identity_deployment(
     settings: Settings, request: Request
 ) -> dict[str, Any]:
+    from .generation_customer_identity_scope import current_identity_scope
+    selected_scope=current_identity_scope(settings)
+    if selected_scope is not None:return selected_scope.profile.public()
     from .identity_deployment import genesis_identity_deployment
     try:
         selected = request.scope["app"].state.identity_deployment
@@ -267,6 +276,11 @@ def _settings_for_enrollment(
     settings: Settings, request: Request, record: dict[str, Any]
 ) -> tuple[Settings, dict[str, Any]]:
     """Pin one request to the enrollment's immutable identity deployment."""
+    from .generation_customer_identity_scope import current_identity_scope
+    selected_scope=current_identity_scope(settings)
+    if selected_scope is not None:
+        selected_scope.require_record(record)
+        return selected_scope.settings,selected_scope.profile.public()
     from .identity_deployment import (
         IdentityDeploymentError,
         deployment_for_enrollment,
@@ -317,6 +331,9 @@ def _hex32(value: bytes) -> str:
 
 
 def _active_genesis_artifact(settings: Settings) -> dict[str, Any]:
+    from .generation_customer_identity_scope import current_identity_scope
+    if current_identity_scope(settings) is not None:
+        raise HTTPException(status_code=503,detail='Legacy genesis authority is not admitted in current customer identity requests.')
     try:
         from .public_artifact import load_signed_public_artifact
 
@@ -329,6 +346,9 @@ def _active_genesis_artifact(settings: Settings) -> dict[str, Any]:
 
 
 def _active_pool_launcher_id(settings: Settings) -> str:
+    from .generation_customer_identity_scope import current_identity_scope
+    selected=current_identity_scope(settings)
+    if selected is not None:return selected.profile.pool_launcher_id
     try:
         return _normalize_hex32(
             _active_genesis_artifact(settings)["launcherIds"]["pool"],
@@ -342,6 +362,9 @@ def _active_pool_launcher_id(settings: Settings) -> str:
 
 
 def _active_bridge_policy_hash(settings: Settings) -> str:
+    from .generation_customer_identity_scope import current_identity_scope
+    selected=current_identity_scope(settings)
+    if selected is not None:return selected.profile.bridge_policy_hash
     try:
         return _normalize_hex32(
             _active_genesis_artifact(settings)["bridgePolicy"]["policyHash"],
@@ -355,6 +378,12 @@ def _active_bridge_policy_hash(settings: Settings) -> str:
 
 
 def _active_bridge_coin_policy(settings: Settings) -> BridgeCoinPolicy:
+    from .generation_customer_identity_scope import current_identity_scope
+    selected=current_identity_scope(settings)
+    if selected is not None:
+        return BridgeCoinPolicy(selected.profile.bridge_policy_hash,
+            frozenset(row.parent_id for row in selected.profile.bridge_coins),
+            frozenset(row.coin_id for row in selected.profile.bridge_coins))
     try:
         return BridgeCoinPolicy.from_artifact(_active_genesis_artifact(settings))
     except ValueError as exc:
@@ -365,6 +394,9 @@ def _require_enrollment_bridge_policy(
     settings: Settings, record: dict[str, Any], *, policy: BridgeCoinPolicy | None = None,
     execution: bool = False,
 ) -> None:
+    from .generation_customer_identity_scope import current_identity_scope
+    selected=current_identity_scope(settings)
+    if selected is not None:selected.require_record(record)
     policy = policy or _active_bridge_coin_policy(settings)
     if execution and (policy.permit_version is not None or record.get('enrollmentPermit') is not None):
         _record_permit(settings, record)
@@ -384,6 +416,11 @@ def _require_enrollment_bridge_policy(
 def _record_permit(settings: Settings, record: dict[str, Any], *,
         owner_auth_type: int | None = None, owner_key: str | None = None,
         current_vault_coin_id: str | None = None, now: int | None = None):
+    from .generation_customer_identity_scope import current_identity_scope
+    selected=current_identity_scope(settings)
+    if selected is not None:
+        selected.require_record(record)
+        return None
     if not settings.enrollment_permit_release_identity and record.get("enrollmentPermit") is None:
         return None
     from .enrollment_permit_runtime import validate_record_permit
@@ -413,11 +450,29 @@ def _fetch_verified_evm_attestation(
     expected_vault_launcher_id: str,
     authenticated_artifact: dict[str, Any] | None = None,
     permit_record: dict[str, Any] | None = None,
+    current_profile: object | None = None,
 ) -> IndexedEvmAttestation:
     """Read and fully validate the canonical emitter event from Sepolia."""
     tx_hash = _normalize_tx(transaction_hash, "evmTxHash")
+    from .generation_customer_identity_scope import current_identity_scope
+    scope = current_identity_scope(settings, expected_vault_launcher_id)
+    if scope is not None:
+        if current_profile is not None and current_profile != scope.profile:
+            raise HTTPException(409, detail='CURRENT_ID_PROFILE_CHANGED')
+        current_profile = scope.profile
+        if getattr(scope.runtime, 'primary_read_set', False):
+            return scope.runtime.verified_event(tx_hash, expected_vault_launcher_id)
+    if current_profile is not None:
+        from .generation_customer_identity_context import CurrentCustomerIdentityProfile
+        if (not isinstance(current_profile, CurrentCustomerIdentityProfile)
+                or settings.network != 'testnet11'
+                or settings.deployment_generation_id != current_profile.generation_id
+                or settings.zkpassport_evm_chain_id != current_profile.evm_chain_id
+                or settings.zkpassport_emitter_address != next(c.address for c in current_profile.contracts if c.role == 'attestationEmitter')
+                or authenticated_artifact is not None or permit_record is not None):
+            raise HTTPException(409, detail='CURRENT_ID_PROFILE_BINDING_CHANGED')
     artifact = authenticated_artifact
-    if artifact is None and settings.enrollment_permit_release_identity:
+    if current_profile is None and artifact is None and settings.enrollment_permit_release_identity:
         artifact = _active_genesis_artifact(settings)
     emitter_address = (Web3.to_checksum_address(artifact["evmAddresses"]["attestationEmitter"])
         if artifact is not None else _active_emitter_address(settings))
@@ -441,6 +496,15 @@ def _fetch_verified_evm_attestation(
     if receipt['status'] != 1:
         raise HTTPException(status_code=409, detail="The zkPassport EVM transaction reverted.")
     block_number = receipt['blockNumber']
+    current_transaction = None
+    if current_profile is not None:
+        from .generation_customer_identity_evm import verify_current_identity_transaction
+        try:
+            current_transaction = verify_current_identity_transaction(w3, current_profile, receipt,
+                launcher=_normalize_hex32(expected_vault_launcher_id, 'vaultLauncherId'))
+        except Exception as exc:
+            # RPC errors and proof-bearing calldata never enter HTTP messages.
+            raise HTTPException(409, detail='CURRENT_ID_EVM_EVIDENCE_REJECTED') from exc
 
     permit = None
     if artifact is not None:
@@ -508,7 +572,7 @@ def _fetch_verified_evm_attestation(
                 detail=f"The zkPassport emitter event is malformed: {exc}",
             ) from exc
 
-        if permit is not None:
+        if permit is not None or current_profile is not None:
             types = ["uint16", "bytes32", "bytes32", "uint64", "bytes32", "bytes32", "bytes32",
                 "uint64", "bytes32", "bytes32", "bytes32", "uint16"]
             values = (nullifier_type, service_scope_hash, service_subscope_hash, proof_timestamp,
@@ -549,6 +613,11 @@ def _fetch_verified_evm_attestation(
             detail="The transaction must contain exactly one canonical vault attestation event.",
         )
     event = matching[0]
+    if current_transaction is not None:
+        sender, parsed = current_transaction
+        if (event.sender.lower() != sender or event.bridge_parent_id != parsed.parent
+                or event.bridge_amount != parsed.amount):
+            raise HTTPException(409, detail='CURRENT_ID_EVENT_TRANSACTION_MISMATCH')
 
     try:
         from solslot_puzzles.zkpassport_attestation import (
@@ -605,7 +674,8 @@ def _fetch_verified_evm_attestation(
         "policyVersion": settings.zkpassport_policy_version,
         "attestationLeafHash": _hex32(leaf),
         "identityAttestRoot": _hex32(root),
-        "bridgePolicyHash": artifact["bridgePolicy"]["policyHash"] if artifact is not None else _active_bridge_policy_hash(settings),
+        "bridgePolicyHash": (current_profile.bridge_policy_hash if current_profile is not None
+            else artifact["bridgePolicy"]["policyHash"] if artifact is not None else _active_bridge_policy_hash(settings)),
         "bridgeCoinId": _hex32(bridge_coin_id),
         "bridgeMessage": _hex32(bridge_message),
     }
@@ -649,6 +719,9 @@ def _fetch_verified_evm_attestation(
 
 
 def _fetch_coin_record_by_name(settings: Settings, coin_id: str) -> Optional[dict[str, Any]]:
+    from .generation_customer_identity_scope import current_identity_scope
+    selected=current_identity_scope(settings)
+    if selected is not None:return selected.runtime.coin_record(coin_id)
     base_url = settings.coinset_base_url.rstrip("/")
     try:
         with httpx.Client(
@@ -676,6 +749,9 @@ def _fetch_coin_records_by_parent_ids(
     *,
     include_spent: bool = False,
 ) -> list[dict[str, Any]]:
+    from .generation_customer_identity_scope import current_identity_scope
+    selected=current_identity_scope(settings)
+    if selected is not None:return selected.runtime.children(parent_ids,include_spent=include_spent)
     base_url = settings.coinset_base_url.rstrip("/")
     try:
         with httpx.Client(
@@ -797,6 +873,11 @@ def _verify_reserved_bridge_coin(settings: Settings, record: EnrollmentRecord) -
 
 
 def _active_artifact_hash(settings: Settings) -> str:
+    # Kept for legacy callers. Current typed validator claims explicitly name
+    # this as an identity-profile commitment, never a new signed genesis.
+    from .generation_customer_identity_scope import current_identity_scope
+    selected=current_identity_scope(settings)
+    if selected is not None:return selected.profile.commitment
     try:
         from .public_artifact import load_signed_public_artifact
 
@@ -815,6 +896,17 @@ def _active_artifact_hash(settings: Settings) -> str:
         ) from exc
 
 
+def _receipt_genesis_artifact_hash(settings: Settings) -> str | None:
+    from .generation_customer_identity_scope import current_identity_scope
+    return None if current_identity_scope(settings) is not None else _active_artifact_hash(settings)
+
+
+def _receipt_current_binding(settings):
+    from .generation_customer_identity_scope import current_identity_scope
+    scope=current_identity_scope(settings)
+    return {'generationId':scope.profile.generation_id,'identityProfileHash':scope.profile.commitment} if scope else {}
+
+
 def _validator_claim(
     settings: Settings,
     *,
@@ -826,7 +918,7 @@ def _validator_claim(
     owner_key: str,
     owner_authorization: str,
     current_timestamp: int,
-) -> ValidatorClaim:
+) -> ValidatorClaim | CurrentIdentityClaim:
     if record.receipt is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -841,10 +933,19 @@ def _validator_claim(
     claim_type = PermitValidatorClaim if permit is not None else ValidatorClaim
     extra = dict(claim_version="solslot.enrollment-permit-claim.v1", enrollment_permit=permit.to_wire(),
         permit_issuer_signature=record.permitIssuerSignature) if permit is not None else {}
+    from .generation_customer_identity_scope import current_identity_scope
+    selected = current_identity_scope(settings, key)
+    if selected is not None:
+        selected.require_record(record.model_dump())
+        claim_type = CurrentIdentityClaim
+        extra = dict(claim_version='solslot.current-customer-identity-claim.v1',
+            generation_id=selected.profile.generation_id,
+            identity_profile_hash=selected.profile.commitment)
+    else:
+        extra['artifact_hash'] = _active_artifact_hash(settings)
     return claim_type(
         **extra,
         network=settings.network,
-        artifact_hash=_active_artifact_hash(settings),
         vault_launcher_id=key,
         current_vault_coin_id=_hex32(vault_coin.name()),
         owner_key=owner_key,
@@ -938,6 +1039,24 @@ def _verify_current_chia_vault_coin(
     return record
 
 
+def _custody_full(settings,launcher,owner,auth,members,pool,**kwargs):
+    if getattr(settings,'deployment_generation_id',None):
+        from solslot_puzzles.generation_vault import vault_inner
+        from chia.wallet.puzzles.singleton_top_layer_v1_1 import puzzle_for_singleton
+        return puzzle_for_singleton(launcher,vault_inner(vault_launcher_id=launcher,owner_pubkey=owner,
+            auth_type=auth,members_merkle_root=members,pool_launcher_id=pool,**kwargs))
+    from solslot_puzzles.vault_driver import puzzle_for_vault_full
+    return puzzle_for_vault_full(launcher,owner,auth,members,pool,**kwargs)
+
+
+def _custody_identity_bundle(settings,**kwargs):
+    if getattr(settings,'deployment_generation_id',None):
+        from solslot_puzzles.generation_vault_identity import build_generation_identity_bundle
+        return build_generation_identity_bundle(**kwargs)
+    from solslot_puzzles.zkpassport_bridge_driver import build_bridge_and_vault_update_identity_bundle
+    return build_bridge_and_vault_update_identity_bundle(**kwargs)
+
+
 def _expected_stamped_vault_puzzle_hash(
     settings: Settings,
     *,
@@ -968,6 +1087,7 @@ def _expected_stamped_vault_puzzle_hash(
             zkpassport_bridge_policy_hash=bytes32.fromhex(
                 bridge_policy_hash.removeprefix("0x")
             ),
+            generation_vault=bool(getattr(settings,'deployment_generation_id',None)),
         )
     except ValueError as exc:
         raise HTTPException(
@@ -983,6 +1103,9 @@ def _sync_chia_stamp(settings: Settings, key: str) -> EnrollmentRecord:
     if not existing:
         raise HTTPException(status_code=404, detail="Enrollment not found.")
     record = EnrollmentRecord.model_validate(existing)
+    from .generation_customer_identity_scope import current_identity_scope
+    selected_scope=current_identity_scope(settings,key)
+    if selected_scope is not None:selected_scope.require_record(existing)
     if record.receipt is None or not record.receipt.chiaVaultCoinId:
         return record
     if record.status not in {"stamp_pending", "receipt_syncing", "chia_confirmed"}:
@@ -1067,7 +1190,7 @@ def _sync_chia_stamp(settings: Settings, key: str) -> EnrollmentRecord:
         update={
             "chiaVaultCoinId": coin_id,
             "chiaStampCoinId": _hex32(stamp_id),
-            "genesisArtifactHash": artifact_hash,
+            "genesisArtifactHash": None if selected_scope is not None else artifact_hash,
             "confirmedBlockIndex": confirmed_block_index,
         }
     )
@@ -1089,6 +1212,9 @@ def _sync_chia_stamp(settings: Settings, key: str) -> EnrollmentRecord:
 
 
 def _fetch_bridge_coin_records(settings: Settings, bridge_policy_hash: str) -> list[dict[str, Any]]:
+    from .generation_customer_identity_scope import current_identity_scope
+    selected=current_identity_scope(settings)
+    if selected is not None:return selected.runtime.bridge_records(bridge_policy_hash)
     base_url = settings.coinset_base_url.rstrip("/")
     try:
         with httpx.Client(
@@ -1231,6 +1357,7 @@ def get_vault_session(
         expiresAt=session.expires_at,
         scope=session.scope,
         sessionFingerprint=vault_session_fingerprint(session.session_id),
+        generationId=settings.deployment_generation_id,
     )
 
 
@@ -1322,9 +1449,10 @@ async def create_enrollment(
             ),
         )
     from .identity_deployment import enrollment_identity_binding
-    identity_binding = enrollment_identity_binding(
-        _current_identity_deployment(settings, request)
-    )
+    from .generation_customer_identity_scope import current_identity_scope
+    selected_scope=current_identity_scope(settings,vault_launcher_id)
+    identity_binding = (selected_scope.enrollment_binding if selected_scope is not None else
+        enrollment_identity_binding(_current_identity_deployment(settings, request)))
     policy = _active_bridge_coin_policy(settings)
     if policy.permit_version is not None:
         artifact = _active_genesis_artifact(settings)
@@ -1545,6 +1673,7 @@ def record_evm_proof(
 
     now = int(time.time())
     receipt = VaultCredentialReceipt(
+        **_receipt_current_binding(settings),
         vaultLauncherId=key,
         network=record.network,
         policyVersion=event.policy_version,
@@ -1564,7 +1693,7 @@ def record_evm_proof(
         validatorMessage=event.validator_message,
         evmTxHash=event.transaction_hash,
         evmConfirmedBlockIndex=event.block_number,
-        genesisArtifactHash=_active_artifact_hash(settings),
+        genesisArtifactHash=_receipt_genesis_artifact_hash(settings),
         enrolledAt=now,
     )
     updated = record.model_copy(
@@ -1647,7 +1776,7 @@ def _build_bls_chia_stamp(
     pool_launcher_id = bytes32.fromhex(active_pool_launcher_id.removeprefix("0x"))
     bridge_policy_hash = bytes32.fromhex(record.bridgePolicyHash.removeprefix("0x"))
     members_root = one_leaf_merkle_root(owner_pubkey)
-    current_puzzle = puzzle_for_vault_full(
+    current_puzzle = _custody_full(settings,
         launcher,
         owner_pubkey,
         AUTH_TYPE_BLS,
@@ -1674,7 +1803,7 @@ def _build_bls_chia_stamp(
         )
 
     try:
-        built = build_bridge_and_vault_update_identity_bundle(
+        built = _custody_identity_bundle(settings,
             enrollment_permit=_record_permit(settings, record.model_dump(), now=int(time.time())),
             bridge_parent_id=bytes32.fromhex(record.bridgeParentId.removeprefix("0x")),
             bridge_amount=record.bridgeAmount,
@@ -1715,7 +1844,7 @@ def _build_bls_chia_stamp(
         )
 
     identity_root = bytes32.fromhex(record.receipt.identityAttestRoot.removeprefix("0x"))
-    expected_puzzle = puzzle_for_vault_full(
+    expected_puzzle = _custody_full(settings,
         launcher,
         owner_pubkey,
         AUTH_TYPE_BLS,
@@ -1747,6 +1876,15 @@ def _freeze_stamp_attempt(settings: Settings, claim: ValidatorClaim, expected_va
         )
     except LedgerConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+def _stamp_funding_context(request,settings):
+    from .generation_customer_identity_scope import current_identity_scope
+    scope=current_identity_scope(settings)
+    if scope is not None:
+        scope.runtime.require_stamp(scope)
+        return scope.runtime.fee_submitter,scope.runtime.funding_store
+    return getattr(request.app.state,'protocol_submitter',None),getattr(request.app.state,'stamp_funding_store',None)
 
 
 async def _push_chia_stamp_and_mark_pending(
@@ -1785,6 +1923,8 @@ async def _push_chia_stamp_and_mark_pending(
             funded = await submit_funded_stamp(submitter=fee_submitter, store=fee_store,
                 ledger=ledger, key=key, original=spend_bundle, expected_coin=expected_vault_coin)
         except (ProtocolSubmissionError, ChiaProviderError, ValueError) as exc:
+            if getattr(exc,'code',None)=='FEE_CAP_EXCEEDED':
+                raise HTTPException(status_code=503,detail={'code':'CURRENT_ID_FEE_CAP_EXCEEDED'}) from exc
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         updated = pending.model_dump(mode='json')
         updated['receipt']['chiaSpendBundleId'] = funded['spendBundleId']
@@ -1885,9 +2025,15 @@ async def submit_evm_chia_stamp(
     vault_launcher_id: VaultLauncherPath,
     req: SubmitChiaStampRequest,
     request: Request,
+    *, recover_retained: bool = False,
 ) -> SubmitChiaStampResponse:
     settings = _settings()
     key = _normalize_hex32(vault_launcher_id, "vaultLauncherId")
+    if recover_retained:
+        from .generation_customer_identity_scope import current_identity_scope
+        if (not getattr(settings,'generation_customer_identity_recovery_enabled',False)
+                or current_identity_scope(settings,key) is None):
+            raise HTTPException(status_code=503,detail='CURRENT_ID_RECOVERY_UNAVAILABLE')
     verified_owner = verify_vault_session(settings, request, key)
     existing = get_credential_ledger(settings).get_enrollment(key)
     if not existing:
@@ -1898,6 +2044,10 @@ async def submit_evm_chia_stamp(
     record = EnrollmentRecord.model_validate(existing)
     _require_enrollment_bridge_policy(settings, existing, execution=True)
     attempt = get_credential_ledger(settings).get_stamp_attempt(key)
+    if recover_retained and (attempt is None or attempt['bundle_hex'] is not None
+            or attempt['dispatch_status'] != 'not_submitted' or attempt['dispatch_count'] != 0
+            or record.status != 'evm_confirmed'):
+        raise HTTPException(status_code=409,detail='Saved stamp must be reconciled before recovery.')
     retained_claim = json.loads(attempt["claim_json"]) if attempt else None
     if retained_claim:
         req = SubmitChiaStampRequest(signature=retained_claim["owner_authorization"],
@@ -1928,8 +2078,8 @@ async def submit_evm_chia_stamp(
                         detail="The retained stamp no longer matches its original owner, EVM event or release. Reconcile the existing receipt.")
                 return await _push_chia_stamp_and_mark_pending(settings,
                     coinset=request.app.state.coinset, key=key,
-                    fee_submitter=getattr(request.app.state, 'protocol_submitter', None),
-                    fee_store=getattr(request.app.state, 'stamp_funding_store', None),
+                    fee_submitter=_stamp_funding_context(request,settings)[0],
+                    fee_store=_stamp_funding_context(request,settings)[1],
                     spend_bundle=SpendBundle.from_bytes(bytes.fromhex(attempt["bundle_hex"])),
                     expected_vault_coin=Coin.from_json_dict(json.loads(attempt["expected_coin_json"])))
             return SubmitChiaStampResponse(
@@ -1964,6 +2114,8 @@ async def submit_evm_chia_stamp(
 
     launcher = bytes32.fromhex(key.removeprefix("0x"))
     vault_record = verified_owner.vault_record
+    if recover_retained and vault_record.auth_type != 3:
+        raise HTTPException(status_code=409,detail='This recovery requires the original EVM vault owner.')
     if vault_record.auth_type == AUTH_TYPE_BLS:
         if req.currentTimestamp is None:
             raise HTTPException(
@@ -2031,8 +2183,8 @@ async def submit_evm_chia_stamp(
         return await _push_chia_stamp_and_mark_pending(
             settings,
             coinset=request.app.state.coinset,
-            fee_submitter=getattr(request.app.state, 'protocol_submitter', None),
-            fee_store=getattr(request.app.state, 'stamp_funding_store', None),
+            fee_submitter=_stamp_funding_context(request,settings)[0],
+            fee_store=_stamp_funding_context(request,settings)[1],
             key=key,
             spend_bundle=spend_bundle,
             expected_vault_coin=expected_vault_coin,
@@ -2072,7 +2224,7 @@ async def submit_evm_chia_stamp(
     pool_launcher_id = bytes32.fromhex(active_pool_launcher_id.removeprefix("0x"))
     bridge_policy_hash = bytes32.fromhex(record.bridgePolicyHash.removeprefix("0x"))
     members_root = one_leaf_merkle_root(recovery.compressed_pubkey)
-    current_puzzle = puzzle_for_vault_full(
+    current_puzzle = _custody_full(settings,
         launcher,
         recovery.compressed_pubkey,
         AUTH_TYPE_SECP256K1,
@@ -2110,12 +2262,14 @@ async def submit_evm_chia_stamp(
             detail="The configured validator quorum does not match the vault bridge policy.",
         )
 
+    # Preserve the original frozen bundle clock. The separately journaled
+    # funded-stamp path already reconstructs a fresh, chain-checked child.
     current_timestamp = retained_claim["current_timestamp"] if retained_claim else int(time.time())
-    if abs(int(time.time()) - current_timestamp) > 90:
+    if not recover_retained and abs(int(time.time()) - current_timestamp) > 90:
         raise HTTPException(status_code=409,
             detail="The retained stamp submission window expired. Check the existing attempt before recovery.")
     try:
-        built = build_bridge_and_vault_update_identity_bundle(
+        built = _custody_identity_bundle(settings,
             enrollment_permit=_record_permit(settings, record.model_dump(), now=int(time.time())),
             bridge_parent_id=bytes32.fromhex(record.bridgeParentId.removeprefix("0x")),
             bridge_amount=record.bridgeAmount,
@@ -2154,7 +2308,7 @@ async def submit_evm_chia_stamp(
             detail="The Chia bridge validator message does not match the EVM event.",
         )
 
-    expected_puzzle = puzzle_for_vault_full(
+    expected_puzzle = _custody_full(settings,
         launcher,
         recovery.compressed_pubkey,
         AUTH_TYPE_SECP256K1,
@@ -2179,14 +2333,23 @@ async def submit_evm_chia_stamp(
         owner_authorization=req.signature,
         current_timestamp=current_timestamp,
     )
-    _freeze_stamp_attempt(settings, claim, expected_vault_coin)
     try:
-        quorum = await collect_validator_quorum(settings, claim)
+        if recover_retained:
+            from .generation_identity_recovery_quorum import collect_retained_identity_quorum
+            from .validator_quorum import CurrentIdentityClaim
+            original=CurrentIdentityClaim.model_validate(retained_claim)
+            if original.canonical_hash()!=attempt['claim_hash'] or original.model_dump(mode='json')!=claim.model_dump(mode='json'):
+                raise ValueError('saved identity authorization differs')
+            refreshed=original.model_copy(update={'current_timestamp':int(time.time())})
+            quorum=await collect_retained_identity_quorum(settings,original,refreshed)
+        else:
+            _freeze_stamp_attempt(settings, claim, expected_vault_coin)
+            quorum = await collect_validator_quorum(settings, claim)
     except ValidatorQuorumError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if quorum.signer_indices != (0, 1):
         try:
-            built = build_bridge_and_vault_update_identity_bundle(
+            built = _custody_identity_bundle(settings,
                 enrollment_permit=_record_permit(settings, record.model_dump(), now=int(time.time())),
                 bridge_parent_id=bytes32.fromhex(record.bridgeParentId.removeprefix("0x")),
                 bridge_amount=record.bridgeAmount,
@@ -2226,8 +2389,8 @@ async def submit_evm_chia_stamp(
     return await _push_chia_stamp_and_mark_pending(
         settings,
         coinset=request.app.state.coinset,
-        fee_submitter=getattr(request.app.state, 'protocol_submitter', None),
-        fee_store=getattr(request.app.state, 'stamp_funding_store', None),
+        fee_submitter=_stamp_funding_context(request,settings)[0],
+        fee_store=_stamp_funding_context(request,settings)[1],
         key=key,
         spend_bundle=spend_bundle,
         expected_vault_coin=expected_vault_coin,

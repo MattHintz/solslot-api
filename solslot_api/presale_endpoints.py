@@ -1,6 +1,8 @@
 """RC20 refundable voucher presales derived from governed collection state."""
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 import asyncio
 import hashlib
 import json
@@ -477,7 +479,7 @@ class PresaleStore(CampaignStore, VoucherWorkStore):
         db_path = Path(path)
         if path != ":memory:":
             db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(
+        self._conn = connect_generation_sqlite(
             ":memory:" if path == ":memory:" else str(db_path),
             check_same_thread=False,
             isolation_level=None,
@@ -3923,6 +3925,12 @@ def build_series_terms(
     collection: dict[str, Any],
     settings: Settings,
 ) -> dict[str, Any]:
+    # Legacy vouchers cannot commit the new generation and TEST_ONLY purpose.
+    # Do not turn an incomplete test dossier into qualified sale terms.
+    if getattr(settings, "deployment_generation_id", None):
+        raise ValueError("generation-bound presale terms are required")
+    if collection.get("purpose") == "TEST_ONLY" or collection.get("dossier", {}).get("purpose") == "TEST_ONLY":
+        raise ValueError("test editions cannot authorize legacy presales")
     if collection["id"] != request.collection_id:
         raise ValueError("collection identity mismatch")
     if collection["state"] != "PUBLISHED":

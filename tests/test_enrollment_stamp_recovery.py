@@ -141,7 +141,7 @@ def test_schema_one_upgrade_preserves_historical_rows_and_has_no_backfilled_atte
     try:
         assert upgraded.get_enrollment(journeys.VAULT_A) == record
         assert upgraded.get_stamp_attempt(journeys.VAULT_A) is None
-        assert upgraded._conn.execute('PRAGMA user_version').fetchone()[0] == 4
+        assert upgraded._conn.execute('PRAGMA user_version').fetchone()[0] == 5
         assert upgraded.get_enrollment_permit(journeys.VAULT_A) is None
         assert upgraded.get_relay_transaction(journeys.VAULT_A) is None
         assert upgraded.enrollment_bridge_coin_ids() == {record['bridgeCoinId']}

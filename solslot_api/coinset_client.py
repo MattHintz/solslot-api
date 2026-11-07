@@ -200,6 +200,13 @@ class CoinsetClient:
             body["cost"] = cost
         return await self._post("/get_fee_estimate", body)
 
+    async def get_routes(self) -> dict[str, Any]:
+        return await self._post('/get_routes', {})
+
+    async def get_fee_tiers_by_cost(self, *, cost: int) -> dict[str, Any]:
+        from .cost_fees import validate_cost
+        return await self._post('/get_fee_tiers_by_cost', {'cost': validate_cost(cost)})
+
     # ── Writes ───────────────────────────────────────────────────────────
 
     async def push_tx(self, spend_bundle_json: dict[str, Any]) -> dict[str, Any]:

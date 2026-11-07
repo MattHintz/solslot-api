@@ -156,6 +156,7 @@ from .external_settlement import (
 from .faucet import AGG_SIG_ME_DATA
 from .public_artifact import (
     PublicArtifactError,
+    _release_source_shas,
     verify_signed_public_artifact_file,
 )
 from .release_metadata import ReleaseMetadata, load_release_metadata
@@ -268,6 +269,13 @@ def load_validator_artifact(
         artifact = verify_signed_public_artifact_file(settings.public_artifact_path)
     except PublicArtifactError as exc:
         raise ValidatorEvidenceError(str(exc)) from exc
+    if getattr(settings,'deployment_generation_id',None):
+        from .vault_puzzle_hash import GENERATION_VAULT_INNER_HASH
+        generation=artifact.get('deploymentGeneration');puzzles=artifact.get('puzzleHashes')
+        if (not isinstance(generation,Mapping) or not isinstance(puzzles,Mapping)
+                or generation.get('generationId')!=settings.deployment_generation_id
+                or puzzles.get('vaultInnerModHash')!='0x'+GENERATION_VAULT_INNER_HASH.hex()):
+            raise ValidatorEvidenceError('signed artifact generation or custody module differs from this signer')
     try:
         release = load_release_metadata(settings.release_metadata_path)
     except (OSError, ValueError) as exc:
@@ -276,6 +284,11 @@ def load_validator_artifact(
         raise ValidatorEvidenceError("validator release metadata is missing")
 
     source_shas = artifact.get("sourceShas")
+    if settings.identity_deployment_amendment_path:
+        try:
+            source_shas = _release_source_shas(_coordinator_settings(settings, artifact), artifact)
+        except PublicArtifactError as exc:
+            raise ValidatorEvidenceError(str(exc)) from exc
     bridge = artifact.get("bridgePolicy")
     validators = artifact.get("validatorSet")
     addresses = artifact.get("evmAddresses")
@@ -334,7 +347,9 @@ def load_validator_artifact(
     if activation != settings.enrollment_activation:
         raise ValidatorEvidenceError("signed enrollment activation differs from signer configuration")
     identity_chain = activation['evmChainId'] if activation is not None else artifact.get('evmChainId')
-    if identity_chain != settings.evm_chain_id:
+    # An amendment-backed signer checks chain/address selection against the
+    # complete confirmed history in validator_app before any sign endpoint.
+    if not settings.identity_deployment_amendment_path and identity_chain != settings.evm_chain_id:
         raise ValidatorEvidenceError("signed artifact identity chain does not match signer config")
     return artifact, release
 
@@ -522,6 +537,7 @@ def _verify_vault_and_owner(
         one_leaf_merkle_root(owner_pubkey),
         pool_launcher,
         identity_attest_root=DEFAULT_IDENTITY_ATTEST_ROOT,
+        generation_vault=bool(getattr(settings,'deployment_generation_id',None)),
         zkpassport_bridge_policy_hash=bridge_policy_hash,
     )
     if coin.puzzle_hash != expected_puzzle_hash:
@@ -560,12 +576,16 @@ def _coordinator_settings(
     return Settings(
         runtime_environment="test",
         network=settings.network,
+        deployment_generation_id=getattr(settings,'deployment_generation_id',None),
         coinset_base_url=settings.coinset_base_url,
         public_artifact_path=settings.public_artifact_path,
         release_metadata_path=settings.release_metadata_path,
         identity_deployment_amendment_path=settings.identity_deployment_amendment_path,
         identity_deployment_artifact_path=settings.identity_deployment_artifact_path,
         identity_deployment_plan_hash=settings.identity_deployment_plan_hash,
+        identity_network_amendment_path=settings.identity_network_amendment_path,
+        identity_network_artifact_path=settings.identity_network_artifact_path,
+        identity_network_plan_hash=settings.identity_network_plan_hash,
         zkpassport_evm_rpc_url=settings.evm_rpc_url,
         zkpassport_evm_chain_id=settings.evm_chain_id,
         zkpassport_evm_min_confirmations=settings.evm_min_confirmations,

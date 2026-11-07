@@ -54,6 +54,7 @@ def proper_list(program: Program, maximum: int) -> list[Program]:
 def decode_offer(
     encoded: str, *, real_spends: int, dummy_spends: int,
     expected_assets: frozenset[bytes32 | None] | None = None,
+    allow_signed: bool = False,
 ) -> DecodedOffer:
     """Decode bytes and spend records without invoking submitted puzzles."""
     if not 0 < real_spends <= MAX_DEEDS + 16 or not 0 <= dummy_spends <= MAX_DEEDS:
@@ -94,7 +95,9 @@ def decode_offer(
     bundle = WalletSpendBundle.from_bytes(raw)
     if bytes(bundle) != raw:
         raise ValueError("wallet offer serialization is not exact")
-    if bundle.aggregated_signature != G2Element():
+    if type(allow_signed) is not bool:
+        raise ValueError("wallet offer signature mode must be explicit")
+    if not allow_signed and bundle.aggregated_signature != G2Element():
         raise ValueError("prepared wallet offer must be unsigned")
     real = []
     dummy = []

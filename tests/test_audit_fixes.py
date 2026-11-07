@@ -483,6 +483,7 @@ class TestVaultRegistrationSafetyFalsifiers:
             alpha_writes_enabled=True,
             protocol_fee_funding_enabled=False,
             runtime_environment="test",
+            deployment_generation_id=None,
             faucet_max_spend_mojos=10_000_000,
             zkpassport_bridge_policy_hash="0x" + "c1" * 32,
         )
@@ -567,6 +568,15 @@ class TestVaultRegistrationSafetyFalsifiers:
             "solslot_api.app._require_vault_protocol_ready",
             lambda _settings: "0x" + "00" * 32,
         )
+        # This unit checks registry persistence after a rejected provider push.
+        # Native launch construction is covered separately; keep its expensive
+        # legacy puzzle hashing out of this transport/persistence falsifier.
+        from types import SimpleNamespace
+        bundle = SimpleNamespace(to_json_dict=lambda: {
+            "coin_spends": [], "aggregated_signature": "0x" + "00" * 96,
+        })
+        monkeypatch.setattr("solslot_api.app.build_and_sign_launch",
+            lambda **kwargs: SimpleNamespace(spend_bundle=bundle))
         faucet = self._faucet()
         coinset = MagicMock()
         coinset.get_coin_records_by_puzzle_hash = AsyncMock(

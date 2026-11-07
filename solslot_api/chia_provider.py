@@ -119,6 +119,8 @@ class ChiaProvider:
             "primary provider is not configured" if primary is None else None
         )
         self._lock = asyncio.Lock()
+        from .cost_fees import CostFeeAdapter
+        self._cost_fees = CostFeeAdapter(primary, fallback, monotonic=monotonic)
 
     async def start(self) -> None:
         if self.primary is None:
@@ -255,6 +257,11 @@ class ChiaProvider:
             "get_network_info", lambda client: client.get_network_info()
         )
 
+    async def get_network_info_primary(self) -> dict[str, Any]:
+        return await self._primary_read(
+            "genesis network proof", lambda client: client.get_network_info()
+        )
+
     async def get_coin_record_by_name(
         self, coin_id: str
     ) -> Optional[dict[str, Any]]:
@@ -289,6 +296,13 @@ class ChiaProvider:
             ),
         )
 
+    async def get_coin_records_by_puzzle_hash_primary(self, puzzle_hash: str, *, include_spent: bool = False):
+        """Authoritative funding selection; an advisory fallback cannot supply it."""
+        return await self._primary_read(
+            'generation mint funding catalog',
+            lambda client: client.get_coin_records_by_puzzle_hash(puzzle_hash, include_spent=include_spent),
+        )
+
     async def get_coin_records_by_parent_ids(
         self, parent_ids: list[str], *, include_spent: bool = False
     ) -> list[dict[str, Any]]:
@@ -297,6 +311,15 @@ class ChiaProvider:
             lambda client: client.get_coin_records_by_parent_ids(
                 parent_ids, include_spent=include_spent
             ),
+        )
+
+    async def get_coin_records_by_parent_ids_primary(
+        self, parent_ids: list[str], *, include_spent: bool = False
+    ) -> list[dict[str, Any]]:
+        """Native ancestry reads must not switch to an advisory provider."""
+        return await self._primary_read(
+            'generation portfolio singleton ancestry',
+            lambda client: client.get_coin_records_by_parent_ids(parent_ids, include_spent=include_spent),
         )
 
     async def get_coin_records_by_puzzle_hashes(
@@ -382,6 +405,10 @@ class ChiaProvider:
         from .chia_snapshot import active_snapshot
         snapshot = active_snapshot()
         if snapshot is not None:
+            # Admission uses a new raw quote, but it must still belong to this
+            # snapshot's exact provider, node and network before/after awaits.
+            snapshot._check(self)
+        if snapshot is not None and not require_primary:
             return await snapshot.read(self, "get_fee_estimate", lambda client: client.get_fee_estimate(
                 target_times=target_times, **estimate_args,
             ))
@@ -390,11 +417,15 @@ class ChiaProvider:
                 raise ChiaProviderError(
                     "local Chia full node is required for protocol fee estimation"
                 )
+            if snapshot is not None:
+                snapshot._check(self)
             try:
                 result = await self.primary.get_fee_estimate(
                     target_times=target_times,
                     **estimate_args,
                 )
+                if snapshot is not None:
+                    snapshot._check(self)
                 self._last_primary_success_at = _utc_now()
                 return result
             except Exception as exc:
@@ -409,6 +440,14 @@ class ChiaProvider:
                 **estimate_args,
             ),
         )
+
+    async def get_cost_fee_advice(self, *, cost: int, target_seconds: int):
+        if self.primary is None or not await self._primary_available():
+            raise ChiaProviderError('A healthy local node is required before cost fee advice')
+        try:
+            return await self._cost_fees.quote(cost=cost, target_seconds=target_seconds)
+        except Exception as exc:
+            raise ChiaProviderError('Primary cost fee advice is unavailable or invalid') from exc
 
     async def _logged_push(self, client, bundle, provider):
         from .submission_errors import record_submission, error_code
@@ -594,13 +633,17 @@ class ChiaProvider:
                 raise ChiaProviderError("saved protocol bundle has no persistent inputs")
             records = {}
             pending = False
-            for spend in persistent:
-                coin_id = "0x" + spend.coin.name().hex()
-                items = await node.get_mempool_items_by_coin_name(coin_id)
+            reads = asyncio.Semaphore(6)
+            async def read_input(spend):
+                async with reads:
+                    coin_id = "0x" + spend.coin.name().hex()
+                    items = await node.get_mempool_items_by_coin_name(coin_id)
+                    record = await node.get_coin_record_by_name(coin_id)
+                    return spend, coin_id, items, record
+            for spend, coin_id, items, record in await asyncio.gather(*(read_input(s) for s in persistent)):
                 if any(not _mempool_item_matches_bundle(item, bundle_id) for item in items):
                     raise ChiaProviderError("saved protocol input has a conflicting pending transaction")
                 pending = pending or bool(items)
-                record = await node.get_coin_record_by_name(coin_id)
                 if (not record or Coin.from_json_dict(record["coin"]) != spend.coin
                         or type(record.get("confirmed_block_index")) is not int
                         or not 0 < record["confirmed_block_index"] <= initial_peak[0]
@@ -614,10 +657,13 @@ class ChiaProvider:
                 if 0 in heights or len(heights) != 1 or pending:
                     raise ChiaProviderError("saved protocol inputs have inconsistent settlement")
                 confirmed_height = next(iter(heights))
-                for spend in bundle.coin_spends:
-                    coin_id = "0x" + spend.coin.name().hex()
-                    record = records.get(coin_id) or await node.get_coin_record_by_name(coin_id)
-                    actual = await node.get_puzzle_and_solution(coin_id, confirmed_height)
+                async def read_spend(spend):
+                    async with reads:
+                        coin_id = "0x" + spend.coin.name().hex()
+                        record = records.get(coin_id) or await node.get_coin_record_by_name(coin_id)
+                        actual = await node.get_puzzle_and_solution(coin_id, confirmed_height)
+                        return spend, record, actual
+                for spend, record, actual in await asyncio.gather(*(read_spend(s) for s in bundle.coin_spends)):
                     if (not record or Coin.from_json_dict(record["coin"]) != spend.coin
                             or record.get("spent_block_index") != confirmed_height
                             or not actual or CoinSpend.from_json_dict(actual) != spend):
@@ -653,6 +699,40 @@ class ChiaProvider:
             return True
         except Exception:
             return False
+
+    async def primary_expiry_input_evidence(self, bundle, *, height):
+        """Exact external inputs for expired-bundle reconciliation only.
+
+        A confirmed competing spend proves an input is no longer usable. It
+        never proves our saved settlement filled. Unknown or pending inputs
+        cannot release a retained reservation.
+        """
+        if self.primary is None or type(height) is not int or height <= 0: return None
+        try:
+            from chia_rs import SpendBundle
+            from .generation_coin_evidence import read_confirmed_coin
+            parsed = SpendBundle.from_json_dict(bundle)
+            ephemeral = {coin.name() for coin in parsed.additions()}
+            rows = []
+            spends = {spend.coin.name(): spend for spend in parsed.coin_spends}
+            for coin in parsed.removals():
+                if coin.name() in ephemeral: continue
+                identity = '0x' + coin.name().hex()
+                evidence = read_confirmed_coin(await self.primary.get_coin_record_by_name(identity), coin.name())
+                if (evidence.coin != coin or evidence.confirmed_height > height or evidence.spent_height > height
+                        or await self.primary.get_mempool_items_by_coin_name(identity)):
+                    return None
+                matches = False
+                if evidence.spent_height:
+                    from chia_rs import CoinSpend
+                    actual=await self.primary.get_puzzle_and_solution(identity,evidence.spent_height)
+                    if not actual:return None
+                    matches=CoinSpend.from_json_dict(actual)==spends[coin.name()]
+                rows.append({'coinId': identity, 'confirmedHeight': evidence.confirmed_height,
+                    'spentHeight': evidence.spent_height, 'matchesSavedSpend':matches})
+            return sorted(rows, key=lambda row: row['coinId']) if rows else None
+        except Exception:
+            return None
 
     async def _spend_observed(self, spend_bundle_json: dict[str, Any]) -> bool:
         try:

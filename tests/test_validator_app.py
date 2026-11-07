@@ -87,6 +87,12 @@ def test_private_signer_health_exposes_public_fingerprints_only(tmp_path) -> Non
             assert body["validatorPubkey"] == settings.roster_pubkeys[0]
             assert body["artifactReady"] is False
             assert body["ledgerReady"] is True
+            # A healthy signer response must be accepted by the coordinator,
+            # including identity-revision fields. Separate schema copies had
+            # drifted and caused healthy signers to be rejected by consumers.
+            from solslot_api.validator_quorum import ValidatorHealthResponse as ConsumedHealth
+            parsed=ConsumedHealth.model_validate(body)
+            assert parsed.validatorPubkey==body['validatorPubkey']
             assert client.get("/openapi.json").status_code == 404
     finally:
         ledger.close()

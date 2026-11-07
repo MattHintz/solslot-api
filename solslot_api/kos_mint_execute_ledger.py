@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 import sqlite3
 import threading
 import time
@@ -22,7 +24,7 @@ class KosMintExecuteLedger:
         self.path = str(path) if path == ":memory:" else str(Path(path))
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(
+        self._conn = connect_generation_sqlite(
             self.path,
             timeout=timeout,
             isolation_level=None,

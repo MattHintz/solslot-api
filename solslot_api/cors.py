@@ -30,5 +30,6 @@ def cors_middleware_options(settings: Settings) -> dict[str, Any]:
             "Content-Type",
             "Origin",
             "X-Requested-With",
+            "X-Solslot-Order-Receipt",
         ],
     }

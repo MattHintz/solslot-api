@@ -1,0 +1,27 @@
+[Unit]
+Description=Solslot generation-only encrypted backup and isolated restore
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=solslot-gen-recovery-ae222
+Group=solslot-gen-recovery-ae222
+WorkingDirectory=/opt/solslot/generation-recovery-AE222
+ExecStartPre=+/usr/bin/python3 -I /opt/solslot/generation-recovery-AE222/worker_entry.py --stage-identity
+ExecStart=/usr/bin/python3 -I /opt/solslot/generation-recovery-AE222/worker_entry.py
+RuntimeDirectory=solslot-generation-recovery-ae222
+RuntimeDirectoryMode=0700
+TimeoutStartSec=240
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/solslot-generation-recovery-ae222
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=3G
+TasksMax=32
