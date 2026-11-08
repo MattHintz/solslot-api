@@ -40,11 +40,17 @@ def checkout(monkeypatch):
     async def quote(key,deed,*,browser_hash):
         events.append(('quote',key,deed,browser_hash));return {'intentId':INTENT}
     async def reserve(identity,*,browser_hash):events.append(('prepare',identity,browser_hash))
+    def request_reservation(identity,*,browser_hash):
+        events.append(('request',identity,browser_hash))
+        return {'schema':'solslot.current-reservation-request.v1','intentId':identity,
+            'generationId':GEN,'receivingVaultLauncherId':VAULT,
+            'reservationClaimHash':'0x'+'07'*32,'quantity':1,'requestedAt':110}
     async def dispatch(identity,phase,*,browser_hash):
         events.append(('dispatch',identity,phase,browser_hash));return {'stage':'MEMPOOL'}
     async def reconcile(identity,phase,*,browser_hash):
         events.append(('observe',identity,phase,browser_hash));return {'stage':'CONFIRMED'}
     service.review=review;service.quote=quote;service.prepare_reservation=reserve
+    service.request_reservation=request_reservation
     async def inventory():events.append(('inventory',));return {'generationId':GEN,'items':[]}
     async def payer_coins(identity,keys,*,browser_hash):
         events.append(('payer-coins',identity,keys));return {'generationId':GEN,'candidates':[]}
@@ -149,10 +155,14 @@ def test_write_disabled_and_other_vault_cannot_reach_purchase_service(checkout):
     assert c.client.get(url()).status_code==503 and not c.events
 
 
-def test_explicit_reservation_post_is_required_for_dispatch(checkout):
+def test_explicit_reservation_post_only_queues_without_waiting_for_signing_or_dispatch(checkout):
     c=checkout;response=c.client.post(url('/reservation'),json={'generationId':GEN},headers=ORIGIN)
-    assert response.status_code==200 and response.json()=={'stage':'MEMPOOL'}
-    assert [e[0] for e in c.events]==['prepare','dispatch']
+    assert response.status_code==200 and response.json()=={
+        'schema':'solslot.current-reservation-request.v1','intentId':INTENT,
+        'generationId':GEN,'receivingVaultLauncherId':VAULT,
+        'reservationClaimHash':'0x'+'07'*32,'quantity':1,'requestedAt':110}
+    assert [e[0] for e in c.events]==['request']
+    assert response.headers['cache-control']=='no-store'
 
 
 def test_client_cannot_supply_claim_destinations_or_amounts(checkout):

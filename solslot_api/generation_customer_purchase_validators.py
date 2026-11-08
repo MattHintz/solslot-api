@@ -59,21 +59,26 @@ async def prove_primary_expired_source(provider,coin,expires_at):
             'spentHeight':0,'expiresAt':expires_at}
 
 
-def previous_transition(previous,current,*,issuer_policy,roster,signer_index):
+def previous_transition(previous,current,*,issuer_policy,roster,signer_index,prior_policy=None,now=None):
     old=CurrentReservationClaim.model_validate_json(previous['canonical_claim'])
     purchase=purchase_artifact_v3_from_json(old.purchase_artifact)
+    history_policy=issuer_policy
+    if old.issuer_policy_hash!=issuer_policy.commitment and prior_policy is not None:
+        from .generation_customer_purchase_policy import validate_purchase_policy_renewal
+        if type(now)is not int:raise ValueError('CURRENT_PURCHASE_RENEWAL_SCOPE_CHANGED')
+        history_policy=validate_purchase_policy_renewal(prior_policy,issuer_policy,now=now)
     if (old.canonical()!=previous['canonical_claim'] or old.digest()!=previous['claim_hash']
             or old.available_coin_id!=previous['available_coin_id']
             or '0x'+purchase.purchase_id.hex()!=previous['purchase_id']
             or old.generation_id!=current.claim.generation_id or old.anchor_hash!=current.claim.anchor_hash
-            or old.issuer_policy_hash!=issuer_policy.commitment
+            or old.issuer_policy_hash!=history_policy.commitment
             or old.available_coin_id!=current.claim.available_coin_id
             or signer_index not in old.signer_indices
             or purchase_artifact_v3_to_json(purchase)!=old.purchase_artifact):
         raise ValueError('CURRENT_RESERVATION_RETAINED_HISTORY_CHANGED')
     terms=current.item.original.terms
-    issuer_policy.require_terms(terms,now=issuer_policy.issued_at)
-    if purchase.vault_launcher_id!=issuer_policy.buyer_vault:raise ValueError('CURRENT_RESERVATION_PRIOR_RECEIVER_CHANGED')
+    history_policy.require_terms(terms,now=history_policy.issued_at)
+    if purchase.vault_launcher_id!=history_policy.buyer_vault:raise ValueError('CURRENT_RESERVATION_PRIOR_RECEIVER_CHANGED')
     struct=Program.to((SINGLETON_MOD_HASH,(terms.deed_launcher_id,terms.deed_launcher_puzzle_hash)))
     transition=build_inventory_reservation_spend(available_coin=current.item.current.coin,
         deed_singleton_struct=struct,lineage_proof=current.item.lineage,
@@ -117,11 +122,15 @@ async def sign_verified_current_reservation(evidence,*,settings,provider,ledger,
     index=settings.signer_index;retirement=None
     previous=ledger.active_inventory_authorization(claim.available_coin_id)
     if previous is not None and previous['claim_hash']!=claim_hash:
-        old,transition=previous_transition(previous,evidence,issuer_policy=issuer_policy,roster=roster,signer_index=index)
+        from .generation_customer_purchase_policy import selected_prior_purchase_policy
+        prior=selected_prior_purchase_policy(settings,issuer_policy,now=int(clock()))
+        old,transition=previous_transition(previous,evidence,issuer_policy=issuer_policy,roster=roster,signer_index=index,
+            prior_policy=prior,now=int(clock()))
         proof=await prove_primary_expired_source(provider,transition.spend.coin,transition.reservation.expires_at)
         retirement={'schema':'solslot.validator-inventory-retirement.v1','claimHash':old.digest(),
             'replacementClaimHash':claim_hash,'sourceCoinId':claim.available_coin_id,
-            'generationId':claim.generation_id,'issuerPolicyHash':issuer_policy.commitment,'chainProof':proof}
+            'generationId':claim.generation_id,'issuerPolicyHash':issuer_policy.commitment,
+            'priorIssuerPolicyHash':old.issuer_policy_hash,'chainProof':proof}
     if previous is not None and previous['claim_hash']==claim_hash:
         if previous['canonical_claim']!=claim.canonical():raise ValueError('CURRENT_RESERVATION_SAVED_CLAIM_CHANGED')
         signature=G2Element.from_bytes(bytes.fromhex(previous['signature'].removeprefix('0x')))

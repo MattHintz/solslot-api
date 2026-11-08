@@ -214,7 +214,22 @@ class CurrentNativePurchaseExecution:
             'quoteExpiresAt':artifact.quote_expires_at, 'feeCapMojosPerStage':str(self.fee_cap),
             'maximumNetworkFeeMojos':str(2*self.fee_cap),
             'quoteExpired':int(self.clock())>=artifact.quote_expires_at,
+            'reservationRequested':self.store.reservation_request(identity,browser_hash=browser_hash)is not None,
             'reservationClaimHash':claim.digest(), 'payerAuthorizationSaved':saved['deliveryClaim'] is not None}
+
+    def request_reservation(self, identity, *, browser_hash):
+        """Save explicit intent for the existing worker, without signing or funding."""
+        claim = self._saved(identity, browser_hash)['reservationClaim']
+        selected = artifacts(claim)
+        now = int(self.clock())
+        prior = self.store.reservation_request(identity, browser_hash=browser_hash)
+        if prior is None and not self.policy.issued_at <= now < min(
+                self.policy.expires_at, selected[0].quote_expires_at):
+            raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_CLOSED')
+        requested = self.store.request_reservation(identity, browser_hash=browser_hash, now=now)
+        return {'schema':'solslot.current-reservation-request.v1', 'intentId':identity,
+            'generationId':self.store.generation_id, 'receivingVaultLauncherId':h(self.policy.buyer_vault),
+            'reservationClaimHash':claim.digest(), 'quantity':len(selected), 'requestedAt':requested}
 
     def reserved_coin_id(self, identity, *, browser_hash):
         if isinstance(self._saved(identity,browser_hash)['reservationClaim'],CurrentReservationBatch):

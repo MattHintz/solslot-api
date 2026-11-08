@@ -83,14 +83,7 @@ def review_batch(s,identity,saved,binding):
 
 
 def request_reservation(s,identity,binding):
-    saved=s._saved(identity,binding);claim=saved['reservationClaim'];now=int(s.clock())
-    prior=s.store.reservation_request(identity,browser_hash=binding)
-    if prior is None and not s.policy.issued_at<=now<min(s.policy.expires_at,artifacts(claim)[0].quote_expires_at):
-        raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_CLOSED')
-    requested=s.store.request_reservation(identity,browser_hash=binding,now=now)
-    return {'schema':'solslot.current-reservation-request.v1','intentId':identity,'generationId':s.store.generation_id,
-        'receivingVaultLauncherId':h(s.policy.buyer_vault),'reservationClaimHash':claim.digest(),
-        'quantity':len(claim.children),'requestedAt':requested}
+    return s.request_reservation(identity,browser_hash=binding)
 
 
 async def prepare_reservation(s,identity,binding):

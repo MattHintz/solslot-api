@@ -6,6 +6,27 @@ from chia_rs.sized_bytes import bytes32
 from .generation_customer_issuer import TestnetIssuerPolicy
 
 
+def validate_purchase_policy_renewal(prior,current,*,now=None):
+    """Time-only lineage; an explicit clock additionally requires live authority."""
+    prior.validate();current.validate()
+    old,new=prior.public(),current.public()
+    for field in ('issuedAt','expiresAt'):
+        old.pop(field);new.pop(field)
+    if (old!=new or current.issued_at<prior.expires_at
+            or current.expires_at<=prior.expires_at
+            or now is not None and (type(now)is not int or not current.issued_at<=now<current.expires_at)):
+        raise ValueError('CURRENT_PURCHASE_RENEWAL_SCOPE_CHANGED')
+    return prior
+
+
+def selected_prior_purchase_policy(settings,current,*,now=None):
+    path=getattr(settings,'generation_customer_purchase_prior_policy_path','')
+    pin=getattr(settings,'generation_customer_purchase_prior_policy_hash','')
+    if not path and not pin:return None
+    if not path or not pin:raise ValueError('CURRENT_PURCHASE_PRIOR_POLICY_PIN_REQUIRED')
+    return validate_purchase_policy_renewal(read_current_issuer_policy(path,pin),current,now=now)
+
+
 def read_current_issuer_policy(path,expected_file_hash):
     p=Path(path)
     info=p.lstat()
@@ -49,4 +70,6 @@ def selected_purchase_policy(settings):
         raise ValueError('CURRENT_PURCHASE_POLICY_DISABLED')
     p=read_current_issuer_policy(settings.generation_customer_purchase_policy_path,settings.generation_customer_purchase_policy_hash)
     if '0x'+p.generation.hex()!=settings.deployment_generation_id:raise ValueError('CURRENT_PURCHASE_POLICY_GENERATION_CHANGED')
+    if getattr(settings,'generation_customer_purchase_prior_policy_path','')or getattr(settings,'generation_customer_purchase_prior_policy_hash',''):
+        selected_prior_purchase_policy(settings,p)
     return p
