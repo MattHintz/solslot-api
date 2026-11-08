@@ -108,6 +108,20 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
             row=db.execute('SELECT requested_at FROM current_customer_reservation_requests WHERE intent_id=?',(identity,)).fetchone()
         return row[0]if row else None
 
+    def unstarted_review(self,identity,*,browser_hash):
+        """One read snapshot; partial reservation evidence is never removed."""
+        with self._connect()as db:
+            db.execute('BEGIN')
+            saved=self._saved_document(db,identity,browser_hash)
+            replies=saved['retainedSignatures'];claim=saved['reservationClaim']
+            if (saved['deliveryClaim']is not None or replies['delivery']
+                    or not set(replies['reservation']).issubset(claim.signer_indices)
+                    or len(replies['reservation'])>=len(claim.signer_indices)
+                    or db.execute('SELECT 1 FROM current_customer_reservation_requests WHERE intent_id=?',(identity,)).fetchone()
+                    or db.execute('SELECT 1 FROM current_purchase_executions WHERE intent_id=?',(identity,)).fetchone()):
+                raise ValueError('CURRENT_CHECKOUT_REVIEW_RECOVERY_REQUIRED')
+            return saved
+
     def request_reservation(self,identity,*,browser_hash,now):
         """Explicit durable customer intent; reads never enqueue work."""
         from .generation_customer_purchase_batch import artifacts

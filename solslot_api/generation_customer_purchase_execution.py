@@ -72,7 +72,6 @@ class CurrentNativePurchaseExecution:
         deed = bytes32.from_hexstr(deed_launcher_id)
         prior = self.store.review_for_request(request_key, browser_hash=browser_hash)
         if prior is not None:
-            self._saved(prior['intentId'], browser_hash)
             return self._same_quote(prior['intentId'], deed, browser_hash)
         now = int(self.clock())
         if not self.policy.issued_at <= now < self.policy.expires_at:
@@ -119,7 +118,7 @@ class CurrentNativePurchaseExecution:
         return self.review(identity, browser_hash=browser_hash)
 
     def _same_quote(self, identity, deed, browser_hash):
-        saved = self._saved(identity, browser_hash)
+        saved = self._review_saved(identity, browser_hash)
         if isinstance(saved['reservationClaim'],CurrentReservationBatch):
             raise ValueError('CURRENT_EXECUTION_REQUEST_KEY_DEED_CHANGED')
         artifact = purchase_artifact_v3_from_json(saved['reservationClaim'].purchase_artifact)
@@ -200,7 +199,7 @@ class CurrentNativePurchaseExecution:
             'candidates':sorted(unique.values(),key=lambda r:(int(r['amountMojos']),r['paymentCoinId']))[:32]}
 
     def review(self, identity, *, browser_hash):
-        saved = self._saved(identity, browser_hash)
+        saved = self._review_saved(identity, browser_hash)
         claim = saved['reservationClaim']
         if isinstance(claim,CurrentReservationBatch):return batch_execution.review_batch(self,identity,saved,browser_hash)
         artifact = purchase_artifact_v3_from_json(claim.purchase_artifact)
@@ -253,6 +252,38 @@ class CurrentNativePurchaseExecution:
         claim = saved['reservationClaim']
         if (claim.generation_id != self.store.generation_id
                 or claim.issuer_policy_hash != self.policy.commitment):
+            raise ValueError('CURRENT_EXECUTION_SAVED_POLICY_CHANGED')
+        return saved
+
+    def _review_saved(self,identity,browser_hash):
+        """Recover only an expired, unstarted predecessor for terminal display.
+
+        This path cannot authorize a financial step. Every mutation continues
+        to use _saved and rejects the prior policy, including its signatures.
+        """
+        try:return self._saved(identity,browser_hash)
+        except ValueError as exc:
+            if str(exc)!='CURRENT_EXECUTION_SAVED_POLICY_CHANGED':raise
+        saved=self.store.unstarted_review(identity,browser_hash=browser_hash)
+        claim=saved['reservationClaim'];selected=artifacts(claim);now=int(self.clock())
+        first=claim.children[0]if isinstance(claim,CurrentReservationBatch)else claim
+        from .generation_customer_purchase_policy import selected_prior_purchase_policy
+        from solslot_puzzles.payment_artifacts_v2 import PaymentRail
+        prior=selected_prior_purchase_policy(self.settings,self.policy)
+        if (prior is None or claim.issuer_policy_hash!=prior.commitment
+                or claim.generation_id!=self.store.generation_id
+                or self.settings.deployment_generation_id!=self.store.generation_id
+                or first.anchor_hash!=self.settings.generation_chain_anchor_hash
+                or now<prior.expires_at or len(selected)>prior.maximum_purchases
+                or any(a.network!='testnet11' or a.vault_launcher_id!=prior.buyer_vault
+                    or a.rail!=PaymentRail.CHIA_XCH or a.rail_chain_id!=0
+                    or a.rail_asset_id!=bytes32.zeros or a.rail_asset_decimals!=12
+                    or a.collection_id!=prior.collection or a.metadata_anchor_id!=prior.edition
+                    or a.metadata_root!=prior.metadata_root or a.deed_launcher_id not in prior.deed_launchers
+                    or a.protocol_treasury_puzzle_hash!=prior.fee_puzzle
+                    or not 0<int(a.rail_amount)<=prior.maximum_gross_mojos
+                    or not prior.issued_at<a.quote_expires_at<=a.authorization_expires_at<=prior.expires_at
+                    or now<a.quote_expires_at for a in selected)):
             raise ValueError('CURRENT_EXECUTION_SAVED_POLICY_CHANGED')
         return saved
 

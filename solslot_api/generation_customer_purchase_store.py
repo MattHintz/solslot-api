@@ -186,14 +186,17 @@ class CurrentCustomerPurchaseStore(PaymentPurchaseStore):
     def saved(self, identity, *, browser_hash):
         """Read only; expiry never destroys signed recovery evidence."""
         with self._connect() as db:
-            row, reservation = self._row(db, identity, browser_hash)
-            delivery = db.execute('SELECT * FROM current_customer_purchase_delivery WHERE intent_id=?', (identity,)).fetchone()
-            parsed = delivery_from_json(delivery['canonical_claim']) if delivery else None
-            if parsed and (parsed.digest() != delivery['claim_hash'] or parsed.reservation.canonical() != reservation.canonical()):
-                raise ValueError('CURRENT_CHECKOUT_SAVED_DELIVERY_CHANGED')
-            responses = {'reservation': {}, 'delivery': {}}
-            for value in db.execute('SELECT * FROM current_customer_purchase_signatures WHERE intent_id=?', (identity,)):
-                responses[value['phase']][value['signer_index']] = json.loads(value['canonical_reply'])
+            return self._saved_document(db,identity,browser_hash)
+
+    def _saved_document(self,db,identity,browser_hash):
+        row, reservation = self._row(db, identity, browser_hash)
+        delivery = db.execute('SELECT * FROM current_customer_purchase_delivery WHERE intent_id=?', (identity,)).fetchone()
+        parsed = delivery_from_json(delivery['canonical_claim']) if delivery else None
+        if parsed and (parsed.digest() != delivery['claim_hash'] or parsed.reservation.canonical() != reservation.canonical()):
+            raise ValueError('CURRENT_CHECKOUT_SAVED_DELIVERY_CHANGED')
+        responses = {'reservation': {}, 'delivery': {}}
+        for value in db.execute('SELECT * FROM current_customer_purchase_signatures WHERE intent_id=?', (identity,)):
+            responses[value['phase']][value['signer_index']] = json.loads(value['canonical_reply'])
         return {'intentId': identity, 'generationId': self.generation_id,
             'reservationClaim': reservation, 'deliveryClaim': parsed,
             'retainedSignatures': responses, 'createdAt': row['created_at']}
