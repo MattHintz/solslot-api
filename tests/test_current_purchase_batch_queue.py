@@ -1,4 +1,4 @@
-"""Durable explicit batch intent, independent of wallets or live networks."""
+"""Durable explicit scalar/batch intent, independent of wallets or live networks."""
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -39,13 +39,142 @@ def batch_queue(tmp_path):
     identity=store.save_review(claim,browser_hash=BROWSER,request_key='customer-batch',now=101)
     service=object.__new__(CurrentNativePurchaseExecution)
     service.settings=SimpleNamespace(network='testnet11');service.store=store;service.clock=lambda:110
-    service.policy=SimpleNamespace(issued_at=100,expires_at=400,buyer_vault=batch.artifacts[0].vault_launcher_id)
-    service._saved=lambda key,binding:store.saved(key,browser_hash=binding)
+    service.policy=SimpleNamespace(issued_at=100,expires_at=400,buyer_vault=batch.artifacts[0].vault_launcher_id,
+        commitment=claim.issuer_policy_hash)
     return SimpleNamespace(store=store,claim=claim,identity=identity,service=service)
 
 
-def test_read_only_reconnect_never_requests_a_reservation(batch_queue):
+@pytest.fixture
+def scalar_queue(batch_queue):
     q=batch_queue
+    claim=q.claim.children[0]
+    identity=q.store.save_review(claim,browser_hash=BROWSER,request_key='customer-scalar',now=102)
+    q.service.fee_cap=10
+    return SimpleNamespace(store=q.store,claim=claim,identity=identity,service=q.service)
+
+
+def test_scalar_request_receipt_and_review_survive_lost_response_and_restart(scalar_queue):
+    q=scalar_queue
+    assert q.service.review(q.identity,browser_hash=BROWSER)['reservationRequested']is False
+    reply=q.service.request_reservation(q.identity,browser_hash=BROWSER)
+    assert reply=={'schema':'solslot.current-reservation-request.v1','intentId':q.identity,
+        'generationId':q.claim.generation_id,'receivingVaultLauncherId':'0x'+bytes(q.service.policy.buyer_vault).hex(),
+        'reservationClaimHash':q.claim.digest(),'quantity':1,'requestedAt':110}
+    q.service.store=CurrentPurchaseExecutionStore(q.store.path,q.store.generation_id)
+    q.service.clock=lambda:999
+    assert q.service.request_reservation(q.identity,browser_hash=BROWSER)==reply
+    review=q.service.review(q.identity,browser_hash=BROWSER)
+    assert review['reservationRequested']is True and review['quoteExpired']is True
+    with q.service.store._connect()as db:
+        assert db.execute('SELECT count(*) FROM current_customer_reservation_requests').fetchone()[0]==1
+        assert db.execute('SELECT count(*) FROM current_purchase_executions').fetchone()[0]==0
+    with pytest.raises(ValueError,match='REVIEW_UNAVAILABLE'):
+        q.service.request_reservation(q.identity,browser_hash='ef'*32)
+
+
+def test_scalar_request_cannot_queue_under_changed_execution_policy(scalar_queue):
+    q=scalar_queue;q.service.policy.commitment='0x'+'ee'*32
+    with pytest.raises(ValueError,match='SAVED_POLICY_CHANGED'):
+        q.service.request_reservation(q.identity,browser_hash=BROWSER)
+    assert q.store.reservation_request(q.identity,browser_hash=BROWSER)is None
+
+
+@pytest.mark.parametrize('now',[99,400,999])
+def test_new_scalar_request_respects_policy_and_quote_expiry(scalar_queue,now):
+    q=scalar_queue;q.service.clock=lambda:now
+    with pytest.raises(ValueError,match='PURCHASE_WINDOW_CLOSED'):
+        q.service.request_reservation(q.identity,browser_hash=BROWSER)
+    assert q.store.reservation_request(q.identity,browser_hash=BROWSER)is None
+
+
+def test_new_scalar_request_cannot_outlive_quote_with_longer_policy(scalar_queue):
+    from solslot_api.generation_customer_purchase_batch import artifacts
+    q=scalar_queue;expires=artifacts(q.claim)[0].quote_expires_at
+    q.service.policy.expires_at=expires+100
+    q.service.clock=lambda:expires
+    with pytest.raises(ValueError,match='PURCHASE_WINDOW_CLOSED'):
+        q.service.request_reservation(q.identity,browser_hash=BROWSER)
+    with pytest.raises(ValueError,match='PURCHASE_WINDOW_CLOSED'):
+        q.store.request_reservation(q.identity,browser_hash=BROWSER,now=expires)
+
+
+def test_concurrent_scalar_retries_create_one_request(scalar_queue):
+    q=scalar_queue
+    def request(_):
+        return CurrentPurchaseExecutionStore(q.store.path,q.store.generation_id).request_reservation(
+            q.identity,browser_hash=BROWSER,now=110)
+    with ThreadPoolExecutor(max_workers=4)as pool:
+        assert list(pool.map(request,range(8)))==[110]*8
+    with q.store._connect()as db:
+        assert db.execute('SELECT count(*) FROM current_customer_reservation_requests').fetchone()[0]==1
+
+
+def test_scalar_queue_and_prepared_work_count_once_against_shared_batch_capacity(scalar_queue,batch_queue):
+    q=scalar_queue;b=batch_queue
+    q.service.request_reservation(q.identity,browser_hash=BROWSER)
+    q.store.prepare_execution(q.identity,'RESERVATION',bundle(),browser_hash=BROWSER,
+        claim_hash=q.claim.digest(),fee_cap=10,expires_at=200,now=111)
+    request_reservation(b.service,b.identity,BROWSER)
+    extra=q.claim.model_copy(update={'available_coin_id':'0x'+'ee'*32})
+    identity=q.store.save_review(extra,browser_hash=BROWSER,request_key='over-scalar-budget',now=112)
+    with pytest.raises(ValueError,match='CAPACITY_EXHAUSTED'):
+        q.store.request_reservation(identity,browser_hash=BROWSER,now=113)
+
+
+def test_concurrent_scalar_and_batch_cannot_overrun_remaining_capacity(scalar_queue,batch_queue):
+    q=scalar_queue;b=batch_queue
+    q.service.request_reservation(q.identity,browser_hash=BROWSER)
+    extra=q.claim.model_copy(update={'available_coin_id':'0x'+'ee'*32})
+    identity=q.store.save_review(extra,browser_hash='ef'*32,request_key='competing-scalar',now=112)
+    def request(pair):
+        try:
+            current=CurrentPurchaseExecutionStore(q.store.path,q.store.generation_id)
+            current.request_reservation(pair[0],browser_hash=pair[1],now=113)
+            return 'accepted'
+        except ValueError as exc:return str(exc)
+    with ThreadPoolExecutor(max_workers=2)as pool:
+        results=list(pool.map(request,[(b.identity,BROWSER),(identity,'ef'*32)]))
+    assert sorted(results)==['CURRENT_EXECUTION_POLICY_CAPACITY_EXHAUSTED','accepted']
+
+
+@pytest.mark.asyncio
+async def test_existing_worker_advances_explicit_scalar_queue_without_payer_or_issuer(scalar_queue):
+    q=scalar_queue;events=[]
+    async def no_issuer(_):raise AssertionError('No saved payer offer')
+    worker=CurrentPurchaseWorker(q.service,issuer_sign=no_issuer,clock=lambda:110)
+    assert worker._claim()==[]
+    q.service.request_reservation(q.identity,browser_hash=BROWSER)
+    def funding():events.append('funding')
+    async def prepare(identity,*,browser_hash):
+        events.append('prepare')
+        return q.store.prepare_execution(identity,'RESERVATION',bundle(),browser_hash=browser_hash,
+            claim_hash=q.claim.digest(),fee_cap=10,expires_at=200,now=111)
+    async def reconcile(identity,phase,*,browser_hash):
+        events.append('reconcile');return q.store.execution_status(identity,phase,browser_hash=browser_hash)
+    async def dispatch(identity,phase,*,browser_hash):events.append('dispatch')
+    q.service._funding_context=funding;q.service.prepare_reservation=prepare
+    q.service.reconcile=reconcile;q.service.dispatch=dispatch
+    result=await worker.tick()
+    assert result['examined']==1 and result['errors']==0
+    assert events==['funding','prepare','reconcile','dispatch']
+
+
+@pytest.mark.asyncio
+async def test_worker_closes_expired_unprepared_scalar_queue_without_signing(scalar_queue):
+    q=scalar_queue
+    async def no_issuer(_):raise AssertionError('No saved payer offer')
+    q.service.request_reservation(q.identity,browser_hash=BROWSER)
+    worker=CurrentPurchaseWorker(q.service,issuer_sign=no_issuer,clock=lambda:999)
+    result=await worker.tick()
+    assert result['examined']==1 and result['errors']==0
+    with q.store._connect()as db:
+        assert db.execute('SELECT state FROM current_purchase_worker_jobs').fetchone()[0]=='CLOSED'
+        assert db.execute('SELECT count(*) FROM current_purchase_executions').fetchone()[0]==0
+
+
+@pytest.mark.parametrize('queue_name',['batch_queue','scalar_queue'])
+def test_read_only_reconnect_never_requests_a_reservation(request,queue_name):
+    q=request.getfixturevalue(queue_name)
     for _ in range(3):
         assert q.store.reservation_request(q.identity,browser_hash=BROWSER)is None
         assert q.store.saved(q.identity,browser_hash=BROWSER)['deliveryClaim']is None
@@ -97,8 +226,9 @@ def test_concurrent_batches_cannot_each_claim_the_same_remaining_deed_budget(bat
 
 
 @pytest.mark.asyncio
-async def test_worker_claims_only_explicit_customer_request_and_recovers_it(batch_queue):
-    q=batch_queue
+@pytest.mark.parametrize('queue_name',['batch_queue','scalar_queue'])
+async def test_worker_claims_only_explicit_customer_request_and_recovers_it(request,queue_name):
+    q=request.getfixturevalue(queue_name)
     async def no_issuer(_):raise AssertionError('No saved payer offer')
     worker=CurrentPurchaseWorker(q.service,issuer_sign=no_issuer,clock=lambda:110)
     assert worker._claim()==[]

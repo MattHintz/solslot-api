@@ -171,16 +171,8 @@ async def reserve(launcher:Identity,identity:Identity,body:CurrentGeneration,
     try:
         service,binding=context(request,settings,launcher)
         service._funding_context()
-        if isinstance(service._saved(identity,binding)['reservationClaim'],CurrentReservationBatch):
-            from .generation_customer_purchase_batch_execution import request_reservation
-            result=request_reservation(service,identity,binding)
-            unchanged(request,settings,launcher,service,binding)
-            return result
-        await service.prepare_reservation(identity,browser_hash=binding)
+        result=service.request_reservation(identity,browser_hash=binding)
         unchanged(request,settings,launcher,service,binding)
-        result=await service.dispatch(identity,'RESERVATION',browser_hash=binding)
-        if isinstance(service._saved(identity,binding)['reservationClaim'],CurrentReservationBatch):
-            result={**result,'reservedCoinIds':list(service.reserved_coin_id(identity,browser_hash=binding))}
         return result
     except Exception as exc:raise failure(exc) from exc
 

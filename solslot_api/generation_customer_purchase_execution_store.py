@@ -110,12 +110,11 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
 
     def request_reservation(self,identity,*,browser_hash,now):
         """Explicit durable customer intent; reads never enqueue work."""
-        from .generation_customer_purchase_batch import CurrentReservationBatch,artifacts
+        from .generation_customer_purchase_batch import artifacts
         with self._connect()as db:
             db.execute('BEGIN IMMEDIATE')
             try:
                 _,claim=self._row(db,identity,browser_hash)
-                if not isinstance(claim,CurrentReservationBatch):raise ValueError('CURRENT_PURCHASE_BATCH_REQUIRED')
                 row=db.execute('SELECT requested_at FROM current_customer_reservation_requests WHERE intent_id=?',(identity,)).fetchone()
                 if row is not None:
                     db.commit();return row[0]
