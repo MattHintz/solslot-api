@@ -192,6 +192,7 @@ class CurrentBatchPaymentRequest(Model):
     reserved_coin_ids:tuple[Hash,...]=Field(alias='reservedCoinIds',min_length=2,max_length=25)
     payment_coin_id:Hash=Field(alias='paymentCoinId')
     payment_public_key:str=Field(alias='paymentPublicKey',pattern=r'^0x[0-9a-f]{96}$')
+    payment_public_key_kind:Literal['raw','synthetic']=Field(default='raw',alias='paymentPublicKeyKind')
 
 
 @dataclass(frozen=True)
@@ -217,7 +218,7 @@ class CurrentBatchPaymentPreparation:
             'smartDeedInnerHashes':[h(t.smart_deed_inner_hash)for t in terms],
             'recipientVaultLauncherId':h(first.vault_launcher_id),'recipientVaultP2PuzzleHash':h(first.vault_p2_puzzle_hash),
             'currentVaultCoinId':r.reservation.children[0].current_vault_coin_id,
-            'reservedCoinIds':list(r.reserved_coin_ids),'paymentCoinId':r.payment_coin_id,'paymentPublicKey':r.payment_public_key,
+            'reservedCoinIds':list(r.reserved_coin_ids),'paymentCoinId':r.payment_coin_id,'paymentPublicKey':r.payment_public_key,'paymentPublicKeyKind':r.payment_public_key_kind,
             'amountMojos':str(b.total_rail_amount),'baseAmountUsdMinor':str(b.total_base_amount_minor),
             'technologyFeeUsdMinor':str(b.total_technology_fee_minor),'totalAmountUsdMinor':str(b.total_subtotal_minor),
             'changeMojos':str(int(p.coin_spend.coin.amount)-b.total_rail_amount),'changePuzzleHash':h(p.payment_puzzle.get_tree_hash()),
@@ -242,7 +243,7 @@ async def prepare_current_batch_payment(request,**arguments):
     record=read_confirmed_coin(await arguments['provider'].get_coin_record_by_name_primary(request.payment_coin_id),bytes32.from_hexstr(request.payment_coin_id))
     if record.spent_height:raise ValueError('CURRENT_PAYMENT_CONFIRMED_UNSPENT_COIN_REQUIRED')
     batch=purchase_batch_from_json(request.reservation.purchase_batch)
-    prepared=prepare_chia_buyer_batch_offer_v3(payment_coin=record.coin,payment_public_key=bytes(public),batch=batch,
+    prepared=prepare_chia_buyer_batch_offer_v3(payment_coin=record.coin,payment_public_key=bytes(public), payment_public_key_kind=request.payment_public_key_kind,batch=batch,
         terms=[c.item.original.terms for c in children],deed_singleton_structs=[c.deed_structure for c in children])
     if len(prepared.offer.coin_spends())!=1 or prepared.offer.fees()!=0:
         raise ValueError('CURRENT_PAYMENT_ONE_ZERO_FEE_WALLET_INPUT_REQUIRED')

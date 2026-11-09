@@ -14,9 +14,9 @@ concurrency:
 
 env:
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
-  # Exact deployed Testnet11 generation protocol source.
+  # Exact coordinated Testnet11 checkout protocol source.
   # Deployment environment pins remain separately governed.
-  PROTOCOL_REF: d3c1e08f96a989e67cab17fc9df1e9868244fa98
+  PROTOCOL_REF: f37f46c30325a3d05f237e0e36c3a93575831404
 
 jobs:
   verify:
@@ -64,6 +64,20 @@ jobs:
           # Match the approved Chia 2.7.4 runtime and constraints.lock exactly.
           python -m pip install -c constraints.lock zstd==1.5.7.2
           python -m pip install -c constraints.lock -e solslot-protocol -e '.[dev]'
+
+      - name: Verify installed protocol source and payment key contract
+        run: |
+          python - <<'PY'
+          import inspect
+          from pathlib import Path
+          from solslot_puzzles import stripe_settlement_v1_driver as driver
+
+          assert Path(driver.__file__).resolve().is_relative_to(Path("solslot-protocol").resolve()), "Imported protocol must be the exact checked-out source"
+          for prepare in (driver.prepare_chia_buyer_offer_v3, driver.prepare_chia_buyer_batch_offer_v3):
+              key_kind = inspect.signature(prepare).parameters["payment_public_key_kind"]
+              assert key_kind.kind is inspect.Parameter.KEYWORD_ONLY
+              assert key_kind.default == "raw"
+          PY
 
       - name: Dependency audit
         run: PYTHON=python bash scripts/check_dependency_audit.sh

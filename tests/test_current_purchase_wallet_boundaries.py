@@ -15,7 +15,7 @@ def request():
 
 
 @pytest.mark.parametrize('change', [
-    {'paymentPublicKey':'0x'+'AA'*48}, {'paymentPublicKey':'0x'+'09'*32},
+    {'paymentPublicKeyKind':'other'}, {'paymentPublicKey':'0x'+'AA'*48}, {'paymentPublicKey':'0x'+'09'*32},
     {'paymentCoinId':'0x'+'GG'*32}, {'reservedCoinId':True},
     {'vaultLauncherId':'0x'+'10'*32}, {'network':'mainnet'},
     {'coinSpends':[{'opaque':'server input'}]}, {'proceedsPuzzleHash':'0x'+'11'*32},
@@ -45,3 +45,7 @@ def test_signed_decoder_is_explicit_and_keeps_original_default_closed():
 def test_signed_mode_does_not_allow_an_extra_payment_input():
     with pytest.raises(ValueError,match='input count'):
         decode_offer(encode_bundle(extra_input_bundle()),real_spends=1,dummy_spends=0,allow_signed=True)
+
+def test_payment_key_kind_is_explicit_and_legacy_defaults_to_raw():
+    assert CurrentNativePaymentRequest.model_validate(request()).payment_public_key_kind=='raw'
+    assert CurrentNativePaymentRequest.model_validate({**request(),'paymentPublicKeyKind':'synthetic'}).payment_public_key_kind=='synthetic'

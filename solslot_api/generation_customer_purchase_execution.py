@@ -142,14 +142,14 @@ class CurrentNativePurchaseExecution:
             'lastCheckedAt':now, 'purchaseWindowOpen':self.policy.issued_at <= now < self.policy.expires_at-300,
             'policyExpiresAt':self.policy.expires_at}
 
-    async def payer_coins(self, identity, public_keys, *, browser_hash):
+    async def payer_coins(self, identity, public_keys, *, browser_hash, public_key_kind="raw"):
         """Find confirmed standard payer coins using public keys, no wallet RPC.
 
         Coin discovery is bounded and does not consolidate, sign, fund, reserve
         or submit. Payment preparation rechecks the selected coin independently.
         """
         from chia_rs import G1Element, Coin
-        from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import puzzle_for_pk
+        from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import puzzle_for_pk, puzzle_for_synthetic_public_key
         from .generation_coin_evidence import read_confirmed_coin
         saved = self._saved(identity, browser_hash)
         reservation=saved['reservationClaim']
@@ -162,13 +162,15 @@ class CurrentNativePurchaseExecution:
             raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_CLOSED')
         if not isinstance(public_keys, (list, tuple)) or not 1 <= len(public_keys) <= 32 or len(set(public_keys)) != len(public_keys):
             raise ValueError('CURRENT_PAYMENT_PUBLIC_KEY_LIST_INVALID')
+        if public_key_kind not in ("raw", "synthetic"):
+            raise ValueError("CURRENT_PAYMENT_PUBLIC_KEY_KIND_INVALID")
         keys = []
         for value in public_keys:
             if not isinstance(value,str) or len(value)!=98 or not value.startswith('0x') or value!=value.lower():
                 raise ValueError('CURRENT_PAYMENT_PUBLIC_KEY_LIST_INVALID')
             key = G1Element.from_bytes(bytes.fromhex(value[2:]))
             if key == G1Element():raise ValueError('CURRENT_PAYMENT_NONIDENTITY_KEY_REQUIRED')
-            keys.append((value,puzzle_for_pk(key).get_tree_hash()))
+            keys.append((value,(puzzle_for_pk(key) if public_key_kind == "raw" else puzzle_for_synthetic_public_key(key)).get_tree_hash()))
         if (await self.provider.get_network_info_primary()).get('network_name') != 'testnet11':
             raise ValueError('CURRENT_PAYMENT_PRIMARY_NETWORK_CHANGED')
         limit = asyncio.Semaphore(4)
@@ -185,7 +187,7 @@ class CurrentNativePurchaseExecution:
                     raise ValueError('CURRENT_PAYMENT_COIN_OWNER_CHANGED')
                 if not record.spent_height and amount <= record.coin.amount <= 2**53-1:
                     candidates.append({'paymentCoinId':h(record.coin.name()),'paymentPublicKey':public,
-                        'amountMojos':str(record.coin.amount),'confirmedHeight':record.confirmed_height})
+                        'paymentPublicKeyKind':public_key_kind,'amountMojos':str(record.coin.amount),'confirmedHeight':record.confirmed_height})
             return candidates
         async with asyncio.timeout(15):
             groups = await asyncio.gather(*(read_key(public,puzzle)for public,puzzle in keys))

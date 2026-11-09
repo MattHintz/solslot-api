@@ -90,6 +90,15 @@ async def exercise_batch(c,ctx,built,inventory,vault,pay_coin,payment_key,synthe
         reservedCoinIds=coins,paymentCoinId=h(pay_coin.name()),paymentPublicKey=h(payment_key.get_g1()))
     prepared=await service.prepare_wallet(identity,request,browser_hash=binding);wallet=prepared.review()
     progress('wallet review')
+    assert wallet['paymentPublicKeyKind']=='raw'
+    sage_request=request.model_copy(update={'payment_public_key':h(synthetic.get_g1()),'payment_public_key_kind':'synthetic'})
+    sage_prepared=await service.prepare_wallet(identity,sage_request,browser_hash=binding)
+    sage_review=sage_prepared.review()
+    assert sage_review['paymentPublicKeyKind']=='synthetic'
+    assert bytes(sage_prepared.prepared.coin_spend)==bytes(prepared.prepared.coin_spend)
+    assert sage_review['reviewHash']!=wallet['reviewHash']
+    with pytest.raises(ValueError):
+        await service.prepare_wallet(identity,sage_request.model_copy(update={'payment_public_key_kind':'raw'}),browser_hash=binding)
     assert wallet['quantity']==quantity and len(wallet['coinSpends'])==1
     assert wallet['changeMojos']==str(int(pay_coin.amount)-quantity*101_000_000_000)
     payment=signed(SpendBundle([prepared.prepared.coin_spend],G2Element()),[synthetic],c.faucet.agg_sig_me_data)

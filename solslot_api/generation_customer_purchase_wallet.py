@@ -4,6 +4,7 @@ Only a confirmed standard-wallet payment coin reaches wallet signing. Protocol,
 reservation, issuer-forwarding and fee spends are not wallet signing inputs.
 No endpoint, key access, funding selection or transaction submission lives here.
 """
+from typing import Literal
 from dataclasses import dataclass
 from hashlib import sha256
 import time
@@ -32,6 +33,7 @@ class CurrentNativePaymentRequest(Model):
     reserved_coin_id: Hash = Field(alias='reservedCoinId')
     payment_coin_id: Hash = Field(alias='paymentCoinId')
     payment_public_key: str = Field(alias='paymentPublicKey', pattern=r'^0x[0-9a-f]{96}$')
+    payment_public_key_kind: Literal['raw','synthetic'] = Field(default='raw', alias='paymentPublicKeyKind')
 
 
 @dataclass(frozen=True)
@@ -55,7 +57,7 @@ class CurrentNativePaymentPreparation:
             'recipientVaultP2PuzzleHash': h(artifact.vault_p2_puzzle_hash),
             'currentVaultCoinId': r.reservation.current_vault_coin_id,
             'reservedCoinId': r.reserved_coin_id, 'paymentCoinId': r.payment_coin_id,
-            'paymentPublicKey': r.payment_public_key, 'amountMojos': str(artifact.rail_amount),
+            'paymentPublicKey': r.payment_public_key, 'paymentPublicKeyKind':r.payment_public_key_kind, 'amountMojos': str(artifact.rail_amount),
             'baseAmountUsdMinor': str(artifact.base_amount_minor),
             'technologyFeeUsdMinor': str(artifact.technology_fee_minor),
             'totalAmountUsdMinor': str(artifact.subtotal_minor),
@@ -101,7 +103,7 @@ async def prepare_current_native_payment(request, *, settings, anchor, provider,
         bytes32.from_hexstr(request.payment_coin_id))
     if record.spent_height:
         raise ValueError('CURRENT_PAYMENT_CONFIRMED_UNSPENT_COIN_REQUIRED')
-    prepared = prepare_chia_buyer_offer_v3(payment_coin=record.coin, payment_public_key=bytes(public),
+    prepared = prepare_chia_buyer_offer_v3(payment_coin=record.coin, payment_public_key=bytes(public), payment_public_key_kind=request.payment_public_key_kind,
         artifact=checked.artifact, terms=checked.item.original.terms,
         deed_singleton_struct=checked.deed_structure)
     if (len(prepared.offer.coin_spends()) != 1
