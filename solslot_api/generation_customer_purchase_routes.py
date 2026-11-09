@@ -166,7 +166,8 @@ async def status(launcher:Identity,identity:Identity,request:Request,response:Re
         # checkout. The original reservation and journals remain intact.
         if result.get('quoteExpired') and not result.get('payerAuthorizationSaved'):
             from .generation_customer_purchase_worker import expired_unsubmitted_reservation
-            result['reservationUnsubmittedExpired']=expired_unsubmitted_reservation(service,identity,binding)
+            if expired_unsubmitted_reservation(service,identity,binding):
+                result['reservationUnsubmittedExpired']=True
             unchanged(request,settings,launcher,service,binding)
         return result
     except Exception as exc:raise failure(exc) from exc

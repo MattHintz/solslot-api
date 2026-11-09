@@ -134,6 +134,20 @@ def test_status_exposes_expiry_only_after_reconciliation_and_bound_proof(checkou
     assert [e[0] for e in c.events]==['observe','proof']
 
 
+@pytest.mark.parametrize('quote_expired,payer_saved',[(True,False),(False,False),(True,True)])
+def test_status_without_expiry_proof_preserves_the_original_review_contract(checkout,monkeypatch,quote_expired,payer_saved):
+    from solslot_api import generation_customer_purchase_worker as worker
+    c=checkout
+    original={'intentId':INTENT,'quoteExpired':quote_expired,'payerAuthorizationSaved':payer_saved}
+    c.service.review=lambda identity,*,browser_hash:dict(original)
+    c.service._existing=lambda identity,phase,binding:{'stage':'PREPARED'} if phase=='RESERVATION' else None
+    monkeypatch.setattr(worker,'expired_unsubmitted_reservation',lambda service,identity,binding:c.events.append(('proof',identity)) or False)
+    reply=c.client.get(url())
+    assert reply.status_code==200 and reply.json()=={**original,'reservation':{'stage':'CONFIRMED'}}
+    assert [e[0]for e in c.events]==(['observe','proof']if quote_expired and not payer_saved else ['observe'])
+    assert reply.headers['cache-control']=='no-store'
+
+
 def test_inventory_get_cannot_quote_reserve_or_dispatch(checkout):
     c=checkout;target='/customer/purchases/'+VAULT+'/inventory'
     for _ in range(3):assert c.client.get(target).status_code==200
