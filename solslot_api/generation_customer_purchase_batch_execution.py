@@ -30,7 +30,7 @@ async def quote_batch(s,request_key,deeds,browser_hash):
     ordered=tuple(sorted(bytes32.from_hexstr(d)for d in deeds))
     prior=s.store.review_for_request(request_key,browser_hash=browser_hash)
     if prior is not None:
-        claim=s._saved(prior['intentId'],browser_hash)['reservationClaim']
+        claim=s._review_saved(prior['intentId'],browser_hash)['reservationClaim']
         if not isinstance(claim,CurrentReservationBatch) or tuple(a.deed_launcher_id for a in artifacts(claim))!=ordered:
             raise ValueError('CURRENT_EXECUTION_REQUEST_KEY_DEED_CHANGED')
         return s.review(prior['intentId'],browser_hash=browser_hash)
