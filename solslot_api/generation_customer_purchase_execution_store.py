@@ -91,10 +91,39 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
             raise ValueError('CURRENT_EXECUTION_RETENTION_FULL')
         self._admit(db, used + additional)
 
+    def _expired_unsubmitted_for_capacity(self,db,row,claim):
+        """Verify the retained native proof inside this admission transaction."""
+        from .generation_customer_purchase_batch import artifacts
+        from .generation_customer_purchase_expiry_proof import valid_expiry_proof
+        from .protocol_admission import admission_conditions
+        try:
+            job=db.execute('SELECT state,lease_token,lease_until,expiry_document,issuer_document FROM current_purchase_worker_jobs WHERE intent_id=?',(row['intent_id'],)).fetchone()
+            execution=db.execute("SELECT * FROM current_purchase_executions WHERE intent_id=? AND phase='RESERVATION'",(row['intent_id'],)).fetchone()
+            if (job is None or job['state']!='CLOSED' or job['lease_token'] is not None or job['lease_until']!=0 or job['issuer_document'] is not None or not job['expiry_document']
+                or len(job['expiry_document'].encode('utf-8'))>4096
+                or execution is None or execution['stage']!='PREPARED' or execution['funded_document'] is not None
+                or execution['transaction_id'] is not None or execution['confirmed_height'] is not None):return False
+            if (db.execute('SELECT 1 FROM current_customer_purchase_delivery WHERE intent_id=?',(row['intent_id'],)).fetchone()
+                or db.execute("SELECT 1 FROM current_customer_purchase_signatures WHERE intent_id=? AND phase='delivery'",(row['intent_id'],)).fetchone()
+                or db.execute("SELECT 1 FROM current_purchase_executions WHERE intent_id=? AND phase IN ('DELIVERY','RELEASE')",(row['intent_id'],)).fetchone()):return False
+            bundle=SpendBundle.from_bytes(execution['protocol_bundle']);proof=json.loads(job['expiry_document'])
+            expiry=artifacts(claim)[0].quote_expires_at
+            if (bytes(bundle)!=execution['protocol_bundle'] or bundle_id(bundle)!=execution['original_id']
+                or row['generation_id']!=self.generation_id or row['claim_hash']!=claim.digest()
+                or execution['claim_hash']!=claim.digest() or execution['expires_at']!=expiry):return False
+            binding={'schema':'solslot.current-unsubmitted-reservation-expiry.v1','generationId':self.generation_id,
+                'intentId':row['intent_id'],'reservationClaimHash':claim.digest(),'bundleId':bundle_id(bundle),
+                'absoluteExpiry':expiry,'inputIds':sorted('0x'+coin.name().hex() for coin in bundle.removals())}
+            if not valid_expiry_proof(proof,binding):return False
+            conditions=admission_conditions(bundle,proof['peakHeight'],'testnet11')
+            return conditions.before_seconds_absolute is not None and int(conditions.before_seconds_absolute)==expiry
+        except Exception:
+            return False
+
     def _purchase_capacity(self,db,identity,reservation,maximum):
         from .generation_customer_purchase_batch import reservation_from_json,CurrentReservationBatch
         quantity=lambda c:len(c.children)if isinstance(c,CurrentReservationBatch)else 1
-        rows=db.execute('''SELECT r.canonical_claim FROM current_customer_purchase_reviews r
+        rows=db.execute('''SELECT r.intent_id,r.generation_id,r.claim_hash,r.canonical_claim FROM current_customer_purchase_reviews r
             WHERE r.intent_id!=? AND (EXISTS(SELECT 1 FROM current_purchase_executions e
                 WHERE e.intent_id=r.intent_id AND e.phase='RESERVATION') OR
                 EXISTS(SELECT 1 FROM current_customer_reservation_requests q WHERE q.intent_id=r.intent_id))
@@ -106,8 +135,8 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
                       WHERE paid.intent_id=r.intent_id)
                   AND NOT EXISTS(SELECT 1 FROM current_purchase_executions delivery
                       WHERE delivery.intent_id=r.intent_id AND delivery.phase='DELIVERY'))''',(identity,)).fetchall()
-        claims=[reservation_from_json(r[0])for r in rows]
-        used=sum(quantity(c)for c in claims if c.issuer_policy_hash==reservation.issuer_policy_hash)
+        claims=[(r,reservation_from_json(r['canonical_claim'])) for r in rows]
+        used=sum(quantity(c) for r,c in claims if c.issuer_policy_hash==reservation.issuer_policy_hash and not self._expired_unsubmitted_for_capacity(db,r,c))
         if used+quantity(reservation)>maximum:raise ValueError('CURRENT_EXECUTION_POLICY_CAPACITY_EXHAUSTED')
 
     def reservation_request(self,identity,*,browser_hash):

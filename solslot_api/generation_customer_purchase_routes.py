@@ -8,7 +8,7 @@ absent by default and its source remains unpublished until release review.
 import hashlib
 import hmac
 import re
-from typing import Annotated
+from typing import Annotated, Literal
 
 from chia_rs import G2Element
 from chia_rs.sized_bytes import bytes32
@@ -43,6 +43,7 @@ class QuoteBody(CurrentGeneration):
 
 
 class PaymentBody(CurrentGeneration):
+    payment_public_key_kind:Literal["raw","synthetic"]=Field(default="raw",alias="paymentPublicKeyKind")
     payment_coin_id:Identity=Field(alias='paymentCoinId')
     payment_public_key:str=Field(alias='paymentPublicKey',pattern=r'^0x[0-9a-f]{96}$')
 
@@ -52,6 +53,7 @@ class PayerBody(CurrentGeneration):
 
 
 class PayerKeysBody(CurrentGeneration):
+    payment_public_key_kind:Literal["raw","synthetic"]=Field(default="raw",alias="paymentPublicKeyKind")
     public_keys:list[str]=Field(alias='publicKeys',min_length=1,max_length=32)
 
 
@@ -143,7 +145,7 @@ async def payer_coins(launcher:Identity,identity:Identity,body:PayerKeysBody,
     mutation(request,settings,body);response.headers['Cache-Control']='no-store'
     try:
         service,binding=context(request,settings,launcher)
-        result=await service.payer_coins(identity,body.public_keys,browser_hash=binding)
+        result=await service.payer_coins(identity,body.public_keys,public_key_kind=body.payment_public_key_kind,browser_hash=binding)
         unchanged(request,settings,launcher,service,binding)
         return result
     except Exception as exc:raise failure(exc) from exc
@@ -160,6 +162,12 @@ async def status(launcher:Identity,identity:Identity,request:Request,response:Re
             if current is not None:
                 result[phase.lower()]=await service.reconcile(identity,phase,browser_hash=binding)
         unchanged(request,settings,launcher,service,binding)
+        # Only a durable, exact-bundle expiry proof may end an unpaid PREPARED
+        # checkout. The original reservation and journals remain intact.
+        if result.get('quoteExpired') and not result.get('payerAuthorizationSaved'):
+            from .generation_customer_purchase_worker import expired_unsubmitted_reservation
+            result['reservationUnsubmittedExpired']=expired_unsubmitted_reservation(service,identity,binding)
+            unchanged(request,settings,launcher,service,binding)
         return result
     except Exception as exc:raise failure(exc) from exc
 
@@ -187,10 +195,10 @@ async def payment(launcher:Identity,identity:Identity,body:PaymentBody,
         if isinstance(saved['reservationClaim'],CurrentReservationBatch):
             operation=CurrentBatchPaymentRequest(reservation=saved['reservationClaim'],
                 reservedCoinIds=service.reserved_coin_id(identity,browser_hash=binding),
-                paymentCoinId=body.payment_coin_id,paymentPublicKey=body.payment_public_key)
+                paymentCoinId=body.payment_coin_id,paymentPublicKey=body.payment_public_key,paymentPublicKeyKind=body.payment_public_key_kind)
         else:operation=CurrentNativePaymentRequest(reservation=saved['reservationClaim'],
             reservedCoinId=service.reserved_coin_id(identity,browser_hash=binding),
-            paymentCoinId=body.payment_coin_id,paymentPublicKey=body.payment_public_key)
+            paymentCoinId=body.payment_coin_id,paymentPublicKey=body.payment_public_key,paymentPublicKeyKind=body.payment_public_key_kind)
         result=(await service.prepare_wallet(identity,operation,browser_hash=binding)).review()
         unchanged(request,settings,launcher,service,binding)
         return result

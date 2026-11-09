@@ -156,7 +156,9 @@ async def test_existing_worker_advances_explicit_scalar_queue_without_payer_or_i
     q.service.reconcile=reconcile;q.service.dispatch=dispatch
     result=await worker.tick()
     assert result['examined']==1 and result['errors']==0
-    assert events==['funding','prepare','reconcile','dispatch']
+    assert events==['funding','prepare']
+    # The durable PREPARED checkpoint returns before a later dispatch cycle.
+    # Dispatch still independently reconciles and validates its saved inputs.
 
 
 @pytest.mark.asyncio

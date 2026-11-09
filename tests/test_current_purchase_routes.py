@@ -52,8 +52,8 @@ def checkout(monkeypatch):
     service.review=review;service.quote=quote;service.prepare_reservation=reserve
     service.request_reservation=request_reservation
     async def inventory():events.append(('inventory',));return {'generationId':GEN,'items':[]}
-    async def payer_coins(identity,keys,*,browser_hash):
-        events.append(('payer-coins',identity,keys));return {'generationId':GEN,'candidates':[]}
+    async def payer_coins(identity,keys,*,browser_hash,public_key_kind='raw'):
+        events.append(('payer-coins',identity,keys,public_key_kind));return {'generationId':GEN,'candidates':[]}
     service.inventory=inventory;service.payer_coins=payer_coins
     service._funding_context=lambda:None
     service.dispatch=dispatch;service.reconcile=reconcile;service._existing=lambda *a:None
@@ -123,6 +123,17 @@ def test_status_get_only_observes_existing_phases(checkout):
     assert response.json()['release']['stage']=='CONFIRMED'
 
 
+def test_status_exposes_expiry_only_after_reconciliation_and_bound_proof(checkout,monkeypatch):
+    from solslot_api import generation_customer_purchase_worker as worker
+    c=checkout
+    c.service.review=lambda identity,*,browser_hash:{'intentId':identity,'quoteExpired':True,'payerAuthorizationSaved':False}
+    c.service._existing=lambda identity,phase,binding: {'stage':'PREPARED'} if phase=='RESERVATION' else None
+    monkeypatch.setattr(worker,'expired_unsubmitted_reservation',lambda service,identity,binding: c.events.append(('proof',identity)) or True)
+    reply=c.client.get(url())
+    assert reply.status_code==200 and reply.json()['reservationUnsubmittedExpired'] is True
+    assert [e[0] for e in c.events]==['observe','proof']
+
+
 def test_inventory_get_cannot_quote_reserve_or_dispatch(checkout):
     c=checkout;target='/customer/purchases/'+VAULT+'/inventory'
     for _ in range(3):assert c.client.get(target).status_code==200
@@ -134,8 +145,12 @@ def test_inventory_get_cannot_quote_reserve_or_dispatch(checkout):
 def test_explicit_public_key_discovery_stays_separate_from_receiver_and_dispatch(checkout):
     c=checkout;keys=['0x'+'01'*48]
     response=c.client.post(url('/payer-coins'),json={'generationId':GEN,'publicKeys':keys},headers=ORIGIN)
-    assert response.status_code==200 and c.events==[('payer-coins',INTENT,keys)]
+    assert response.status_code==200 and c.events==[('payer-coins',INTENT,keys,'raw')]
     assert c.owner.auth_type=='evm'
+    c.events.clear()
+    assert c.client.post(url('/payer-coins'),json={'generationId':GEN,'publicKeys':keys,'paymentPublicKeyKind':'synthetic'},headers=ORIGIN).status_code==200
+    assert c.events==[('payer-coins',INTENT,keys,'synthetic')]
+    assert c.client.post(url('/payer-coins'),json={'generationId':GEN,'publicKeys':keys,'paymentPublicKeyKind':'unknown'},headers=ORIGIN).status_code==422
     assert c.client.post(url('/payer-coins'),json={'generationId':GEN,'publicKeys':keys,'privateKey':'synthetic'},headers=ORIGIN).status_code==422
 
 

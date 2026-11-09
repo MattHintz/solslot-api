@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 from chia_rs import AugSchemeMPL,Coin
 from chia_rs.sized_bytes import bytes32
-from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import puzzle_for_pk
+from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import puzzle_for_pk, calculate_synthetic_public_key, DEFAULT_HIDDEN_PUZZLE_HASH
 from solslot_api import generation_customer_purchase_execution as execution
 
 @pytest.fixture
@@ -31,7 +31,7 @@ def setup(monkeypatch):
 async def test_primary_confirmed_coin_is_public_only_and_no_transaction_prepared(setup):
     s=setup;value=await s.call()
     assert value['candidates']==[{'paymentCoinId':'0x'+s.coin.name().hex(),'paymentPublicKey':s.public,
-        'amountMojos':'1000','confirmedHeight':10}]
+        'paymentPublicKeyKind':'raw','amountMojos':'1000','confirmedHeight':10}]
     assert value['receivingVaultLauncherId']!='0x'+s.coin.name().hex()
     assert s.state.reads==1
 
@@ -72,3 +72,15 @@ async def test_expired_quote_and_wrong_network_never_query_coins(setup):
     s.state.now=100;s.state.network='mainnet'
     with pytest.raises(ValueError,match='NETWORK_CHANGED'):await s.call()
     assert s.state.reads==0
+
+@pytest.mark.asyncio
+async def test_sage_synthetic_key_finds_same_coin_without_double_derivation(setup):
+    from chia_rs import G1Element
+    raw=G1Element.from_bytes(bytes.fromhex(setup.public[2:]))
+    synthetic=calculate_synthetic_public_key(raw,DEFAULT_HIDDEN_PUZZLE_HASH)
+    value=await setup.service.payer_coins('0x'+'02'*32,['0x'+bytes(synthetic).hex()],
+        browser_hash='synthetic',public_key_kind='synthetic')
+    assert value['candidates'][0]['paymentCoinId']=='0x'+setup.coin.name().hex()
+    assert value['candidates'][0]['paymentPublicKeyKind']=='synthetic'
+    with pytest.raises(ValueError,match='KIND_INVALID'):
+        await setup.service.payer_coins('0x'+'02'*32,[setup.public],browser_hash='synthetic',public_key_kind='invalid')
