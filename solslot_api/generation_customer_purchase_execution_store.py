@@ -97,7 +97,15 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
         rows=db.execute('''SELECT r.canonical_claim FROM current_customer_purchase_reviews r
             WHERE r.intent_id!=? AND (EXISTS(SELECT 1 FROM current_purchase_executions e
                 WHERE e.intent_id=r.intent_id AND e.phase='RESERVATION') OR
-                EXISTS(SELECT 1 FROM current_customer_reservation_requests q WHERE q.intent_id=r.intent_id))''',(identity,)).fetchall()
+                EXISTS(SELECT 1 FROM current_customer_reservation_requests q WHERE q.intent_id=r.intent_id))
+            AND NOT EXISTS(SELECT 1 FROM current_purchase_executions released
+                WHERE released.intent_id=r.intent_id AND released.phase='RELEASE'
+                  AND released.stage='CONFIRMED' AND released.confirmed_height>0
+                  AND released.transaction_id IS NOT NULL
+                  AND NOT EXISTS(SELECT 1 FROM current_customer_purchase_delivery paid
+                      WHERE paid.intent_id=r.intent_id)
+                  AND NOT EXISTS(SELECT 1 FROM current_purchase_executions delivery
+                      WHERE delivery.intent_id=r.intent_id AND delivery.phase='DELIVERY'))''',(identity,)).fetchall()
         claims=[reservation_from_json(r[0])for r in rows]
         used=sum(quantity(c)for c in claims if c.issuer_policy_hash==reservation.issuer_policy_hash)
         if used+quantity(reservation)>maximum:raise ValueError('CURRENT_EXECUTION_POLICY_CAPACITY_EXHAUSTED')
