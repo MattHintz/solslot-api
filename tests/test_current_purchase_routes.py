@@ -27,9 +27,9 @@ def checkout(monkeypatch):
         generation_customer_purchase_enabled=True,generation_customer_public_origin='https://solslot.com',
         vault_session_jwt_secret='synthetic-jwt-only-for-local-tests-'+'x'*32)
     service=object.__new__(CurrentNativePurchaseExecution)
-    service.settings=settings;service.store=SimpleNamespace(generation_id=GEN)
+    service.settings=settings;service.store=SimpleNamespace(generation_id=GEN,review_for_request=lambda *a,**k:None)
     service.policy=SimpleNamespace(buyer_vault=bytes32.from_hexstr(VAULT))
-    events=[];current=SimpleNamespace(owner_key='0x'+'05'*20,auth_type='evm',session_id='first')
+    events=[];current=SimpleNamespace(owner_key='0x'+'05'*48,auth_type='chia_bls',session_id='first')
     def owner(*args):
         if current.session_id=='expired':raise HTTPException(401,detail='synthetic sensitive provider detail')
         return current
@@ -66,6 +66,58 @@ def checkout(monkeypatch):
 
 def url(suffix=''):
     return '/customer/purchases/'+VAULT+'/'+INTENT+suffix
+
+
+@pytest.mark.parametrize('suffix,body',[
+    ('/quotes',{'requestKey':'one','deedLauncherIds':[DEED,'0x'+'08'*32]}),
+    ('/'+INTENT+'/reservation',{}),
+    ('/'+INTENT+'/payment-review',{'paymentCoinId':DEED,'paymentPublicKey':'0x'+'01'*48}),
+    ('/'+INTENT+'/payer-coins',{'publicKeys':['0x'+'01'*48],'paymentPublicKeyKind':'synthetic'}),
+    ('/'+INTENT+'/payer-authorization',{'buyerOffer':'offer1synthetic'}),
+    ('/'+INTENT+'/issuer-review',{'buyerOffer':'offer1synthetic'}),
+    ('/'+INTENT+'/delivery',{'buyerOffer':'offer1synthetic','issuerSignature':'0x'+'00'*96}),
+])
+def test_evm_vault_cannot_begin_or_authorize_native_payment(checkout,suffix,body):
+    c=checkout;c.owner.auth_type='evm';c.owner.owner_key='0x'+'05'*20
+    response=c.client.post('/customer/purchases/'+VAULT+suffix,
+        json={'generationId':GEN,**body},headers=ORIGIN)
+    assert response.status_code==403 and c.events==[]
+    assert response.json()['detail']['code']=='CURRENT_CHECKOUT_PAYMENT_WALLET_NOT_ALLOWED'
+    assert 'Chia-wallet vault' in response.json()['detail']['message']
+    assert 'Reconnect' not in response.text and response.headers['cache-control']=='no-store'
+
+
+def test_evm_vault_retains_status_and_inventory_reads_without_mutation(checkout):
+    c=checkout;c.owner.auth_type='evm'
+    assert c.client.get(url()).status_code==200
+    assert c.client.get('/customer/purchases/'+VAULT+'/inventory').status_code==200
+    assert [event[0]for event in c.events]==['read','inventory']
+
+
+@pytest.mark.parametrize('quantity',[1,2,3])
+def test_evm_interrupted_quote_recovers_only_the_exact_saved_selection(checkout,quantity):
+    c=checkout;c.owner.auth_type='evm'
+    deeds=['0x'+f'{i:02x}'*32 for i in range(10,10+quantity)]
+    c.service.store.review_for_request=lambda key,**k:{'intentId':INTENT}if key=='saved'else None
+    c.service.review=lambda identity,**k:{'intentId':identity,'deedLauncherIds':deeds}
+    target='/customer/purchases/'+VAULT+'/quotes'
+    body={'generationId':GEN,'requestKey':'saved','deedLauncherIds':list(reversed(deeds))}
+    assert c.client.post(target,json=body,headers=ORIGIN).json()['intentId']==INTENT
+    assert c.client.post(target,json={**body,'requestKey':'new'},headers=ORIGIN).status_code==403
+    assert c.client.post(target,json={**body,'deedLauncherIds':[DEED]},headers=ORIGIN).status_code==403
+    assert c.events==[] # No new quote, signatures, reservation or dispatch.
+
+
+@pytest.mark.parametrize('claim_type',[routes.CurrentDeliveryClaim,routes.CurrentDeliveryBatch])
+def test_existing_evm_authorized_delivery_can_continue_only_its_exact_offer(checkout,monkeypatch,claim_type):
+    c=checkout
+    monkeypatch.setattr(routes,'context',lambda *a:(c.service,'original-owner-binding','evm'))
+    claim=claim_type.model_construct(buyer_offer='offer1previouslysigned')
+    c.service._saved=lambda identity,binding:{'deliveryClaim':claim}
+    assert routes.delivery_context(None,None,VAULT,INTENT,claim.buyer_offer)==(c.service,'original-owner-binding')
+    with pytest.raises(HTTPException)as denied:
+        routes.delivery_context(None,None,VAULT,INTENT,'offer1replacement')
+    assert denied.value.status_code==403 and c.events==[]
 
 
 @pytest.mark.parametrize('quantity',[2,3])
@@ -160,7 +212,7 @@ def test_explicit_public_key_discovery_stays_separate_from_receiver_and_dispatch
     c=checkout;keys=['0x'+'01'*48]
     response=c.client.post(url('/payer-coins'),json={'generationId':GEN,'publicKeys':keys},headers=ORIGIN)
     assert response.status_code==200 and c.events==[('payer-coins',INTENT,keys,'raw')]
-    assert c.owner.auth_type=='evm'
+    assert c.owner.auth_type=='chia_bls'
     c.events.clear()
     assert c.client.post(url('/payer-coins'),json={'generationId':GEN,'publicKeys':keys,'paymentPublicKeyKind':'synthetic'},headers=ORIGIN).status_code==200
     assert c.events==[('payer-coins',INTENT,keys,'synthetic')]
@@ -172,7 +224,7 @@ def test_reconnect_preserves_binding_and_owner_change_replaces_it(checkout):
     c=checkout;c.client.get(url());first=c.events[-1][-1]
     c.owner.session_id='new-session';c.client.get(url())
     assert c.events[-1][-1]==first
-    c.owner.owner_key='0x'+'06'*20;c.client.get(url())
+    c.owner.owner_key='0x'+'06'*48;c.client.get(url())
     assert c.events[-1][-1]!=first
 
 
