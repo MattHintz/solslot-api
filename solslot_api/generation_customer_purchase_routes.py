@@ -1,6 +1,7 @@
 """Current native checkout HTTP adapter; installation remains separately gated.
 
-Receiving-vault authentication is separate from the payer's Chia wallet.
+Only Chia-owned vaults may begin Chia payment. Base and card eligibility is
+separate from those rails' installed capabilities. Existing work remains readable.
 GET observes saved work only. Every financial action requires an explicit
 same-origin POST and the installed finite execution policy. Its runtime is
 absent by default and its source remains unpublished until release review.
@@ -23,6 +24,7 @@ from .generation_customer_purchase_execution import CurrentNativePurchaseExecuti
 from .generation_customer_purchase_wallet import CurrentNativePaymentRequest
 from .generation_customer_purchase_delivery import CurrentDeliveryClaim
 from .generation_customer_purchase_batch import CurrentReservationBatch,CurrentDeliveryBatch,CurrentBatchPaymentRequest
+from .current_payment_wallet_policy import permits_payment_rail,CHIA_PAYMENT_VAULT_MESSAGE
 
 router=APIRouter(prefix='/customer/purchases',tags=['current-customer-purchases'])
 Configured=Annotated[Settings,Depends(get_settings)]
@@ -80,6 +82,29 @@ def context(request,settings,launcher):
     document=canonical(['current-purchase-owner-v1',settings.deployment_generation_id,
         launcher,verified.auth_type,verified.owner_key.lower()])
     binding=hmac.new(secret.encode(),document.encode(),hashlib.sha256).hexdigest()
+    return service,binding,verified.auth_type
+
+
+def wallet_denied():
+    return HTTPException(403,detail={'code':'CURRENT_CHECKOUT_PAYMENT_WALLET_NOT_ALLOWED',
+        'message':CHIA_PAYMENT_VAULT_MESSAGE},headers={'Cache-Control':'no-store'})
+
+
+def native_context(request,settings,launcher):
+    service,binding,auth_type=context(request,settings,launcher)
+    if not permits_payment_rail(auth_type,'CHIA_XCH'):
+        raise wallet_denied()
+    return service,binding
+
+
+def delivery_context(request,settings,launcher,identity,buyer_offer):
+    service,binding,auth_type=context(request,settings,launcher)
+    if not permits_payment_rail(auth_type,'CHIA_XCH'):
+        # Do not strand payment authorized before the rule changed. Only the
+        # exact durably accepted claim may continue; a new offer is rejected.
+        claim=service._saved(identity,binding).get('deliveryClaim')
+        if not isinstance(claim,(CurrentDeliveryClaim,CurrentDeliveryBatch)) or claim.buyer_offer!=buyer_offer:
+            raise wallet_denied()
     return service,binding
 
 
@@ -94,6 +119,8 @@ def failure(exc):
     status=exc.status_code if isinstance(exc,HTTPException) else 409
     detail=exc.detail if isinstance(exc,HTTPException) else None
     code=detail.get('code') if isinstance(detail,dict) else str(exc)
+    if code=='CURRENT_CHECKOUT_PAYMENT_WALLET_NOT_ALLOWED':
+        return wallet_denied()
     if status in (401,403):
         return HTTPException(status,detail={'code':'CURRENT_CHECKOUT_OWNER_SESSION_REQUIRED',
             'message':'Reconnect the owner wallet for this vault to resume your saved checkout.'},
@@ -111,7 +138,7 @@ def failure(exc):
 
 
 def unchanged(request,settings,launcher,service,binding):
-    fresh,current=context(request,settings,launcher)
+    fresh,current,_=context(request,settings,launcher)
     if fresh is not service or not hmac.compare_digest(current,binding):
         raise HTTPException(409,detail={'code':'CURRENT_CHECKOUT_OWNER_CHANGED',
             'message':'Your wallet changed. Reconnect the receiving vault before continuing.'})
@@ -121,7 +148,16 @@ def unchanged(request,settings,launcher,service,binding):
 async def quote(launcher:Identity,body:QuoteBody,request:Request,response:Response,settings:Configured):
     mutation(request,settings,body);response.headers['Cache-Control']='no-store'
     try:
-        service,binding=context(request,settings,launcher)
+        service,binding,auth_type=context(request,settings,launcher)
+        if not permits_payment_rail(auth_type,'CHIA_XCH'):
+            prior=service.store.review_for_request(body.request_key,browser_hash=binding)
+            if prior is None:raise wallet_denied()
+            result=service.review(prior['intentId'],browser_hash=binding)
+            selected=body.deed_launcher_ids if body.deed_launcher_ids is not None else [body.deed_launcher_id]
+            retained=result.get('deedLauncherIds') or [result.get('deedLauncherId')]
+            if sorted(selected)!=sorted(retained):raise wallet_denied()
+            unchanged(request,settings,launcher,service,binding)
+            return result
         result=await service.quote(body.request_key,body.deed_launcher_ids if body.deed_launcher_ids is not None else body.deed_launcher_id,browser_hash=binding)
         unchanged(request,settings,launcher,service,binding)
         return result
@@ -132,7 +168,7 @@ async def quote(launcher:Identity,body:QuoteBody,request:Request,response:Respon
 async def inventory(launcher:Identity,request:Request,response:Response,settings:Configured):
     response.headers['Cache-Control']='no-store'
     try:
-        service,binding=context(request,settings,launcher)
+        service,binding,_=context(request,settings,launcher)
         result=await service.inventory()
         unchanged(request,settings,launcher,service,binding)
         return result
@@ -144,7 +180,7 @@ async def payer_coins(launcher:Identity,identity:Identity,body:PayerKeysBody,
         request:Request,response:Response,settings:Configured):
     mutation(request,settings,body);response.headers['Cache-Control']='no-store'
     try:
-        service,binding=context(request,settings,launcher)
+        service,binding=native_context(request,settings,launcher)
         result=await service.payer_coins(identity,body.public_keys,public_key_kind=body.payment_public_key_kind,browser_hash=binding)
         unchanged(request,settings,launcher,service,binding)
         return result
@@ -155,7 +191,7 @@ async def payer_coins(launcher:Identity,identity:Identity,body:PayerKeysBody,
 async def status(launcher:Identity,identity:Identity,request:Request,response:Response,settings:Configured):
     response.headers['Cache-Control']='no-store'
     try:
-        service,binding=context(request,settings,launcher)
+        service,binding,_=context(request,settings,launcher)
         result=service.review(identity,browser_hash=binding)
         for phase in ('RESERVATION','DELIVERY','RELEASE'):
             current=service._existing(identity,phase,binding)
@@ -178,7 +214,7 @@ async def reserve(launcher:Identity,identity:Identity,body:CurrentGeneration,
         request:Request,response:Response,settings:Configured):
     mutation(request,settings,body);response.headers['Cache-Control']='no-store'
     try:
-        service,binding=context(request,settings,launcher)
+        service,binding=native_context(request,settings,launcher)
         service._funding_context()
         result=service.request_reservation(identity,browser_hash=binding)
         unchanged(request,settings,launcher,service,binding)
@@ -191,7 +227,7 @@ async def payment(launcher:Identity,identity:Identity,body:PaymentBody,
         request:Request,response:Response,settings:Configured):
     mutation(request,settings,body);response.headers['Cache-Control']='no-store'
     try:
-        service,binding=context(request,settings,launcher)
+        service,binding=native_context(request,settings,launcher)
         saved=service._saved(identity,binding)
         if isinstance(saved['reservationClaim'],CurrentReservationBatch):
             operation=CurrentBatchPaymentRequest(reservation=saved['reservationClaim'],
@@ -220,7 +256,7 @@ async def accept_payer(launcher:Identity,identity:Identity,body:PayerBody,
         request:Request,response:Response,settings:Configured):
     mutation(request,settings,body);response.headers['Cache-Control']='no-store'
     try:
-        service,binding=context(request,settings,launcher)
+        service,binding=native_context(request,settings,launcher)
         claim=payer_claim(service,binding,identity,body)
         result=await service.accept_payer(identity,claim,browser_hash=binding)
         unchanged(request,settings,launcher,service,binding)
@@ -233,7 +269,7 @@ async def issuer_review(launcher:Identity,identity:Identity,body:PayerBody,
         request:Request,response:Response,settings:Configured):
     mutation(request,settings,body);response.headers['Cache-Control']='no-store'
     try:
-        service,binding=context(request,settings,launcher)
+        service,binding=delivery_context(request,settings,launcher,identity,body.buyer_offer)
         claim=payer_claim(service,binding,identity,body)
         _,signed,companion,pair=await service.delivery_issuer_review(identity,claim,browser_hash=binding)
         unchanged(request,settings,launcher,service,binding)
@@ -253,7 +289,7 @@ async def deliver(launcher:Identity,identity:Identity,body:DeliveryBody,
         request:Request,response:Response,settings:Configured):
     mutation(request,settings,body);response.headers['Cache-Control']='no-store'
     try:
-        service,binding=context(request,settings,launcher)
+        service,binding=delivery_context(request,settings,launcher,identity,body.buyer_offer)
         service._funding_context()
         claim=payer_claim(service,binding,identity,body)
         signature=G2Element.from_bytes(bytes.fromhex(body.issuer_signature[2:]))
