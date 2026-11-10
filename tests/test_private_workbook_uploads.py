@@ -40,7 +40,8 @@ def settings(root):
 
 @pytest.mark.parametrize('payload', [b'PK\x03\x04not-a-workbook', workbook(macro=True),
     workbook(extra=('../escape', b'x')), workbook(extra=('xl/vbaProject.bin', b'bad')),
-    workbook(extra=('xl/large.xml', b'x'*(8*1024*1024+1)))])
+    workbook(extra=('xl/large.xml', b'x'*(8*1024*1024+1)))],
+    ids=['invalid-zip', 'macro-workbook', 'path-traversal', 'macro-part', 'oversized-expansion'])
 def test_private_workbook_rejects_other_archives_macros_and_expansion(payload):
     assert not is_private_workbook(payload)
 

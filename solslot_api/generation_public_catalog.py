@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from .config import Settings, get_settings
 from .collection_store import CollectionStoreError
 from .collection_endpoints import get_collection_store
+from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy
 
 router = APIRouter(prefix='/public/generation', tags=['public-generation-catalog'])
 
@@ -64,6 +65,45 @@ def _bound_context(request: Request, settings: Settings):
     return reviews, journal, index, generation
 
 
+async def _collection_sale(service, pricing, fixed):
+    inventory = await service.inventory_snapshot()
+    execution = await service.collection_readiness(inventory)
+    count = sum(item.available for item in inventory.items)
+    status = 'UNAVAILABLE'
+    code = 'PRIMARY_OFFERING_STATUS_UNAVAILABLE'
+    reason = 'Purchase availability could not be checked for this edition.'
+    if execution['status'] == 'PAUSED' or count == 0:
+        status = 'NOT_OPEN'
+        code = 'CURRENT_PRIMARY_SALE_NOT_OPEN'
+        reason = 'Purchases are currently unavailable for this edition.'
+    elif execution['status'] == 'READY':
+        if fixed:
+            from .generation_customer_test_conversion import status as conversion_status
+            price = conversion_status(service.policy, now=int(service.clock()))
+        else:
+            price = await pricing.status()
+        if price['price']['canQuote'] or price['price']['canRefresh']:
+            status = 'OPEN'
+            code = 'CURRENT_PRIMARY_SALE_OPEN'
+            reason = 'Available on Chia Testnet11 with a verified Chia vault.'
+    checked = int(time.time())
+    return {
+        'checkedAt': checked,
+        'generationId': service.store.generation_id,
+        'editionHash': '0x' + inventory.edition.hex(),
+        'metadataRoot': '0x' + inventory.metadata_root.hex(),
+        'sale': {
+            'schema': 'solslot.current-primary-sale.v2',
+            'status': status,
+            'availableDeeds': count,
+            'code': code,
+            'reason': reason,
+            'paymentRails': ['CHIA_XCH'] if status == 'OPEN' else [],
+            'checkedAt': checked,
+        },
+    }
+
+
 async def _catalog_settings(request: Request, settings: Settings = Depends(get_settings)):
     # Reject an unbound feed before opening a store or resolving native state.
     _bound_context(request, settings)
@@ -83,6 +123,12 @@ async def _catalog_settings(request: Request, settings: Settings = Depends(get_s
             async with asyncio.timeout(25):
                 async with lock:
                     now=int(time.time());cached=getattr(request.app.state,'current_sale_projection',None)
+                    if isinstance(getattr(service, 'policy', None), TestnetCollectionIssuerPolicy):
+                        if cached is None or not 0 <= now - cached['checkedAt'] < 5:
+                            cached = await _collection_sale(service, pricing, fixed)
+                            request.app.state.current_sale_projection = cached
+                        request.state.current_sale = cached
+                        return settings
                     if cached is None or cached['checkedAt']+30<=now:
                         service._funding_context()
                         inventory=await service.inventory()

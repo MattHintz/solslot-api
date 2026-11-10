@@ -14,6 +14,7 @@ import time
 from chia_rs import AugSchemeMPL, G2Element
 from solslot_puzzles.payment_artifacts_v3 import purchase_artifact_v3_from_json
 from .generation_customer_purchase_execution import CurrentNativePurchaseExecution, h
+from .generation_customer_purchase_scope import policy_live_at, quote_deadline
 from .generation_customer_purchase_expiry_proof import valid_expiry_proof as _valid_expiry_proof
 from .generation_operations import canonical
 from .generation_customer_purchase_batch import artifacts,CurrentReservationBatch
@@ -139,6 +140,9 @@ class CurrentPurchaseWorker:
                 or value.get('generationId')!=self.store.generation_id
                 or type(value.get('checkedAt'))is not int or type(value.get('cycles'))is not int):
             raise ValueError('CURRENT_PURCHASE_WORKER_HEALTH_CHANGED')
+        cutover = getattr(self.service, 'cutover', None)
+        if cutover is not None and value.get('cutoverHash') != self.service.settings.generation_customer_purchase_cutover_hash:
+            return {**value, 'status': 'STALE'}
         if int(self.clock())-value['checkedAt']>self.batch_size*self.LEASE_SECONDS_PER_ACTION+2*self.interval:
             return {**value,'status':'STALE'}
         return value
@@ -152,12 +156,18 @@ class CurrentPurchaseWorker:
                 LEFT JOIN current_customer_reservation_requests q ON q.intent_id=r.intent_id
                 LEFT JOIN current_customer_purchase_delivery d ON d.intent_id=r.intent_id
                 LEFT JOIN current_purchase_executions f ON f.intent_id=r.intent_id AND f.phase='DELIVERY'
+                LEFT JOIN current_purchase_worker_jobs j ON j.intent_id=r.intent_id
                 WHERE r.generation_id=?
                 AND (e.intent_id IS NOT NULL OR q.intent_id IS NOT NULL)
-                AND (f.stage IS NULL OR f.stage!='CONFIRMED') ORDER BY r.created_at,r.intent_id LIMIT 129''',
-                (self.store.generation_id,)).fetchall()
-            if len(rows)>128:raise ValueError('CURRENT_PURCHASE_WORKER_CAPACITY_EXCEEDED')
+                AND (f.stage IS NULL OR f.stage!='CONFIRMED')
+                AND (j.intent_id IS NULL OR
+                    (j.state NOT IN ('COMPLETE','RELEASED','REVIEW_REQUIRED') AND j.lease_until<=?
+                     AND j.next_attempt<=? AND (j.state!='CLOSED' OR
+                        (j.expiry_document IS NULL AND e.stage='PREPARED'))))
+                ORDER BY r.created_at,r.intent_id''', (self.store.generation_id, now, now))
             for row in rows:
+                if row['intent_id'] in getattr(self.service, 'retired_orders', {}):
+                    continue
                 self.store._row(db,row['intent_id'],row['browser_hash'])
                 db.execute('INSERT OR IGNORE INTO current_purchase_worker_jobs(intent_id) VALUES(?)',(row['intent_id'],))
                 job=db.execute('SELECT * FROM current_purchase_worker_jobs WHERE intent_id=?',(row['intent_id'],)).fetchone()
@@ -262,7 +272,7 @@ class CurrentPurchaseWorker:
             if int(self.clock())<artifact.quote_expires_at:return 'REVIEW_REQUIRED'
             return 'CLOSED' if await self._prove_unsubmitted_expiry(identity,binding,token) else 'REVIEW_REQUIRED'
         if s._existing(identity,'RESERVATION',binding)is None:
-            if int(self.clock())>=min(artifact.quote_expires_at,s.policy.expires_at):return 'CLOSED'
+            if int(self.clock())>=quote_deadline(s.policy, artifact.quote_expires_at):return 'CLOSED'
             s._funding_context()
             self._action_stage='RESERVATION_PREPARATION'
             await s.prepare_reservation(identity,browser_hash=binding)
@@ -274,7 +284,7 @@ class CurrentPurchaseWorker:
         self._action_stage='RESERVATION_RECONCILIATION'
         status=await s.reconcile(identity,'RESERVATION',browser_hash=binding)
         if status['stage']!='CONFIRMED':
-            if int(self.clock())>=min(artifact.quote_expires_at,s.policy.expires_at):
+            if int(self.clock())>=quote_deadline(s.policy, artifact.quote_expires_at):
                 return 'CLOSED' if await self._prove_unsubmitted_expiry(identity,binding,token) else 'REVIEW_REQUIRED'
             if status['stage']!='MEMPOOL':
                 self._action_stage='RESERVATION_DISPATCH'
@@ -286,7 +296,7 @@ class CurrentPurchaseWorker:
             self._action_stage='DELIVERY_RECONCILIATION'
             current=await s.reconcile(identity,'DELIVERY',browser_hash=binding)
             if current['stage']=='CONFIRMED':return 'COMPLETE'
-        if int(self.clock())>=s.policy.expires_at:return 'REVIEW_REQUIRED'
+        if not policy_live_at(s.policy, int(self.clock())):return 'REVIEW_REQUIRED'
         if int(self.clock())>=artifact.quote_expires_at:
             release=s._existing(identity,'RELEASE',binding)
             if release is not None:
@@ -374,6 +384,8 @@ class CurrentPurchaseWorker:
                 'checkedAt':int(self.clock()),'cycles':(old['cycles']if old else 0)+1,
                 'examined':len(rows),'completed':complete,'errors':errors,'nextCheckAt':int(self.clock())+self.interval,
                 'reviewRequiredCount':review_required,'status':'DEGRADED'if errors or review_required else'HEALTHY'}
+            if getattr(self.service, 'cutover', None) is not None:
+                value['cutoverHash'] = self.service.settings.generation_customer_purchase_cutover_hash
             if timing_sample is not None:value['lastWorkerTiming']=timing_sample
             with self.store._connect() as db:
                 db.execute('INSERT INTO current_purchase_worker_health VALUES(?,?) ON CONFLICT(generation_id) DO UPDATE SET document=excluded.document',

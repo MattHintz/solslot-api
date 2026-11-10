@@ -90,7 +90,7 @@ async def sign_current_issuer(request,*,settings,anchor,provider,journal,load_ke
     await unspent(provider,evidence.reservation_transition.reserved_coin)
     await unspent(provider,evidence.vault.coin)
     def fixed_sign(message):
-        if message!=bytes(expected[0][1]) or int(clock())>=min(artifact.quote_expires_at,journal.policy.expires_at):
+        if message!=bytes(expected[0][1]) or int(clock())>=min(artifact.quote_expires_at,getattr(journal.policy,'expires_at',artifact.quote_expires_at)):
             raise ValueError('CURRENT_ISSUER_MESSAGE_OR_DEADLINE_CHANGED')
         private=load_key()
         if bytes(private.get_g1())!=journal.policy.issuer_public_key:

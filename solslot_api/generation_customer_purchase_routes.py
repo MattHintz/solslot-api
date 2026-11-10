@@ -3,7 +3,7 @@
 Only Chia-owned vaults may begin Chia payment. Base and card eligibility is
 separate from those rails' installed capabilities. Existing work remains readable.
 GET observes saved work only. Every financial action requires an explicit
-same-origin POST and the installed finite execution policy. Its runtime is
+same-origin POST and the installed execution authority. Its runtime is
 absent by default and its source remains unpublished until release review.
 """
 import hashlib
@@ -21,6 +21,8 @@ from .generation_operations import canonical
 from .generation_customer_identity_routes import owner
 from .generation_customer_routes import CurrentGeneration, Identity, _origin
 from .generation_customer_purchase_execution import CurrentNativePurchaseExecution, h
+from .generation_customer_issuer import TestnetIssuerPolicy
+from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy
 from .generation_customer_purchase_wallet import CurrentNativePaymentRequest
 from .generation_customer_purchase_delivery import CurrentDeliveryClaim
 from .generation_customer_purchase_batch import CurrentReservationBatch,CurrentDeliveryBatch,CurrentBatchPaymentRequest
@@ -71,7 +73,8 @@ def context(request,settings,launcher):
             or settings.network!='testnet11'
             or service.settings is not settings
             or service.store.generation_id!=settings.deployment_generation_id
-            or service.policy.buyer_vault!=bytes32.from_hexstr(launcher)):
+            or (not isinstance(service.policy,TestnetCollectionIssuerPolicy)
+                and service.policy.buyer_vault!=bytes32.from_hexstr(launcher))):
         raise HTTPException(503,detail={'code':'CURRENT_CHECKOUT_NOT_OPEN',
             'message':'Test purchases are not open for this vault yet.'})
     secret=settings.vault_session_jwt_secret
@@ -133,6 +136,7 @@ def failure(exc):
         'CURRENT_EXECUTION_DISPATCH_WINDOW_CLOSED':'This payment window ended. Your saved work is preserved; check its status before starting another checkout.',
         'CURRENT_EXECUTION_RESERVATION_NOT_CONFIRMED':'Your deed reservation is waiting for confirmation. No payment approval is needed yet.',
         'CURRENT_PRIMARY_DEED_NOT_AVAILABLE':'This deed is no longer available. Check its saved purchase status before choosing another.',
+        'CURRENT_EXECUTION_OPERATIONAL_PAUSED':'Checkout is temporarily paused. Check the status of any saved purchase.',
     }.get(code,'Your saved checkout is preserved. Check its progress before trying again.')
     return HTTPException(status,detail={'code':code,'message':message},headers={'Cache-Control':'no-store'})
 
@@ -158,7 +162,13 @@ async def quote(launcher:Identity,body:QuoteBody,request:Request,response:Respon
             if sorted(selected)!=sorted(retained):raise wallet_denied()
             unchanged(request,settings,launcher,service,binding)
             return result
-        result=await service.quote(body.request_key,body.deed_launcher_ids if body.deed_launcher_ids is not None else body.deed_launcher_id,browser_hash=binding)
+        selected=body.deed_launcher_ids if body.deed_launcher_ids is not None else body.deed_launcher_id
+        if isinstance(service.policy,TestnetCollectionIssuerPolicy):
+            verified = owner(request, settings, launcher)
+            result = await service.quote(body.request_key, selected, browser_hash=binding,
+                receiving_launcher=bytes32.from_hexstr(launcher), receiving_owner=verified.owner_key)
+        else:
+            result=await service.quote(body.request_key,selected,browser_hash=binding)
         unchanged(request,settings,launcher,service,binding)
         return result
     except Exception as exc:raise failure(exc) from exc
@@ -169,7 +179,10 @@ async def inventory(launcher:Identity,request:Request,response:Response,settings
     response.headers['Cache-Control']='no-store'
     try:
         service,binding,_=context(request,settings,launcher)
-        result=await service.inventory()
+        if isinstance(service.policy,TestnetCollectionIssuerPolicy):
+            result=await service.inventory(receiving_launcher=bytes32.from_hexstr(launcher))
+        else:
+            result=await service.inventory()
         unchanged(request,settings,launcher,service,binding)
         return result
     except Exception as exc:raise failure(exc) from exc
@@ -202,7 +215,13 @@ async def status(launcher:Identity,identity:Identity,request:Request,response:Re
         # checkout. The original reservation and journals remain intact.
         if result.get('quoteExpired') and not result.get('payerAuthorizationSaved'):
             from .generation_customer_purchase_worker import expired_unsubmitted_reservation
-            if expired_unsubmitted_reservation(service,identity,binding):
+            collection = isinstance(service.policy, TestnetCollectionIssuerPolicy)
+            retired = (service.retired_outcome(identity, service._review_saved(identity, binding)['reservationClaim'])
+                       if collection else None)
+            closed_before_preparation = (collection and retired is None and result.get('reservationRequested')
+                and 'reservation' not in result and service.store.closed_without_preparation(identity, browser_hash=binding))
+            if retired == 'UNSUBMITTED_EXPIRED' or (
+                    retired is None and expired_unsubmitted_reservation(service,identity,binding)) or closed_before_preparation:
                 result['reservationUnsubmittedExpired']=True
             unchanged(request,settings,launcher,service,binding)
         return result

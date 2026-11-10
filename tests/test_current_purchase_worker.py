@@ -354,7 +354,7 @@ async def test_worker_health_instrumentation_failure_does_not_change_work(recove
 @pytest.mark.asyncio
 async def test_confirmed_unpaid_reservation_is_selected_for_automatic_timeout(recover):
  r=recover;r.retain();await r.service.reconcile(r.identity,'RESERVATION',browser_hash=BROWSER)
- r.clock[0]=210;r.service.policy=SimpleNamespace(expires_at=400,commitment=r.service.policy.commitment)
+ r.clock[0]=210;r.service.policy=SimpleNamespace(issued_at=100,expires_at=400,commitment=r.service.policy.commitment)
  calls=[]
  def funding():calls.append('funding')
  async def release(identity,*,browser_hash):calls.append(('release',identity,browser_hash))
@@ -367,7 +367,7 @@ async def test_confirmed_unpaid_reservation_is_selected_for_automatic_timeout(re
 @pytest.mark.asyncio
 async def test_saved_delivery_is_reconciled_before_timeout_even_after_quote_expiry(recover):
  r=recover;r.retain();await r.service.reconcile(r.identity,'RESERVATION',browser_hash=BROWSER)
- r.clock[0]=210;r.service.policy=SimpleNamespace(expires_at=400,commitment=r.service.policy.commitment)
+ r.clock[0]=210;r.service.policy=SimpleNamespace(issued_at=100,expires_at=400,commitment=r.service.policy.commitment)
  original=r.service._existing
  r.service._existing=lambda identity,phase,binding:({'stage':'RECONCILING'}if phase=='DELIVERY'else original(identity,phase,binding))
  calls=[]

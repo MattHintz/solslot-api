@@ -29,10 +29,19 @@ class PrivateCurrentIssuerClient:
             async with _private_validator_client(self.settings)as client:
                 response=await client.get('https://10.77.0.12:9544/v1/generation/purchase/issuer/status',timeout=6)
                 response.raise_for_status();value=response.json()
-        if (not isinstance(value,dict) or value.get('generationId')!='0x'+policy.generation.hex()
+        from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy
+        common={'generationId','policyHash','checkedAt','canSign'}
+        collection=isinstance(policy,TestnetCollectionIssuerPolicy)
+        expected=common|({'cutoverHash'} if collection else {'expiresAt','remainingPurchases'})
+        if (not isinstance(value,dict) or set(value)!=expected
+                or value.get('generationId')!='0x'+policy.generation.hex()
                 or value.get('policyHash')!=policy.commitment or type(value.get('checkedAt'))is not int
-                or abs(now-value['checkedAt'])>10 or value.get('expiresAt')!=policy.expires_at
-                or type(value.get('remainingPurchases'))is not int or not 0<=value['remainingPurchases']<=policy.maximum_purchases
-                or type(value.get('canSign'))is not bool):
+                or abs(now-value['checkedAt'])>10 or type(value.get('canSign'))is not bool):
+            raise ValueError('CURRENT_ISSUER_PRIVATE_HEALTH_CHANGED')
+        if collection:
+            pin=getattr(self.settings,'generation_customer_purchase_cutover_hash',None)
+            if not pin or value['cutoverHash']!=pin:raise ValueError('CURRENT_ISSUER_PRIVATE_HEALTH_CHANGED')
+        elif (value['expiresAt']!=policy.expires_at or type(value['remainingPurchases'])is not int
+                or not 0<=value['remainingPurchases']<=policy.maximum_purchases):
             raise ValueError('CURRENT_ISSUER_PRIVATE_HEALTH_CHANGED')
         return value

@@ -4,6 +4,8 @@ import json,os,stat
 from pathlib import Path
 from chia_rs.sized_bytes import bytes32
 from .generation_customer_issuer import TestnetIssuerPolicy
+from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy, read_collection_issuer_policy
+from .generation_customer_purchase_cutover import read_checkout_cutover
 
 
 def validate_purchase_policy_renewal(prior,current,*,now=None):
@@ -19,12 +21,27 @@ def validate_purchase_policy_renewal(prior,current,*,now=None):
     return prior
 
 
+def validate_collection_policy_successor(prior, current):
+    prior.validate()
+    current.validate()
+    preserved = ('generation', 'collection', 'edition', 'metadata_root', 'proceeds_puzzle',
+        'fee_puzzle', 'issuer_public_key', 'maximum_gross_mojos', 'test_usd_minor_per_txch')
+    if (any(getattr(prior, field) != getattr(current, field) for field in preserved)
+            or not prior.deed_launchers.issubset(current.deed_launchers)):
+        raise ValueError('CURRENT_PURCHASE_COLLECTION_SCOPE_CHANGED')
+    return prior
+
+
 def selected_prior_purchase_policy(settings,current,*,now=None):
     path=getattr(settings,'generation_customer_purchase_prior_policy_path','')
     pin=getattr(settings,'generation_customer_purchase_prior_policy_hash','')
-    if not path and not pin:return None
+    if not path and not pin and not isinstance(current, TestnetCollectionIssuerPolicy):
+        return None
     if not path or not pin:raise ValueError('CURRENT_PURCHASE_PRIOR_POLICY_PIN_REQUIRED')
-    return validate_purchase_policy_renewal(read_current_issuer_policy(path,pin),current,now=now)
+    prior = read_current_issuer_policy(path, pin)
+    if isinstance(current, TestnetCollectionIssuerPolicy):
+        return validate_collection_policy_successor(prior, current)
+    return validate_purchase_policy_renewal(prior,current,now=now)
 
 
 def read_current_issuer_policy(path,expected_file_hash):
@@ -68,8 +85,15 @@ def read_current_issuer_policy(path,expected_file_hash):
 def selected_purchase_policy(settings):
     if not settings.generation_customer_purchase_enabled or settings.network!='testnet11':
         raise ValueError('CURRENT_PURCHASE_POLICY_DISABLED')
-    p=read_current_issuer_policy(settings.generation_customer_purchase_policy_path,settings.generation_customer_purchase_policy_hash)
-    if '0x'+p.generation.hex()!=settings.deployment_generation_id:raise ValueError('CURRENT_PURCHASE_POLICY_GENERATION_CHANGED')
-    if getattr(settings,'generation_customer_purchase_prior_policy_path','')or getattr(settings,'generation_customer_purchase_prior_policy_hash',''):
-        selected_prior_purchase_policy(settings,p)
-    return p
+    path = settings.generation_customer_purchase_policy_path
+    pin = settings.generation_customer_purchase_policy_hash
+    if getattr(settings, 'generation_customer_purchase_cutover_hash', ''):
+        policy = read_collection_issuer_policy(path, pin)
+        prior = selected_prior_purchase_policy(settings, policy)
+        read_checkout_cutover(settings, prior, policy)
+    else:
+        policy = read_current_issuer_policy(path, pin)
+        selected_prior_purchase_policy(settings, policy)
+    if '0x'+policy.generation.hex()!=settings.deployment_generation_id:
+        raise ValueError('CURRENT_PURCHASE_POLICY_GENERATION_CHANGED')
+    return policy

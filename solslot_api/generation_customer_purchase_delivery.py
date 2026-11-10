@@ -29,6 +29,7 @@ from .generation_customer_context import customer_bindings_from_evidence
 from .generation_customer_vault import resolve_native_identity_vault
 from .generation_customer_quote import current_customer_xch_quote
 from .generation_customer_issuer import TestnetIssuerPolicy
+from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy
 from .generation_preparation import read_generation_preparation
 from .generation_sols_batch_execution import signed_price,unspent
 from .generation_coin_evidence import read_confirmed_coin
@@ -131,7 +132,7 @@ async def verify_current_delivery(claim,*,settings,anchor,provider,issuer_policy
     bundle=delivery.aggregate_offer.to_valid_spend()
     if not await current_evidence_unchanged(inventory.evidence,provider=provider):raise ValueError('CURRENT_DELIVERY_AUTHORITY_CHANGED')
     await unspent(provider,transition.reserved_coin);await unspent(provider,vault.coin);await unspent(provider,inputs[0])
-    if not now<=int(clock())<min(purchase.quote_expires_at,issuer_policy.expires_at):raise ValueError('CURRENT_DELIVERY_REVIEW_EXPIRED_DURING_READ')
+    if not now<=int(clock())<(min(purchase.quote_expires_at,issuer_policy.expires_at) if isinstance(issuer_policy,TestnetIssuerPolicy) else purchase.quote_expires_at):raise ValueError('CURRENT_DELIVERY_REVIEW_EXPIRED_DURING_READ')
     return CurrentDeliveryEvidence(claim,inventory,historical,vault,transition,delivery,bundle,inputs[0])
 
 
@@ -146,7 +147,7 @@ async def resolve_current_reserved_purchase(r,reserved_coin_id,*,settings,anchor
     r=CurrentReservationClaim.model_validate_json(r.model_dump_json(by_alias=True))
     if h(bytes32.from_hexstr(reserved_coin_id))!=reserved_coin_id:
         raise ValueError('CURRENT_RESERVATION_CANONICAL_COIN_REQUIRED')
-    if (not isinstance(issuer_policy,TestnetIssuerPolicy)or issuer_policy.commitment!=expected_issuer_policy_hash
+    if (not isinstance(issuer_policy,(TestnetIssuerPolicy,TestnetCollectionIssuerPolicy))or issuer_policy.commitment!=expected_issuer_policy_hash
             or r.issuer_policy_hash!=expected_issuer_policy_hash or settings.network!='testnet11'
             or r.generation_id!=settings.deployment_generation_id or r.anchor_hash!=settings.generation_chain_anchor_hash
             or bytes32.from_hexstr(r.generation_id)!=anchor.issuance.generation
@@ -154,9 +155,10 @@ async def resolve_current_reserved_purchase(r,reserved_coin_id,*,settings,anchor
     now=int(clock());purchase=purchase_artifact_v3_from_json(r.purchase_artifact)
     if (purchase_artifact_v3_to_json(purchase)!=r.purchase_artifact or purchase.rail!=PaymentRail.CHIA_XCH
             or purchase.collection_id!=issuer_policy.collection or purchase.metadata_anchor_id!=issuer_policy.edition
-            or purchase.metadata_root!=issuer_policy.metadata_root or purchase.vault_launcher_id!=issuer_policy.buyer_vault
+            or purchase.metadata_root!=issuer_policy.metadata_root
+            or (isinstance(issuer_policy,TestnetIssuerPolicy) and purchase.vault_launcher_id!=issuer_policy.buyer_vault)
             or purchase.deed_launcher_id not in issuer_policy.deed_launchers
-            or not issuer_policy.issued_at<=now<issuer_policy.expires_at):raise ValueError('CURRENT_DELIVERY_FINITE_SCOPE_CHANGED')
+            or (isinstance(issuer_policy,TestnetIssuerPolicy) and not issuer_policy.issued_at<=now<issuer_policy.expires_at)):raise ValueError('CURRENT_DELIVERY_FINITE_SCOPE_CHANGED')
     inventory=(_current[0]if _current is not None else await resolve_current_primary_inventory(settings=settings,anchor=anchor,provider=provider,
         collection=issuer_policy.collection,edition_hash=issuer_policy.edition,metadata_root=issuer_policy.metadata_root))
     matches=[x for x in inventory.items if x.original.terms.deed_launcher_id==purchase.deed_launcher_id]
@@ -186,7 +188,7 @@ async def resolve_current_reserved_purchase(r,reserved_coin_id,*,settings,anchor
     if rebuilt!=purchase:raise ValueError('CURRENT_DELIVERY_REVIEW_CHANGED')
     if not await current_evidence_unchanged(inventory.evidence,provider=provider):raise ValueError('CURRENT_DELIVERY_AUTHORITY_CHANGED')
     await unspent(provider,transition.reserved_coin);await unspent(provider,vault.coin)
-    if not now<=int(clock())<min(purchase.quote_expires_at,issuer_policy.expires_at):raise ValueError('CURRENT_DELIVERY_REVIEW_EXPIRED_DURING_READ')
+    if not now<=int(clock())<(min(purchase.quote_expires_at,issuer_policy.expires_at) if isinstance(issuer_policy,TestnetIssuerPolicy) else purchase.quote_expires_at):raise ValueError('CURRENT_DELIVERY_REVIEW_EXPIRED_DURING_READ')
     return CurrentReservedPurchaseEvidence(r,inventory,historical,vault,transition,purchase,struct)
 
 
@@ -200,7 +202,7 @@ async def sign_current_delivery(claim,claim_hash,*,settings,anchor,provider,ledg
     if (getattr(settings,'generation_customer_purchase_enabled',False)is not True
             or not isinstance(claim,CurrentDeliveryClaim)or claim.digest()!=claim_hash
             or settings.signer_index not in claim.reservation.signer_indices
-            or issuer_policy.maximum_purchases!=len(issuer_policy.deed_launchers)):
+            or (isinstance(issuer_policy,TestnetIssuerPolicy) and issuer_policy.maximum_purchases!=len(issuer_policy.deed_launchers))):
         raise ValueError('CURRENT_DELIVERY_SIGNER_NOT_ENABLED')
     evidence=await verify_current_delivery(claim,settings=settings,anchor=anchor,provider=provider,
         issuer_policy=issuer_policy,expected_issuer_policy_hash=expected_issuer_policy_hash,clock=clock)

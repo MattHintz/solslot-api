@@ -265,13 +265,26 @@ def create_validator_app(
         application.state.current_issuer=None
         if signer_settings.generation_customer_purchase_issuer_enabled:
             import time
+            from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy
             from .generation_customer_issuer import TestnetIssuerJournal
             from .generation_customer_purchase_issuer import load_fixed_issuer_key
             policy=selected_purchase_policy(signer_settings)
-            if policy.issued_at<=int(time.time())<policy.expires_at:
-                if bytes(load_fixed_issuer_key(signer_settings).get_g1())!=policy.issuer_public_key:
-                    raise RuntimeError('CURRENT_ISSUER_FIXED_KEY_CHANGED')
-                application.state.current_issuer=TestnetIssuerJournal.in_validator_journal(active_ledger,policy)
+            collection = isinstance(policy, TestnetCollectionIssuerPolicy)
+            if collection or policy.issued_at <= int(time.time()) < policy.expires_at:
+                try:
+                    key = load_fixed_issuer_key(signer_settings)
+                except FileNotFoundError:
+                    if not collection:
+                        raise
+                    # The existing credential timer can close issuer signing
+                    # independently of the collection and other validator actions.
+                    key = None
+                if key is not None:
+                    if bytes(key.get_g1()) != policy.issuer_public_key:
+                        raise RuntimeError('CURRENT_ISSUER_FIXED_KEY_CHANGED')
+                    del key
+                    application.state.current_issuer = TestnetIssuerJournal.in_validator_journal(
+                        active_ledger, policy, cutover_hash=signer_settings.generation_customer_purchase_cutover_hash)
         try:
             yield
         finally:
@@ -363,14 +376,27 @@ def create_validator_app(
     async def current_issuer_status():
         import time
         journal=getattr(application.state,'current_issuer',None)
-        if not current_settings().generation_customer_purchase_issuer_enabled or current_settings().signer_index!=2 or journal is None:
+        settings = current_settings()
+        if not settings.generation_customer_purchase_issuer_enabled or settings.signer_index!=2 or journal is None:
             raise HTTPException(404,detail='CURRENT_ISSUER_ACTION_DISABLED')
         with application.state.validator_ledger._lock:
-            used=journal.db.execute('SELECT count(*) FROM issuer_forwarding').fetchone()[0]
-        now=int(time.time());p=journal.policy
-        return {'generationId':'0x'+p.generation.hex(),'policyHash':p.commitment,'checkedAt':now,
-            'expiresAt':p.expires_at,'remainingPurchases':max(0,p.maximum_purchases-used),
-            'canSign':p.issued_at<=now<p.expires_at and used<p.maximum_purchases}
+            try:
+                journal._require_binding()
+                bound = True
+            except ValueError:
+                bound = False
+            p = journal.policy
+            finite = hasattr(p, 'expires_at')
+            if finite:
+                used = journal.db.execute('SELECT count(*) FROM issuer_forwarding').fetchone()[0]
+        now = int(time.time())
+        available = (p.issued_at <= now < p.expires_at and used < p.maximum_purchases if finite
+                     else Path(settings.generation_customer_purchase_issuer_key_path).is_file())
+        value={'generationId':'0x'+p.generation.hex(),'policyHash':p.commitment,'checkedAt':now,
+            'canSign':bound and available}
+        if finite:value.update(expiresAt=p.expires_at,remainingPurchases=max(0,p.maximum_purchases-used))
+        else:value['cutoverHash']=journal.cutover_hash
+        return value
 
     @application.post('/v1/generation/identity/sign', response_model=ValidatorSignatureResponse)
     async def sign_generation_identity(body: CurrentIdentitySignRequest):
@@ -475,7 +501,7 @@ def create_validator_app(
             currentIdentityConfigured=current_profile is not None,
             currentPurchaseConfigured=purchase_policy is not None,
             currentPurchasePolicyHash=purchase_policy.commitment if purchase_policy else None,
-            currentPurchaseExpiresAt=purchase_policy.expires_at if purchase_policy else None,
+            currentPurchaseExpiresAt=getattr(purchase_policy,'expires_at',None) if purchase_policy else None,
             evmChainId=signer_settings.evm_chain_id,
             enrollmentActivation=signer_settings.enrollment_activation,
             identityDeploymentRevision=(

@@ -50,7 +50,7 @@ async def sign_batch_issuer(request,*,settings,anchor,provider,journal,load_key,
     allowed={bytes(p[1])for p in expected};private=None
     def fixed_sign(message):
         nonlocal private
-        if message not in allowed or int(clock())>=min(evidence.batch.artifacts[0].quote_expires_at,journal.policy.expires_at):
+        if message not in allowed or int(clock())>=min(evidence.batch.artifacts[0].quote_expires_at,getattr(journal.policy,'expires_at',evidence.batch.artifacts[0].quote_expires_at)):
             raise ValueError('CURRENT_ISSUER_MESSAGE_OR_DEADLINE_CHANGED')
         if private is None:
             private=load_key()

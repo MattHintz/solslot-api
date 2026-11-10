@@ -19,6 +19,7 @@ from .generation_execution import Model,Hash
 from .generation_operations import canonical
 from .generation_customer_inventory import resolve_current_primary_inventory,h
 from .generation_customer_issuer import TestnetIssuerPolicy
+from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy
 from .generation_customer_quote import current_customer_xch_quote
 from .generation_customer_vault import resolve_native_identity_vault
 from .generation_customer_context import customer_bindings_from_evidence
@@ -71,7 +72,7 @@ async def verify_current_reservation(claim,*,settings,anchor,provider,issuer_pol
     """
     if not isinstance(claim,CurrentReservationClaim):raise ValueError('CURRENT_PURCHASE_TYPED_CLAIM_REQUIRED')
     claim=CurrentReservationClaim.model_validate_json(claim.model_dump_json(by_alias=True))
-    if (not isinstance(issuer_policy,TestnetIssuerPolicy)or issuer_policy.commitment!=expected_issuer_policy_hash
+    if (not isinstance(issuer_policy,(TestnetIssuerPolicy,TestnetCollectionIssuerPolicy))or issuer_policy.commitment!=expected_issuer_policy_hash
             or claim.issuer_policy_hash!=expected_issuer_policy_hash
             or settings.network!='testnet11' or claim.generation_id!=settings.deployment_generation_id
             or claim.anchor_hash!=settings.generation_chain_anchor_hash
@@ -79,13 +80,15 @@ async def verify_current_reservation(claim,*,settings,anchor,provider,issuer_pol
             or issuer_policy.generation!=anchor.issuance.generation):
         raise ValueError('CURRENT_PURCHASE_POLICY_BINDING_CHANGED')
     now=int(clock())
-    if not issuer_policy.issued_at<=now<issuer_policy.expires_at:raise ValueError('CURRENT_PURCHASE_POLICY_EXPIRED')
+    if isinstance(issuer_policy,TestnetIssuerPolicy) and not issuer_policy.issued_at<=now<issuer_policy.expires_at:
+        raise ValueError('CURRENT_PURCHASE_POLICY_EXPIRED')
     purchase=purchase_artifact_v3_from_json(claim.purchase_artifact)
     # Reject noncanonical extra/omitted terms before any primary-node reads.
     if purchase_artifact_v3_to_json(purchase)!=claim.purchase_artifact:
         raise ValueError('CURRENT_PURCHASE_CANONICAL_ARTIFACT_REQUIRED')
     if (purchase.collection_id!=issuer_policy.collection or purchase.metadata_anchor_id!=issuer_policy.edition
-            or purchase.metadata_root!=issuer_policy.metadata_root or purchase.vault_launcher_id!=issuer_policy.buyer_vault
+            or purchase.metadata_root!=issuer_policy.metadata_root
+            or (isinstance(issuer_policy,TestnetIssuerPolicy) and purchase.vault_launcher_id!=issuer_policy.buyer_vault)
             or purchase.deed_launcher_id not in issuer_policy.deed_launchers):
         raise ValueError('CURRENT_PURCHASE_FINITE_SCOPE_CHANGED')
     inventory=(_current[0]if _current is not None else await resolve_current_primary_inventory(settings=settings,anchor=anchor,provider=provider,
@@ -112,6 +115,7 @@ async def verify_current_reservation(claim,*,settings,anchor,provider,issuer_pol
     if not await current_evidence_unchanged(inventory.evidence,provider=provider):
         raise ValueError('CURRENT_PURCHASE_AUTHORITY_CHANGED_DURING_READ')
     fresh=int(clock())
-    if not now<=fresh<purchase.quote_expires_at or fresh>=issuer_policy.expires_at:
+    if (not now<=fresh<purchase.quote_expires_at or
+            isinstance(issuer_policy,TestnetIssuerPolicy) and fresh>=issuer_policy.expires_at):
         raise ValueError('CURRENT_PURCHASE_REVIEW_EXPIRED_DURING_READ')
     return CurrentReservationEvidence(claim,inventory,vault,item,reservation,transition,record)

@@ -53,6 +53,8 @@ class ValidatorSettings(BaseSettings):
     generation_customer_purchase_policy_hash:str=Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
     generation_customer_purchase_prior_policy_path:str=''
     generation_customer_purchase_prior_policy_hash:str=Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
+    generation_customer_purchase_cutover_path: str = ''
+    generation_customer_purchase_cutover_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
     generation_customer_identity_recovery_expires_at:int=Field(default=0,ge=0)
     generation_customer_identity_profile_path:str=''
     generation_customer_identity_profile_hash:str=Field(default='', pattern=r'^(|0x[0-9a-f]{64})$')
@@ -147,6 +149,8 @@ class ValidatorSettings(BaseSettings):
                     or self.generation_primary_client_cert_path
                     or self.generation_primary_client_key_path):
                 raise ValueError('private native reader must use its exact TLS and generation boundary')
+        if bool(self.generation_customer_purchase_cutover_path)!=bool(self.generation_customer_purchase_cutover_hash):
+            raise ValueError('checkout cutover requires both its path and hash')
         if bool(self.generation_customer_purchase_prior_policy_path)!=bool(self.generation_customer_purchase_prior_policy_hash):
             raise ValueError('prior purchase policy requires both its path and hash')
         if self.generation_customer_purchase_enabled:

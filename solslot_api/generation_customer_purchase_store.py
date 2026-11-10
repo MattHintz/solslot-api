@@ -28,7 +28,6 @@ class CurrentCustomerPurchaseStore(PaymentPurchaseStore):
     Different quotes and signed payer offers cannot overwrite one another.
     """
     MAX_CURRENT_RETAINED_BYTES = 64 * 1024 * 1024
-    MAX_CURRENT_REVIEWS = 128
 
     def __init__(self, path, generation_id):
         generation_bytes(generation_id)
@@ -110,8 +109,6 @@ class CurrentCustomerPurchaseStore(PaymentPurchaseStore):
                     if row['canonical_claim'] != document or row['claim_hash'] != digest:
                         raise ValueError('CURRENT_CHECKOUT_RETRY_CHANGES_REVIEW')
                 else:
-                    if db.execute('SELECT count(*) FROM current_customer_purchase_reviews').fetchone()[0] >= self.MAX_CURRENT_REVIEWS:
-                        raise ValueError('CURRENT_CHECKOUT_REVIEW_RETENTION_FULL')
                     if db.execute('SELECT 1 FROM current_customer_purchase_reviews WHERE claim_hash=?', (digest,)).fetchone():
                         raise ValueError('CURRENT_CHECKOUT_REVIEW_ALREADY_BOUND')
                     self._admit(db, len(document.encode()) + 512)
