@@ -16,7 +16,7 @@ env:
   PROTOCOL_REPOSITORY: MattHintz/solslot-protocol
   # Exact coordinated Testnet11 checkout protocol source.
   # Deployment environment pins remain separately governed.
-  PROTOCOL_REF: f37f46c30325a3d05f237e0e36c3a93575831404
+  PROTOCOL_REF: b4e7d4894e8752b3faa92559c7543bf227fb7c88
 
 jobs:
   verify:
