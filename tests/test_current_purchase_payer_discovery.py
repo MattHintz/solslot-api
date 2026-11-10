@@ -34,6 +34,7 @@ async def test_primary_confirmed_coin_is_public_only_and_no_transaction_prepared
         'paymentPublicKeyKind':'raw','amountMojos':'1000','confirmedHeight':10}]
     assert value['receivingVaultLauncherId']!='0x'+s.coin.name().hex()
     assert s.state.reads==1
+    assert value['diagnostic']=={'status':'eligible_found','keysChecked':1}
 
 @pytest.mark.asyncio
 async def test_batch_requires_one_coin_covering_every_selected_deed(setup,monkeypatch):
@@ -47,6 +48,7 @@ async def test_batch_requires_one_coin_covering_every_selected_deed(setup,monkey
     s.service._saved=lambda *a:{'reservationClaim':claim}
     value=await s.call()
     assert value['amountMojos']=='1200'and value['candidates']==[]
+    assert value['diagnostic']=={'status':'no_eligible_coin','keysChecked':1}
     assert s.state.reads==1
 
 @pytest.mark.asyncio
@@ -72,6 +74,18 @@ async def test_expired_quote_and_wrong_network_never_query_coins(setup):
     s.state.now=100;s.state.network='mainnet'
     with pytest.raises(ValueError,match='NETWORK_CHANGED'):await s.call()
     assert s.state.reads==0
+
+@pytest.mark.asyncio
+async def test_primary_unavailable_has_sanitized_code_and_no_false_empty_result(setup):
+    async def failed(*args,**kwargs):raise RuntimeError('private endpoint and details')
+    setup.service.provider.get_network_info_primary=failed
+    with pytest.raises(ValueError,match='^CURRENT_PAYMENT_PRIMARY_UNAVAILABLE$'):
+        await setup.call()
+    setup.service.provider.get_network_info_primary=lambda: network()
+    setup.service.provider.get_coin_records_by_puzzle_hash_primary=failed
+    async def network():return {'network_name':'testnet11'}
+    with pytest.raises(ValueError,match='^CURRENT_PAYMENT_PRIMARY_UNAVAILABLE$'):
+        await setup.call()
 
 @pytest.mark.asyncio
 async def test_sage_synthetic_key_finds_same_coin_without_double_derivation(setup):

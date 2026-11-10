@@ -333,12 +333,18 @@ class CurrentPurchaseWorker:
         self.running=True
         try:
             old=self.health();rows=self._claim();errors=0;complete=0
+            from .generation_customer_purchase_timing import health_sample, retained_health_sample
+            timing_sample=retained_health_sample((old or {}).get('lastWorkerTiming'))
             for identity,binding,token in rows:
                 error=None;self._action_stage='CONTINUATION'
+                try:previous_timing=self.service._checkout_timings.attempt_marker(identity)
+                except Exception:previous_timing=None
                 try:
                     # Finite native batch reconstruction can exceed the scalar
                     # path; the durable lease covers this explicit upper bound.
-                    async with asyncio.timeout(self.ACTION_TIMEOUT_SECONDS):state=await self._advance(identity,binding,token)
+                    from .generation_customer_purchase_timing import worker_attempt
+                    async with asyncio.timeout(self.ACTION_TIMEOUT_SECONDS):
+                        state=await worker_attempt(self.service,identity,self._advance(identity,binding,token))
                     complete+=state=='COMPLETE'
                 except asyncio.CancelledError:raise
                 except TimeoutError:
@@ -347,6 +353,13 @@ class CurrentPurchaseWorker:
                 except Exception as exc:
                     errors+=1;state='RETRY';code=str(exc)
                     error=code if re.fullmatch(r'CURRENT_[A-Z_]{1,100}',code)else'CURRENT_PURCHASE_CONTINUATION_UNAVAILABLE'
+                try:
+                    collector=self.service._checkout_timings
+                    if collector.attempt_marker(identity) is not previous_timing:
+                        observed=collector.snapshot(identity)['latestAttempt']
+                        timing_sample=health_sample(observed,int(self.clock())) or timing_sample
+                except Exception:
+                    pass  # Instrumentation must not affect worker progress.
                 with self.store._connect() as db:
                     job=db.execute('SELECT attempts FROM current_purchase_worker_jobs WHERE intent_id=? AND lease_token=?',(identity,token)).fetchone()
                     if job:
@@ -361,6 +374,7 @@ class CurrentPurchaseWorker:
                 'checkedAt':int(self.clock()),'cycles':(old['cycles']if old else 0)+1,
                 'examined':len(rows),'completed':complete,'errors':errors,'nextCheckAt':int(self.clock())+self.interval,
                 'reviewRequiredCount':review_required,'status':'DEGRADED'if errors or review_required else'HEALTHY'}
+            if timing_sample is not None:value['lastWorkerTiming']=timing_sample
             with self.store._connect() as db:
                 db.execute('INSERT INTO current_purchase_worker_health VALUES(?,?) ON CONFLICT(generation_id) DO UPDATE SET document=excluded.document',
                     (self.store.generation_id,canonical(value)))

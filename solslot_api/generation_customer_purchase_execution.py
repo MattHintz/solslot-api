@@ -47,6 +47,9 @@ def h(value):
     return '0x'+bytes(value).hex()
 
 
+from .generation_customer_purchase_timing import CheckoutTimings, measured, start, record
+
+
 class CurrentNativePurchaseExecution:
     def __init__(self, *, settings, anchor, provider, policy, store, fee_cap,
                  submitter=None, clock=time.time):
@@ -63,7 +66,20 @@ class CurrentNativePurchaseExecution:
         self.settings, self.anchor, self.provider = settings, anchor, provider
         self.policy, self.store, self.fee_cap = policy, store, fee_cap
         self.submitter, self.clock = submitter, clock
+        try:
+            self._checkout_timings = CheckoutTimings()
+        except Exception:
+            self._checkout_timings = None
         store.bind_execution_policy(policy.commitment, policy.maximum_purchases, fee_cap)
+
+    def timing_snapshot(self, identity, *, browser_hash):
+        """Return local observations for this bound intent, never purchase authority."""
+        from .generation_customer_purchase_timing import STAGES
+        self._saved(identity, browser_hash)
+        try:
+            return self._checkout_timings.snapshot(identity)
+        except Exception:
+            return {'scope':'unavailable','lastCompleted':None,'latestAttempt':None,'stages':{stage:None for stage in STAGES}}
 
     async def quote(self, request_key, deed_launcher_id, *, browser_hash):
         if isinstance(deed_launcher_id,(list,tuple)):
@@ -102,7 +118,9 @@ class CurrentNativePurchaseExecution:
             purchaseArtifact=purchase_artifact_v3_to_json(quote), signedPrice=price_evidence,
             availableCoinId=h(inventory.require_available(deed).current.coin.name()),
             currentVaultCoinId=h(vault.coin.name()), signerIndices=(0,1))
+        quote_started = start()
         await verify_current_reservation(claim, **self._arguments())
+        quote_finished = start()
         try:
             identity = self.store.save_review(claim, browser_hash=browser_hash,
                 request_key=request_key, now=int(self.clock()))
@@ -115,6 +133,8 @@ class CurrentNativePurchaseExecution:
             if prior is None:
                 raise
             return self._same_quote(prior['intentId'], deed, browser_hash)
+        if quote_finished is not None:
+            record(self, identity, 'quote_verification', quote_started, quote_finished)
         return self.review(identity, browser_hash=browser_hash)
 
     def _same_quote(self, identity, deed, browser_hash):
@@ -171,12 +191,19 @@ class CurrentNativePurchaseExecution:
             key = G1Element.from_bytes(bytes.fromhex(value[2:]))
             if key == G1Element():raise ValueError('CURRENT_PAYMENT_NONIDENTITY_KEY_REQUIRED')
             keys.append((value,(puzzle_for_pk(key) if public_key_kind == "raw" else puzzle_for_synthetic_public_key(key)).get_tree_hash()))
-        if (await self.provider.get_network_info_primary()).get('network_name') != 'testnet11':
+        try:
+            network_info = await self.provider.get_network_info_primary()
+        except Exception as exc:
+            raise ValueError('CURRENT_PAYMENT_PRIMARY_UNAVAILABLE') from exc
+        if network_info.get('network_name') != 'testnet11':
             raise ValueError('CURRENT_PAYMENT_PRIMARY_NETWORK_CHANGED')
         limit = asyncio.Semaphore(4)
         async def read_key(public,puzzle):
             async with limit:
-                records = await self.provider.get_coin_records_by_puzzle_hash_primary(h(puzzle),include_spent=False)
+                try:
+                    records = await self.provider.get_coin_records_by_puzzle_hash_primary(h(puzzle),include_spent=False)
+                except Exception as exc:
+                    raise ValueError('CURRENT_PAYMENT_PRIMARY_UNAVAILABLE') from exc
             if not isinstance(records,list) or len(records)>256:
                 raise ValueError('CURRENT_PAYMENT_COIN_READ_BOUND_EXCEEDED')
             candidates = []
@@ -189,8 +216,11 @@ class CurrentNativePurchaseExecution:
                     candidates.append({'paymentCoinId':h(record.coin.name()),'paymentPublicKey':public,
                         'paymentPublicKeyKind':public_key_kind,'amountMojos':str(record.coin.amount),'confirmedHeight':record.confirmed_height})
             return candidates
-        async with asyncio.timeout(15):
-            groups = await asyncio.gather(*(read_key(public,puzzle)for public,puzzle in keys))
+        try:
+            async with asyncio.timeout(15):
+                groups = await asyncio.gather(*(read_key(public,puzzle)for public,puzzle in keys))
+        except TimeoutError as exc:
+            raise ValueError('CURRENT_PAYMENT_PRIMARY_UNAVAILABLE') from exc
         candidates = [row for group in groups for row in group]
         if int(self.clock()) >= min(self.policy.expires_at,artifact.quote_expires_at):
             raise ValueError('CURRENT_PAYMENT_REVIEW_EXPIRED_DURING_READ')
@@ -198,6 +228,7 @@ class CurrentNativePurchaseExecution:
         return {'schema':'solslot.current-payer-coins.v1','generationId':self.store.generation_id,
             'network':'testnet11','intentId':identity,'receivingVaultLauncherId':h(self.policy.buyer_vault),
             'amountMojos':str(amount),'lastCheckedAt':int(self.clock()),
+            'diagnostic':{'status':'eligible_found' if unique else 'no_eligible_coin','keysChecked':len(keys)},
             'candidates':sorted(unique.values(),key=lambda r:(int(r['amountMojos']),r['paymentCoinId']))[:32]}
 
     def review(self, identity, *, browser_hash):
@@ -304,14 +335,17 @@ class CurrentNativePurchaseExecution:
         existing = self._existing(identity, 'RESERVATION', browser_hash)
         if existing is not None:
             return existing
-        checked = await verify_current_reservation(saved['reservationClaim'], **self._arguments())
+        checked = await measured(self, identity, 'reservation_verification',
+            verify_current_reservation(saved['reservationClaim'], **self._arguments()))
         def retain(index, reply):
             self.store.save_signature(identity, 'reservation', index, reply, browser_hash=browser_hash)
-        signature = await collect_current_purchase_quorum(self.settings, checked,
-            retained=saved['retainedSignatures']['reservation'], on_signature=retain)
+        signature = await measured(self, identity, 'validator_quorum',
+            collect_current_purchase_quorum(self.settings, checked,
+                retained=saved['retainedSignatures']['reservation'], on_signature=retain))
         # Reconstruct after the network calls. A response received just before
         # an expiry or custody change cannot authorize an outdated spend.
-        fresh = await verify_current_reservation(saved['reservationClaim'], **self._arguments())
+        fresh = await measured(self, identity, 'freshness_verification',
+            verify_current_reservation(saved['reservationClaim'], **self._arguments()))
         if bytes(fresh.transition.spend) != bytes(checked.transition.spend):
             raise ValueError('CURRENT_EXECUTION_RESERVATION_CHANGED_DURING_QUORUM')
         bundle = SpendBundle([fresh.transition.spend], signature)
@@ -489,7 +523,8 @@ class CurrentNativePurchaseExecution:
             self.store.save_execution_funding(identity, phase, prepared, browser_hash=browser_hash, now=int(self.clock()))
             if int(self.clock()) >= min(self.policy.expires_at, status['expiresAt']):
                 raise ProtocolSubmissionError('Saved payment window ended before submission.', code='CHAIN_WINDOW_EXPIRED')
-        receipt = await self.submitter.submit(bundle.to_json_dict(), before_push=before_push)
+        receipt = await measured(self, identity, 'funding_admission',
+            self.submitter.submit(bundle.to_json_dict(), before_push=before_push))
         status = receipt['status'].upper()
         if status == 'MEMPOOL_RECONCILED':
             status = 'MEMPOOL'
@@ -526,7 +561,8 @@ class CurrentNativePurchaseExecution:
         if (await self.provider.get_network_info_primary()).get('network_name') != 'testnet11':
             raise ValueError('CURRENT_EXECUTION_PRIMARY_TESTNET_REQUIRED')
         async with asyncio.timeout(20):
-            receipt = await self.provider.observe_exact_protocol_bundle(funded['spendBundle'])
+            receipt = await measured(self, identity, 'confirmation_observation',
+                self.provider.observe_exact_protocol_bundle(funded['spendBundle']))
         if receipt is None:
             return self.store.execution_status(identity, phase, browser_hash=browser_hash)
         if self.submitter is not None and self.submitter.funding_store is not None:

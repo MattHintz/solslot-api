@@ -17,6 +17,7 @@ from .generation_customer_vault import resolve_native_identity_vault
 from .generation_customer_quote import current_customer_xch_quote
 from .generation_customer_test_conversion import configured_price
 from .generation_preparation import read_generation_preparation
+from .generation_customer_purchase_timing import measured, start, record
 from .faucet import AGG_SIG_ME_DATA
 
 
@@ -56,11 +57,14 @@ async def quote_batch(s,request_key,deeds,browser_hash):
             currentVaultCoinId=h(vault.coin.name()),signerIndices=(0,1)))
     batch=build_purchase_batch_v1(batch_nonce=bytes32(secrets.token_bytes(32)),artifacts=purchases)
     claim=CurrentReservationBatch(purchaseBatch=purchase_batch_to_json(batch),children=tuple(children))
+    quote_started=start()
     await verify_current_batch_reservation(claim,**s._arguments())
+    quote_finished=start()
     try:identity=s.store.save_review(claim,browser_hash=browser_hash,request_key=request_key,now=int(s.clock()))
     except ValueError as exc:
         if str(exc)!='CURRENT_CHECKOUT_RETRY_CHANGES_REVIEW':raise
         return await quote_batch(s,request_key,deeds,browser_hash)
+    if quote_finished is not None:record(s,identity,'quote_verification',quote_started,quote_finished)
     return s.review(identity,browser_hash=browser_hash)
 
 
@@ -89,11 +93,14 @@ def request_reservation(s,identity,binding):
 async def prepare_reservation(s,identity,binding):
     saved=s._saved(identity,binding);old=s._existing(identity,'RESERVATION',binding)
     if old is not None:return old
-    checked=await verify_current_batch_reservation(saved['reservationClaim'],**s._arguments())
+    checked=await measured(s,identity,'reservation_verification',
+        verify_current_batch_reservation(saved['reservationClaim'],**s._arguments()))
     def retain(index,reply):s.store.save_signature(identity,'reservation',index,reply,browser_hash=binding)
-    signature=await collect_current_purchase_quorum(s.settings,checked,
-        retained=saved['retainedSignatures']['reservation'],on_signature=retain)
-    fresh=await verify_current_batch_reservation(saved['reservationClaim'],**s._arguments())
+    signature=await measured(s,identity,'validator_quorum',
+        collect_current_purchase_quorum(s.settings,checked,
+            retained=saved['retainedSignatures']['reservation'],on_signature=retain))
+    fresh=await measured(s,identity,'freshness_verification',
+        verify_current_batch_reservation(saved['reservationClaim'],**s._arguments()))
     if [bytes(c.transition.spend)for c in fresh.children]!=[bytes(c.transition.spend)for c in checked.children]:
         raise ValueError('CURRENT_EXECUTION_RESERVATION_CHANGED_DURING_QUORUM')
     return s.store.prepare_execution(identity,'RESERVATION',SpendBundle([c.transition.spend for c in fresh.children],signature),

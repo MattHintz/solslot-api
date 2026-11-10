@@ -315,6 +315,43 @@ async def test_stale_health_is_not_an_enabled_worker_claim(recover):
  r.clock[0]+=1;assert w.health()['status']=='STALE'
 
 @pytest.mark.asyncio
+async def test_worker_health_keeps_one_bounded_anonymous_timing_sample_on_idle(recover):
+ from solslot_api.generation_customer_purchase_timing import measured,STAGES
+ r=recover;r.retain()
+ w=CurrentPurchaseWorker(r.service,issuer_sign=no_issuer,clock=lambda:r.clock[0])
+ async def advance(identity,binding,token):
+  async def read():return None
+  await measured(r.service,identity,'confirmation_observation',read())
+  return 'WAITING'
+ w._advance=advance
+ first=await w.tick();sample=first['lastWorkerTiming']
+ assert sample['measurementScope']=='originating_process_worker_cycle'
+ assert sample['sampledAt']==r.clock[0] and sample['outcome']=='success'
+ assert set(sample['stagesMs'])==set(STAGES)
+ assert sample['stagesMs']['confirmation_observation'] is not None and sample['stagesMs']['queue'] is None
+ assert r.identity not in json.dumps(sample) and BROWSER not in json.dumps(sample)
+ assert (await w.tick())['lastWorkerTiming']==sample
+ assert w.health()['lastWorkerTiming']==sample
+ with r.service.store._connect() as db:
+  assert db.execute('SELECT count(*) FROM current_purchase_worker_health').fetchone()[0]==1
+ r.clock[0]+=w.batch_size*w.LEASE_SECONDS_PER_ACTION+2*w.interval+1
+ assert w.health()['status']=='STALE' and w.health()['lastWorkerTiming']['sampledAt']==sample['sampledAt']
+
+@pytest.mark.asyncio
+async def test_worker_health_instrumentation_failure_does_not_change_work(recover):
+ r=recover;r.retain()
+ class Broken:
+  def attempt_marker(self,*args):raise RuntimeError('private timing failure')
+  def attempt(self,*args):raise RuntimeError('private timing failure')
+ r.service._checkout_timings=Broken()
+ w=CurrentPurchaseWorker(r.service,issuer_sign=no_issuer,clock=lambda:r.clock[0])
+ async def advance(*args):return 'WAITING'
+ w._advance=advance
+ value=await w.tick()
+ assert value['examined']==1 and value['errors']==0 and 'lastWorkerTiming' not in value
+ assert 'private timing failure' not in json.dumps(value)
+
+@pytest.mark.asyncio
 async def test_confirmed_unpaid_reservation_is_selected_for_automatic_timeout(recover):
  r=recover;r.retain();await r.service.reconcile(r.identity,'RESERVATION',browser_hash=BROWSER)
  r.clock[0]=210;r.service.policy=SimpleNamespace(expires_at=400,commitment=r.service.policy.commitment)
