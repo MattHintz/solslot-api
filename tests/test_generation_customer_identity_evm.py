@@ -58,14 +58,15 @@ def evidence(*,forwarded=False):
     return pins,w3,receipt,tx,code,calls
 
 
-def test_matching_upstream_and_adapter_code_cannot_admit_an_unsupported_patch():
+@pytest.mark.parametrize('version',['0.21.1','0.22.0'])
+def test_matching_upstream_and_adapter_code_cannot_admit_an_unsupported_patch(version):
     pins,w3,receipt,*_=evidence()
     document=pins.model_dump(mode='json',by_alias=True)
-    document['acceptedProofVersions'].append('0.21.1')
+    document['acceptedProofVersions'].append(version)
     amended=CurrentCustomerIdentityProfile.model_validate(document)
     with pytest.raises(ValueError,match='CURRENT_ID_EVM_PROOF_VERSION_UNSUPPORTED'):
         verify_current_identity_contracts(w3,amended,receipt['blockNumber'])
-    w3.eth.supported_versions={*w3.eth.supported_versions,PROOF_VERSIONS['0.21.1']}
+    w3.eth.supported_versions={*w3.eth.supported_versions,PROOF_VERSIONS[version]}
     assert verify_current_identity_contracts(w3,amended,receipt['blockNumber'])['verifierAdapter']
 
 
@@ -89,19 +90,20 @@ def test_only_the_profiled_private_real_document_query_is_allowed(version):
     assert result.vault==LAUNCHER and result.amount==1 and result.permit is None
 
 
-def test_patch_version_requires_explicit_profile_approval_and_preserves_query_boundaries():
+@pytest.mark.parametrize('version',['0.21.1','0.22.0'])
+def test_patch_version_requires_explicit_profile_approval_and_preserves_query_boundaries(version):
     original = CurrentCustomerIdentityProfile.model_validate(profile()[0])
-    encoded = calldata(original, version='0.21.1')
+    encoded = calldata(original, version=version)
     with pytest.raises(ValueError, match='PRIVATE_QUERY_REJECTED'):
         require_current_identity_query(encoded, original, launcher=LAUNCHER)
     amended = original.model_dump(mode='json', by_alias=True)
-    amended['acceptedProofVersions'].append('0.21.1')
+    amended['acceptedProofVersions'].append(version)
     pins = CurrentCustomerIdentityProfile.model_validate(amended)
     assert pins.commitment != original.commitment
     assert require_current_identity_query(encoded, pins, launcher=LAUNCHER).vault == LAUNCHER
     for changes in ({'dev':True}, {'domain':'other.invalid'}, {'query':bytes.fromhex('0100021200')}):
         with pytest.raises(ValueError, match='PRIVATE_QUERY_REJECTED'):
-            require_current_identity_query(calldata(pins, version='0.21.1', **changes), pins, launcher=LAUNCHER)
+            require_current_identity_query(calldata(pins, version=version, **changes), pins, launcher=LAUNCHER)
     # A valid canonical envelope with a different patch remains unsupported.
     params = (bytes.fromhex('000000150002' + '00' * 26), (bytes(32), b'synthetic-proof', []), INPUTS,
         (604800, 'solslot.com', 'vault:' + LAUNCHER, False))

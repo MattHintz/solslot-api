@@ -102,7 +102,10 @@ async def profile(request:Request,response:Response,settings:Configured):
         if service.authority is not None:
             try:service.authority.require_live(pins,int(service.clock()));enabled=service.compatibility_ready(pins)
             except ValueError:pass
+        from .generation_customer_identity_context import validated_previous_identity_profile
+        previous=validated_previous_identity_profile(settings,pins)
         return {'schema':'solslot.current-customer-identity-runtime.v1','profileHash':pins.commitment,
+            'previousProfileHashes':[previous.commitment] if previous else [],
             'profile':pins.model_dump(mode='json',by_alias=True),'enrollmentEnabled':enabled,
             'stampEnabled':enabled and service.fee_submitter is not None,
             'authorityExpiresAt':service.authority.expires_at if service.authority else None,

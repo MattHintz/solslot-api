@@ -54,7 +54,7 @@ class CurrentCustomerIdentityProfile(PreparationModel):
     trusted_direct_relayer:Address=Field(alias='trustedDirectRelayer')
     contracts:tuple[IdentityContract,IdentityContract,IdentityContract,IdentityContract]
     source_identity_amendment:Hash=Field(alias='sourceIdentityAmendment')
-    accepted_proof_versions:tuple[Literal['0.20.0','0.21.0','0.21.1'],...]=Field(alias='acceptedProofVersions',min_length=1,max_length=3)
+    accepted_proof_versions:tuple[Literal['0.20.0','0.21.0','0.21.1','0.22.0'],...]=Field(alias='acceptedProofVersions',min_length=1,max_length=4)
     legacy_vaults_admitted:Literal[False]=Field(alias='legacyVaultsAdmitted')
     legacy_receipts_admitted:Literal[False]=Field(alias='legacyReceiptsAdmitted')
     requires_fresh_private_check:Literal[True]=Field(alias='requiresFreshPrivateCheck')
@@ -135,3 +135,32 @@ def read_current_identity_profile(path, expected_hash):
     if '0x' + sha256(raw).hexdigest() != expected_hash:
         raise ValueError('current identity profile differs from its frozen release')
     return CurrentCustomerIdentityProfile.model_validate_json(raw)
+
+
+def validated_previous_identity_profile(settings, current):
+    path=getattr(settings,'generation_customer_identity_previous_profile_path','')
+    expected=getattr(settings,'generation_customer_identity_previous_profile_hash','')
+    if not path and not expected:return None
+    if not path or not expected:raise ValueError('CURRENT_ID_PREVIOUS_PROFILE_UNAVAILABLE')
+    previous=read_current_identity_profile(path,expected)
+    stable=('network','generation_id','preparation_manifest','pool_launcher_id','vault_module_hash',
+        'bridge_policy_hash','validator_public_keys','validator_threshold','bridge_coins',
+        'evm_chain_id','trusted_direct_relayer')
+    if (previous.commitment==current.commitment or
+            any(getattr(previous,key)!=getattr(current,key) for key in stable)):
+        raise ValueError('CURRENT_ID_PREVIOUS_PROFILE_MISMATCH')
+    return previous
+
+
+def select_record_identity_profile(settings, current, record):
+    """Select one pinned predecessor only for an already confirmed record."""
+    if record is None:return current
+    binding=record.get('identityDeployment') or {}
+    if binding.get('identityProfileHash')==current.commitment:return current
+    if record.get('status')!='chia_confirmed':
+        raise ValueError('CURRENT_ID_PREVIOUS_IN_FLIGHT_REQUIRES_REVIEW')
+    previous=validated_previous_identity_profile(settings,current)
+    if previous is None:raise ValueError('CURRENT_ID_PREVIOUS_PROFILE_UNAVAILABLE')
+    if binding.get('identityProfileHash')!=previous.commitment:
+        raise ValueError('CURRENT_ID_PREVIOUS_PROFILE_MISMATCH')
+    return previous

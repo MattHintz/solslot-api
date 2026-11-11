@@ -18,6 +18,52 @@ from solslot_api.generation_customer_runtime import GenerationCustomerRuntime
 from tests.test_generation_customer_identity_context import profile
 
 
+@pytest.mark.asyncio
+async def test_old_confirmed_receipt_remains_readable_and_sync_keeps_evm_evidence(tmp_path,monkeypatch):
+    from solslot_api.generation_customer_identity_context import select_record_identity_profile
+    import solslot_api.generation_customer_context as context
+    doc,bindings=profile();old=CurrentCustomerIdentityProfile.model_validate(doc)
+    path=tmp_path/'old.json';path.write_text(old.model_dump_json(by_alias=True))
+    settings=SimpleNamespace(network='testnet11',deployment_generation_id=old.generation_id,alpha_writes_enabled=False,
+        zkpassport_base_evm_rpc_url='https://example.invalid',generation_customer_identity_previous_profile_path=str(path),
+        generation_customer_identity_previous_profile_hash='0x'+sha256(path.read_bytes()).hexdigest())
+    settings.model_copy=lambda *,update:SimpleNamespace(**{**vars(settings),**update})
+    monkeypatch.setattr(context,'current_customer_launch_bindings',lambda *args,**kwargs:bindings)
+    doc['acceptedProofVersions'].append('0.22.0');current=CurrentCustomerIdentityProfile.model_validate(doc)
+    h=lambda c:'0x'+c*64
+    launcher=h('1');registration=h('2');root=h('3');coin=h('4');newcoin=h('5');tx=h('6');bridge=old.bridge_coins[0]
+    receipt=dict(generationId=old.generation_id,identityProfileHash=old.commitment,vaultLauncherId=launcher,
+        network='testnet11',policyVersion=2,identityAttestRoot=root,attestationLeafHash=h('7'),
+        attestationProof={'bitpath':0,'siblings':[]},bridgePolicyHash=old.bridge_policy_hash,
+        bridgeParentId=bridge.parent_id,bridgeAmount=1,bridgeCoinId=bridge.coin_id,evmTxHash=tx,
+        chiaVaultCoinId=coin,enrolledAt=1)
+    record=dict(vaultLauncherId=launcher,network='testnet11',policyVersion=2,status='chia_confirmed',
+        bridgePolicyHash=old.bridge_policy_hash,bridgeParentId=bridge.parent_id,bridgeAmount=1,bridgeCoinId=bridge.coin_id,
+        createdAt=1,updatedAt=1,identityDeployment={'schema':'solslot.current-customer-enrollment-binding.v1',
+        'generationId':old.generation_id,'identityProfileHash':old.commitment,'registrationId':registration},receipt=receipt)
+    class Ledger:
+        def get_enrollment(self,_):return copy.deepcopy(record)
+        def update_enrollment(self,value,**_):self.saved=value
+    ledger=Ledger();snapshot={'generationId':old.generation_id,'registrationId':registration,'owner':'0x'+'01'*20,
+        'authType':'evm','checkedAt':1000,'vault':{'identityVerified':True,'identityAttestRoot':root,'currentCoinId':coin}}
+    service=CurrentCustomerIdentityRuntime.__new__(CurrentCustomerIdentityRuntime)
+    service.settings=settings;service.ledger=ledger;service.clock=lambda:1000;service.funding_store=None
+    service.customers=SimpleNamespace(index=object(),current_vault_snapshot=lambda _:snapshot)
+    service.profile=lambda:current
+    assert service.cached(launcher)['receipt']['identityProfileHash']==old.commitment
+    class NativeCoin:
+        def name(self):return bytes.fromhex(newcoin[2:])
+    native=SimpleNamespace(identity_verified=True,root=bytes.fromhex(root[2:]),bridge_coin_id=bytes.fromhex(bridge.coin_id[2:]),
+        coin=NativeCoin(),stamp_coin_id=bytes.fromhex(coin[2:]),confirmed_height=5)
+    async def reads(*args,**kwargs):
+        selected=select_record_identity_profile(settings,current,record)
+        return SimpleNamespace(profile=selected),native
+    service.request_reads=reads
+    await service.sync(launcher)
+    assert ledger.saved['receipt']['identityProfileHash']==old.commitment
+    assert ledger.saved['receipt']['evmTxHash']==tx and ledger.saved['receipt']['chiaVaultCoinId']==newcoin
+
+
 def authority(pins,**changes):
     data=dict(schema='solslot.current-customer-identity-authority.v1',network='testnet11',
         generationId=pins.generation_id,identityProfileHash=pins.commitment,

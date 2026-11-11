@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from chia_rs.sized_bytes import bytes32
 from starlette.concurrency import run_in_threadpool
 from .credential_ledger import get_credential_ledger, LedgerConflict
-from .generation_customer_identity_context import load_current_identity_profile
+from .generation_customer_identity_context import load_current_identity_profile, select_record_identity_profile
 from .generation_customer_identity_scope import current_identity_request, current_identity_settings
 from .generation_customer_execution import saved_customer_operation, validate_customer_bundle
 from .vault_chain_evidence import read_vault_coin
@@ -120,10 +120,10 @@ class CurrentCustomerIdentityRuntime:
         return profile
 
     def cached(self, launcher):
-        profile=self.profile()
+        record=self.ledger.get_enrollment(launcher)
+        profile=select_record_identity_profile(self.settings,self.profile(),record)
         with current_identity_request(self.settings,profile,launcher,self.customers,runtime=object(),
                 clock=self.clock,require_fresh=False) as scope:
-            record=self.ledger.get_enrollment(launcher)
             if record is not None:scope.require_record(record)
             if record is not None and record['status']=='chia_confirmed':
                 native=self.customers.current_vault_snapshot(launcher)['vault']
@@ -139,7 +139,8 @@ class CurrentCustomerIdentityRuntime:
             return copy.deepcopy(record)
 
     async def request_reads(self, launcher, *, include_event=True, all_bridges=False, transaction_hash=None):
-        profile=self.profile()
+        existing=self.ledger.get_enrollment(launcher)
+        profile=select_record_identity_profile(self.settings,self.profile(),existing)
         registered,_=self.customers.store.registered_vault(launcher)
         native=await self.customers.observe_current_vault(registered)
         operation=saved_customer_operation(self.customers.store,self.customers.journal,registered)
@@ -148,7 +149,6 @@ class CurrentCustomerIdentityRuntime:
         initial_id='0x'+initial.name().hex()
         with current_identity_request(self.settings,profile,launcher,self.customers,runtime=object(),
                 clock=self.clock,require_fresh=False) as scope:
-            existing=self.ledger.get_enrollment(launcher)
             if existing is not None:scope.require_record(existing)
         ids={launcher,initial_id}
         if existing is not None:ids.add(existing['bridgeCoinId'])
@@ -183,6 +183,8 @@ class CurrentCustomerIdentityRuntime:
         # configuration cannot ask a customer to scan a document or sign.
         await self.refresh_compatibility()
         reads,native=await self.request_reads(launcher,include_event=False,all_bridges=True)
+        if reads.profile.commitment!=self.profile().commitment:
+            raise ValueError('CURRENT_ID_PREVIOUS_ENROLLMENT_REQUIRES_REVIEW')
         if native.identity_verified:raise ValueError('CURRENT_ID_ALREADY_CONFIRMED')
         with current_identity_request(self.settings,reads.profile,launcher,self.customers,runtime=reads,clock=self.clock) as scope:
             existing=self.ledger.get_enrollment(launcher)
@@ -227,8 +229,9 @@ class CurrentCustomerIdentityRuntime:
 
     async def sync_evm(self,launcher):
         from .zkpassport_enrollments import _fetch_verified_evm_attestation,VaultCredentialReceipt,EnrollmentRecord,AttestationProof
-        profile=self.profile();record=self.cached(launcher)
+        record=self.cached(launcher)
         if record is None or record['status']!='reserved':return
+        profile=select_record_identity_profile(self.settings,self.profile(),record)
         saved=self.ledger.get_relay_transaction(launcher)
         if saved is None:return
         identity,_=self.customers.store.registered_vault(launcher)

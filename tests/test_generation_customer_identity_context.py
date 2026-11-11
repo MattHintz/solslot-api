@@ -7,7 +7,7 @@ from chia_rs import AugSchemeMPL,Coin
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 from solslot_puzzles.zkpassport_bridge_driver import make_bridge_policy_hash
-from solslot_api.generation_customer_identity_context import CurrentCustomerIdentityProfile,load_current_identity_profile
+from solslot_api.generation_customer_identity_context import CurrentCustomerIdentityProfile,load_current_identity_profile,select_record_identity_profile
 from tests.test_generation_customer_launch import fixture
 
 
@@ -66,6 +66,26 @@ def test_exact_native_bridge_and_external_contract_roles(mutation):
 
 def test_disabled_profile_reads_no_file_or_native_index():
     assert load_current_identity_profile(SimpleNamespace(generation_customer_identity_enabled=False),None,now=1000) is None
+
+
+def test_existing_record_uses_only_exactly_pinned_same_custody_previous_profile(tmp_path):
+    data,_=profile();old=CurrentCustomerIdentityProfile.model_validate(data)
+    path=tmp_path/'old.json';path.write_text(old.model_dump_json(by_alias=True))
+    settings=SimpleNamespace(generation_customer_identity_previous_profile_path=str(path),
+        generation_customer_identity_previous_profile_hash='0x'+sha256(path.read_bytes()).hexdigest())
+    data['acceptedProofVersions'].append('0.22.0')
+    current=CurrentCustomerIdentityProfile.model_validate(data)
+    record={'status':'chia_confirmed','identityDeployment':{'identityProfileHash':old.commitment}}
+    assert select_record_identity_profile(settings,current,record)==old
+    assert select_record_identity_profile(settings,current,None)==current
+    with pytest.raises(ValueError,match='MISMATCH'):
+        select_record_identity_profile(settings,current,{'status':'chia_confirmed','identityDeployment':{'identityProfileHash':'0x'+'99'*32}})
+    with pytest.raises(ValueError,match='IN_FLIGHT'):
+        select_record_identity_profile(settings,current,{**record,'status':'reserved'})
+    changed=current.model_copy(update={'pool_launcher_id':'0x'+'88'*32})
+    with pytest.raises(ValueError,match='MISMATCH'):select_record_identity_profile(settings,changed,record)
+    path.write_text(path.read_text()+' ')
+    with pytest.raises(ValueError,match='frozen release'):select_record_identity_profile(settings,current,record)
 
 
 def test_frozen_source_and_native_binding_are_both_required(tmp_path,monkeypatch):
