@@ -70,7 +70,12 @@ def test_offline_activation_cas_preserves_rows_and_requires_exact_closure(db):
     assert db.execute('SELECT prior_commitment,closure_hash,state FROM issuer_collection_activation').fetchone()==(prior().commitment,h(9),'ACTIVE')
     old=SimpleNamespace(db=db,policy=prior())
     with pytest.raises(ValueError,match='JOURNAL_POLICY_CHANGED'):TestnetIssuerJournal._require_binding(old)
-    with pytest.raises(ValueError):activate_collection_issuer_lineage(db,closure_hash=h(9),**args)
+    activated=tuple(db.iterdump())
+    activate_collection_issuer_lineage(db,closure_hash=h(9),**args)
+    assert tuple(db.iterdump())==activated
+    with pytest.raises(ValueError,match='CURRENT_ISSUER_LINEAGE_ALREADY_ACTIVATED'):
+        activate_collection_issuer_lineage(db,closure_hash=h(8),**args)
+    assert tuple(db.iterdump())==activated
 
 
 def test_collection_journal_requires_matching_active_cutover(tmp_path):
