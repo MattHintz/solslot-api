@@ -42,6 +42,8 @@ future multi-worker deployments.
 """
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 import logging
 import sqlite3
 import threading
@@ -88,7 +90,7 @@ class VaultStore:
         path: filesystem path to the database file.  Parent directories
             are created if missing.  The special value ``":memory:"``
             yields an in-process ephemeral database (useful for tests).
-        timeout: ``sqlite3.connect(timeout=...)`` — how long the
+        timeout: ``connect_generation_sqlite(timeout=...)`` — how long the
             connection waits when another process holds an exclusive
             lock.  Five seconds is generous for the registry's write
             volume.
@@ -108,7 +110,7 @@ class VaultStore:
         # ``check_same_thread=False`` is safe because we serialize via
         # ``self._lock``; SQLite itself is fine with cross-thread access
         # so long as concurrent operations are externally coordinated.
-        self._conn = sqlite3.connect(
+        self._conn = connect_generation_sqlite(
             self.path,
             timeout=timeout,
             isolation_level=None,            # explicit transactions

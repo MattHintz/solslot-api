@@ -51,12 +51,17 @@ def _draft(collection_id: str, revision: int, title: str = "17 Harbor Street") -
     }
 
 
-def test_feature_gate_and_revisioned_draft_round_trip(tmp_path) -> None:
+def test_feature_gate_and_revisioned_draft_round_trip(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("solslot_api.collection_recovery_health.read_receipt", lambda: {
+        "checkedAt": time.time(), "restoredAt": time.time(),
+    })
     client, store, _app = _client(tmp_path)
     try:
         flags = client.get("/admin/collections/feature-status")
         assert flags.status_code == 200
         assert flags.json()["metadataEnabled"] is True
+        assert flags.json()["metadataConfigured"] is True
+        assert flags.json()["recovery"]["healthy"] is True
 
         created = client.post(
             "/admin/collections",
@@ -81,6 +86,22 @@ def test_feature_gate_and_revisioned_draft_round_trip(tmp_path) -> None:
         )
         assert conflict.status_code == 409
         assert "current 2" in conflict.json()["detail"]
+    finally:
+        client.close()
+        store.close()
+
+
+def test_feature_status_pauses_authoring_when_recovery_is_unavailable(tmp_path, monkeypatch) -> None:
+    def stale():
+        raise ValueError("Recovery receipt is stale")
+    monkeypatch.setattr("solslot_api.collection_recovery_health.read_receipt", stale)
+    client, store, _app = _client(tmp_path)
+    try:
+        status = client.get("/admin/collections/feature-status").json()
+        assert status["metadataConfigured"] is True
+        assert status["metadataEnabled"] is False
+        assert status["recovery"] == {"healthy": False, "checkedAt": None, "restoredAt": None}
+        assert status["mintingEnabled"] is False
     finally:
         client.close()
         store.close()
@@ -236,3 +257,60 @@ def test_public_endpoint_hides_unpublished_drafts(tmp_path) -> None:
     finally:
         client.close()
         store.close()
+
+
+def test_generation_conversion_never_uses_legacy_quorum_or_requests_a_price(tmp_path, monkeypatch):
+    client, store, app = _client(tmp_path)
+    settings = app.dependency_overrides[get_settings]()
+    settings.deployment_generation_id = '0x' + 'a1' * 32
+    monkeypatch.setattr('solslot_api.collection_generation_recovery.read_record_receipt', lambda _: {})
+    def forbidden(*args, **kwargs):
+        raise AssertionError('A plain conversion must not load legacy authority or pricing')
+    monkeypatch.setattr('solslot_api.collection_endpoints._signed_governance_threshold', forbidden)
+    monkeypatch.setattr('solslot_api.collection_endpoints.load_authorized_oracle_round', forbidden)
+    try:
+        response = client.post('/admin/collections/display-units/convert', json={
+            'money':{'targetRaise':'75000','marketValue':'1550000'},
+            'percentages':{'technologyFee':'1'},
+            'ownershipShares':{'deed.0':'4'},'deriveXchPar':False})
+        assert response.status_code == 200
+        assert response.json() == {'moneyMinor':{'targetRaise':'7500000','marketValue':'155000000'},
+            'percentageBps':{'technologyFee':'100'},'ownershipPpm':{'deed.0':40000},
+            'governanceQuorum':None,'xchParMojos':None,'xchOracle':None}
+        rejected = client.post('/admin/collections/display-units/convert', json={
+            'percentages':{'technologyFee':'10.01'}})
+        assert rejected.status_code == 422
+    finally:
+        client.close(); store.close()
+
+
+def test_generation_price_derivation_still_requires_current_authorized_round(tmp_path, monkeypatch):
+    from solslot_api.payment_quotes import PaymentQuoteError
+    client, store, app = _client(tmp_path)
+    settings = app.dependency_overrides[get_settings]()
+    settings.deployment_generation_id = '0x' + 'a1' * 32
+    monkeypatch.setattr('solslot_api.collection_generation_recovery.read_record_receipt', lambda _: {})
+    def unavailable(*args, **kwargs):
+        raise PaymentQuoteError('Current signed XCH price unavailable')
+    monkeypatch.setattr('solslot_api.collection_endpoints.load_authorized_oracle_round', unavailable)
+    try:
+        response = client.post('/admin/collections/display-units/convert', json={
+            'money':{'targetRaise':'75000'},'deriveXchPar':True})
+        assert response.status_code == 422
+        assert 'signed XCH' in response.json()['detail']
+    finally:
+        client.close(); store.close()
+
+
+def test_legacy_conversion_does_not_fall_back_when_signed_economics_are_missing(tmp_path, monkeypatch):
+    from solslot_api.public_artifact import PublicArtifactError
+    client, store, _ = _client(tmp_path)
+    def missing(_):
+        raise PublicArtifactError('No trusted legacy artifact')
+    monkeypatch.setattr('solslot_api.collection_endpoints._signed_governance_threshold', missing)
+    try:
+        response = client.post('/admin/collections/display-units/convert', json={'money':{'targetRaise':'75000'}})
+        assert response.status_code == 503
+        assert response.json()['detail'] == 'Signed genesis economics are not available yet.'
+    finally:
+        client.close(); store.close()

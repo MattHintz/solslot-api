@@ -130,18 +130,13 @@ _registry: Optional[VaultRegistry] = None
 def get_registry() -> VaultRegistry:
     """Return the process-wide ``VaultRegistry`` singleton.
 
-    Path resolution: ``SOLSLOT_VAULT_REGISTRY_PATH``, defaulting to the
-    fresh V2 state directory. Settings is intentionally NOT consulted
-    so this function remains importable from tests without forcing a
-    pydantic-settings load.
+    Runtime settings resolve the generation namespace. Importing this module
+    does not load settings; tests may still install an isolated memory store.
     """
     global _registry
     if _registry is None:
-        path = os.environ.get(
-            "SOLSLOT_VAULT_REGISTRY_PATH",
-            "./state/vault_registry_v2.db",
-        )
-        _registry = VaultRegistry.open(path)
+        from .config import get_settings
+        _registry = VaultRegistry.open(get_settings().vault_registry_path)
     return _registry
 
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 import json
 import sqlite3
 import time
@@ -63,18 +65,34 @@ class GenesisStore:
     same time or the API process restarts between phases.
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, generation_id: str | None = None, network: str = "testnet11") -> None:
+        self.generation_id, self.network = generation_id, network
         self.path = str(path) if str(path) == ":memory:" else str(Path(path))
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._memory_connection: sqlite3.Connection | None = None
         if self.path == ":memory:":
-            self._memory_connection = sqlite3.connect(
-                ":memory:", isolation_level=None, check_same_thread=False
+            self._memory_connection = connect_generation_sqlite(
+                ":memory:", isolation_level=None, check_same_thread=False,
+                generation_id=generation_id, generation_network=network,
             )
             self._configure(self._memory_connection)
-        self._migrate()
-        self.validate_pending_broadcast_reservations()
+        try:
+            with self._connect() as connection:
+                from .generation_storage import bind_generation
+                bind_generation(connection, generation_id, network)
+            self._migrate()
+            self.validate_pending_broadcast_reservations()
+        except Exception:
+            if self._memory_connection is not None:
+                self._memory_connection.close()
+            raise
+
+    @classmethod
+    def for_settings(cls, settings: Settings) -> GenesisStore:
+        from .generation_storage import generation_path
+        return cls(generation_path(settings.genesis_db_path, settings.deployment_generation_id),
+                   generation_id=settings.deployment_generation_id, network=settings.network)
 
     @staticmethod
     def _configure(connection: sqlite3.Connection) -> None:
@@ -88,7 +106,8 @@ class GenesisStore:
         if self._memory_connection is not None:
             yield self._memory_connection
             return
-        connection = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+        connection = connect_generation_sqlite(self.path, timeout=10, isolation_level=None,
+            generation_id=self.generation_id,generation_network=self.network)
         self._configure(connection)
         try:
             yield connection
@@ -824,6 +843,13 @@ class GenesisStore:
                 f"ceremony is {row['state']}; expected " + " or ".join(states)
             )
 
+    def _bound_draft(self, draft: dict[str, Any]) -> dict[str, Any]:
+        """The configured namespace owns the ceremony domain, never a request."""
+        supplied = draft.get("generationId")
+        if supplied is not None and supplied != self.generation_id:
+            raise GenesisConflict("ceremony belongs to another deployment generation")
+        return {**draft, **({"generationId": self.generation_id} if self.generation_id else {})}
+
     def create_draft(
         self,
         ceremony_id: str,
@@ -832,6 +858,7 @@ class GenesisStore:
         now: int | None = None,
     ) -> dict[str, Any]:
         timestamp = int(time.time()) if now is None else now
+        draft = self._bound_draft(draft)
         encoded = canonical_json(draft)
         with self._transaction() as connection:
             try:
@@ -855,6 +882,7 @@ class GenesisStore:
     ) -> dict[str, Any]:
         """Atomically consume an owner link and select the one active ceremony."""
         timestamp = int(time.time()) if now is None else now
+        draft = self._bound_draft(draft)
         encoded = canonical_json(draft)
         selected_id: str
         with self._transaction() as connection:
@@ -4349,6 +4377,8 @@ class GenesisStore:
         result["invitations"] = [dict(row) for row in invitations]
         result["plan_signatures"] = [dict(row) for row in plan_signatures]
         result["artifact_signatures"] = [dict(row) for row in artifact_signatures]
+        if result["draft"].get("generationId") != self.generation_id:
+            raise GenesisConflict("ceremony belongs to another deployment generation")
         return result
 
 

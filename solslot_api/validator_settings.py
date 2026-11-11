@@ -39,6 +39,35 @@ class ValidatorSettings(BaseSettings):
     identity_deployment_amendment_path: str = ""
     identity_deployment_artifact_path: str = ""
     identity_deployment_plan_hash: str = ""
+    identity_network_amendment_path: str = ""
+    identity_network_artifact_path: str = ""
+    identity_network_plan_hash: str = ""
+
+    generation_sols_batch_enabled:bool=False
+    generation_customer_identity_enabled:bool=False
+    generation_customer_identity_recovery_enabled:bool=False
+    generation_customer_purchase_enabled:bool=False
+    generation_customer_purchase_issuer_enabled:bool=False
+    generation_customer_purchase_issuer_key_path:str=''
+    generation_customer_purchase_policy_path:str=''
+    generation_customer_purchase_policy_hash:str=Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
+    generation_customer_purchase_prior_policy_path:str=''
+    generation_customer_purchase_prior_policy_hash:str=Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
+    generation_customer_purchase_cutover_path: str = ''
+    generation_customer_purchase_cutover_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
+    generation_customer_identity_recovery_expires_at:int=Field(default=0,ge=0)
+    generation_customer_identity_profile_path:str=''
+    generation_customer_identity_profile_hash:str=Field(default='', pattern=r'^(|0x[0-9a-f]{64})$')
+    deployment_generation_id:str|None=Field(default=None,pattern=r'^0x[0-9a-f]{64}$')
+    generation_preparation_path:str|None=None
+    generation_preparation_hash:str|None=None
+    generation_chain_anchor_path:str|None=None
+    generation_chain_anchor_hash:str|None=None
+    generation_primary_url:str|None=None
+    generation_primary_ca_cert_path:str|None=None
+    generation_primary_client_cert_path:str|None=None
+    generation_primary_client_key_path:str|None=None
+    generation_primary_readonly_gateway:bool=False
 
     network: Literal["testnet11"] = "testnet11"
     coinset_base_url: str = "https://testnet11.api.coinset.org"
@@ -108,9 +137,48 @@ class ValidatorSettings(BaseSettings):
 
     @model_validator(mode="after")
     def _permit_deployment(self) -> "ValidatorSettings":
+        if self.generation_customer_identity_recovery_enabled and not self.generation_customer_identity_enabled:
+            raise ValueError('identity signature recovery requires the current identity boundary')
+        if self.generation_customer_identity_recovery_enabled and not self.generation_customer_identity_recovery_expires_at:
+            raise ValueError('identity signature recovery requires a finite expiry')
+        if self.generation_primary_readonly_gateway:
+            from .generation_primary_reader import PRIMARY_READER_URL
+            if (not (self.generation_customer_identity_enabled or self.generation_customer_purchase_enabled)
+                    or self.generation_primary_url != PRIMARY_READER_URL
+                    or not self.generation_primary_ca_cert_path
+                    or self.generation_primary_client_cert_path
+                    or self.generation_primary_client_key_path):
+                raise ValueError('private native reader must use its exact TLS and generation boundary')
+        if bool(self.generation_customer_purchase_cutover_path)!=bool(self.generation_customer_purchase_cutover_hash):
+            raise ValueError('checkout cutover requires both its path and hash')
+        if bool(self.generation_customer_purchase_prior_policy_path)!=bool(self.generation_customer_purchase_prior_policy_hash):
+            raise ValueError('prior purchase policy requires both its path and hash')
+        if self.generation_customer_purchase_enabled:
+            if (not self.generation_customer_identity_enabled or self.enrollment_activation is not None
+                    or not all((self.generation_customer_purchase_policy_path,self.generation_customer_purchase_policy_hash))):
+                raise ValueError('current purchase signing requires the current identity boundary and frozen finite issuer policy')
+        if self.generation_customer_purchase_issuer_enabled and (
+                not self.generation_customer_purchase_enabled or self.signer_index!=2
+                or not self.generation_customer_purchase_issuer_key_path.startswith('/run/')):
+            raise ValueError('finite issuer forwarding requires private signer two and its fixed runtime credential')
+        if self.generation_customer_identity_enabled:
+            if (self.enrollment_activation is not None or self.evm_chain_id != 8453
+                    or not all((self.deployment_generation_id, self.generation_preparation_path,
+                        self.generation_preparation_hash, self.generation_chain_anchor_path,
+                        self.generation_chain_anchor_hash, self.generation_primary_url,
+                        self.generation_customer_identity_profile_path,
+                        self.generation_customer_identity_profile_hash))):
+                raise ValueError('current identity signer requires an exact profile and independent native generation source')
+            return self
         if self.enrollment_activation is None:
             if self.evm_chain_id != 11155111:
-                raise ValueError("Base enrollment requires complete activation evidence")
+                # This is only a completeness check. Startup and every identity
+                # sign request authenticate the full Chia amendment history.
+                evidence = (self.identity_deployment_amendment_path, self.identity_deployment_artifact_path,
+                            self.identity_deployment_plan_hash, self.identity_network_amendment_path,
+                            self.identity_network_artifact_path, self.identity_network_plan_hash)
+                if self.evm_chain_id != 8453 or not all(evidence):
+                    raise ValueError("Base enrollment requires complete activation evidence")
             return self
         from solslot_puzzles.enrollment_activation import validate_enrollment_activation
         value = self.enrollment_activation

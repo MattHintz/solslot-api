@@ -189,14 +189,16 @@ class AbandonRequest(ApiModel):
 
 
 @lru_cache(maxsize=8)
-def _store_for_path(path: str) -> GenesisStore:
-    return GenesisStore(path)
+def _store_for_path(path: str, generation_id: str | None = None, network: str = "testnet11") -> GenesisStore:
+    return GenesisStore(path, generation_id=generation_id, network=network)
 
 
 def get_genesis_store(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> GenesisStore:
-    return _store_for_path(settings.genesis_db_path)
+    from .generation_storage import generation_path
+    return _store_for_path(generation_path(settings.genesis_db_path, settings.deployment_generation_id),
+                           settings.deployment_generation_id, settings.network)
 
 
 def _coinset() -> CoinsetClient:
@@ -356,6 +358,7 @@ def _plan_typed_data(record: Mapping[str, Any]) -> dict[str, Any]:
         plan_hash=str(record["plan_hash"]),
         expires_at=int(record["plan_expires_at"]),
         chain_id=record.get('draft',{}).get('evmChainId',11155111),
+        generation_id=record.get('draft', {}).get('generationId'),
     )
 
 
@@ -922,6 +925,7 @@ def _invitation_typed_data(
             nonce=str(invitation["nonce"]),
             expires_at=int(invitation["expires_at"]),
             chain_id=store.get(str(invitation['ceremony_id']))['draft'].get('evmChainId',11155111),
+            generation_id=store.generation_id,
         )
         return invitation, typed
     except GenesisStoreError as exc:
@@ -1000,6 +1004,8 @@ async def create_plan(
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[GenesisStore, Depends(get_genesis_store)],
 ) -> dict[str, Any]:
+    if settings.deployment_generation_id:
+        raise HTTPException(409,detail='The replacement generation requires its reviewed generation genesis builder. Historical genesis plans cannot be reused.')
     try:
         current = store.get(ceremony_id.lower())
         require_scope(settings, current)
@@ -1454,6 +1460,8 @@ async def _prepare_bundle(
     dict[str, Any],
     tuple[ValidatorHealthResponse, ...],
 ]:
+    if settings.deployment_generation_id:
+        raise GenesisConflict('Historical genesis bundle preparation is unavailable in the replacement generation.')
     authority_review = await _authority_preflight(settings, record)
     faucet = _faucet()
     if _hex(faucet.address_puzzle_hash).lower() != str(
@@ -1568,6 +1576,8 @@ async def _broadcast_ceremony(
     *,
     gate_authorization: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    if settings.deployment_generation_id:
+        raise GenesisConflict('Historical genesis broadcast is unavailable in the replacement generation.')
     record = store.get(ceremony_id.lower())
     try:
         require_scope(settings, record)

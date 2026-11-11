@@ -1206,7 +1206,11 @@ def _build_native_purchase_spend(*, group, buyer_offer, signer_indices, aggregat
             terms=tuple(context.terms for context in group.contexts),
             reservations=reservations,
         )
-    valid_spend = primary.aggregate_offer.to_valid_spend()
+    # The equal-price completion repair is native XCH only. Preserve the
+    # established CAT completion path for its separate acceptance release.
+    valid_spend = (primary.to_valid_spend()
+        if group.batch is not None and group.contexts[0].purchase.rail == PaymentRail.CHIA_XCH
+        else primary.aggregate_offer.to_valid_spend())
     signed_spend = WalletSpendBundle(
         valid_spend.coin_spends,
         AugSchemeMPL.aggregate(

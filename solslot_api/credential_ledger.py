@@ -8,6 +8,8 @@ across threads and API worker processes.
 """
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 import json
 import hashlib
 import secrets
@@ -19,7 +21,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 OWNER_CHALLENGE_MAX_TTL_SECONDS = 900
 
 
@@ -53,21 +55,28 @@ class OwnerChallenge:
 class CredentialLedger:
     """SQLite-backed V2 credential state machine and replay ledger."""
 
-    def __init__(self, path: str | Path, timeout: float = 10.0) -> None:
+    def __init__(self, path: str | Path, timeout: float = 10.0, *, generation_id: str | None = None, network: str = "testnet11") -> None:
         self.path = str(path) if path == ":memory:" else str(Path(path))
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(
+        self._conn = connect_generation_sqlite(
             self.path,
+            generation_id=generation_id, generation_network=network,
             timeout=timeout,
             isolation_level=None,
             check_same_thread=False,
         )
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
-        self._configure()
-        self._migrate()
-        self._prepare_owner_challenge_retention()
+        try:
+            from .generation_storage import bind_generation
+            bind_generation(self._conn, generation_id, network)
+            self._configure()
+            self._migrate()
+            self._prepare_owner_challenge_retention()
+        except Exception:
+            self._conn.close()
+            raise
 
     def _prepare_owner_challenge_retention(self) -> None:
         # Additive index, compatible with existing schema-1 ledgers. Owner
@@ -265,6 +274,22 @@ class CredentialLedger:
                 );
                 CREATE INDEX IF NOT EXISTS permit_history_vault ON permit_issuance_history(vault_launcher_id,id);
                 PRAGMA user_version = 4;
+                COMMIT;
+            """)
+
+            # Append a money-denominated reservation for Base only. Existing
+            # attempts/transactions retain every byte and outcome unchanged.
+            self._conn.executescript("""
+                BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS relay_fee_reservations (
+                    request_digest TEXT PRIMARY KEY REFERENCES relay_transactions(request_digest),
+                    chain_id INTEGER NOT NULL,
+                    relayer TEXT NOT NULL,
+                    maximum_fee_wei TEXT NOT NULL,
+                    quote_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                PRAGMA user_version = 5;
                 COMMIT;
             """)
 
@@ -805,9 +830,16 @@ class CredentialLedger:
                 (vault_launcher_id.lower(),)).fetchone()
         return dict(row) if row else None
 
+    def get_relay_fee_reservation(self, request_digest: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute('SELECT * FROM relay_fee_reservations WHERE request_digest=?',
+                (request_digest.lower(),)).fetchone()
+        return dict(row) if row else None
+
     def prepare_relay_transaction(self, *, request_digest: str, context: dict[str, Any],
                                   request: dict[str, Any], transaction: dict[str, Any],
-                                  sign_transaction: Any, retry_until: int) -> dict[str, Any]:
+                                  sign_transaction: Any, retry_until: int,
+                                  base_fee_quote: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         """Allocate the outer nonce, sign locally and retain bytes in one SQLite transaction.
 
         The callback must only sign the supplied transaction; it must not send
@@ -839,16 +871,35 @@ class CredentialLedger:
                 if ambiguous_legacy:
                     raise LedgerConflict('An unresolved historical relay must be reconciled before allocating any new sponsored transaction nonce.')
                 tx = dict(transaction)
+                if tx['chainId'] == 8453:
+                    from .identity_relay_fees import validate_quote
+                    if base_fee_quote is None:
+                        raise LedgerConflict('Base relay requires a reviewed fee reservation.')
+                    validate_quote(base_fee_quote, tx)
+                    fees = self._conn.execute('SELECT maximum_fee_wei FROM relay_fee_reservations WHERE chain_id=? AND relayer=? AND created_at>=?',
+                        (8453, tx['from'].lower(), now - 86400)).fetchall()
+                    # Python integers avoid SQLite SUM's signed-64-bit overflow.
+                    reserved = sum(int(fee[0]) for fee in fees)
+                    if reserved + base_fee_quote['maximumFeeWei'] > base_fee_quote['dailyFeeLimitWei']:
+                        raise LedgerRateLimited('The daily sponsored Base fee budget is exhausted.')
+                elif base_fee_quote is not None:
+                    raise LedgerConflict('Base fee reservation cannot authorize a different chain.')
                 latest = self._conn.execute('SELECT MAX(outer_nonce) FROM relay_transactions WHERE chain_id=? AND relayer=?',
                     (tx['chainId'], tx['from'].lower())).fetchone()[0]
                 tx['nonce'] = max(int(tx['nonce']), int(latest) + 1 if latest is not None else 0)
                 raw = bytes(sign_transaction(tx).raw_transaction)
                 identity = signed_transaction_identity(raw, tx)
+                if base_fee_quote is not None and len(raw) > base_fee_quote['maximumSignedBytes']:
+                    raise LedgerConflict('Signed Base transaction exceeds its reviewed byte bound.')
                 self._conn.execute("""INSERT INTO relay_transactions
                     (request_digest,vault_launcher_id,context_json,request_json,raw_transaction_hex,
                      tx_hash,chain_id,relayer,outer_nonce,retry_until,created_at)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (request_digest.lower(),row['vault_launcher_id'],encoded_context,
                     encoded_request,raw.hex(),identity['tx_hash'],identity['chain_id'],identity['relayer'],identity['nonce'],retry_until,now))
+                if base_fee_quote is not None:
+                    self._conn.execute('INSERT INTO relay_fee_reservations VALUES (?,?,?,?,?,?)',
+                        (request_digest.lower(),8453,identity['relayer'],str(base_fee_quote['maximumFeeWei']),
+                         _canonical_json(base_fee_quote),now))
                 self._conn.execute('UPDATE relay_attempts SET tx_hash=?, updated_at=? WHERE request_digest=?',
                     (identity['tx_hash'],now,request_digest.lower()))
                 self._conn.execute('COMMIT')
@@ -1109,29 +1160,37 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
-_LEDGERS: dict[str, CredentialLedger] = {}
+_LEDGERS: dict[tuple[str, str | None, str], CredentialLedger] = {}
 _LEDGERS_LOCK = threading.Lock()
 
 
 def get_credential_ledger(settings: Any) -> CredentialLedger:
-    path = str(settings.zkpassport_ledger_db_path)
+    from .generation_storage import generation_path
+    generation = getattr(settings, 'deployment_generation_id', None)
+    network = getattr(settings, 'network', 'testnet11')
+    path = generation_path(str(settings.zkpassport_ledger_db_path), generation)
+    key = (path, generation, network)
     with _LEDGERS_LOCK:
-        ledger = _LEDGERS.get(path)
+        ledger = _LEDGERS.get(key)
         if ledger is None:
-            ledger = CredentialLedger(path)
-            _LEDGERS[path] = ledger
+            ledger = CredentialLedger(path, generation_id=generation, network=network)
+            _LEDGERS[key] = ledger
         return ledger
 
 
 def get_existing_credential_ledger(settings: Any) -> CredentialLedger | None:
     """Open retained recovery state without creating a ledger for a blocked request."""
 
-    path = str(settings.zkpassport_ledger_db_path)
+    from .generation_storage import generation_path
+    generation = getattr(settings, 'deployment_generation_id', None)
+    network = getattr(settings, 'network', 'testnet11')
+    path = generation_path(str(settings.zkpassport_ledger_db_path), generation)
+    key = (path, generation, network)
     with _LEDGERS_LOCK:
-        ledger = _LEDGERS.get(path)
+        ledger = _LEDGERS.get(key)
         if ledger is None and path != ":memory:" and Path(path).is_file():
-            ledger = CredentialLedger(path)
-            _LEDGERS[path] = ledger
+            ledger = CredentialLedger(path, generation_id=generation, network=network)
+            _LEDGERS[key] = ledger
         return ledger
 
 

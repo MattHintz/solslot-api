@@ -15,7 +15,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Optional
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .service_urls import (
@@ -527,16 +527,43 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
         )
     if settings.collection_metadata_enabled:
         required_collection_settings = {
-            "SOLSLOT_COLLECTION_S3_ENDPOINT_URL": settings.collection_s3_endpoint_url,
-            "SOLSLOT_COLLECTION_S3_ACCESS_KEY_ID": settings.collection_s3_access_key_id,
-            "SOLSLOT_COLLECTION_S3_SECRET_ACCESS_KEY": settings.collection_s3_secret_access_key,
-            "SOLSLOT_COLLECTION_S3_PUBLIC_BASE_URL": settings.collection_s3_public_base_url,
             "SOLSLOT_COLLECTION_IPFS_API_URL": settings.collection_ipfs_api_url,
-            "SOLSLOT_COLLECTION_IPFS_PINNING_SERVICE_URL": settings.collection_ipfs_pinning_service_url,
-            "SOLSLOT_COLLECTION_IPFS_PINNING_TOKEN": settings.collection_ipfs_pinning_token,
             "SOLSLOT_COLLECTION_IPFS_GATEWAY_URL": settings.collection_ipfs_gateway_url,
-            "SOLSLOT_COLLECTION_MALWARE_SCAN_URL": settings.collection_malware_scan_url,
         }
+        if settings.collection_storage_backend == "filesystem":
+            required_collection_settings.update({
+                "SOLSLOT_COLLECTION_LOCAL_ROOT": settings.collection_local_root,
+                "SOLSLOT_COLLECTION_LOCAL_BASE_URL": settings.collection_local_base_url,
+            })
+            if len(settings.admin_jwt_secret) < 32:
+                raise RuntimeError("Local collection capabilities require the protected admin signing secret")
+            if not str(settings.collection_local_base_url).startswith("https://"):
+                raise RuntimeError("Local collection media must use HTTPS when hosted")
+        else:
+            required_collection_settings.update({
+                "SOLSLOT_COLLECTION_S3_ENDPOINT_URL": settings.collection_s3_endpoint_url,
+                "SOLSLOT_COLLECTION_S3_ACCESS_KEY_ID": settings.collection_s3_access_key_id,
+                "SOLSLOT_COLLECTION_S3_SECRET_ACCESS_KEY": settings.collection_s3_secret_access_key,
+                "SOLSLOT_COLLECTION_S3_PUBLIC_BASE_URL": settings.collection_s3_public_base_url,
+            })
+        if settings.collection_ipfs_pinning_mode == "service":
+            required_collection_settings.update({
+                "SOLSLOT_COLLECTION_IPFS_PINNING_SERVICE_URL": settings.collection_ipfs_pinning_service_url,
+                "SOLSLOT_COLLECTION_IPFS_PINNING_TOKEN": settings.collection_ipfs_pinning_token,
+            })
+        else:
+            from urllib.parse import urlsplit
+            rpc = str(settings.collection_ipfs_api_url or "")
+            if not valid_internal_service_url(rpc) or urlsplit(rpc).hostname not in {"127.0.0.1", "::1"}:
+                raise RuntimeError("Unauthenticated Kubo RPC must stay on loopback")
+        required_collection_settings["collection malware scanner"] = (
+            settings.collection_clamav_socket if settings.collection_malware_scan_backend == "clamav"
+            else settings.collection_malware_scan_url
+        )
+        if settings.collection_malware_scan_backend == "clamav":
+            required_collection_settings["SOLSLOT_COLLECTION_CLAMAV_POLICY_PATH"] = settings.collection_clamav_policy_path
+            if settings.collection_asset_max_bytes > 20 * 1024 * 1024:
+                raise RuntimeError("Local ClamAV uploads must be capped at 20 MiB")
         missing = [name for name, value in required_collection_settings.items() if not value]
         if missing:
             raise RuntimeError(
@@ -703,6 +730,14 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
     # The signed enrollment activation independently pins the exact identity
     # chain; complete issuer metadata is mandatory for either selected chain.
     identity_chains = {8453, 84532} if all(permit_metadata) else {expected_evm_chain_id}
+    network_metadata = (settings.identity_network_amendment_path,
+                        settings.identity_network_artifact_path, settings.identity_network_plan_hash)
+    if any(network_metadata):
+        if settings.network != "testnet11" or not all(network_metadata) or not all((
+            settings.identity_deployment_amendment_path, settings.identity_deployment_artifact_path,
+            settings.identity_deployment_plan_hash)):
+            raise RuntimeError("Identity network amendment requires complete isolated Testnet evidence.")
+        identity_chains.add(8453)
     if settings.zkpassport_evm_chain_id not in identity_chains:
         raise RuntimeError(
             "SOLSLOT_ZKPASSPORT_EVM_CHAIN_ID does not match the selected identity deployment."
@@ -886,6 +921,9 @@ class Settings(BaseSettings):
     protocol_issuance_backing_max_mojos: int = Field(default=0, ge=0)
     protocol_medium_fee_target_seconds: int = Field(300, ge=60, le=1800)
     protocol_fee_estimate_buffer_bps: int = Field(12_500, ge=10_000, le=30_000)
+    protocol_fee_native_admission_enabled: bool = True
+    protocol_fee_cost_tiers_enabled: bool = False
+    governance_publication_approval_window_seconds: int = Field(86_400, ge=3_600, le=7 * 86_400)
     protocol_minimum_fee_mojos: int = Field(1, ge=0)
     protocol_maximum_fee_mojos: int = Field(10_000_000, ge=1)
     protocol_mempool_timeout_seconds: float = Field(20.0, ge=2.0, le=120.0)
@@ -1010,6 +1048,10 @@ class Settings(BaseSettings):
     identity_deployment_amendment_path: str = ""
     identity_deployment_artifact_path: str = ""
     identity_deployment_plan_hash: str = ""
+    # A separately staged candidate never replaces the confirmed V1 evidence.
+    identity_network_amendment_path: str = ""
+    identity_network_artifact_path: str = ""
+    identity_network_plan_hash: str = ""
     # Public, version-pinned issuer coordinates only; private keys remain in Key Vault.
     enrollment_permit_release_identity: str = ""
     enrollment_permit_issuer_key_ref: str = ""
@@ -1294,6 +1336,7 @@ class Settings(BaseSettings):
     )
     # JSON-RPC endpoint the relayer uses (defaults to a public Sepolia node).
     zkpassport_evm_rpc_url: str = "https://ethereum-sepolia-rpc.publicnode.com"
+    zkpassport_base_evm_rpc_url: str = "https://mainnet.base.org"
     # EIP-155 chain id the relayer signs for (11155111 = Eth Sepolia).
     zkpassport_evm_chain_id: int = 11155111
     # Fresh V2 addresses are intentionally unset until the EVM ceremony.
@@ -1311,6 +1354,10 @@ class Settings(BaseSettings):
     zkpassport_relay_per_owner_per_minute: int = Field(6, ge=1)
     zkpassport_relay_per_vault_per_hour: int = Field(2, ge=1)
     zkpassport_relay_global_gas_per_day: int = Field(20_000_000, ge=1)
+    # Base uses real ETH even for Testnet11 credentials. Zero disables new
+    # sponsored Base writes until an explicit operating budget is approved.
+    zkpassport_base_relay_max_fee_wei: int = Field(0, ge=0, le=100_000_000_000_000)
+    zkpassport_base_relay_daily_fee_wei: int = Field(0, ge=0, le=1_000_000_000_000_000)
     zkpassport_relay_circuit_failure_threshold: int = Field(5, ge=1)
     zkpassport_relay_circuit_cooldown_seconds: int = Field(900, ge=60)
 
@@ -1425,8 +1472,83 @@ class Settings(BaseSettings):
     # ── Chain-verifiable collection minting ──────────────────────────────
     # Metadata authoring and proposal publication are independently gated.
     # Both default off so an API upgrade cannot expose an unfinished desk.
+    deployment_generation_id: Optional[str] = Field(default=None, pattern=r"^0x[0-9a-f]{64}$")
+    generation_preparation_path: Optional[str] = None
+    generation_preparation_hash: Optional[str] = Field(default=None,pattern=r"^0x[0-9a-f]{64}$")
+    generation_preparation_db_path: str = "./state/generation-preparation.sqlite3"
+    # Startup schema preparation only; never enables dispatch or certifies recovery.
+    generation_recovery_storage_enabled: bool = False
+    generation_launch_artifact_path: Optional[str] = None
+    generation_launch_certificate_path: Optional[str] = None
+    generation_launch_certificate_hash: Optional[str] = Field(default=None,pattern=r"^0x[0-9a-f]{64}$")
+    generation_launch_db_path: str = "./state/generation-launch.sqlite3"
+    generation_launch_enabled: bool = False
+    generation_chain_anchor_path: Optional[str] = None
+    generation_chain_anchor_hash: Optional[str] = Field(default=None,pattern=r"^0x[0-9a-f]{64}$")
+    # Public recovery-policy preimages, pinned separately and always checked
+    # against the current confirmed identity custody before granting access.
+    generation_admin_identity_witnesses_path: Optional[str] = None
+    generation_admin_identity_witnesses_hash: Optional[str] = Field(default=None,pattern=r"^0x[0-9a-f]{64}$")
+    generation_index_db_path: str = "./state/generation-index.sqlite3"
+    generation_operations_db_path: str = "./state/generation-operations.sqlite3"
+    generation_consents_db_path: str = "./state/generation-consents.sqlite3"
+    generation_ballots_db_path: str = "./state/generation-ballots.sqlite3"
+    generation_mint_reviews_db_path: str = "./state/generation-mint-reviews.sqlite3"
+    # Only a separately approved, verified generation deployment may enable
+    # native operation dispatch. Preparation/status never imply this consent.
+    generation_sols_batch_enabled: bool=False
+    generation_sols_orders_db_path: str='./state/generation-sols-orders.sqlite3'
+    generation_execution_enabled: bool = False
+    generation_customer_enabled: bool = False
+    generation_customer_db_path: str = './state/generation-customers.sqlite3'
+    generation_customer_public_origin: str = 'https://solslot.com'
+    generation_customer_policy_path: str = ''
+    generation_customer_policy_hash: str = ''
+    generation_customer_signer_key_path: str = ''
+    generation_customer_fee_db_path: str = './state/customer-fees.sqlite3'
+    generation_customer_identity_enabled: bool = False
+    # Separate Testnet-only price demand worker. Disabled until explicitly configured.
+    generation_customer_pricing_enabled: bool = False
+    generation_customer_pricing_socket: str = '/run/solslot-price-demand/input.sock'
+    generation_customer_pricing_socket_gid: int = Field(default=-1,ge=-1)
+    # Separate finite Testnet purchase policy; no legacy write gate enables it.
+    generation_customer_purchase_enabled: bool = False
+    generation_customer_purchase_funding_enabled: bool = False
+    generation_customer_purchase_worker_enabled: bool = False
+    generation_customer_purchase_policy_path: str = ''
+    generation_customer_purchase_policy_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
+    generation_customer_purchase_prior_policy_path: str = ''
+    generation_customer_purchase_prior_policy_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
+    generation_customer_purchase_cutover_path: str = ''
+    generation_customer_purchase_cutover_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
+    generation_customer_purchase_fee_authority_path: str = ''
+    generation_customer_purchase_fee_authority_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
+    generation_customer_purchase_fee_signer_key_path: str = ''
+    generation_customer_identity_recovery_enabled: bool = False
+    generation_customer_identity_profile_path: str = ''
+    generation_customer_identity_profile_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
+    generation_customer_identity_previous_profile_path: str = ''
+    generation_customer_identity_previous_profile_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
+    generation_customer_identity_authority_path: str = ''
+    generation_customer_identity_authority_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
+    generation_customer_identity_fee_signer_key_path: str = ''
+    generation_customer_identity_relayer_key_path: str = ''
+    generation_customer_identity_funding_db_path: str = './state/customer-identity-funding.sqlite3'
+    vault_registry_path: str = "./state/vault_registry_v2.db"
+    test_collection_editions_enabled: bool = False
+    collection_source_archive_db_path: Optional[str] = None
+    collection_source_archive_generation_id: Optional[str] = None
+    collection_generation_recovery_path: Optional[str] = None
+    collection_generation_recovery_source_hash: Optional[str] = None
     collection_metadata_enabled: bool = False
     collection_minting_enabled: bool = False
+
+    # Optional existing-host backend; the S3 contract remains the default.
+    collection_storage_backend: Literal["s3", "filesystem"] = "s3"
+    collection_local_root: Optional[str] = None
+    collection_local_base_url: Optional[str] = None
+    collection_local_quota_bytes: int = Field(1024 * 1024 * 1024, ge=1)
+    collection_local_min_free_bytes: int = Field(5 * 1024 * 1024 * 1024, ge=0)
 
     # Authenticated S3-compatible staging store. Objects are never considered
     # investor-ready until the API has fetched and verified their bytes.
@@ -1452,11 +1574,15 @@ class Settings(BaseSettings):
     collection_ipfs_pinning_service_url: Optional[str] = None
     collection_ipfs_pinning_token: Optional[str] = None
     collection_ipfs_gateway_url: Optional[str] = None
+    collection_ipfs_pinning_mode: Literal["service", "kubo"] = "service"
 
     # Scanner must return {"status":"CLEAN"}. No scanner means no publish;
     # there is deliberately no production fail-open mode.
     collection_malware_scan_url: Optional[str] = None
     collection_malware_scan_token: Optional[str] = None
+    collection_malware_scan_backend: Literal["http", "clamav"] = "http"
+    collection_clamav_socket: Optional[str] = None
+    collection_clamav_policy_path: Optional[str] = None
 
     # ── CORS ──────────────────────────────────────────────────────────────
     # Same-origin deployments need no CORS entries. Local development opts
@@ -1496,6 +1622,63 @@ class Settings(BaseSettings):
     faucet_consolidation_fee: int = 0
     # Cap on inputs per consolidation run (well below MAX_SPENDS_PER_BLOCK).
     faucet_consolidation_max_inputs: int = 500
+
+    @model_validator(mode='after')
+    def isolate_generation_runtime(self):
+        from urllib.parse import urlsplit
+        origin=urlsplit(self.generation_customer_public_origin)
+        if (origin.scheme!='https' or not origin.hostname or origin.username or origin.password
+                or origin.path or origin.query or origin.fragment
+                or self.generation_customer_public_origin != f'https://{origin.netloc}'
+                or origin.netloc != origin.netloc.lower()):
+            raise ValueError('customer registration requires an exact HTTPS origin')
+        if self.generation_customer_pricing_enabled and (
+                self.network!='testnet11' or not self.deployment_generation_id
+                or not self.generation_customer_identity_enabled
+                or self.generation_customer_pricing_socket!='/run/solslot-price-demand/input.sock'
+                or self.generation_customer_pricing_socket_gid<0):
+            raise ValueError('Testnet price demand requires the current identity context and exact local socket')
+        if self.generation_customer_purchase_funding_enabled and not self.generation_customer_purchase_enabled:
+            raise ValueError('purchase fees require the separately enabled current checkout')
+        if bool(self.generation_customer_purchase_cutover_path)!=bool(self.generation_customer_purchase_cutover_hash):
+            raise ValueError('checkout cutover requires both its path and hash')
+        if bool(self.generation_customer_purchase_prior_policy_path)!=bool(self.generation_customer_purchase_prior_policy_hash):
+            raise ValueError('prior purchase policy requires both its path and hash')
+        if self.generation_customer_purchase_worker_enabled and (not self.generation_customer_purchase_funding_enabled
+                or self.zkpassport_validator_urls!=['https://10.77.0.10:9544','https://10.77.0.11:9544','https://10.77.0.12:9544']):
+            raise ValueError('automatic delivery requires finite Testnet purchase funding and the existing private signers')
+        if self.generation_customer_purchase_enabled and (
+                self.network!='testnet11' or not self.deployment_generation_id or self.alpha_writes_enabled
+                or not self.generation_customer_enabled or not self.generation_customer_identity_enabled
+                or not all((self.generation_customer_purchase_policy_path,self.generation_customer_purchase_policy_hash,
+                    self.generation_customer_purchase_fee_authority_path,self.generation_customer_purchase_fee_authority_hash))
+                or (self.generation_customer_purchase_funding_enabled
+                    and not self.generation_customer_purchase_fee_signer_key_path)):
+            raise ValueError('current checkout requires exact Testnet custody and finite policy files')
+        if self.deployment_generation_id is None:
+            if self.generation_customer_enabled:
+                raise ValueError('customer registration requires a separate Testnet generation')
+            if self.generation_recovery_storage_enabled:
+                raise ValueError('generation recovery storage requires a separate Testnet generation')
+            if self.generation_launch_enabled:
+                raise ValueError('final launch requires a separate Testnet generation')
+            if self.generation_execution_enabled:
+                raise ValueError('generation execution requires an explicit Testnet11 generation')
+            return self
+        from .generation_storage import generation_path
+        from .generation_context import generation_bytes
+        generation_bytes(self.deployment_generation_id)
+        if self.network!='testnet11':
+            raise ValueError('replacement generations require Chia Testnet11')
+        # Explicit owned outputs only. Do not rewrite source evidence, keys,
+        # private documents, recovery locations or the read-only old archive.
+        for field in ('genesis_db_path','zkpassport_ledger_db_path','payment_purchase_db_path',
+            'stripe_delivery_db_path','admin_db_path','generation_preparation_db_path','generation_index_db_path','generation_operations_db_path','generation_consents_db_path','generation_ballots_db_path','generation_mint_reviews_db_path',
+            'generation_launch_db_path','generation_sols_orders_db_path','generation_customer_db_path','generation_customer_fee_db_path','generation_customer_identity_funding_db_path',
+            'vault_registry_path','sols_capability_operations_path','challenge_store_path',
+            'genesis_output_dir','deployment_manifest_path','public_artifact_path','bootstrap_manifest_path'):
+            setattr(self,field,generation_path(getattr(self,field),self.deployment_generation_id))
+        return self
 
     def allowed_origins(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
