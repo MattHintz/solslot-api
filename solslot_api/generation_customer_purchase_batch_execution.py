@@ -15,6 +15,9 @@ from .generation_customer_inventory import resolve_current_primary_inventory
 from .generation_customer_context import customer_bindings_from_evidence
 from .generation_customer_vault import resolve_native_identity_vault
 from .generation_customer_quote import current_customer_xch_quote
+from .generation_customer_issuer import TestnetIssuerPolicy
+from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy
+from .generation_customer_purchase_scope import quote_deadline
 from .generation_customer_test_conversion import configured_price
 from .generation_preparation import read_generation_preparation
 from .generation_customer_purchase_timing import measured, start, record
@@ -24,26 +27,45 @@ from .faucet import AGG_SIG_ME_DATA
 def h(v):return '0x'+bytes(v).hex()
 
 
-async def quote_batch(s,request_key,deeds,browser_hash):
+async def quote_batch(s,request_key,deeds,browser_hash,receiving_launcher=None,receiving_owner=None):
     if (not isinstance(deeds,(list,tuple))or not 2<=len(deeds)<=25
             or len(set(deeds))!=len(deeds)):
         raise ValueError('CURRENT_PURCHASE_BATCH_QUANTITY_INVALID')
     ordered=tuple(sorted(bytes32.from_hexstr(d)for d in deeds))
+    collection = isinstance(s.policy, TestnetCollectionIssuerPolicy)
+    if collection and (not isinstance(receiving_launcher, bytes32) or receiving_launcher == bytes32.zeros
+            or not isinstance(receiving_owner, str) or not receiving_owner):
+        raise ValueError('CURRENT_EXECUTION_RECEIVING_VAULT_REQUIRED')
     prior=s.store.review_for_request(request_key,browser_hash=browser_hash)
     if prior is not None:
         claim=s._review_saved(prior['intentId'],browser_hash)['reservationClaim']
         if not isinstance(claim,CurrentReservationBatch) or tuple(a.deed_launcher_id for a in artifacts(claim))!=ordered:
             raise ValueError('CURRENT_EXECUTION_REQUEST_KEY_DEED_CHANGED')
+        if isinstance(s.policy,TestnetCollectionIssuerPolicy) and any(a.vault_launcher_id!=receiving_launcher for a in artifacts(claim)):
+            raise ValueError('CURRENT_EXECUTION_RECEIVING_VAULT_CHANGED')
         return s.review(prior['intentId'],browser_hash=browser_hash)
     now=int(s.clock());expires=now+300
-    if not s.policy.issued_at<=now<expires<=s.policy.expires_at:
-        raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_CLOSED')
+    if isinstance(s.policy,TestnetIssuerPolicy):
+        if not s.policy.issued_at<=now<expires<=s.policy.expires_at:
+            raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_CLOSED')
+        launcher=s.policy.buyer_vault
+        if receiving_launcher is not None and receiving_launcher!=launcher:
+            raise ValueError('CURRENT_EXECUTION_RECEIVING_VAULT_CHANGED')
+    elif isinstance(s.policy,TestnetCollectionIssuerPolicy) and isinstance(receiving_launcher,bytes32) and receiving_launcher!=bytes32.zeros:
+        launcher=receiving_launcher
+        s._funding_context(until=expires)
+    else:raise ValueError('CURRENT_EXECUTION_RECEIVING_VAULT_REQUIRED')
     if any(d not in s.policy.deed_launchers for d in ordered):
         raise ValueError('CURRENT_EXECUTION_DEED_OUTSIDE_REVIEWED_POLICY')
-    inventory=await resolve_current_primary_inventory(settings=s.settings,anchor=s.anchor,provider=s.provider,
-        collection=s.policy.collection,edition_hash=s.policy.edition,metadata_root=s.policy.metadata_root)
+    if collection:
+        inventory = await s.inventory_snapshot()
+    else:
+        inventory = await resolve_current_primary_inventory(settings=s.settings, anchor=s.anchor, provider=s.provider,
+            collection=s.policy.collection, edition_hash=s.policy.edition, metadata_root=s.policy.metadata_root)
     bindings=customer_bindings_from_evidence(read_generation_preparation(s.settings),s.anchor,inventory.evidence)
-    vault=await resolve_native_identity_vault(bindings=bindings,launcher=s.policy.buyer_vault,provider=s.provider)
+    vault=await resolve_native_identity_vault(bindings=bindings,launcher=launcher,provider=s.provider)
+    if isinstance(s.policy, TestnetCollectionIssuerPolicy):
+        s.policy.require_verified_vault(vault, launcher=launcher, auth_type='chia_bls', owner_key=receiving_owner)
     price,evidence=configured_price(s.settings,s.policy,now=now,expires_at=expires)
     nonce=bytes32(secrets.token_bytes(32));children=[];purchases=[]
     for deed in ordered:
@@ -63,7 +85,8 @@ async def quote_batch(s,request_key,deeds,browser_hash):
     try:identity=s.store.save_review(claim,browser_hash=browser_hash,request_key=request_key,now=int(s.clock()))
     except ValueError as exc:
         if str(exc)!='CURRENT_CHECKOUT_RETRY_CHANGES_REVIEW':raise
-        return await quote_batch(s,request_key,deeds,browser_hash)
+        return await quote_batch(s,request_key,deeds,browser_hash,
+            receiving_launcher=receiving_launcher,receiving_owner=receiving_owner)
     if quote_finished is not None:record(s,identity,'quote_verification',quote_started,quote_finished)
     return s.review(identity,browser_hash=browser_hash)
 
@@ -71,6 +94,7 @@ async def quote_batch(s,request_key,deeds,browser_hash):
 def review_batch(s,identity,saved,binding):
     claim=saved['reservationClaim'];batch=purchase_batch_from_json(claim.purchase_batch);first=batch.artifacts[0]
     existing=s._existing(identity,'RESERVATION',binding)
+    fee_cap = s.review_fee_cap(identity, binding)
     return {'schema':'solslot.current-primary-checkout-batch.v1','intentId':identity,'generationId':s.store.generation_id,
         'network':'testnet11','receivingVaultLauncherId':h(first.vault_launcher_id),'rail':'CHIA_XCH',
         'purchaseBatch':claim.purchase_batch,'quantity':len(batch.artifacts),
@@ -78,11 +102,11 @@ def review_batch(s,identity,saved,binding):
         'purchaseId':h(batch.purchase_id),'purchaseArtifactHash':h(batch.batch_hash),
         'amountMojos':str(batch.total_rail_amount),'baseAmountUsdMinor':str(batch.total_base_amount_minor),
         'technologyFeeUsdMinor':str(batch.total_technology_fee_minor),'totalAmountUsdMinor':str(batch.total_subtotal_minor),
-        'quoteExpiresAt':first.quote_expires_at,'feeCapMojosPerStage':str(s.fee_cap),'maximumNetworkFeeMojos':str(2*s.fee_cap),
+        'quoteExpiresAt':first.quote_expires_at,'feeCapMojosPerStage':str(fee_cap),'maximumNetworkFeeMojos':str(2*fee_cap),
         'quoteExpired':int(s.clock())>=first.quote_expires_at,'reservationClaimHash':claim.digest(),
         'currentVaultCoinId':claim.children[0].current_vault_coin_id,
         'reservationRequested':s.store.reservation_request(identity,browser_hash=binding)is not None,
-        'reservedCoinIds':list(reserved_coins(s,identity,binding))if existing is not None else None,
+        'reservedCoinIds':list(reserved_coins(s,identity,binding,claim=claim))if existing is not None else None,
         'payerAuthorizationSaved':saved['deliveryClaim']is not None}
 
 
@@ -105,11 +129,12 @@ async def prepare_reservation(s,identity,binding):
         raise ValueError('CURRENT_EXECUTION_RESERVATION_CHANGED_DURING_QUORUM')
     return s.store.prepare_execution(identity,'RESERVATION',SpendBundle([c.transition.spend for c in fresh.children],signature),
         browser_hash=binding,claim_hash=saved['reservationClaim'].digest(),fee_cap=s.fee_cap,
-        expires_at=min(s.policy.expires_at,artifacts(saved['reservationClaim'])[0].quote_expires_at),now=int(s.clock()))
+        expires_at=quote_deadline(s.policy,artifacts(saved['reservationClaim'])[0].quote_expires_at),now=int(s.clock()))
 
 
-def reserved_coins(s,identity,binding):
-    saved=s._saved(identity,binding);claim=saved['reservationClaim']
+def reserved_coins(s,identity,binding,*,claim=None):
+    if claim is None:
+        claim = s._saved(identity,binding)['reservationClaim']
     bundle=s.store.execution_bundle(identity,'RESERVATION',browser_hash=binding)
     byinput={h(spend.coin.name()):spend for spend in bundle.coin_spends}
     if set(byinput)!={c.available_coin_id for c in claim.children}:
@@ -185,11 +210,11 @@ async def save_reviewed_delivery(s,identity,claim,signature,binding,evidence,sig
     if not AugSchemeMPL.aggregate_verify([p[0]for p in messages],[p[1]for p in messages],signed.aggregated_signature):
         raise ValueError('CURRENT_EXECUTION_NATIVE_SIGNATURE_INVALID')
     await fresh_children(evidence.children,s.provider);await unspent(s.provider,evidence.payment_coin)
-    if int(s.clock())>=min(s.policy.expires_at,evidence.batch.artifacts[0].quote_expires_at):
+    if int(s.clock())>=quote_deadline(s.policy,evidence.batch.artifacts[0].quote_expires_at):
         raise ValueError('CURRENT_EXECUTION_DISPATCH_WINDOW_CLOSED')
     bundle=SpendBundle([*signed.coin_spends,*companion.operation.spends],AugSchemeMPL.aggregate([signed.aggregated_signature,signature]))
     return s.store.prepare_execution(identity,'DELIVERY',bundle,browser_hash=binding,claim_hash=claim.digest(),
-        fee_cap=s.fee_cap,expires_at=min(s.policy.expires_at,evidence.batch.artifacts[0].quote_expires_at),now=int(s.clock()))
+        fee_cap=s.fee_cap,expires_at=quote_deadline(s.policy,evidence.batch.artifacts[0].quote_expires_at),now=int(s.clock()))
 
 
 async def expected_spends(s,saved,phase):

@@ -23,6 +23,7 @@ from solslot_puzzles.stripe_settlement_v1_driver import (
     prepare_chia_buyer_batch_offer_v3, build_native_primary_batch_offer_v5)
 from .generation_execution import Model, Hash
 from .generation_operations import canonical
+from .generation_customer_purchase_scope import quote_deadline
 from .generation_customer_purchase_reservation import CurrentReservationClaim, verify_current_reservation
 from .generation_customer_purchase_delivery import resolve_current_reserved_purchase
 from .generation_chain_evidence import current_evidence_unchanged
@@ -136,7 +137,7 @@ async def verify_current_batch_reservation(claim,**arguments):
     current=(first.inventory,first.vault)
     children=(first,*[await verify_current_reservation(child,**arguments,_current=current)for child in claim.children[1:]])
     await fresh_children(children,arguments['provider'])
-    if int(arguments.get('clock',time.time)())>=min(artifacts(claim)[0].quote_expires_at,arguments['issuer_policy'].expires_at):
+    if int(arguments.get('clock',time.time)())>=quote_deadline(arguments['issuer_policy'],artifacts(claim)[0].quote_expires_at):
         raise ValueError('CURRENT_PURCHASE_BATCH_EXPIRED_DURING_READ')
     return CurrentBatchEvidence(claim,purchase_batch_from_json(claim.purchase_batch),children)
 
@@ -182,7 +183,7 @@ async def verify_current_batch_delivery(claim,**arguments):
     if len(outputs)!=len(children)or len({o.coin_id for o in outputs})!=len(children):
         raise ValueError('CURRENT_DELIVERY_BATCH_EXACT_OUTPUTS_REQUIRED')
     await fresh_children(children,arguments['provider']);await unspent(arguments['provider'],inputs[0])
-    if int(arguments.get('clock',time.time)())>=min(batch.artifacts[0].quote_expires_at,arguments['issuer_policy'].expires_at):
+    if int(arguments.get('clock',time.time)())>=quote_deadline(arguments['issuer_policy'],batch.artifacts[0].quote_expires_at):
         raise ValueError('CURRENT_DELIVERY_BATCH_EXPIRED_DURING_READ')
     return CurrentBatchEvidence(claim,batch,children,purchase,bundle,inputs[0],outputs)
 
@@ -249,6 +250,6 @@ async def prepare_current_batch_payment(request,**arguments):
         raise ValueError('CURRENT_PAYMENT_ONE_ZERO_FEE_WALLET_INPUT_REQUIRED')
     await unspent(arguments['provider'],record.coin);await fresh_children(children,arguments['provider'])
     now=int(arguments.get('clock',time.time)())
-    if now>=min(batch.artifacts[0].quote_expires_at,arguments['issuer_policy'].expires_at):
+    if now>=quote_deadline(arguments['issuer_policy'],batch.artifacts[0].quote_expires_at):
         raise ValueError('CURRENT_PAYMENT_REVIEW_EXPIRED_DURING_READ')
     return CurrentBatchPaymentPreparation(request,children,batch,prepared,record,now)

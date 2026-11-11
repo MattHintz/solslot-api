@@ -107,7 +107,7 @@ async def test_get_and_same_key_retry_restore_frozen_terminal_review_without_wri
 def test_http_get_and_same_key_post_use_existing_terminal_contract(retired,monkeypatch):
     r=retired;app=FastAPI();app.include_router(routes.router)
     app.dependency_overrides[get_settings]=lambda:r.settings
-    monkeypatch.setattr(routes,'context',lambda *a:(r.service,BROWSER))
+    monkeypatch.setattr(routes,'context',lambda *a:(r.service,BROWSER,'evm'))
     before=fingerprint(r.store);observe_only(r.store,monkeypatch)
     target='/customer/purchases/'+h(r.prior.buyer_vault)
     selection={'deedLauncherId':selected(r)}if r.quantity==1 else {'deedLauncherIds':selected(r)}

@@ -31,7 +31,7 @@ def batch_messages(evidence,roster):
 async def sign_batch_reservation(claim,claim_hash,**arguments):
     settings=arguments['settings'];policy=arguments['issuer_policy']
     if (not settings.generation_customer_purchase_enabled or claim.digest()!=claim_hash
-            or settings.signer_index not in claim.signer_indices or policy.maximum_purchases!=len(policy.deed_launchers)):
+            or settings.signer_index not in claim.signer_indices or (hasattr(policy,'maximum_purchases') and policy.maximum_purchases!=len(policy.deed_launchers))):
         raise ValueError('CURRENT_RESERVATION_SIGNER_NOT_ENABLED')
     native={k:v for k,v in arguments.items()if k not in ('ledger','load_key')}
     evidence=await verify_current_batch_reservation(claim,**native)
@@ -43,7 +43,7 @@ async def sign_batch_reservation(claim,claim_hash,**arguments):
             ('settings','provider','ledger','issuer_policy','clock','load_key')})
         signatures.append(G2Element.from_bytes(bytes.fromhex(reply.signature[2:])))
     await fresh_children(evidence.children,arguments['provider'])
-    if int(arguments['clock']())>=min(artifacts(claim)[0].quote_expires_at,policy.expires_at):
+    if int(arguments['clock']())>=min(artifacts(claim)[0].quote_expires_at,getattr(policy,'expires_at',artifacts(claim)[0].quote_expires_at)):
         raise ValueError('CURRENT_RESERVATION_REVIEW_EXPIRED')
     roster=tuple(bytes.fromhex(k.removeprefix('0x'))for k in settings.roster_pubkeys)
     signature=AugSchemeMPL.aggregate(signatures);messages=batch_messages(evidence,roster)[settings.signer_index]
@@ -56,7 +56,7 @@ async def sign_batch_reservation(claim,claim_hash,**arguments):
 async def sign_batch_delivery(claim,claim_hash,**arguments):
     settings=arguments['settings'];policy=arguments['issuer_policy'];ledger=arguments['ledger']
     if (not settings.generation_customer_purchase_enabled or claim.digest()!=claim_hash
-            or settings.signer_index not in claim.reservation.signer_indices or policy.maximum_purchases!=len(policy.deed_launchers)):
+            or settings.signer_index not in claim.reservation.signer_indices or (hasattr(policy,'maximum_purchases') and policy.maximum_purchases!=len(policy.deed_launchers))):
         raise ValueError('CURRENT_DELIVERY_SIGNER_NOT_ENABLED')
     native={k:v for k,v in arguments.items()if k not in ('ledger','load_key')}
     evidence=await verify_current_batch_delivery(claim,**native)
@@ -71,7 +71,7 @@ async def sign_batch_delivery(claim,claim_hash,**arguments):
             signature=G2Element.from_bytes(bytes.fromhex(old['signature'][2:]))
         else:
             if private is None:
-                if int(arguments['clock']())>=min(evidence.batch.artifacts[0].quote_expires_at,policy.expires_at):
+                if int(arguments['clock']())>=min(evidence.batch.artifacts[0].quote_expires_at,getattr(policy,'expires_at',evidence.batch.artifacts[0].quote_expires_at)):
                     raise ValueError('CURRENT_DELIVERY_REVIEW_EXPIRED')
                 if arguments.get('load_key')is None:
                     from .validator_service import load_validator_private_key

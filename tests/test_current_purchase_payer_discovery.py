@@ -22,7 +22,8 @@ def setup(monkeypatch):
     service.policy=SimpleNamespace(issued_at=1,expires_at=1000,buyer_vault=bytes32(b'V'*32))
     service.clock=lambda:state.now
     service._saved=lambda *a:{'reservationClaim':SimpleNamespace(purchase_artifact={})}
-    monkeypatch.setattr(execution,'purchase_artifact_v3_from_json',lambda value:SimpleNamespace(rail_amount=500,quote_expires_at=400))
+    monkeypatch.setattr(execution,'purchase_artifact_v3_from_json',lambda value:SimpleNamespace(
+        rail_amount=500,quote_expires_at=400,vault_launcher_id=service.policy.buyer_vault))
     async def call(keys=None):return await service.payer_coins('0x'+'02'*32,
         ['0x'+bytes(public).hex()]if keys is None else keys,browser_hash='synthetic')
     return SimpleNamespace(state=state,call=call,coin=coin,raw=raw,public='0x'+bytes(public).hex(),service=service)
@@ -44,7 +45,7 @@ async def test_batch_requires_one_coin_covering_every_selected_deed(setup,monkey
     # public coin query must use the full total, never the first child's price.
     claim=CurrentReservationBatch.model_construct()
     monkeypatch.setattr(execution,'artifacts',lambda _:tuple(SimpleNamespace(
-        rail_amount=600,quote_expires_at=400)for _ in range(2)))
+        rail_amount=600,quote_expires_at=400,vault_launcher_id=s.service.policy.buyer_vault)for _ in range(2)))
     s.service._saved=lambda *a:{'reservationClaim':claim}
     value=await s.call()
     assert value['amountMojos']=='1200'and value['candidates']==[]

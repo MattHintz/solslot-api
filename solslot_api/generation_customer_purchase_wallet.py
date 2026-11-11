@@ -17,6 +17,7 @@ from solslot_puzzles.stripe_settlement_v1_driver import prepare_chia_buyer_offer
 from .generation_execution import Model, Hash
 from .generation_operations import canonical
 from .generation_customer_purchase_reservation import CurrentReservationClaim
+from .generation_customer_purchase_scope import quote_deadline
 from .generation_customer_purchase_delivery import CurrentDeliveryClaim, resolve_current_reserved_purchase
 from .generation_coin_evidence import read_confirmed_coin
 from .generation_sols_batch_execution import unspent
@@ -115,6 +116,6 @@ async def prepare_current_native_payment(request, *, settings, anchor, provider,
     await unspent(provider, checked.transition.reserved_coin)
     if not await current_evidence_unchanged(checked.inventory.evidence, provider=provider):
         raise ValueError('CURRENT_PAYMENT_AUTHORITY_CHANGED')
-    if not now <= int(clock()) < min(checked.artifact.quote_expires_at, issuer_policy.expires_at):
+    if not now <= int(clock()) < quote_deadline(issuer_policy,checked.artifact.quote_expires_at):
         raise ValueError('CURRENT_PAYMENT_REVIEW_EXPIRED_DURING_READ')
     return CurrentNativePaymentPreparation(request, checked, prepared, record, int(clock()))

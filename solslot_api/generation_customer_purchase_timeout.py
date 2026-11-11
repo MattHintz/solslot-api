@@ -14,6 +14,7 @@ from solslot_puzzles.payment_artifacts_v2 import PaymentRail
 from solslot_puzzles.payment_artifacts_v3 import purchase_artifact_v3_from_json,purchase_artifact_v3_to_json
 from solslot_puzzles.stripe_settlement_v1_driver import InventoryReservationV1,build_inventory_reservation_spend,build_inventory_release_spend
 from .generation_customer_issuer import TestnetIssuerPolicy
+from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy
 from .generation_customer_purchase_reservation import CurrentReservationClaim
 from .generation_customer_purchase_delivery import _confirmed_reservation_source
 from .generation_customer_purchase_validators import prove_primary_expired_source
@@ -26,7 +27,7 @@ async def verify_current_timeout(claim,reserved_coin_id,*,settings,anchor,provid
         issuer_policy,expected_issuer_policy_hash,clock=time.time):
     if not isinstance(claim,CurrentReservationClaim):raise ValueError('CURRENT_TIMEOUT_TYPED_CLAIM_REQUIRED')
     claim=CurrentReservationClaim.model_validate_json(claim.model_dump_json(by_alias=True))
-    if (not isinstance(issuer_policy,TestnetIssuerPolicy)or issuer_policy.commitment!=expected_issuer_policy_hash
+    if (not isinstance(issuer_policy,(TestnetIssuerPolicy,TestnetCollectionIssuerPolicy))or issuer_policy.commitment!=expected_issuer_policy_hash
             or claim.issuer_policy_hash!=expected_issuer_policy_hash or settings.network!='testnet11'
             or claim.generation_id!=settings.deployment_generation_id or claim.anchor_hash!=settings.generation_chain_anchor_hash
             or bytes32.from_hexstr(claim.generation_id)!=anchor.issuance.generation
@@ -35,9 +36,10 @@ async def verify_current_timeout(claim,reserved_coin_id,*,settings,anchor,provid
     now=int(clock());purchase=purchase_artifact_v3_from_json(claim.purchase_artifact)
     if (purchase_artifact_v3_to_json(purchase)!=claim.purchase_artifact or purchase.rail!=PaymentRail.CHIA_XCH
             or purchase.collection_id!=issuer_policy.collection or purchase.metadata_anchor_id!=issuer_policy.edition
-            or purchase.metadata_root!=issuer_policy.metadata_root or purchase.vault_launcher_id!=issuer_policy.buyer_vault
+            or purchase.metadata_root!=issuer_policy.metadata_root
+            or (isinstance(issuer_policy,TestnetIssuerPolicy) and purchase.vault_launcher_id!=issuer_policy.buyer_vault)
             or purchase.deed_launcher_id not in issuer_policy.deed_launchers
-            or not issuer_policy.issued_at<=now<issuer_policy.expires_at
+            or (isinstance(issuer_policy,TestnetIssuerPolicy) and not issuer_policy.issued_at<=now<issuer_policy.expires_at)
             or now<purchase.quote_expires_at):raise ValueError('CURRENT_TIMEOUT_FINITE_SCOPE_CHANGED')
     inventory=await resolve_current_primary_inventory(settings=settings,anchor=anchor,provider=provider,
         collection=issuer_policy.collection,edition_hash=issuer_policy.edition,metadata_root=issuer_policy.metadata_root)

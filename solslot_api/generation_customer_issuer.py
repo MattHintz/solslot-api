@@ -100,8 +100,9 @@ class TestnetIssuerJournal:
     A failed/uncertain signer call retains its slot. It can resume only the
     same spend. Expiry cannot reset the grant or admit a different payout.
     """
-    def __init__(self,path,policy):
+    def __init__(self,path,policy,*,cutover_hash=None):
         self.policy=policy.validate()
+        self.cutover_hash=cutover_hash
         self._lock=threading.RLock()
         self.path=str(path)
         Path(path).parent.mkdir(parents=True,exist_ok=True)
@@ -111,7 +112,7 @@ class TestnetIssuerJournal:
         self._bind_policy()
 
     @classmethod
-    def in_validator_journal(cls,ledger,policy):
+    def in_validator_journal(cls,ledger,policy,*,cutover_hash=None):
         """Add issuer checkpoints to the already recovered signer journal.
 
         No generation rebinding, credential copying or new backup database.
@@ -120,7 +121,7 @@ class TestnetIssuerJournal:
         from .validator_ledger import ValidatorLedger
         if not isinstance(ledger,ValidatorLedger) or ledger.path==':memory:':
             raise ValueError('CURRENT_ISSUER_DURABLE_VALIDATOR_JOURNAL_REQUIRED')
-        value=cls.__new__(cls);value.policy=policy.validate();value.path=ledger.path
+        value=cls.__new__(cls);value.policy=policy.validate();value.cutover_hash=cutover_hash;value.path=ledger.path
         value.db=ledger._conn;value._shared=True
         value._lock=ledger._lock
         with ledger._lock:value._bind_policy()
@@ -139,15 +140,34 @@ class TestnetIssuerJournal:
             row=self.db.execute('SELECT commitment FROM issuer_policy WHERE id=1').fetchone()
             if row is not None and row['commitment']!=policy.commitment:
                 raise ValueError('CURRENT_ISSUER_JOURNAL_POLICY_CHANGED')
-            self.db.execute('INSERT OR IGNORE INTO issuer_policy(id,commitment) VALUES(1,?)',(policy.commitment,))
+            from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy
+            if isinstance(policy,TestnetCollectionIssuerPolicy):
+                if row is None or not self.cutover_hash:
+                    raise ValueError('CURRENT_ISSUER_ACTIVE_LINEAGE_REQUIRED')
+                active=self.db.execute("SELECT next_commitment,closure_hash FROM issuer_collection_activation WHERE singleton=1").fetchone()
+                if active is None or tuple(active)!=(policy.commitment,self.cutover_hash):
+                    raise ValueError('CURRENT_ISSUER_ACTIVE_LINEAGE_REQUIRED')
+            else:
+                self.db.execute('INSERT OR IGNORE INTO issuer_policy(id,commitment) VALUES(1,?)',(policy.commitment,))
             self.db.execute('COMMIT')
         except BaseException:
             self.db.execute('ROLLBACK')
             if not self._shared:self.db.close()
             raise
 
+    def _require_binding(self):
+        row=self.db.execute('SELECT commitment FROM issuer_policy WHERE id=1').fetchone()
+        if row is None or row[0]!=self.policy.commitment:
+            raise ValueError('CURRENT_ISSUER_JOURNAL_POLICY_CHANGED')
+        from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy
+        if isinstance(self.policy,TestnetCollectionIssuerPolicy):
+            active=self.db.execute('SELECT next_commitment,closure_hash,state FROM issuer_collection_activation WHERE singleton=1').fetchone()
+            if active is None or tuple(active)!=(self.policy.commitment,self.cutover_hash,'ACTIVE'):
+                raise ValueError('CURRENT_ISSUER_ACTIVE_LINEAGE_REQUIRED')
+
     def authorize(self,*,bundle,artifact,terms,fees,now,sign_message):
         with self._lock:
+            self._require_binding()
             return self._authorize(bundle=bundle,artifact=artifact,terms=terms,fees=fees,now=now,sign_message=sign_message)
 
     def authorize_batch(self,*,bundle,artifacts,terms,fees,now,sign_message):
@@ -159,6 +179,7 @@ class TestnetIssuerJournal:
         if not 2<=len(artifacts)<=25 or len(artifacts)!=len(terms):
             raise ValueError('CURRENT_ISSUER_BATCH_BOUNDS_INVALID')
         with self._lock:
+            self._require_binding()
             reviews=[self._review(bundle=bundle,artifact=a,terms=t,fees=fees,now=now)
                 for a,t in zip(artifacts,terms,strict=True)]
             if len({r[2]for r in reviews})!=len(reviews):raise ValueError('CURRENT_ISSUER_BATCH_REPEATED_ARTIFACT')
@@ -170,7 +191,7 @@ class TestnetIssuerJournal:
                     if row is None:missing.append((identity,expected))
                     elif any(row[k]!=v for k,v in expected.items()):raise ValueError('CURRENT_ISSUER_SAVED_PURCHASE_CHANGED')
                 used=self.db.execute('SELECT COUNT(*) FROM issuer_forwarding').fetchone()[0]
-                if used+len(missing)>self.policy.maximum_purchases:raise ValueError('CURRENT_ISSUER_PURCHASE_BUDGET_EXHAUSTED')
+                if hasattr(self.policy,'maximum_purchases') and used+len(missing)>self.policy.maximum_purchases:raise ValueError('CURRENT_ISSUER_PURCHASE_BUDGET_EXHAUSTED')
                 for identity,expected in missing:
                     self.db.execute('''INSERT INTO issuer_forwarding
                         (artifact_hash,deed_id,gross_coin_id,purchase_bundle_hash,spend_hash,message,created_at)
@@ -193,9 +214,10 @@ class TestnetIssuerJournal:
         """
         policy=self.policy
         policy.require_terms(terms,now=now)
-        if (artifact.vault_launcher_id!=policy.buyer_vault
+        if ((isinstance(policy,TestnetIssuerPolicy) and artifact.vault_launcher_id!=policy.buyer_vault)
                 or not 1<int(artifact.rail_amount)<=policy.maximum_gross_mojos
-                or not now<artifact.quote_expires_at<=artifact.authorization_expires_at<=policy.expires_at
+                or not now<artifact.quote_expires_at<=artifact.authorization_expires_at
+                or (isinstance(policy,TestnetIssuerPolicy) and artifact.authorization_expires_at>policy.expires_at)
                 or not isinstance(fees,PrimaryFeeSplitter) or fees.bindings.generation!=policy.generation
                 or fees.inner().get_tree_hash()!=policy.fee_puzzle):
             raise ValueError('CURRENT_ISSUER_PURCHASE_SCOPE_CHANGED')
@@ -223,7 +245,7 @@ class TestnetIssuerJournal:
                 if any(row[key]!=value for key,value in expected.items()):
                     raise ValueError('CURRENT_ISSUER_SAVED_PURCHASE_CHANGED')
             else:
-                if self.db.execute('SELECT COUNT(*) FROM issuer_forwarding').fetchone()[0]>=policy.maximum_purchases:
+                if hasattr(policy,'maximum_purchases') and self.db.execute('SELECT COUNT(*) FROM issuer_forwarding').fetchone()[0]>=policy.maximum_purchases:
                     raise ValueError('CURRENT_ISSUER_PURCHASE_BUDGET_EXHAUSTED')
                 self.db.execute('''INSERT INTO issuer_forwarding
                     (artifact_hash,deed_id,gross_coin_id,purchase_bundle_hash,spend_hash,message,created_at) VALUES(?,?,?,?,?,?,?)''',

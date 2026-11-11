@@ -5,6 +5,7 @@ No HTTP input can select a treasury, change the sealed dollars or replace the
 price operator set. This constructs no wallet spend and reserves no input.
 """
 from chia.types.blockchain_format.program import Program
+from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import MOD as _P2_MOD
 from chia_rs.sized_bytes import bytes32
 from solslot_puzzles.generation_primary_price import SignedPrimaryPrice
 from solslot_puzzles.generation_statutes import GenerationStatutes
@@ -13,6 +14,8 @@ from solslot_puzzles.vault_driver import puzzle_for_p2_vault
 from .generation_customer_inventory import CurrentPrimaryInventory
 from .generation_customer_vault import CurrentCustomerVault
 from .generation_customer_test_conversion import FixedTestnetConversion
+
+_P2_MOD_BYTES=bytes(_P2_MOD)
 
 
 def current_customer_xch_quote(*,inventory:CurrentPrimaryInventory,vault:CurrentCustomerVault,
@@ -66,17 +69,22 @@ def current_customer_xch_quote(*,inventory:CurrentPrimaryInventory,vault:Current
         CompanyRevenue(inventory.generation,inventory.evidence.registry.state.administrator_id))
     if forwarding_policy is not None:
         from .generation_customer_issuer import TestnetIssuerPolicy
-        from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import MOD
+        from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy
         from chia_rs import G1Element
-        if proceeds is not None or not isinstance(forwarding_policy,TestnetIssuerPolicy):
+        if proceeds is not None or not isinstance(forwarding_policy,(TestnetIssuerPolicy,TestnetCollectionIssuerPolicy)):
             raise ValueError('CURRENT_PURCHASE_FEE_ROUTE_CHANGED')
-        forwarding_policy.require_terms(terms,now=now)
+        if isinstance(forwarding_policy,TestnetIssuerPolicy):
+            forwarding_policy.require_terms(terms,now=now)
+            if forwarding_policy.buyer_vault!=vault.launcher or expires_at>forwarding_policy.expires_at:
+                raise ValueError('CURRENT_PURCHASE_FEE_ROUTE_CHANGED')
+        else:
+            forwarding_policy.require_terms(terms)
+            forwarding_policy.require_verified_vault(vault,launcher=vault.launcher,auth_type='chia_bls')
         if (forwarding_policy.generation!=inventory.generation
                 or forwarding_policy.collection!=inventory.collection or forwarding_policy.edition!=inventory.edition
                 or forwarding_policy.metadata_root!=inventory.metadata_root
-                or forwarding_policy.buyer_vault!=vault.launcher or expires_at>forwarding_policy.expires_at
                 or expected_fees.inner().get_tree_hash()!=forwarding_policy.fee_puzzle
-                or Program.from_bytes(bytes(MOD)).curry(G1Element.from_bytes(forwarding_policy.issuer_public_key)).get_tree_hash()!=terms.protocol_puzhash):
+                or Program.from_bytes(_P2_MOD_BYTES).curry(G1Element.from_bytes(forwarding_policy.issuer_public_key)).get_tree_hash()!=terms.protocol_puzhash):
             raise ValueError('CURRENT_PURCHASE_FEE_ROUTE_CHANGED')
         proceeds=PrimaryProceedsSplitter.for_terms(terms.protocol_puzhash,expected_fees,
             terms.base_amount_minor,terms.technology_fee_minor)
@@ -99,6 +107,8 @@ def current_customer_xch_quote(*,inventory:CurrentPrimaryInventory,vault:Current
         vault_p2_puzzle_hash=puzzle_for_p2_vault(vault.launcher).get_tree_hash(),
         authorization_nonce=nonce,authorization_expires_at=expires_at,
         quote_expires_at=expires_at,oracle_round=price.round)
+    if forwarding_policy is not None and isinstance(forwarding_policy,TestnetCollectionIssuerPolicy):
+        forwarding_policy.require_purchase(quote,terms,vault,launcher=vault.launcher,auth_type='chia_bls',now=now)
     if forwarding_policy is not None and int(quote.rail_amount)>forwarding_policy.maximum_gross_mojos:
         raise ValueError('CURRENT_PURCHASE_ISSUER_AMOUNT_CAP')
     return quote

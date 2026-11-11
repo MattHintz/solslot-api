@@ -31,7 +31,7 @@ async def test_health_and_signing_both_use_exact_current_index_two_lane(monkeypa
     def respond(r):
         seen.append((r.method,str(r.url)))
         if r.url.path.endswith('/status'):
-            return httpx.Response(200,json={**request,'checkedAt':1100,'expiresAt':p.expires_at,
+            return httpx.Response(200,json={'generationId':request['generationId'],'policyHash':p.commitment,'checkedAt':1100,'expiresAt':p.expires_at,
                 'remainingPurchases':p.maximum_purchases,'canSign':True})
         return httpx.Response(200,json={**request,'signature':'0x'+bytes(signature).hex()})
     monkeypatch.setattr(module,'_private_validator_client',lambda _:httpx.AsyncClient(transport=httpx.MockTransport(respond)))

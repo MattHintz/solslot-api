@@ -1519,6 +1519,8 @@ class Settings(BaseSettings):
     generation_customer_purchase_policy_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
     generation_customer_purchase_prior_policy_path: str = ''
     generation_customer_purchase_prior_policy_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
+    generation_customer_purchase_cutover_path: str = ''
+    generation_customer_purchase_cutover_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
     generation_customer_purchase_fee_authority_path: str = ''
     generation_customer_purchase_fee_authority_hash: str = Field(default='',pattern=r'^(|0x[0-9a-f]{64})$')
     generation_customer_purchase_fee_signer_key_path: str = ''
@@ -1636,6 +1638,8 @@ class Settings(BaseSettings):
             raise ValueError('Testnet price demand requires the current identity context and exact local socket')
         if self.generation_customer_purchase_funding_enabled and not self.generation_customer_purchase_enabled:
             raise ValueError('purchase fees require the separately enabled current checkout')
+        if bool(self.generation_customer_purchase_cutover_path)!=bool(self.generation_customer_purchase_cutover_hash):
+            raise ValueError('checkout cutover requires both its path and hash')
         if bool(self.generation_customer_purchase_prior_policy_path)!=bool(self.generation_customer_purchase_prior_policy_hash):
             raise ValueError('prior purchase policy requires both its path and hash')
         if self.generation_customer_purchase_worker_enabled and (not self.generation_customer_purchase_funding_enabled

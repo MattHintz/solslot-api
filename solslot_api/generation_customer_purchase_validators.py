@@ -64,9 +64,21 @@ def previous_transition(previous,current,*,issuer_policy,roster,signer_index,pri
     purchase=purchase_artifact_v3_from_json(old.purchase_artifact)
     history_policy=issuer_policy
     if old.issuer_policy_hash!=issuer_policy.commitment and prior_policy is not None:
-        from .generation_customer_purchase_policy import validate_purchase_policy_renewal
-        if type(now)is not int:raise ValueError('CURRENT_PURCHASE_RENEWAL_SCOPE_CHANGED')
-        history_policy=validate_purchase_policy_renewal(prior_policy,issuer_policy,now=now)
+        from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy
+        if isinstance(issuer_policy,TestnetCollectionIssuerPolicy):
+            # Recheck the predecessor scope even after pinned selection.
+            from .generation_customer_issuer import TestnetIssuerPolicy
+            fields=('generation','collection','edition','metadata_root','proceeds_puzzle','fee_puzzle',
+                'issuer_public_key','maximum_gross_mojos','test_usd_minor_per_txch')
+            if (not isinstance(prior_policy,TestnetIssuerPolicy)
+                    or any(getattr(prior_policy,k)!=getattr(issuer_policy,k) for k in fields)
+                    or not prior_policy.deed_launchers.issubset(issuer_policy.deed_launchers)):
+                raise ValueError('CURRENT_RESERVATION_PRIOR_POLICY_SCOPE_CHANGED')
+            history_policy=prior_policy
+        else:
+            from .generation_customer_purchase_policy import validate_purchase_policy_renewal
+            if type(now)is not int:raise ValueError('CURRENT_PURCHASE_RENEWAL_SCOPE_CHANGED')
+            history_policy=validate_purchase_policy_renewal(prior_policy,issuer_policy,now=now)
     if (old.canonical()!=previous['canonical_claim'] or old.digest()!=previous['claim_hash']
             or old.available_coin_id!=previous['available_coin_id']
             or '0x'+purchase.purchase_id.hex()!=previous['purchase_id']
@@ -77,8 +89,8 @@ def previous_transition(previous,current,*,issuer_policy,roster,signer_index,pri
             or purchase_artifact_v3_to_json(purchase)!=old.purchase_artifact):
         raise ValueError('CURRENT_RESERVATION_RETAINED_HISTORY_CHANGED')
     terms=current.item.original.terms
-    history_policy.require_terms(terms,now=history_policy.issued_at)
-    if purchase.vault_launcher_id!=history_policy.buyer_vault:raise ValueError('CURRENT_RESERVATION_PRIOR_RECEIVER_CHANGED')
+    history_policy.require_terms(terms,now=getattr(history_policy,'issued_at',now))
+    if hasattr(history_policy,'buyer_vault') and purchase.vault_launcher_id!=history_policy.buyer_vault:raise ValueError('CURRENT_RESERVATION_PRIOR_RECEIVER_CHANGED')
     struct=Program.to((SINGLETON_MOD_HASH,(terms.deed_launcher_id,terms.deed_launcher_puzzle_hash)))
     transition=build_inventory_reservation_spend(available_coin=current.item.current.coin,
         deed_singleton_struct=struct,lineage_proof=current.item.lineage,
@@ -101,7 +113,7 @@ async def sign_current_reservation(claim,claim_hash,*,settings,anchor,provider,l
     if (getattr(settings,'generation_customer_purchase_enabled',False)is not True
             or not isinstance(claim,CurrentReservationClaim)or claim.digest()!=claim_hash
             or settings.signer_index not in claim.signer_indices
-            or issuer_policy.maximum_purchases!=len(issuer_policy.deed_launchers)):
+            or (hasattr(issuer_policy,'maximum_purchases') and issuer_policy.maximum_purchases!=len(issuer_policy.deed_launchers))):
         raise ValueError('CURRENT_RESERVATION_SIGNER_NOT_ENABLED')
     evidence=await verify_current_reservation(claim,settings=settings,anchor=anchor,provider=provider,
         issuer_policy=issuer_policy,expected_issuer_policy_hash=expected_issuer_policy_hash,clock=clock)
@@ -145,7 +157,7 @@ async def sign_verified_current_reservation(evidence,*,settings,provider,ledger,
             raise ValueError('CURRENT_RESERVATION_AUTHORITY_CHANGED_BEFORE_SIGNATURE')
         await unspent(provider,evidence.item.current.coin);await unspent(provider,evidence.vault.coin)
         now=int(clock())
-        if now>=min(evidence.reservation.expires_at,issuer_policy.expires_at):raise ValueError('CURRENT_RESERVATION_REVIEW_EXPIRED')
+        if now>=min(evidence.reservation.expires_at,getattr(issuer_policy,'expires_at',evidence.reservation.expires_at)):raise ValueError('CURRENT_RESERVATION_REVIEW_EXPIRED')
         if load_key is None:
             from .validator_service import load_validator_private_key
             private=load_validator_private_key(settings)

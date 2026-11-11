@@ -11,6 +11,7 @@ from hashlib import sha256
 from types import SimpleNamespace
 from chia_rs.sized_bytes import bytes32
 from .generation_customer_issuer import TestnetIssuerPolicy
+from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy
 
 
 @dataclass(frozen=True)
@@ -34,17 +35,18 @@ class FixedTestnetConversion:
             source_evidence_root=digest(b'SOLSLOT_APPROVED_TEST_POLICY_V1'))
 
     def verify_policy(self,policy,*,now,expires_at):
-        if (not isinstance(policy,TestnetIssuerPolicy)or policy.test_usd_minor_per_txch is None
+        if (not isinstance(policy,(TestnetIssuerPolicy,TestnetCollectionIssuerPolicy))or policy.test_usd_minor_per_txch is None
                 or policy.commitment!=self.policy.commitment or type(now)is not int
                 or type(expires_at)is not int or expires_at!=self.expires_at
-                or not policy.issued_at<=expires_at-300<=now<expires_at<=policy.expires_at):
+                or not expires_at-300<=now<expires_at
+                or (isinstance(policy,TestnetIssuerPolicy) and not (policy.issued_at<=expires_at-300 and expires_at<=policy.expires_at))):
             raise ValueError('CURRENT_PURCHASE_FIXED_TEST_CONVERSION_CHANGED')
         policy.validate()
         return self
 
 
 def claim_price(evidence,policy):
-    if policy.test_usd_minor_per_txch is None:
+    if getattr(policy,'test_usd_minor_per_txch',None) is None:
         from .generation_sols_batch_execution import signed_price
         return signed_price(evidence)
     if (not isinstance(evidence,dict)or set(evidence)!={'schema','issuerPolicyHash','expiresAt'}
@@ -57,7 +59,7 @@ def claim_price(evidence,policy):
 def configured_price(settings,policy,*,now,expires_at):
     if settings.network!='testnet11' or settings.deployment_generation_id!='0x'+policy.generation.hex():
         raise ValueError('CURRENT_PURCHASE_FIXED_TEST_NETWORK_CHANGED')
-    if policy.test_usd_minor_per_txch is not None:
+    if getattr(policy,'test_usd_minor_per_txch',None) is not None:
         price=FixedTestnetConversion(policy,expires_at).verify_policy(policy,now=now,expires_at=expires_at)
         return price,price.evidence()
     from .payment_quotes import load_authorized_oracle_round
@@ -70,9 +72,10 @@ def configured_price(settings,policy,*,now,expires_at):
 
 def status(policy,*,now):
     policy.validate()
-    if policy.test_usd_minor_per_txch is None:raise ValueError('CURRENT_PURCHASE_FIXED_TEST_DISABLED')
-    ready=policy.issued_at<=now and now+300<=policy.expires_at
+    if getattr(policy,'test_usd_minor_per_txch',None) is None:raise ValueError('CURRENT_PURCHASE_FIXED_TEST_DISABLED')
+    ready=(policy.issued_at<=now and now+300<=policy.expires_at) if isinstance(policy,TestnetIssuerPolicy) else type(now)is int and now>0
+    valid_until=policy.expires_at if isinstance(policy,TestnetIssuerPolicy) else now+300
     return {'price':{'schema':'solslot.price-refresh-status.v1','network':'testnet11',
         'mode':'FIXED_TESTNET_CONVERSION','policyHash':policy.commitment,'checkedAt':now,
-        'requiredUntil':now+300,'validUntil':policy.expires_at,'status':'READY'if ready else'CLOSED',
+        'requiredUntil':now+300,'validUntil':valid_until,'status':'READY'if ready else'CLOSED',
         'canQuote':ready,'canRefresh':False,'sourceCount':0,'signerCount':0},'job':None}

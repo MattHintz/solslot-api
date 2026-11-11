@@ -5,6 +5,7 @@ must reconstruct the typed current reservation/delivery before saving a bundle.
 Saved funded bytes survive expiry, reconnects and an uncertain broadcast.
 """
 import json
+import re
 
 from chia_rs import SpendBundle
 
@@ -48,7 +49,6 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
                 except BaseException:db.rollback();raise
 
     def bind_execution_policy(self, policy_hash, maximum_purchases, fee_cap):
-        import re
         if (re.fullmatch(r'0x[0-9a-f]{64}', policy_hash or '') is None
                 or type(maximum_purchases) is not int or not 1 <= maximum_purchases <= 25
                 or type(fee_cap) is not int or not 0 <= fee_cap <= 1_000_000_000):
@@ -56,6 +56,8 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
         with self._connect() as db:
             db.execute('BEGIN IMMEDIATE')
             try:
+                if self._collection_binding(db) is not None:
+                    raise ValueError('CURRENT_EXECUTION_LEGACY_POLICY_RETIRED')
                 row = db.execute('SELECT * FROM current_purchase_execution_policies WHERE policy_hash=?',
                                  (policy_hash,)).fetchone()
                 if row is not None:
@@ -69,6 +71,68 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
             except BaseException:
                 db.rollback()
                 raise
+
+    @staticmethod
+    def _collection_binding(db):
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='current_purchase_collection_execution'").fetchone() is None:
+            return None
+        row = db.execute('SELECT policy_hash,cutover_hash,fee_cap FROM current_purchase_collection_execution WHERE id=1').fetchone()
+        if row is None:
+            raise ValueError('CURRENT_EXECUTION_COLLECTION_BINDING_MISSING')
+        return tuple(row)
+
+    def require_collection_execution(self, policy_hash, cutover_hash, fee_cap):
+        with self._connect() as db:
+            if self._collection_binding(db) != (policy_hash, cutover_hash, fee_cap):
+                raise ValueError('CURRENT_EXECUTION_COLLECTION_CUTOVER_REQUIRED')
+
+    def _admit_reservation(self, db, identity, claim, *, fee_cap=None, check_inventory=False):
+        binding = self._collection_binding(db)
+        if binding is not None:
+            if binding[0] != claim.issuer_policy_hash or (fee_cap is not None and binding[2] != fee_cap):
+                raise ValueError('CURRENT_EXECUTION_BOUND_FEE_POLICY_REQUIRED')
+            if check_inventory:
+                self._require_unreserved_inventory(db, identity, claim)
+            return
+        limit = db.execute('SELECT maximum_purchases,fee_cap FROM current_purchase_execution_policies WHERE policy_hash=?',
+                           (claim.issuer_policy_hash,)).fetchone()
+        if limit is None or (fee_cap is not None and fee_cap != limit['fee_cap']):
+            raise ValueError('CURRENT_EXECUTION_BOUND_FEE_POLICY_REQUIRED')
+        if check_inventory:
+            self._purchase_capacity(db, identity, claim, limit['maximum_purchases'])
+
+    def _require_unreserved_inventory(self, db, identity, claim):
+        from .generation_customer_purchase_batch import CurrentReservationBatch, reservation_from_json
+
+        def inputs(value):
+            children = value.children if isinstance(value, CurrentReservationBatch) else (value,)
+            return {child.available_coin_id for child in children}
+
+        requested = inputs(claim)
+        for row in self._active_reservation_rows(db, identity):
+            current = reservation_from_json(row['canonical_claim'])
+            if (current.issuer_policy_hash == claim.issuer_policy_hash
+                    and requested.intersection(inputs(current))
+                    and not self._closed_without_preparation(db, row['intent_id'])
+                    and not self._expired_unsubmitted_for_capacity(db, row, current)):
+                raise ValueError('CURRENT_PRIMARY_DEED_NOT_AVAILABLE')
+
+    @staticmethod
+    def _closed_without_preparation(db, identity):
+        return db.execute('''SELECT 1 FROM current_purchase_worker_jobs j
+            JOIN current_customer_reservation_requests q ON q.intent_id=j.intent_id
+            WHERE j.intent_id=? AND j.state='CLOSED' AND j.lease_token IS NULL AND j.lease_until=0
+            AND j.expiry_document IS NULL AND j.issuer_document IS NULL
+            AND NOT EXISTS(SELECT 1 FROM current_purchase_executions WHERE intent_id=j.intent_id)
+            AND NOT EXISTS(SELECT 1 FROM current_customer_purchase_delivery WHERE intent_id=j.intent_id)
+            AND NOT EXISTS(SELECT 1 FROM current_customer_purchase_signatures WHERE intent_id=j.intent_id)''',
+            (identity,)).fetchone() is not None
+
+    def closed_without_preparation(self, identity, *, browser_hash):
+        with self._connect() as db:
+            db.execute('BEGIN')
+            self._row(db, identity, browser_hash)
+            return self._closed_without_preparation(db, identity)
 
     def _execution(self, db, identity, phase, browser_hash):
         self._row(db, identity, browser_hash)
@@ -120,11 +184,13 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
         except Exception:
             return False
 
-    def _purchase_capacity(self,db,identity,reservation,maximum):
-        from .generation_customer_purchase_batch import reservation_from_json,CurrentReservationBatch
-        quantity=lambda c:len(c.children)if isinstance(c,CurrentReservationBatch)else 1
-        rows=db.execute('''SELECT r.intent_id,r.generation_id,r.claim_hash,r.canonical_claim FROM current_customer_purchase_reviews r
-            WHERE r.intent_id!=? AND (EXISTS(SELECT 1 FROM current_purchase_executions e
+    @staticmethod
+    def _active_reservation_rows(db, identity, *, exclude_delivered=True):
+        return db.execute('''SELECT r.intent_id,r.generation_id,r.claim_hash,r.canonical_claim FROM current_customer_purchase_reviews r
+            WHERE r.intent_id!=?
+            AND (?=0 OR NOT EXISTS(SELECT 1 FROM current_purchase_executions sold WHERE sold.intent_id=r.intent_id
+                AND sold.phase='DELIVERY' AND sold.stage='CONFIRMED'))
+            AND (EXISTS(SELECT 1 FROM current_purchase_executions e
                 WHERE e.intent_id=r.intent_id AND e.phase='RESERVATION') OR
                 EXISTS(SELECT 1 FROM current_customer_reservation_requests q WHERE q.intent_id=r.intent_id))
             AND NOT EXISTS(SELECT 1 FROM current_purchase_executions released
@@ -134,7 +200,12 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
                   AND NOT EXISTS(SELECT 1 FROM current_customer_purchase_delivery paid
                       WHERE paid.intent_id=r.intent_id)
                   AND NOT EXISTS(SELECT 1 FROM current_purchase_executions delivery
-                      WHERE delivery.intent_id=r.intent_id AND delivery.phase='DELIVERY'))''',(identity,)).fetchall()
+                      WHERE delivery.intent_id=r.intent_id AND delivery.phase='DELIVERY'))''',(identity, exclude_delivered)).fetchall()
+
+    def _purchase_capacity(self,db,identity,reservation,maximum):
+        from .generation_customer_purchase_batch import reservation_from_json,CurrentReservationBatch
+        quantity=lambda c:len(c.children)if isinstance(c,CurrentReservationBatch)else 1
+        rows = self._active_reservation_rows(db, identity, exclude_delivered=False)
         claims=[(r,reservation_from_json(r['canonical_claim'])) for r in rows]
         used=sum(quantity(c) for r,c in claims if c.issuer_policy_hash==reservation.issuer_policy_hash and not self._expired_unsubmitted_for_capacity(db,r,c))
         if used+quantity(reservation)>maximum:raise ValueError('CURRENT_EXECUTION_POLICY_CAPACITY_EXHAUSTED')
@@ -171,9 +242,8 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
                     db.commit();return row[0]
                 if type(now)is not int or not 0<now<artifacts(claim)[0].quote_expires_at:
                     raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_CLOSED')
-                limit=db.execute('SELECT maximum_purchases FROM current_purchase_execution_policies WHERE policy_hash=?',(claim.issuer_policy_hash,)).fetchone()
-                if limit is None:raise ValueError('CURRENT_EXECUTION_BOUND_FEE_POLICY_REQUIRED')
-                self._purchase_capacity(db,identity,claim,limit[0]);self._execution_capacity(db,128)
+                self._admit_reservation(db, identity, claim, check_inventory=True)
+                self._execution_capacity(db,128)
                 db.execute('INSERT INTO current_customer_reservation_requests VALUES(?,?)',(identity,now))
                 db.commit();return now
             except BaseException:db.rollback();raise
@@ -193,10 +263,7 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
             db.execute('BEGIN IMMEDIATE')
             try:
                 _, reservation = self._row(db, identity, browser_hash)
-                limit = db.execute('SELECT * FROM current_purchase_execution_policies WHERE policy_hash=?',
-                                   (reservation.issuer_policy_hash,)).fetchone()
-                if limit is None or fee_cap != limit['fee_cap']:
-                    raise ValueError('CURRENT_EXECUTION_BOUND_FEE_POLICY_REQUIRED')
+                self._admit_reservation(db, identity, reservation, fee_cap=fee_cap)
                 if phase == 'RESERVATION':
                     expected_claim = reservation.digest()
                 elif phase == 'DELIVERY':
@@ -227,7 +294,7 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
                         raise ValueError('CURRENT_EXECUTION_REPLACEMENT_REJECTED')
                 else:
                     if phase == 'RESERVATION':
-                        self._purchase_capacity(db,identity,reservation,limit['maximum_purchases'])
+                        self._admit_reservation(db, identity, reservation, fee_cap=fee_cap, check_inventory=True)
                     self._execution_capacity(db, len(raw) + 512)
                     db.execute('''INSERT INTO current_purchase_executions
                         (intent_id,phase,protocol_bundle,original_id,claim_hash,fee_cap,

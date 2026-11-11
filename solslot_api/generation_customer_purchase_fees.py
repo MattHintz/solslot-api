@@ -14,6 +14,8 @@ from pydantic import Field, field_validator, model_validator
 
 from .generation_preparation import PreparationModel
 from .generation_execution import Hash
+from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy
+from .generation_customer_issuer import TestnetIssuerPolicy
 from .protocol_submission import ProtocolBundleSubmitter
 
 
@@ -47,9 +49,11 @@ class CurrentPurchaseFeeAuthority(PreparationModel):
         return self
 
     def require_policy(self,policy):
-        if (self.generation_id!='0x'+policy.generation.hex()
+        if (not isinstance(policy, (TestnetIssuerPolicy, TestnetCollectionIssuerPolicy))
+                or self.generation_id!='0x'+policy.generation.hex()
                 or self.issuer_policy_hash!=policy.commitment
-                or not policy.issued_at<=self.issued_at<self.expires_at<=policy.expires_at):
+                or (isinstance(policy, TestnetIssuerPolicy)
+                    and not policy.issued_at<=self.issued_at<self.expires_at<=policy.expires_at)):
             raise ValueError('CURRENT_PURCHASE_FEE_POLICY_CHANGED')
         return self
 
@@ -69,29 +73,49 @@ def read_purchase_fee_authority(path,expected_hash,policy):
 
 
 class CurrentPurchaseFeeFaucet:
-    def __init__(self,faucet,authority,policy,store,*,clock):
+    def __init__(self,faucet,authority,policy,store,*,clock,funding_store=None,cutover=None):
         from .generation_customer_purchase_execution_store import CurrentPurchaseExecutionStore
         authority.require_policy(policy)
         if (not isinstance(store,CurrentPurchaseExecutionStore) or store.generation_id!=authority.generation_id
                 or faucet.network!='testnet11' or faucet.address_hex!=authority.funding_puzzle_hash):
             raise ValueError('CURRENT_PURCHASE_FEE_ACCOUNT_CHANGED')
+        if isinstance(policy, TestnetCollectionIssuerPolicy):
+            if (funding_store is None or cutover is None
+                    or cutover.collection_policy != policy.commitment
+                    or authority.maximum_total_fee_mojos > cutover.fee_limit_mojos - cutover.inherited_fee_mojos):
+                raise ValueError('CURRENT_PURCHASE_FEE_CUTOVER_BUDGET_REQUIRED')
         self._faucet,self.authority,self.policy,self.store,self.clock=faucet,authority,policy,store,clock
+        self.funding_store = funding_store
         self.network=faucet.network;self.address_hex=faucet.address_hex
         self.address_puzzle_hash=faucet.address_puzzle_hash
         self.key=SimpleNamespace(puzzle=faucet.key.puzzle)
 
     def add_coin_reservation_source(self,source):self._faucet.add_coin_reservation_source(source)
 
+    def available_fee_ids(self):
+        allowed = set(self.authority.fee_coin_ids)
+        if isinstance(self.policy, TestnetCollectionIssuerPolicy):
+            # A released funding hold can be reused by other protocol flows.
+            # Checkout sponsorship counts each approved input only once over
+            # this budget's lifetime, including after restart or release.
+            with self.funding_store.lock:
+                used = self.funding_store.db.execute(
+                    'SELECT DISTINCT coin_id FROM funded_protocol_input_history WHERE network=? AND coin_id IN ('
+                    + ','.join('?' for _ in allowed) + ')', ('testnet11', *sorted(allowed))).fetchall()
+            allowed.difference_update(row[0] for row in used)
+        return allowed
+
     def select_coin(self,records,**kwargs):
         self.authority.require_live(self.policy,int(self.clock()))
+        allowed = self.available_fee_ids()
         selected=[r for r in records if '0x'+Coin.from_json_dict(r.get('coin')or r).name().hex()
-            in self.authority.fee_coin_ids]
+            in allowed]
         return self._faucet.select_coin(selected,**kwargs)
 
     def sign_delegated_spend(self,coin,conditions,*,purpose=None):
         self.authority.require_live(self.policy,int(self.clock()))
         if (purpose is not None or self.network!='testnet11'
-                or '0x'+coin.name().hex() not in self.authority.fee_coin_ids
+                or '0x'+coin.name().hex() not in self.available_fee_ids()
                 or coin.puzzle_hash!=self.address_puzzle_hash
                 or coin.amount>self.authority.maximum_fee_parent_mojos):
             raise ValueError('CURRENT_PURCHASE_FEE_INPUT_REJECTED')

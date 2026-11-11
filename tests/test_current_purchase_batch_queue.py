@@ -1,5 +1,6 @@
 """Durable explicit scalar/batch intent, independent of wallets or live networks."""
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -225,6 +226,64 @@ def test_concurrent_batches_cannot_each_claim_the_same_remaining_deed_budget(bat
     with ThreadPoolExecutor(max_workers=2)as pool:
         results=list(pool.map(request,[(q.identity,BROWSER),(other,'ef'*32)]))
     assert sorted(results)==['CURRENT_EXECUTION_POLICY_CAPACITY_EXHAUSTED','accepted']
+
+
+def test_collection_admission_serializes_coin_holds_and_releases_unsigned_expired_work(scalar_queue):
+    from solslot_api.generation_customer_purchase_batch import artifacts
+
+    q = scalar_queue
+    collection_policy = '0x' + 'ab' * 32
+    old_request = q.store.request_reservation(q.identity, browser_hash=BROWSER, now=110)
+
+    async def unused_issuer(_):
+        raise AssertionError('Reservation admission cannot call the issuer')
+
+    CurrentPurchaseWorker(q.service, issuer_sign=unused_issuer, clock=lambda: 110)
+    with q.store._connect() as db:
+        db.execute('''CREATE TABLE current_purchase_collection_execution (
+            id INTEGER PRIMARY KEY, policy_hash TEXT, cutover_hash TEXT, fee_cap INTEGER)''')
+        db.execute('INSERT INTO current_purchase_collection_execution VALUES (1,?,?,10)',
+                   (collection_policy, '0x' + 'cd' * 32))
+    claim = q.claim.model_copy(update={'issuer_policy_hash': collection_policy})
+    other_browser = 'ef' * 32
+    first = q.store.save_review(claim, browser_hash=BROWSER, request_key='first', now=111)
+    competitor_artifact = replace(artifacts(claim)[0], vault_launcher_id=bytes32(b'v' * 32),
+                                  authorization_nonce=bytes32(b'a' * 32))
+    competitor_claim = claim.model_copy(update={'purchase_artifact': purchase_artifact_to_json(competitor_artifact)})
+    competitor = q.store.save_review(competitor_claim, browser_hash=other_browser, request_key='competitor', now=111)
+
+    def attempt(entry):
+        identity, browser = entry
+        store = CurrentPurchaseExecutionStore(q.store.path, q.store.generation_id)
+        try:
+            assert store.request_reservation(identity, browser_hash=browser, now=112) == 112
+            return entry
+        except ValueError as exc:
+            assert str(exc) == 'CURRENT_PRIMARY_DEED_NOT_AVAILABLE'
+            return None
+
+    entries = [(first, BROWSER), (competitor, other_browser)]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        winner, = [entry for entry in pool.map(attempt, entries) if entry is not None]
+    reopened = CurrentPurchaseExecutionStore(q.store.path, q.store.generation_id)
+    assert reopened.request_reservation(winner[0], browser_hash=winner[1], now=113) == 112
+    assert reopened.reservation_request(q.identity, browser_hash=BROWSER) == old_request
+
+    for index in range(3):
+        available = claim.model_copy(update={'available_coin_id': '0x' + f'{70 + index:02x}' * 32})
+        identity = reopened.save_review(available, browser_hash=BROWSER, request_key=f'available-{index}', now=114)
+        assert reopened.request_reservation(identity, browser_hash=BROWSER, now=115) == 115
+
+    assert not reopened.closed_without_preparation(winner[0], browser_hash=winner[1])
+    expiry = artifacts(claim)[0].quote_expires_at
+    with reopened._connect() as db:
+        db.execute("INSERT INTO current_purchase_worker_jobs(intent_id,state) VALUES(?,'CLOSED')", (winner[0],))
+    assert reopened.closed_without_preparation(winner[0], browser_hash=winner[1])
+    renewed_artifact = replace(artifacts(claim)[0], quote_expires_at=expiry + 300,
+                               authorization_expires_at=expiry + 300)
+    renewed = claim.model_copy(update={'purchase_artifact': purchase_artifact_to_json(renewed_artifact)})
+    identity = reopened.save_review(renewed, browser_hash=other_browser, request_key='fresh', now=expiry + 1)
+    assert reopened.request_reservation(identity, browser_hash=other_browser, now=expiry + 2) == expiry + 2
 
 
 @pytest.mark.asyncio
