@@ -83,6 +83,8 @@ async def review_identity_deployment(
             "approvalExpiresAt": int(build.statement["approvalExpiresAt"]),
             "signerSlots": list(build.context["signerSlots"]),
             "currentDeployment": current,
+            "currentEvmChainId": int(build.statement.get("previousEvmChainId", build.statement["evmChainId"])),
+            "replacementEvmChainId": int(build.statement["evmChainId"]),
             "replacementDeployment": replacement,
             "acceptedProofVersions": list(replacement["acceptedProofVersions"]),
             "credentialPolicy": build.statement["identityPolicy"],

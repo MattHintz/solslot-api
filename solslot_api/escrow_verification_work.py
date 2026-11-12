@@ -7,6 +7,8 @@ They authorize neither a payment nor an inventory hold.
 """
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import secrets
@@ -41,7 +43,7 @@ def migrate_escrow_verifications(db):
 def _connect(path, *, busy_timeout_seconds=0.05):
     # Do not allow a contended lease table to stall the event loop. Never hold
     # a database transaction across provider I/O or sleep while holding a lock.
-    db = sqlite3.connect(path, timeout=busy_timeout_seconds, isolation_level=None)
+    db = connect_generation_sqlite(path, timeout=busy_timeout_seconds, isolation_level=None)
     db.execute("PRAGMA foreign_keys=ON")
     return db
 

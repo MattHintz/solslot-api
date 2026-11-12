@@ -3,6 +3,10 @@ from __future__ import annotations
 
 import secrets
 import time
+import hashlib
+import json
+import sqlite3
+from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, Mapping, Optional, TypeVar
 
 import httpx
@@ -11,7 +15,9 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 from .admin_auth import AdminClaims, require_admin_jwt
-from .admin_operations import require_admin_operation
+from .test_collection_metadata import TestPropertyDraftV1
+from solslot_puzzles.property_metadata import commit_metadata
+from .admin_operations import require_admin_operation, get_operation_store, OperationStore
 from .collection_display_units import (
     DisplayUnitError,
     allocate_par_mojos,
@@ -20,6 +26,7 @@ from .collection_display_units import (
     percentage_to_bps,
     usd_minor_to_asset_units,
 )
+from .collection_document_types import XLSX_MIME
 from .collection_media import (
     CollectionMediaPipeline,
     MediaPipelineUnavailable,
@@ -78,6 +85,51 @@ class CreateCollectionRequest(ApiModel):
     )
     title: str = Field(min_length=1, max_length=180)
     slug: Optional[str] = Field(default=None, min_length=1, max_length=100)
+
+
+class CreateTestEditionRequest(ApiModel):
+    source_collection_id: str = Field(alias='sourceCollectionId', min_length=1, max_length=120)
+    source_revision: int = Field(alias='sourceRevision', ge=1)
+    source_draft_hash: str = Field(alias='sourceDraftHash', pattern=r'^0x[0-9a-f]{64}$')
+
+
+class PreviewAcknowledgement(ApiModel):
+    draft_hash: str = Field(alias='draftHash', pattern=r'^0x[0-9a-f]{64}$')
+
+
+class TreasuryCorrectionRequest(ApiModel):
+    generation_id: str = Field(alias='generationId', pattern=r'^0x[0-9a-f]{64}$')
+    metadata_root: str = Field(alias='metadataRoot', pattern=r'^0x[0-9a-f]{64}$')
+    treasury: str = Field(pattern=r'^0x[0-9a-f]{64}$')
+
+
+def _collection_mint_authority_or_none(settings):
+    from .collection_mint_authority import collection_mint_authority
+    try:
+        return collection_mint_authority(settings)
+    except (OSError,ValueError,TypeError,KeyError):
+        return None
+
+
+def require_test_editions(settings: Annotated[Settings, Depends(get_settings)]) -> None:
+    if not (settings.test_collection_editions_enabled and settings.network == 'testnet11'
+            and settings.deployment_generation_id):
+        raise HTTPException(503, 'Test editions are disabled for this deployment generation.')
+
+
+def _read_archive_draft(settings: Settings, collection_id: str) -> dict:
+    if not settings.collection_source_archive_db_path or not settings.collection_source_archive_generation_id:
+        raise HTTPException(503, 'The reviewed source archive is not configured.')
+    path = Path(settings.collection_source_archive_db_path).resolve()
+    # Read-only connection: no schema migrations, WAL changes or writes to the original.
+    connection = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
+    try:
+        row = connection.execute('SELECT dossier_json FROM property_collections WHERE id=?', (collection_id,)).fetchone()
+    finally:
+        connection.close()
+    if not row:
+        raise HTTPException(404, 'Source draft was not found in the reviewed archive.')
+    return PropertyDossierDraftV1.model_validate_json(row[0]).model_dump(mode='json', by_alias=True, exclude_none=True)
 
 
 class AssetUploadRequest(ApiModel):
@@ -155,7 +207,8 @@ def _signed_governance_threshold(settings: Settings) -> int:
     return threshold
 
 
-def require_collection_metadata(
+async def require_collection_metadata(
+    request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> None:
     if not settings.collection_metadata_enabled:
@@ -163,12 +216,15 @@ def require_collection_metadata(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Chain-verifiable collection metadata is disabled.",
         )
+    from .collection_generation_recovery import require_preparation_step
+    require_preparation_step(request, settings)
 
 
-def require_collection_minting(
+async def require_collection_minting(
+    request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> None:
-    require_collection_metadata(settings)
+    await require_collection_metadata(request, settings)
     if not settings.collection_minting_enabled:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -233,11 +289,27 @@ def _store_call(call: Callable[[], T]) -> T:
 async def collection_feature_status(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict[str, Any]:
+    from .collection_recovery_health import read_receipt
+    try:
+        if settings.deployment_generation_id:
+            from .collection_generation_recovery import read_record_receipt
+            receipt = read_record_receipt(settings)
+        else:
+            receipt = read_receipt()
+        recovery = {"healthy": True, "checkedAt": receipt["checkedAt"], "restoredAt": receipt["restoredAt"]}
+    except (OSError, ValueError, TypeError, KeyError):
+        recovery = {"healthy": False, "checkedAt": None, "restoredAt": None}
     return {
-        "metadataEnabled": settings.collection_metadata_enabled,
+        "generationId": settings.deployment_generation_id,
+        "mintAuthority": _collection_mint_authority_or_none(settings),
+        "testEditionsEnabled": bool(settings.test_collection_editions_enabled and settings.network == 'testnet11' and settings.deployment_generation_id),
+        "metadataConfigured": settings.collection_metadata_enabled,
+        "metadataEnabled": settings.collection_metadata_enabled and recovery["healthy"],
+        "recovery": recovery,
         "mintingEnabled": settings.collection_minting_enabled,
         "maxCanonicalBytes": 24 * 1024,
         "maxAssetBytes": settings.collection_asset_max_bytes,
+        "storageQuotaBytes": settings.collection_local_quota_bytes,
         "network": settings.network,
     }
 
@@ -274,6 +346,37 @@ async def collection_profiles() -> dict[str, Any]:
     }
 
 
+@router.get(
+    "/admin/collections/pricing/xch",
+    dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)],
+)
+async def collection_xch_pricing(
+    response: Response,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    """Read current verified pricing without changing any collection revision."""
+    response.headers["Cache-Control"] = "no-store"
+    now = int(time.time())
+    try:
+        authorized = load_authorized_oracle_round(settings, asset_id=bytes32.zeros, now=now)
+        round_ = authorized.round
+        if round_.network != settings.network or round_.asset_decimals != 12:
+            raise PaymentQuoteError("oracle round does not match native workspace XCH")
+    except PaymentQuoteError:
+        return {"status": "unavailable", "checkedAt": now, "quote": None}
+    return {
+        "status": "available", "checkedAt": now,
+        "quote": {
+            "priceUsdMinorPerXch": str(round_.price_usd_minor_per_asset),
+            "validUntil": round_.valid_until,
+            # Display the oldest supporting observation, not the fetch clock.
+            "observedAt": min(item.observed_at for item in round_.observations),
+            "sequence": str(round_.sequence), "roundHash": "0x" + round_.round_hash.hex(),
+            "sourceCount": len(round_.observations), "signerCount": len(authorized.signatures),
+        },
+    }
+
+
 @router.post(
     "/admin/collections/display-units/convert",
     dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)],
@@ -284,8 +387,9 @@ async def convert_collection_display_units(
 ) -> dict[str, Any]:
     """Convert owner-facing values into canonical protocol integers.
 
-    The browser cannot choose governance or oracle-derived values.  Both are
-    taken from cryptographically verified runtime artifacts.
+    The browser cannot choose oracle-derived values. Generation quorum belongs
+    to the consensus opening snapshot, never to property metadata; only legacy
+    deployments obtain their fixed display threshold from the signed artifact.
     """
 
     try:
@@ -305,12 +409,16 @@ async def convert_collection_display_units(
             key: ownership_to_ppm(value, label=key)
             for key, value in body.ownership_shares.items()
         }
-        governance_quorum = _signed_governance_threshold(settings)
+        # The confirmed-generation handoff deliberately has no RC23 artifact.
+        # Its holder-supply quorum is frozen when a proposal opens. A monetary
+        # conversion must neither require legacy authority nor invent a quorum.
+        governance_quorum = (None if settings.deployment_generation_id
+                             else _signed_governance_threshold(settings))
         result: dict[str, Any] = {
             "moneyMinor": money_minor,
             "percentageBps": percentage_bps,
             "ownershipPpm": ownership_ppm,
-            "governanceQuorum": str(governance_quorum),
+            "governanceQuorum": str(governance_quorum) if governance_quorum is not None else None,
             "xchParMojos": None,
             "xchOracle": None,
         }
@@ -383,6 +491,75 @@ async def create_collection(
     return _with_etag(response, payload)
 
 
+@router.get('/admin/collection-source/{collection_id}', dependencies=[Depends(require_admin_jwt), Depends(require_test_editions)])
+async def collection_source_summary(collection_id: str, settings: Annotated[Settings, Depends(get_settings)]) -> dict:
+    payload = _read_archive_draft(settings, collection_id)
+    return {'collectionId': payload['collectionId'], 'revision': payload['revision'], 'title': payload['title'],
+        'draftHash': '0x' + commit_metadata(payload).metadata_root.hex(),
+        'generationId': settings.collection_source_archive_generation_id}
+
+
+@router.post('/admin/collections/test-editions', dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata), Depends(require_test_editions)])
+async def create_test_edition(body: CreateTestEditionRequest, response: Response,
+                             settings: Annotated[Settings, Depends(get_settings)],
+                             claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
+                             store: Annotated[CollectionStore, Depends(get_collection_store)]) -> dict:
+    source = _read_archive_draft(settings, body.source_collection_id)
+    digest = '0x' + commit_metadata(source).metadata_root.hex()
+    if source['revision'] != body.source_revision or digest != body.source_draft_hash:
+        raise HTTPException(409, 'Source revision changed. Review the source again.')
+    generation = settings.deployment_generation_id
+    collection_id = 'TEST-' + hashlib.sha256(f'{generation}:{digest}'.encode()).hexdigest()[:24].upper()
+    try:
+        existing = store.get(collection_id)
+    except CollectionNotFound:
+        existing = None
+    if existing:
+        if existing['ownerSubject'] != claims.sub.lower():
+            raise HTTPException(409, 'This source edition already belongs to another administrator.')
+        return _with_etag(response, existing)
+    payload = _store_call(lambda: store.create_test_edition(source=source,
+        source_generation_id=settings.collection_source_archive_generation_id,
+        collection_id=collection_id, actor_subject=claims.sub, actor_auth_type=claims.auth_type))
+    return _with_etag(response, payload)
+
+
+@router.post('/admin/collections/{collection_id}/preview-acknowledgements',
+    dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)])
+async def acknowledge_collection_preview(collection_id: str, body: PreviewAcknowledgement, response: Response,
+    claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
+    store: Annotated[CollectionStore, Depends(get_collection_store)],
+    if_match: Annotated[Optional[str], Header(alias='If-Match')] = None) -> dict:
+    payload = _store_call(lambda: store.acknowledge_preview(collection_id,
+        expected_revision=_expected_revision(if_match), expected_draft_hash=body.draft_hash, actor_subject=claims.sub))
+    return _with_etag(response, payload)
+
+
+@router.post('/admin/collections/{collection_id}/corrections/treasury',
+    dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata), Depends(require_test_editions)])
+async def correct_unissued_treasury(collection_id: str, body: TreasuryCorrectionRequest,
+    request: Request, response: Response, settings: Annotated[Settings, Depends(get_settings)],
+    claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
+    store: Annotated[CollectionStore, Depends(get_collection_store)],
+    if_match: Annotated[Optional[str], Header(alias='If-Match')] = None):
+    from .collection_treasury_correction import correct_treasury
+    from .collection_store import CollectionStoreError
+    revision = _expected_revision(if_match)
+    try:
+        payload=await correct_treasury(collection_id=collection_id,generation_id=body.generation_id,
+            revision=revision,metadata_root=body.metadata_root,treasury=body.treasury,actor=claims.sub,
+            settings=settings,collections=store,index=getattr(request.app.state,'generation_index',None),
+            provider=getattr(request.app.state,'coinset',None),submitter=getattr(request.app.state,'protocol_submitter',None),
+            reviews=getattr(request.app.state,'generation_mint_reviews',None))
+        return _with_etag(response,payload)
+    except CollectionForbidden as exc:
+        raise HTTPException(403,str(exc)) from exc
+    except (ValueError,CollectionStoreError) as exc:
+        raise HTTPException(409,str(exc)) from exc
+    except (OSError,RuntimeError,TimeoutError) as exc:
+        raise HTTPException(503,'The current mint authority could not be checked. No correction was saved.') from exc
+
+
 @router.get(
     "/admin/collections",
     dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata)],
@@ -418,7 +595,7 @@ async def get_collection(
 )
 async def update_collection(
     collection_id: str,
-    body: PropertyDossierDraftV1,
+    body: PropertyDossierDraftV1 | TestPropertyDraftV1,
     response: Response,
     claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     store: Annotated[CollectionStore, Depends(get_collection_store)],
@@ -434,6 +611,24 @@ async def update_collection(
             submit_for_review=submit_for_review,
         )
     )
+    return _with_etag(response, payload)
+
+
+@router.post('/admin/collections/{collection_id}/pricing/apply',
+    dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata), Depends(require_test_editions)])
+async def apply_test_collection_pricing(
+    collection_id: str, response: Response,
+    claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
+    store: Annotated[CollectionStore, Depends(get_collection_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    if_match: Annotated[Optional[str], Header(alias='If-Match')] = None,
+) -> dict[str, Any]:
+    try:
+        authorized = load_authorized_oracle_round(settings, asset_id=bytes32.zeros, now=int(time.time()))
+    except PaymentQuoteError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    payload = _store_call(lambda: store.apply_test_pricing(collection_id,
+        expected_revision=_expected_revision(if_match), actor_subject=claims.sub, authorized=authorized))
     return _with_etag(response, payload)
 
 
@@ -473,24 +668,35 @@ async def collection_readiness(
 @router.post(
     "/admin/collections/{collection_id}/seal",
     dependencies=[
-        Depends(require_admin_operation("collection.seal")),
+        Depends(require_admin_operation("collection.seal", defer_consume=True, reconcile_seal=True)),
         Depends(require_collection_metadata),
     ],
 )
 async def seal_collection(
     collection_id: str,
+    request: Request,
     response: Response,
     claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     store: Annotated[CollectionStore, Depends(get_collection_store)],
+    operations: Annotated[OperationStore, Depends(get_operation_store)],
     if_match: Annotated[Optional[str], Header(alias="If-Match")] = None,
 ) -> dict[str, Any]:
+    operation = getattr(request.state, 'admin_operation', None)
+    consume = getattr(request.state, 'admin_operation_consume', None)
     payload = _store_call(
         lambda: store.seal(
             collection_id,
             expected_revision=_expected_revision(if_match),
             actor_subject=claims.sub,
+            operation_id=operation['operation_id'] if operation else None,
+            payload_hash=operation['payload_hash'] if operation else None,
         )
     )
+    if consume is not None:
+        # The collection's atomic audit receipt makes this recoverable if the
+        # process stops between the metadata commit and approval consumption.
+        operations.consume(**consume,
+            now=request.state.admin_operation_authorized_at, reconcile_seal=True)
     return _with_etag(response, payload)
 
 
@@ -507,22 +713,37 @@ async def presign_collection_asset(
 ) -> dict[str, Any]:
     if body.byte_size > settings.collection_asset_max_bytes:
         raise HTTPException(status_code=413, detail="asset exceeds configured upload limit")
-    declared = _store_call(
-        lambda: store.declare_asset(
-            collection_id,
-            asset_id=body.asset_id,
-            kind=body.kind,
-            expected_sha256=body.sha256,
-            expected_mime_type=body.mime_type,
-            expected_byte_size=body.byte_size,
-            actor_subject=claims.sub,
-            role=body.role,
-            title=body.title,
-            alt_text=body.alt,
-            category=body.category,
-            visibility=body.visibility,
+    workspace = _store_call(lambda: store.get(collection_id))
+    if workspace["state"] not in ("DRAFT", "REVIEW", "PUBLISHED"):
+        raise HTTPException(status_code=409, detail="Assets cannot be changed in this collection state")
+    if body.mime_type.lower() == XLSX_MIME and (body.visibility != "PRIVATE" or body.kind != "DOCUMENT"):
+        raise HTTPException(status_code=422, detail="Spreadsheets are restricted private originals")
+    try:
+        existing = store.get_asset(collection_id, body.asset_id)
+    except CollectionNotFound:
+        existing = None
+    if existing is not None:
+        if workspace["state"] == "PUBLISHED":
+            raise HTTPException(status_code=409, detail="Published asset IDs are immutable; declare a new asset for an amendment")
+        expected = {"kind": body.kind, "visibility": body.visibility,
+                    "expectedSha256": body.sha256.lower(), "expectedMimeType": body.mime_type.lower(),
+                    "expectedByteSize": body.byte_size, "title": body.title, "category": body.category,
+                    "role": body.role, "alt": body.alt}
+        if any(existing.get(key) != value for key, value in expected.items()):
+            raise HTTPException(status_code=409, detail="This asset ID already identifies another file or declaration; the original is retained")
+        if existing["state"] in ("PINNED", "VERIFIED"):
+            return {"alreadyVerified": True, "asset": existing}
+        declared = existing
+    else:
+        declared = _store_call(
+            lambda: store.declare_asset(
+                collection_id, asset_id=body.asset_id, kind=body.kind,
+                expected_sha256=body.sha256, expected_mime_type=body.mime_type,
+                expected_byte_size=body.byte_size, actor_subject=claims.sub,
+                role=body.role, title=body.title, alt_text=body.alt,
+                category=body.category, visibility=body.visibility,
+            )
         )
-    )
     pipeline = CollectionMediaPipeline(settings)
     try:
         upload = pipeline.presign_upload(
@@ -530,10 +751,14 @@ async def presign_collection_asset(
             asset_id=body.asset_id,
             filename=body.filename,
             private=body.visibility == "PRIVATE",
+            expected_sha256=body.sha256,
+            expected_byte_size=body.byte_size,
+            expected_mime_type=body.mime_type,
+            object_key=declared.get("objectKey"),
         )
     except (MediaPipelineUnavailable, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    asset = _store_call(
+    asset = declared if declared.get("objectKey") else _store_call(
         lambda: store.assign_asset_object_key(
             collection_id,
             body.asset_id,

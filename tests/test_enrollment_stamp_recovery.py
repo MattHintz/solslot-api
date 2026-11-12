@@ -3,6 +3,7 @@ import asyncio
 import json
 from copy import deepcopy
 import pytest
+from functools import partial
 from fastapi import HTTPException
 from chia_rs import Coin, SpendBundle
 from chia_rs.sized_bytes import bytes32
@@ -13,7 +14,7 @@ from solslot_api.credential_ledger import CredentialLedger, LedgerConflict, get_
 from tests import test_zkpassport_enrollments as journeys
 
 JOURNEYS = [journeys.test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp,
-    journeys.test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp]
+    partial(journeys.test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp, generation_custody=False)]
 
 
 @pytest.mark.parametrize('journey', JOURNEYS, ids=['evm','bls'])
@@ -141,7 +142,7 @@ def test_schema_one_upgrade_preserves_historical_rows_and_has_no_backfilled_atte
     try:
         assert upgraded.get_enrollment(journeys.VAULT_A) == record
         assert upgraded.get_stamp_attempt(journeys.VAULT_A) is None
-        assert upgraded._conn.execute('PRAGMA user_version').fetchone()[0] == 4
+        assert upgraded._conn.execute('PRAGMA user_version').fetchone()[0] == 5
         assert upgraded.get_enrollment_permit(journeys.VAULT_A) is None
         assert upgraded.get_relay_transaction(journeys.VAULT_A) is None
         assert upgraded.enrollment_bridge_coin_ids() == {record['bridgeCoinId']}

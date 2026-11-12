@@ -11,7 +11,7 @@ from eth_keys import keys as eth_keys
 from chia_rs import Coin, SpendBundle
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
-from fastapi import Request
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 from solslot_api.app import app
@@ -672,11 +672,14 @@ def test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp(monkeypatch, tmp_
     assert synced.enrollment.receipt.confirmedBlockIndex == 789
 
 
+@pytest.mark.parametrize('generation_custody', [False, True])
 def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, generation_custody
 ):
     _install_owner_bypass(monkeypatch)
     monkeypatch.setenv("SOLSLOT_ALPHA_WRITES_ENABLED", "true")
+    if generation_custody:
+        monkeypatch.setenv('SOLSLOT_DEPLOYMENT_GENERATION_ID', '0x' + '71' * 32)
     from chia.types.blockchain_format.program import Program
     from solslot_api.state import VaultRecord, get_registry
     from solslot_puzzles.vault_driver import (
@@ -709,7 +712,8 @@ def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
         bridge_policy_hash=policy_hex,
         pool_launcher_id="0x" + pool_launcher.hex(),
     )
-    current_puzzle = puzzle_for_vault_full(
+    current_puzzle = zkpassport_enrollments._custody_full(
+        Settings(),
         launcher,
         owner_pubkey,
         AUTH_TYPE_BLS,
@@ -874,10 +878,16 @@ def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
         ),
         _request(),
     )
-    prepared = zkpassport_enrollments.prepare_chia_stamp(
-        VAULT_A,
-        _request(),
-    )
+    if generation_custody:
+        stamp_app = FastAPI()
+        stamp_app.include_router(zkpassport_enrollments.router)
+        stamp_app.state.coinset = fake_chia_provider
+        stamp_client = TestClient(stamp_app)
+        prepared_response = stamp_client.post(f'/zkpassport/enrollments/{VAULT_A}/stamp/prepare')
+        assert prepared_response.status_code == 200, prepared_response.text
+        prepared = zkpassport_enrollments.PrepareChiaStampResponse.model_validate(prepared_response.json())
+    else:
+        prepared = zkpassport_enrollments.prepare_chia_stamp(VAULT_A, _request())
     assert prepared.authType == "chia_bls"
     assert prepared.typedData is None
     assert prepared.currentTimestamp is not None
@@ -901,44 +911,60 @@ def test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp(
     wrong_owner_signature = zkpassport_enrollments.AugSchemeMPL.sign(
         wrong_owner_sk, owner_message
     )
-    with pytest.raises(zkpassport_enrollments.HTTPException) as wrong_error:
-        asyncio.run(
-            zkpassport_enrollments.submit_evm_chia_stamp(
+    if generation_custody:
+        wrong_response = stamp_client.post(f'/zkpassport/enrollments/{VAULT_A}/stamp/submit', json={
+            'signature': '0x' + bytes(wrong_owner_signature).hex(),
+            'currentTimestamp': prepared.currentTimestamp,
+        })
+        assert wrong_response.status_code == 400
+        assert pushed == []
+
+        stale_response = stamp_client.post(f'/zkpassport/enrollments/{VAULT_A}/stamp/submit', json={
+            'signature': '0x' + bytes(owner_signature).hex(),
+            'currentTimestamp': prepared.currentTimestamp - 1000,
+        })
+        assert stale_response.status_code == 409
+        assert pushed == []
+
+        submitted_response = stamp_client.post(f'/zkpassport/enrollments/{VAULT_A}/stamp/submit', json={
+            'signature': '0x' + bytes(owner_signature).hex(),
+            'currentTimestamp': prepared.currentTimestamp,
+        })
+        assert submitted_response.status_code == 200, submitted_response.text
+        submitted = zkpassport_enrollments.SubmitChiaStampResponse.model_validate(submitted_response.json())
+    else:
+        with pytest.raises(zkpassport_enrollments.HTTPException) as wrong_error:
+            asyncio.run(zkpassport_enrollments.submit_evm_chia_stamp(
                 VAULT_A,
                 zkpassport_enrollments.SubmitChiaStampRequest(
-                    signature="0x" + bytes(wrong_owner_signature).hex(),
+                    signature='0x' + bytes(wrong_owner_signature).hex(),
                     currentTimestamp=prepared.currentTimestamp,
                 ),
                 _request(),
-            )
-        )
-    assert wrong_error.value.status_code == 400
-    assert pushed == []
+            ))
+        assert wrong_error.value.status_code == 400
+        assert pushed == []
 
-    with pytest.raises(zkpassport_enrollments.HTTPException) as stale_error:
-        asyncio.run(
-            zkpassport_enrollments.submit_evm_chia_stamp(
+        with pytest.raises(zkpassport_enrollments.HTTPException) as stale_error:
+            asyncio.run(zkpassport_enrollments.submit_evm_chia_stamp(
                 VAULT_A,
                 zkpassport_enrollments.SubmitChiaStampRequest(
-                    signature="0x" + bytes(owner_signature).hex(),
+                    signature='0x' + bytes(owner_signature).hex(),
                     currentTimestamp=prepared.currentTimestamp - 1000,
                 ),
                 _request(),
-            )
-        )
-    assert stale_error.value.status_code == 409
-    assert pushed == []
+            ))
+        assert stale_error.value.status_code == 409
+        assert pushed == []
 
-    submitted = asyncio.run(
-        zkpassport_enrollments.submit_evm_chia_stamp(
+        submitted = asyncio.run(zkpassport_enrollments.submit_evm_chia_stamp(
             VAULT_A,
             zkpassport_enrollments.SubmitChiaStampRequest(
-                signature="0x" + bytes(owner_signature).hex(),
+                signature='0x' + bytes(owner_signature).hex(),
                 currentTimestamp=prepared.currentTimestamp,
             ),
             _request(fake_chia_provider),
-        )
-    )
+        ))
 
     assert proof.status == "evm_confirmed"
     assert submitted.enrollment.status == "stamp_pending"

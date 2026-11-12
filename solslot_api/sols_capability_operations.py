@@ -1,6 +1,8 @@
 """Durable capability receipts. Wallet hints never establish chain finality."""
 from __future__ import annotations
 
+from .generation_storage import connect_generation_sqlite
+
 import json
 import sqlite3
 from pathlib import Path
@@ -15,7 +17,7 @@ class CapabilityOperationConflict(ValueError):
 class CapabilityOperationStore:
     def __init__(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(path, timeout=10)
+        self.connection = connect_generation_sqlite(path, timeout=10)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("""CREATE TABLE IF NOT EXISTS capability_operations (

@@ -138,6 +138,8 @@ def build_vault_version_registry_snapshot(
     publish.  Callers can therefore use ``snapshot.content_hash_hex is None``
     as the "registry descriptor not yet computable" signal.
     """
+    from .vault_puzzle_hash import GENERATION_VAULT_INNER_HASH
+    vault_hash=('0x'+GENERATION_VAULT_INNER_HASH.hex() if getattr(settings,'deployment_generation_id',None) else _VAULT_INNER_MOD_HASH_HEX)
     vault_version = settings.vault_version_registry_version
     launcher_id_hex = settings.vault_version_registry_launcher_id
 
@@ -145,7 +147,7 @@ def build_vault_version_registry_snapshot(
         return VaultVersionRegistrySnapshot(
             vault_version_registry_launcher_id_hex=launcher_id_hex,
             vault_version_registry_mod_hash_hex=_VAULT_VERSION_REGISTRY_MOD_HASH_HEX,
-            vault_inner_mod_hash_hex=_VAULT_INNER_MOD_HASH_HEX,
+            vault_inner_mod_hash_hex=vault_hash,
             vault_version=vault_version,
             canonical_params_hash_hex=None,
             content_hash_hex=None,
@@ -167,7 +169,7 @@ def build_vault_version_registry_snapshot(
 
     content_hash = list_hash(
         (
-            bytes.fromhex(_strip0x(_VAULT_INNER_MOD_HASH_HEX)),
+            bytes.fromhex(_strip0x(vault_hash)),
             bytes(canonical_params_hash),
             positive_clvm_int(vault_version),
         )
@@ -176,7 +178,7 @@ def build_vault_version_registry_snapshot(
     return VaultVersionRegistrySnapshot(
         vault_version_registry_launcher_id_hex=launcher_id_hex,
         vault_version_registry_mod_hash_hex=_VAULT_VERSION_REGISTRY_MOD_HASH_HEX,
-        vault_inner_mod_hash_hex=_VAULT_INNER_MOD_HASH_HEX,
+        vault_inner_mod_hash_hex=vault_hash,
         vault_version=vault_version,
         canonical_params_hash_hex="0x" + canonical_params_hash.hex(),
         content_hash_hex="0x" + content_hash.hex(),

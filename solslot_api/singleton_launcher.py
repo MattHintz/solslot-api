@@ -81,6 +81,17 @@ def build_and_sign_singleton_launch(
             ]
         )
     ]
+    launcher_solution = Program.to([full_puzzle_hash, SINGLETON_AMOUNT, list(eve_memos)])
+    # Use Chia's native funding-to-launcher announcement commitment. A
+    # launcher is signatureless; CREATE_COIN alone does not bind which
+    # custody puzzle it launches and permits stripping/redirecting it.
+    # All callers receive this invariant; there is no opt-out configuration.
+    from chia.wallet.puzzles.singleton_top_layer_v1_1 import launch_conditions_and_coinsol
+    canonical_conditions, bound_launcher = launch_conditions_and_coinsol(
+        parent_coin, inner_puzzle, list(eve_memos), SINGLETON_AMOUNT)
+    if bound_launcher.coin != launcher_coin or bytes(bound_launcher.solution) != bytes(launcher_solution):
+        raise ValueError('bound singleton launcher differs from the reviewed destination')
+    conditions_list.append(canonical_conditions[1])
     if change:
         conditions_list.append(Program.to([51, parent_coin.puzzle_hash, change]))
     if fee:
@@ -93,7 +104,7 @@ def build_and_sign_singleton_launch(
     launcher_spend = make_spend(
         launcher_coin,
         SINGLETON_LAUNCHER,
-        Program.to([full_puzzle_hash, SINGLETON_AMOUNT, list(eve_memos)]),
+        launcher_solution,
     )
     signature = G2Element.from_bytes(faucet.sign_delegated_spend(parent_coin, conditions))
 

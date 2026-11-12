@@ -2,6 +2,7 @@ import asyncio
 import json
 from dataclasses import replace
 import pytest
+from functools import partial
 from chia_rs import Coin, SpendBundle
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
@@ -26,7 +27,7 @@ from tests import test_zkpassport_enrollments as journeys
 from tests.test_protocol_submission import FakeProvider
 
 @pytest.mark.parametrize('journey',[journeys.test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp,
-    journeys.test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp],ids=['evm','bls'])
+    partial(journeys.test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp, generation_custody=False)],ids=['evm','bls'])
 def test_real_signed_stamp_fee_funding_and_immutable_recovery(monkeypatch,tmp_path,journey):
     original_push=enroll._push_chia_stamp_and_mark_pending
     observed=[]
@@ -127,6 +128,8 @@ def test_predictive_buffer_respects_cap_and_never_submits():
     submitter=ProtocolBundleSubmitter(provider=provider,faucet=faucet,
         policy=ProtocolFeePolicy(enabled=True,maximum_mojos=13_000_000,estimate_buffer_bps=12500))
     from tests.test_protocol_submission import protocol_bundle
-    with pytest.raises(ProtocolSubmissionError,match='exceeds configured cap'):
+    with pytest.raises(ProtocolSubmissionError) as rejected:
         asyncio.run(submitter.submit(protocol_bundle().to_json_dict()))
+    assert rejected.value.code=='FEE_CAP_EXCEEDED'
+    assert rejected.value.submission_attempted is False
     assert provider.submitted is None

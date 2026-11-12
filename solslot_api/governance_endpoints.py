@@ -8,7 +8,7 @@ import time
 from collections.abc import Mapping
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from chia_rs import G2Element
 from chia_rs.sized_bytes import bytes32
@@ -41,9 +41,14 @@ from .admin_auth import AdminClaims, require_admin_jwt
 from .admin_security import SecurityActor, require_security_actor
 from .admin_key_changes import _bytes32_hex
 from .config import Settings, get_settings
+from .chia_provider import ChiaProviderError
 from .genesis import get_genesis_store
 from .genesis_store import GenesisStore
 from .governance_publisher import build_governance_publication
+from .governance_sponsorship import (
+    require_reserve_sponsored_publication,
+    reserve_sponsored_publication_status,
+)
 from .governance_execution import build_allocation_execution, build_allocation_vote
 from .governance_sale_offer import (
     reconstruct_governed_sale_coin,
@@ -76,6 +81,7 @@ from .sols_swaps import (
     _verify_aggregate_signature,
 )
 from .vault_eligibility import ApprovedVault, require_current_approved_vault
+from .sgt_vault_eligibility import require_current_sgt_vault
 
 
 router = APIRouter(tags=["governance-queue"])
@@ -200,6 +206,10 @@ class TransitionRequest(BaseModel):
 
 class PublicationPackageRequest(BaseModel):
     coadmin_slot: int = Field(alias="coadminSlot", ge=1, le=2)
+
+
+class PublicationPrepareRequest(PublicationPackageRequest):
+    renew_expired: bool = Field(False, alias="renewExpired")
 
 
 class PublicationSignatureRequest(PublicationPackageRequest):
@@ -481,6 +491,8 @@ def _public(
         "completionBundleId": value.completion_bundle_id,
         "publicationCoadminSlot": value.publication_coadmin_slot,
         "publicationVotingDeadline": value.publication_voting_deadline,
+        "publicationApprovalExpiresAt": value.publication_approval_expires_at,
+        "savedPublication": value.saved_publication,
         "executionBundleId": value.execution_bundle_id,
         "expectedOutputCoinIds": list(value.expected_output_coin_ids),
         "executionSubmittedAt": value.execution_submitted_at,
@@ -531,8 +543,9 @@ def _if_match(value: str | None) -> int:
 
 
 @router.post("/admin/governance/proposals", status_code=201)
-def create_proposal(
+async def create_proposal(
     body: CreateGovernanceProposal,
+    request: Request,
     response: Response,
     claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
     settings: Annotated[Settings, Depends(get_settings)],
@@ -540,7 +553,13 @@ def create_proposal(
 ) -> dict:
     try:
         require_sgt_allocation_drafts(settings)
-        approved_vault, recipient = _recipient_vault(body, settings)
+        if body.kind == "SGT_GRANT":
+            approved_vault = await require_current_sgt_vault(
+                settings, body.recipient_vault_launcher_id, request.app.state.coinset,
+            )
+            recipient = _b32(approved_vault.p2_puzzle_hash, "SGT vault p2 puzzle hash", nonzero=True)
+        else:
+            approved_vault, recipient = _recipient_vault(body, settings)
         if body.kind == "SGT_SALE":
             treasury = _treasury(settings)
             reserve_owner = _reserve_owner(settings)
@@ -674,7 +693,7 @@ async def preview_starter_grants(
             raise ValueError('current minimum proposal stake is invalid')
         proposals = []
         for slot, vault_id in enumerate(body.vault_launcher_ids):
-            approved = require_current_approved_vault(settings, vault_id)
+            approved = await require_current_sgt_vault(settings, vault_id, provider)
             # These are explicitly selected recipients. The owner and coadmin
             # review the slot-to-vault mapping before any on-chain allocation.
             grant_id = hashlib.sha256(bytes(Program.to([
@@ -737,7 +756,10 @@ def get_sgt_allocation_options(
                 "serverPriced": True,
             }
         )
-    return {"paymentRails": rails}
+    return {
+        "paymentRails": rails,
+        "sponsoredPublication": reserve_sponsored_publication_status(),
+    }
 
 
 @router.post("/protocol/sgt-sales/{proposal_id}/purchase-artifact")
@@ -1094,8 +1116,10 @@ def _publication_view(build, store: GovernanceQueueStore) -> dict:
         "network": "Testnet11",
         "authorityRule": "Owner plus one coadministrator",
         "coadminSlot": build.coadmin_slot,
-        "votingDeadline": build.deadline,
-        "votingWindowSeconds": max(0, build.deadline - int(time.time())),
+        "approvalExpiresAt": build.approval_expires_at,
+        "votingDeadline": build.record.publication_voting_deadline if build.approval_expires_at else build.deadline,
+        "votingWindowSeconds": build.vote_window_seconds if build.approval_expires_at else max(0, build.deadline - int(time.time())),
+        "savedSubmission": store.publication_dispatch(build.record.id) is not None,
         "proposalHash": _hex32(build.proposal_hash),
         "reserveVoteAmount": str(build.reserve_coin.amount),
         "actions": [
@@ -1201,10 +1225,14 @@ async def _publication_build(
     genesis_store: GenesisStore,
     queue_store: GovernanceQueueStore,
     actor: SecurityActor,
+    renew_expired: bool = False,
+    publication_chain_time: int | None = None,
 ):
     record = queue_store.get(proposal_id)
     if record.publication_coadmin_slot is None and actor.authority_slot != 0:
         raise ValueError("the owner must assign the publication coadministrator")
+    if renew_expired and actor.authority_slot != 0:
+        raise ValueError("only the owner can restart expired publication approvals")
     return await build_governance_publication(
         record=record,
         coadmin_slot=coadmin_slot,
@@ -1213,6 +1241,8 @@ async def _publication_build(
         genesis_store=genesis_store,
         queue_store=queue_store,
         actor=actor.wallet,
+        renew_expired=renew_expired,
+        publication_chain_time=publication_chain_time,
     )
 
 
@@ -1392,7 +1422,7 @@ async def complete_allocation_vote(
 @router.post("/admin/governance/proposals/{proposal_id}/publication/package")
 async def publication_package(
     proposal_id: str,
-    body: PublicationPackageRequest,
+    body: PublicationPrepareRequest,
     request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
     genesis_store: Annotated[GenesisStore, Depends(get_genesis_store)],
@@ -1409,8 +1439,110 @@ async def publication_package(
             genesis_store=genesis_store,
             queue_store=queue_store,
             actor=actor,
+            renew_expired=body.renew_expired,
         )
         return _publication_view(build, queue_store)
+    except (ValueError, GovernanceQueueNotFound, GovernanceQueueConflict) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/admin/governance/proposals/{proposal_id}/publication/status")
+async def publication_status(
+    proposal_id: str,
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    genesis_store: Annotated[GenesisStore, Depends(get_genesis_store)],
+    queue_store: Annotated[GovernanceQueueStore, Depends(get_governance_queue_store)],
+    actor: Annotated[SecurityActor, Depends(require_security_actor)],
+) -> dict:
+    """Read an already prepared package; never assign or renew approvals."""
+    try:
+        require_sgt_allocation_drafts(settings)
+        record = queue_store.get(proposal_id)
+        if record.publication_coadmin_slot is None or (record.publication_voting_deadline is None and record.publication_approval_expires_at is None):
+            raise ValueError("the owner must prepare approvals before checking status")
+        build = await _publication_build(
+            proposal_id=proposal_id, coadmin_slot=record.publication_coadmin_slot,
+            request=request, settings=settings, genesis_store=genesis_store,
+            queue_store=queue_store, actor=actor,
+        )
+        return _publication_view(build, queue_store)
+    except (ValueError, GovernanceQueueNotFound, GovernanceQueueConflict) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/admin/governance/proposals/{proposal_id}/publication/signature-status")
+async def publication_signature_status(
+    proposal_id: str,
+    settings: Annotated[Settings, Depends(get_settings)],
+    queue_store: Annotated[GovernanceQueueStore, Depends(get_governance_queue_store)],
+    actor: Annotated[SecurityActor, Depends(require_security_actor)],
+    owner_action_id: Annotated[str, Query(alias="ownerActionId", pattern=r"^0x[0-9a-f]{64}$")],
+    coadmin_action_id: Annotated[str, Query(alias="coadminActionId", pattern=r"^0x[0-9a-f]{64}$")],
+) -> dict:
+    """Read just the two displayed signatures; never build or renew a transaction."""
+    try:
+        require_sgt_allocation_drafts(settings)
+        record = queue_store.get(proposal_id)
+        if (record.publication_coadmin_slot is None
+                or not (record.publication_approval_expires_at or record.publication_voting_deadline)
+                or owner_action_id == coadmin_action_id):
+            raise ValueError('the owner must prepare the current approvals first')
+        return {'proposal': _public(record), 'coadminSlot': record.publication_coadmin_slot,
+            'approvalExpiresAt': record.publication_approval_expires_at,
+            'votingDeadline': record.publication_voting_deadline,
+            'savedSubmission': queue_store.publication_dispatch(proposal_id) is not None,
+            'signedActions': queue_store.signature_metadata(proposal_id, (owner_action_id, coadmin_action_id))}
+    except (ValueError, GovernanceQueueNotFound, GovernanceQueueConflict) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/admin/governance/proposals/{proposal_id}/publication/check-submission")
+async def check_publication_submission(
+    proposal_id: str, request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    queue_store: Annotated[GovernanceQueueStore, Depends(get_governance_queue_store)],
+    actor: Annotated[SecurityActor, Depends(require_security_actor)],
+) -> dict:
+    """Explicitly reconcile the exact saved receipt; never push a replacement."""
+    try:
+        require_sgt_allocation_drafts(settings)
+        if actor.authority_slot != 0:
+            raise ValueError('only the owner can reconcile a saved publication')
+        record = queue_store.get(proposal_id)
+        receipt = queue_store.publication_dispatch(proposal_id)
+        if receipt is None:
+            return {'proposal': _public(record), 'chainState': record.state}
+        if (record.state == 'ACTIVE' and record.activation_bundle_id == receipt['bundle_id']
+                and record.proposal_coin_id == receipt['proposal_coin_id']):
+            record = queue_store.reconcile_publication_dispatch(proposal_id=proposal_id,
+                original_id=receipt['original_id'], outcome='ACCEPTED', actor=actor.wallet, now=int(time.time()))
+            return {'proposal': _public(record), 'chainState': 'ACCEPTED'}
+        if record.state != 'READY' or receipt['revision'] != record.revision:
+            raise ValueError('saved publication does not match the current reviewed revision')
+        submitter = getattr(request.app.state, 'protocol_submitter', None)
+        if not isinstance(submitter, ProtocolBundleSubmitter) or submitter.funding_store is None:
+            raise ProtocolSubmissionError('durable publication reconciliation is unavailable')
+        context = {'feeTill': submitter.faucet.address_hex, 'purpose': None, 'backingMojos': 0}
+        saved = submitter.funding_store.lookup(submitter.faucet.network, receipt['original_id'], context)
+        if saved is None or saved['spendBundleId'] != receipt['bundle_id']:
+            raise ValueError('saved publication receipt and funding journal disagree')
+        observed = await submitter.provider.observe_exact_protocol_bundle(saved['spendBundle'])
+        if observed:
+            record = queue_store.transition(proposal_id=proposal_id, expected_revision=record.revision,
+                target='ACTIVE', actor=actor.wallet, activation_bundle_id=receipt['bundle_id'],
+                proposal_coin_id=receipt['proposal_coin_id'])
+            outcome = 'ACCEPTED'
+        else:
+            await submitter.release_expired_saved(receipt['original_id'])
+            outcome = 'EXPIRED'
+        record = queue_store.reconcile_publication_dispatch(proposal_id=proposal_id,
+            original_id=receipt['original_id'], outcome=outcome, actor=actor.wallet, now=int(time.time()))
+        return {'proposal': _public(record), 'chainState': outcome}
+    except ChiaProviderError as exc:
+        raise HTTPException(status_code=503, detail='The primary network check is temporarily unavailable. Your exact saved transaction and approvals are retained; check status again.') from exc
+    except ProtocolSubmissionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except (ValueError, GovernanceQueueNotFound, GovernanceQueueConflict) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -1458,16 +1590,10 @@ async def publication_signature(
             signature=body.signature,
             actor=actor.wallet,
         )
-        refreshed = await _publication_build(
-            proposal_id=proposal_id,
-            coadmin_slot=body.coadmin_slot,
-            request=request,
-            settings=settings,
-            genesis_store=genesis_store,
-            queue_store=queue_store,
-            actor=actor,
-        )
-        return _publication_view(refreshed, queue_store)
+        # The pre-sign rebuild verified the exact live action. Return its
+        # refreshed signature metadata without repeating every chain read.
+        # Submission always rebuilds and validates the complete signed bundle.
+        return _publication_view(build, queue_store)
     except (ValueError, GovernanceQueueNotFound, GovernanceQueueConflict) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -1486,6 +1612,27 @@ async def submit_publication(
         require_sgt_allocation_drafts(settings)
         if actor.authority_slot != 0:
             raise ValueError("only the owner can submit an approved proposal")
+        require_reserve_sponsored_publication()
+        if queue_store.publication_dispatch(proposal_id) is not None:
+            raise GovernanceQueueConflict('Check saved submission before submitting again')
+        provider = getattr(request.app.state, "coinset", None)
+        if provider is None:
+            raise ProtocolSubmissionError('The primary Testnet11 node is unavailable; approvals are retained')
+        publication_chain_time = None
+        if queue_store.get(proposal_id).publication_approval_expires_at is not None:
+            # Separate publication consent is bound to the unchanged bill and
+            # approval expiry, so the vote can begin on the chain's clock.
+            # Chia checks ASSERT_SECONDS_ABSOLUTE against the latest transaction
+            # block, which normally trails wall-clock time.
+            from .protocol_admission import primary_admission_state
+            try:
+                clock = await provider.get_fee_estimate(
+                    target_times=[settings.protocol_medium_fee_target_seconds],
+                    cost=1, require_primary=True,
+                )
+            except ChiaProviderError as exc:
+                raise ProtocolSubmissionError('The primary network clock is unavailable; approvals are retained') from exc
+            _, _, _, publication_chain_time = primary_admission_state(clock)
         build = await _publication_build(
             proposal_id=proposal_id,
             coadmin_slot=body.coadmin_slot,
@@ -1494,6 +1641,7 @@ async def submit_publication(
             genesis_store=genesis_store,
             queue_store=queue_store,
             actor=actor,
+            publication_chain_time=publication_chain_time,
         )
         if build.bundle is None or build.proposal_coin_id is None:
             raise GovernanceQueueConflict("owner-plus-one approvals are incomplete")
@@ -1504,7 +1652,14 @@ async def submit_publication(
         submitter = getattr(request.app.state, "protocol_submitter", None)
         if not isinstance(submitter, ProtocolBundleSubmitter):
             raise ProtocolSubmissionError("protocol fee-till submission is unavailable")
-        submission = await submitter.submit(build.bundle.to_json_dict())
+        if queue_store.publication_dispatch(proposal_id) is not None:
+            raise GovernanceQueueConflict('Check saved submission before submitting again')
+        def record_dispatch(prepared):
+            queue_store.bind_publication_dispatch(proposal_id=proposal_id,
+                expected_revision=build.record.revision, voting_deadline=build.deadline,
+                original_id=_hex32(build.bundle.name()), bundle_id=prepared.spend_bundle_id,
+                proposal_coin_id=build.proposal_coin_id, actor=actor.wallet, now=int(time.time()))
+        submission = await submitter.submit(build.bundle.to_json_dict(), before_push=record_dispatch)
         active = queue_store.transition(
             proposal_id=proposal_id,
             expected_revision=build.record.revision,
@@ -1513,6 +1668,8 @@ async def submit_publication(
             activation_bundle_id=str(submission["spendBundleId"]),
             proposal_coin_id=build.proposal_coin_id,
         )
+        queue_store.reconcile_publication_dispatch(proposal_id=proposal_id,
+            original_id=_hex32(build.bundle.name()), outcome='ACCEPTED', actor=actor.wallet, now=int(time.time()))
         return {
             "proposal": _public(active),
             "submission": {

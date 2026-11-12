@@ -75,6 +75,7 @@ class VaultSessionResponse(BaseModel):
     protocolVersion: Literal["solslot-v2"] = "solslot-v2"
     expiresAt: int
     sessionFingerprint: str | None = None
+    generationId: str | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,7 @@ def vault_session_payload(settings: Settings) -> dict[str, Any]:
     return {
         "network": settings.network,
         "protocolVersion": "solslot-v2",
+        **({'generationId': settings.deployment_generation_id} if settings.deployment_generation_id else {}),
     }
 
 
@@ -129,6 +131,7 @@ def issue_vault_session(
         "authType": verified_owner.auth_type,
         "network": settings.network,
         "protocolVersion": "solslot-v2",
+        "generationId": settings.deployment_generation_id,
     }
     token = pyjwt.encode(claims, secret, algorithm="HS256")
     return token, VaultSessionResponse(
@@ -138,6 +141,7 @@ def issue_vault_session(
         network=settings.network,
         expiresAt=expires_at,
         sessionFingerprint=vault_session_fingerprint(claims["jti"]),
+        generationId=settings.deployment_generation_id,
     )
 
 
@@ -186,6 +190,7 @@ def verify_vault_session(
         claims.get("vaultLauncherId") != vault
         or claims.get("network") != settings.network
         or claims.get("protocolVersion") != "solslot-v2"
+        or claims.get('generationId') != settings.deployment_generation_id
         or claims.get("authType") not in {"evm", "chia_bls"}
         or not claims.get("sub")
     ):
@@ -267,7 +272,8 @@ def credential_typed_data(
     settings: Settings,
     challenge: OwnerChallenge,
 ) -> dict[str, Any]:
-    return {
+    from .generation_context import bind_typed_generation
+    return bind_typed_generation({
         "types": CREDENTIAL_ACTION_TYPES,
         "primaryType": CREDENTIAL_ACTION_PRIMARY_TYPE,
         "domain": {
@@ -282,7 +288,7 @@ def credential_typed_data(
             "nonce": challenge.nonce,
             "expiresAt": challenge.expires_at,
         },
-    }
+    }, settings.deployment_generation_id)
 
 
 def credential_bls_message(settings: Settings, challenge: OwnerChallenge) -> bytes:
@@ -296,6 +302,9 @@ def credential_bls_message(settings: Settings, challenge: OwnerChallenge) -> byt
             settings.network.encode("ascii"),
         )
     )
+    if settings.deployment_generation_id:
+        from .generation_context import generation_bytes
+        material += b'\x00SOLSLOT_GENERATION\x00' + generation_bytes(settings.deployment_generation_id)
     return hashlib.sha256(material).digest()
 
 
@@ -357,7 +366,21 @@ def require_vault_record(vault_launcher_id: str) -> VaultRecord:
     return record
 
 
-def _require_credential_action(settings: Settings, action: str, vault: str) -> None:
+def _require_credential_action(settings: Settings, action: str, vault: str, *, current_customer_session=False) -> None:
+    if action == 'relay':
+        from .generation_customer_identity_scope import current_identity_scope
+        scope=current_identity_scope(settings,vault)
+        if scope is not None:
+            try:scope.runtime.require_relay(scope)
+            except (ValueError,AttributeError) as exc:
+                raise HTTPException(503,detail='CURRENT_ID_RELAY_NOT_AUTHORIZED') from exc
+            return
+    # Only the current-customer route opts in, after proving its registration
+    # and live native ancestry. This authorizes sign-in, never relay or spending.
+    if (current_customer_session and action=='session_login' and
+            getattr(settings,'generation_customer_enabled',False) and
+            settings.network=='testnet11' and settings.deployment_generation_id):
+        return
     if action == 'session_login' and not settings.alpha_writes_enabled:
         # A write freeze must not lock an owner out of an existing receipt.
         # The login route issues a restricted recovery session in this state.
@@ -372,9 +395,10 @@ def issue_owner_challenge(
     *,
     vault_launcher_id: str,
     request: OwnerChallengeRequest,
+    current_customer_session: bool = False,
 ) -> OwnerChallengeResponse:
     vault = normalize_hex32(vault_launcher_id, "vaultLauncherId")
-    _require_credential_action(settings, request.action, vault)
+    _require_credential_action(settings, request.action, vault,current_customer_session=current_customer_session)
     record = require_vault_record(vault)
     if record.auth_type == AUTH_TYPE_SECP256K1 and record.owner_evm_address:
         auth_type: Literal["evm", "chia_bls"] = "evm"
@@ -421,9 +445,10 @@ def verify_owner_auth(
     action: CredentialAction,
     payload: dict[str, Any],
     owner_auth: OwnerAuth,
+    current_customer_session: bool = False,
 ) -> VerifiedOwner:
     vault = normalize_hex32(vault_launcher_id, "vaultLauncherId")
-    _require_credential_action(settings, action, vault)
+    _require_credential_action(settings, action, vault,current_customer_session=current_customer_session)
     record = require_vault_record(vault)
     payload_hash = credential_payload_hash(action, vault, payload)
     ledger = get_credential_ledger(settings)

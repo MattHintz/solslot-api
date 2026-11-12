@@ -3,6 +3,7 @@
 Only signed release metadata and off-chain enrollment records are fixtures.
 Coins, lineage, signatures, puzzle execution and inclusion are real SpendSim.
 """
+from tests.historical_reserve_fixture import historical_reserve_native_only
 from types import SimpleNamespace
 
 import pytest
@@ -85,7 +86,7 @@ async def grant_stake(world, sim, client, provider, owner, coadmin_slot, amount)
 @pytest.mark.parametrize('auth_type', [1, 3], ids=['bls', 'evm'])
 @pytest.mark.parametrize('coadmin_slot', [1, 2])
 @pytest.mark.parametrize('inventory', [False, True], ids=['historical-deed', 'inventory-v2'])
-async def test_fresh_grant_to_vault_then_owner_plus_one_mint(monkeypatch, tmp_path, auth_type, coadmin_slot, inventory):
+async def test_fresh_grant_to_vault_then_owner_plus_one_mint(monkeypatch, tmp_path, auth_type, coadmin_slot, inventory, historical_reserve_native_only):
     async with SpendSim.managed(None, defaults=CONSTANTS) as sim:
         client = SimClient(sim)
         world = await fresh_genesis(sim, client)
