@@ -3,6 +3,7 @@ import asyncio
 import json
 from copy import deepcopy
 import pytest
+from functools import partial
 from fastapi import HTTPException
 from chia_rs import Coin, SpendBundle
 from chia_rs.sized_bytes import bytes32
@@ -13,7 +14,7 @@ from solslot_api.credential_ledger import CredentialLedger, LedgerConflict, get_
 from tests import test_zkpassport_enrollments as journeys
 
 JOURNEYS = [journeys.test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp,
-    journeys.test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp]
+    partial(journeys.test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp, generation_custody=False)]
 
 
 @pytest.mark.parametrize('journey', JOURNEYS, ids=['evm','bls'])

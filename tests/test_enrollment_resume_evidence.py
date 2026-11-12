@@ -1,11 +1,12 @@
 import pytest
+from functools import partial
 from fastapi import HTTPException
 from solslot_api import zkpassport_enrollments as enroll
 from solslot_api.credential_ledger import get_credential_ledger
 from tests import test_zkpassport_enrollments as journeys
 
 @pytest.mark.parametrize('journey', [journeys.test_evm_proof_builds_and_confirms_atomic_chia_vault_stamp,
-    journeys.test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp], ids=['evm','bls'])
+    partial(journeys.test_bls_proof_requires_wallet_signature_for_atomic_chia_vault_stamp, generation_custody=False)], ids=['evm','bls'])
 @pytest.mark.parametrize('change', ['event_removed','artifact_changed','emitter_changed'])
 def test_retained_resume_revalidates_original_evidence(monkeypatch, tmp_path, journey, change):
     original = enroll._push_chia_stamp_and_mark_pending

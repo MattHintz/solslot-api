@@ -1042,7 +1042,7 @@ def _verify_current_chia_vault_coin(
 def _custody_full(settings,launcher,owner,auth,members,pool,**kwargs):
     if getattr(settings,'deployment_generation_id',None):
         from solslot_puzzles.generation_vault import vault_inner
-        from chia.wallet.puzzles.singleton_top_layer_v1_1 import puzzle_for_singleton
+        from solslot_puzzles.vault_driver import puzzle_for_singleton
         return puzzle_for_singleton(launcher,vault_inner(vault_launcher_id=launcher,owner_pubkey=owner,
             auth_type=auth,members_merkle_root=members,pool_launcher_id=pool,**kwargs))
     from solslot_puzzles.vault_driver import puzzle_for_vault_full

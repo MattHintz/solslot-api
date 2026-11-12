@@ -35,7 +35,9 @@ def test_generation_api_hash_matches_native_custody_on_worker_threads(auth):
     assert expected!=legacy
     with ThreadPoolExecutor(max_workers=4) as workers:
         hashes=list(workers.map(lambda _:puzzle_hash_for_vault_full(*fields,**options,generation_vault=True),range(16)))
+        native_hashes=list(workers.map(lambda _:_custody_full(settings,*fields,**options).get_tree_hash(),range(16)))
     assert hashes==[expected]*16
+    assert native_hashes==[expected]*16
     assert _custody_full(SimpleNamespace(deployment_generation_id=None),*fields,**options).get_tree_hash()==legacy
 
 
@@ -54,6 +56,14 @@ def test_generation_stamp_uses_same_bridge_and_preserves_signed_effects_on_retry
         service_subscope_hash=h(18),proof_timestamp=timestamp,current_timestamp=timestamp,
         lineage_proof=LineageProof(h(9),None,uint64(1)))
     built=_custody_identity_bundle(SimpleNamespace(deployment_generation_id='0x'+h(6).hex()),**args)
+    def serialized_bundle():
+        local=_custody_identity_bundle(SimpleNamespace(deployment_generation_id='0x'+h(6).hex()),**args)
+        return (bytes(local.spend_bundle),bytes(local.bridge.puzzle),bytes(local.bridge.solution),
+            bytes(local.vault_spend),bytes(local.bridge.validator_message))
+    expected=(bytes(built.spend_bundle),bytes(built.bridge.puzzle),bytes(built.bridge.solution),
+        bytes(built.vault_spend),bytes(built.bridge.validator_message))
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        assert list(workers.map(lambda _:serialized_bundle(),range(8)))==[expected]*8
     keys={bytes(k.get_g1()):k for k in [owner,*validators]};signatures=[]
     for spend in built.spend_bundle.coin_spends:
         cd=conditions_dict_for_solution(spend.puzzle_reveal,spend.solution,100_000_000)
