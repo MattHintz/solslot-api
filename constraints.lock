@@ -44,7 +44,7 @@ cyclonedx-python-lib==11.11.0
 cytoolz==1.2.0
 defusedxml==0.7.1
 dnslib==0.9.26
-dnspython==2.9.0
+dnspython==2.9.2
 eth-account==0.13.7
 eth-hash==0.8.0
 eth-keyfile==0.8.1
