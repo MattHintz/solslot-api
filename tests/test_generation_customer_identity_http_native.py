@@ -53,6 +53,7 @@ async def test_current_id_http_requires_fresh_vault_preserves_work_and_confirms_
     original=dict(vars(p.settings));p.settings.__dict__.update(defaults);p.settings.__dict__.update(original)
     p.settings.model_copy=lambda *,update:SimpleNamespace(**{**vars(p.settings),**update})
     p.settings.generation_customer_identity_enabled=True
+    p.settings.protocol_fee_cost_tiers_enabled=True
     p.settings.zkpassport_validator_urls=[f'https://synthetic-validator-{i}.invalid' for i in range(3)]
     secret=Account.from_key(b'z'*32)
     review=await p.client.post(BASE+'/reviews',json={'generationId':generation,'owner':secret.address,'authType':'evm'})
@@ -214,7 +215,13 @@ async def test_current_id_http_requires_fresh_vault_preserves_work_and_confirms_
         async def available():return True
         p.node._primary_available=available
         original_estimate=p.node.get_fee_estimate
+        quoted_spend_counts=[]
+        async def unused_advice(**kwargs):
+            pytest.fail('The current identity stamp must use the primary node fee estimate')
+        p.node.get_cost_fee_advice=unused_advice
         async def estimated(**kwargs):
+            assert kwargs['require_primary'] and kwargs['target_times']==[60]
+            quoted_spend_counts.append(len(kwargs['spend_bundle']['coin_spends']))
             quote=await original_estimate(**kwargs)
             return {**quote,'target_times':kwargs['target_times']}
         p.node.get_fee_estimate=estimated
@@ -273,6 +280,7 @@ async def test_current_id_http_requires_fresh_vault_preserves_work_and_confirms_
         else:
             posted=await p.client.post(current_path+'/stamp/submit',json={'generationId':generation,'signature':owner_signature})
         assert posted.status_code==200,(posted.text,diagnostics[-1:] )
+        assert quoted_spend_counts[0]>0 and quoted_spend_counts[-1]==quoted_spend_counts[0]+1
         txid=posted.json()['spendBundleId'];assert p.node.pushes==before_pushes+1
         repeated=await p.client.post(current_path+'/stamp/submit',json={'generationId':generation,'signature':owner_signature})
         assert repeated.status_code==200,repeated.text

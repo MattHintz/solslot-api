@@ -36,6 +36,7 @@ def configured_current_customer_identity(settings,customers,*,clock=time.time):
             policy=ProtocolFeePolicy(enabled=True,minimum_mojos=1,
                 maximum_mojos=authority.maximum_stamp_fee_mojos,
                 maximum_funding_coin_mojos=authority.maximum_fee_parent_mojos,
-                native_admission_enabled=True,cost_fee_tiers_enabled=settings.protocol_fee_cost_tiers_enabled))
+                # Price this bounded stamp from the primary node's complete spend bundle.
+                native_admission_enabled=True,cost_fee_tiers_enabled=False))
         return runtime
     except BaseException:store.close();raise
