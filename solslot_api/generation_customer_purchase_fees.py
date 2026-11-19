@@ -72,6 +72,22 @@ def read_purchase_fee_authority(path,expected_hash,policy):
     return CurrentPurchaseFeeAuthority.model_validate_json(raw).require_policy(policy)
 
 
+def read_purchase_fee_renewal(path, expected_hash, policy, original):
+    """Renew the dates for a subset of the same journal-bound fee inputs."""
+    if not isinstance(policy, TestnetCollectionIssuerPolicy):
+        raise ValueError('CURRENT_PURCHASE_COLLECTION_RENEWAL_REQUIRED')
+    original.require_policy(policy)
+    renewed = read_purchase_fee_authority(path, expected_hash, policy)
+    if (renewed.issued_at < original.expires_at
+            or renewed.funding_puzzle_hash != original.funding_puzzle_hash
+            or not set(renewed.fee_coin_ids).issubset(original.fee_coin_ids)
+            or renewed.maximum_fee_parent_mojos != original.maximum_fee_parent_mojos
+            or renewed.maximum_stage_fee_mojos != original.maximum_stage_fee_mojos
+            or renewed.maximum_total_fee_mojos > original.maximum_total_fee_mojos):
+        raise ValueError('CURRENT_PURCHASE_FEE_RENEWAL_SCOPE_CHANGED')
+    return renewed
+
+
 class CurrentPurchaseFeeFaucet:
     def __init__(self,faucet,authority,policy,store,*,clock,funding_store=None,cutover=None):
         from .generation_customer_purchase_execution_store import CurrentPurchaseExecutionStore

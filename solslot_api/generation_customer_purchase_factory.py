@@ -16,7 +16,12 @@ from .generation_customer_purchase_policy import selected_purchase_policy, selec
 from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy
 from .generation_customer_purchase_cutover import read_checkout_cutover
 from .generation_customer_purchase_scope import policy_live_at
-from .generation_customer_purchase_fees import read_purchase_fee_authority,CurrentPurchaseFeeFaucet,CurrentPurchaseBundleSubmitter
+from .generation_customer_purchase_fees import (
+    CurrentPurchaseBundleSubmitter,
+    CurrentPurchaseFeeFaucet,
+    read_purchase_fee_authority,
+    read_purchase_fee_renewal,
+)
 from .generation_customer_purchase_execution import CurrentNativePurchaseExecution
 from .generation_customer_purchase_execution_store import CurrentPurchaseExecutionStore
 from .generation_storage import generation_path
@@ -43,6 +48,10 @@ def configured_current_customer_purchase(settings,*,customers,funding_store,cloc
         if (cutover.fee_authority != settings.generation_customer_purchase_fee_authority_hash
                 or authority.maximum_total_fee_mojos > cutover.fee_limit_mojos - cutover.inherited_fee_mojos):
             raise ValueError('CURRENT_PURCHASE_FEE_CUTOVER_BUDGET_CHANGED')
+    renewal_path = getattr(settings, 'generation_customer_purchase_fee_renewal_path', '')
+    renewal_hash = getattr(settings, 'generation_customer_purchase_fee_renewal_hash', '')
+    if renewal_path or renewal_hash:
+        authority = read_purchase_fee_renewal(renewal_path, renewal_hash, policy, authority)
     if collection or not authority.issued_at<=now<authority.expires_at:
         path=Path(generation_path(settings.payment_purchase_db_path,settings.deployment_generation_id))
         if not path.is_file() or path.is_symlink():
