@@ -16,7 +16,9 @@ PROOF_VERSIONS = {
     '0.21.0': bytes.fromhex('000000150000' + '00' * 26),
     '0.21.1': bytes.fromhex('000000150001' + '00' * 26),
     '0.22.0': bytes.fromhex('000000160000' + '00' * 26),
+    '0.23.0': bytes.fromhex('000000170000' + '00' * 26),
 }
+ICAO_CHIP = (100).to_bytes(32, 'big')
 
 
 def require_current_identity_query(data, profile, *, launcher):
@@ -33,6 +35,13 @@ def require_current_identity_query(data, profile, *, launcher):
                 or params[3] != (604800, 'solslot.com', 'vault:' + launcher, False)):
             raise ValueError('proof policy differs')
         require_eligibility_inputs(params[2])
+        if params[0] == PROOF_VERSIONS['0.23.0']:
+            public_inputs = params[1][2]
+            # Five fixed fields, two policy commitments, four trailing fields.
+            if (len(public_inputs) != 11 or public_inputs[-1] != ICAO_CHIP
+                    or int.from_bytes(public_inputs[-4], 'big') not in (0, 1)
+                    or public_inputs[-3] == bytes(32)):
+                raise ValueError('proof must use the reviewed ICAO chip layout')
     except (ValueError, TypeError, DecodingError) as exc:
         raise ValueError('CURRENT_ID_PRIVATE_QUERY_REJECTED') from exc
     return parsed

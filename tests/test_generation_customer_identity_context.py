@@ -54,6 +54,17 @@ def test_legacy_admission_or_weakened_identity_policy_is_rejected(field,value):
     with pytest.raises(ValueError):CurrentCustomerIdentityProfile.model_validate(data)
 
 
+def test_only_distinct_reviewed_proof_versions_are_admitted():
+    data, _ = profile()
+    versions = ['0.20.0', '0.21.0', '0.21.1', '0.22.0', '0.23.0']
+    data['acceptedProofVersions'] = versions
+    assert CurrentCustomerIdentityProfile.model_validate(data).accepted_proof_versions == tuple(versions)
+    for unreviewed in ('0.23.1', '0.22.0'):
+        data['acceptedProofVersions'] = versions[:-1] + [unreviewed]
+        with pytest.raises(ValueError):
+            CurrentCustomerIdentityProfile.model_validate(data)
+
+
 @pytest.mark.parametrize('mutation', ['validator','bridge','code','role'])
 def test_exact_native_bridge_and_external_contract_roles(mutation):
     data,_=profile()
