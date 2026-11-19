@@ -15,10 +15,15 @@ from tests.test_generation_customer_identity_context import profile
 LAUNCHER='0x'+'81'*32
 OWNER='0x'+'82'*20
 INPUTS=bytes.fromhex('0100021200090021')+bytes(33)
+CHIP_PROOF_INPUTS = tuple(word.to_bytes(32, 'big') for word in
+    (10, 11, 1800000000, 12, 13, 14, 15, 1, 42, 0, 100))
 
 
-def calldata(pins,*,version='0.21.0',query=INPUTS,domain='solslot.com',scope=None,dev=False,parent=None):
-    params=(PROOF_VERSIONS[version],(bytes(32),b'synthetic-proof',[]),query,
+def calldata(pins,*,version='0.21.0',query=INPUTS,domain='solslot.com',scope=None,dev=False,parent=None,
+             public_inputs=None):
+    if public_inputs is None:
+        public_inputs = CHIP_PROOF_INPUTS if version == '0.23.0' else ()
+    params=(PROOF_VERSIONS[version],(bytes(32),b'synthetic-proof',public_inputs),query,
         (604800,domain,scope or 'vault:'+LAUNCHER,dev))
     return LEGACY_SELECTOR+encode([BINDING_ABI,'bytes'],[(bytes.fromhex(LAUNCHER[2:]),
         bytes.fromhex((parent or pins.bridge_coins[0].parent_id)[2:]),1),encode([PROOF_PARAMS_ABI],[params])])
@@ -58,7 +63,7 @@ def evidence(*,forwarded=False):
     return pins,w3,receipt,tx,code,calls
 
 
-@pytest.mark.parametrize('version',['0.21.1','0.22.0'])
+@pytest.mark.parametrize('version',['0.21.1','0.22.0','0.23.0'])
 def test_matching_upstream_and_adapter_code_cannot_admit_an_unsupported_patch(version):
     pins,w3,receipt,*_=evidence()
     document=pins.model_dump(mode='json',by_alias=True)
@@ -90,7 +95,7 @@ def test_only_the_profiled_private_real_document_query_is_allowed(version):
     assert result.vault==LAUNCHER and result.amount==1 and result.permit is None
 
 
-@pytest.mark.parametrize('version',['0.21.1','0.22.0'])
+@pytest.mark.parametrize('version',['0.21.1','0.22.0','0.23.0'])
 def test_patch_version_requires_explicit_profile_approval_and_preserves_query_boundaries(version):
     original = CurrentCustomerIdentityProfile.model_validate(profile()[0])
     encoded = calldata(original, version=version)
@@ -111,6 +116,21 @@ def test_patch_version_requires_explicit_profile_approval_and_preserves_query_bo
         bytes.fromhex(pins.bridge_coins[0].parent_id[2:]), 1), encode([PROOF_PARAMS_ABI], [params])])
     with pytest.raises(ValueError, match='PRIVATE_QUERY_REJECTED'):
         require_current_identity_query(unknown, pins, launcher=LAUNCHER)
+
+
+@pytest.mark.parametrize('public_inputs', [
+    CHIP_PROOF_INPUTS[:-1],
+    CHIP_PROOF_INPUTS[:-1] + ((200).to_bytes(32, 'big'),),
+    CHIP_PROOF_INPUTS[:7] + ((2).to_bytes(32, 'big'),) + CHIP_PROOF_INPUTS[8:],
+    CHIP_PROOF_INPUTS[:8] + (bytes(32),) + CHIP_PROOF_INPUTS[9:],
+])
+def test_new_circuit_requires_exact_chip_layout_before_relay(public_inputs):
+    document, _ = profile()
+    document['acceptedProofVersions'].append('0.23.0')
+    pins = CurrentCustomerIdentityProfile.model_validate(document)
+    encoded = calldata(pins, version='0.23.0', public_inputs=public_inputs)
+    with pytest.raises(ValueError, match='PRIVATE_QUERY_REJECTED'):
+        require_current_identity_query(encoded, pins, launcher=LAUNCHER)
 
 
 @pytest.mark.parametrize('changes',[{'query':bytes.fromhex('0100021200')},{'query':INPUTS+b'extra'},
