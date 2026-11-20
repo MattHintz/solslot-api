@@ -93,7 +93,8 @@ def configured_current_customer_purchase(settings,*,customers,funding_store,cloc
             policy=ProtocolFeePolicy(enabled=True,minimum_mojos=1,
                 maximum_mojos=authority.maximum_stage_fee_mojos,
                 maximum_funding_coin_mojos=authority.maximum_fee_parent_mojos,native_admission_enabled=True,
-                cost_fee_tiers_enabled=bool(getattr(settings,'protocol_fee_cost_tiers_enabled',False))))
+                # Use the primary node estimate and admission floor within the approved fee cap.
+                cost_fee_tiers_enabled=False))
     return CurrentNativePurchaseExecution(settings=settings,anchor=customers.index.anchor,
         provider=customers.provider,policy=policy,store=store,fee_cap=authority.maximum_stage_fee_mojos,
         submitter=sender,clock=clock,cutover=cutover)
