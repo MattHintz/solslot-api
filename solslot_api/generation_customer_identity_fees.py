@@ -1,4 +1,4 @@
-"""Finite Testnet identity sponsorship, independent of legacy write authority."""
+"""Testnet identity sponsorship bounded by time or by one named vault and fee coin."""
 from hashlib import sha256
 import json
 from types import SimpleNamespace
@@ -11,13 +11,15 @@ from .generation_customer_identity_context import Hash, Address
 
 
 class CurrentIdentityAuthority(PreparationModel):
-    schema_version:Literal['solslot.current-customer-identity-authority.v1']=Field(alias='schema')
+    schema_version:Literal['solslot.current-customer-identity-authority.v1',
+        'solslot.single-vault-identity-authority.v1']=Field(alias='schema')
     network:Literal['testnet11']
     generation_id:Hash=Field(alias='generationId')
     identity_profile_hash:Hash=Field(alias='identityProfileHash')
     relayer_address:Address=Field(alias='relayerAddress')
     issued_at:int=Field(alias='issuedAt',gt=0)
-    expires_at:int=Field(alias='expiresAt',gt=0)
+    expires_at:int|None=Field(alias='expiresAt',gt=0)
+    vault_launcher_id:Hash|None=Field(default=None,alias='vaultLauncherId',exclude_if=lambda value:value is None)
     base_max_fee_wei:int=Field(alias='baseMaximumFeeWei',gt=0,le=100_000_000_000_000)
     base_daily_fee_wei:int=Field(alias='baseDailyFeeWei',gt=0,le=1_000_000_000_000_000)
     funding_puzzle_hash:Hash=Field(alias='fundingPuzzleHash')
@@ -28,20 +30,37 @@ class CurrentIdentityAuthority(PreparationModel):
     @field_validator('issued_at','expires_at','base_max_fee_wei','base_daily_fee_wei',
         'maximum_fee_parent_mojos','maximum_stamp_fee_mojos',mode='before')
     @classmethod
-    def exact_integer(cls,value):
+    def exact_integer(cls,value,info):
+        if info.field_name=='expires_at' and value is None:return None
         if type(value)is not int:raise ValueError('identity authority requires exact integers')
         return value
 
     @model_validator(mode='after')
     def bounded(self):
-        if (not 0<self.expires_at-self.issued_at<=48*3600 or len(set(self.fee_coin_ids))!=len(self.fee_coin_ids)
+        if self.schema_version=='solslot.single-vault-identity-authority.v1':
+            # One durable Base transaction per vault and one spendable Chia fee input.
+            if (not self.vault_launcher_id or self.vault_launcher_id=='0x'+'00'*32
+                    or self.expires_at is not None or len(self.fee_coin_ids)!=1
+                    or self.base_daily_fee_wei!=self.base_max_fee_wei):
+                raise ValueError('single-vault sponsorship requires one vault, one fee coin and a fixed Base cap')
+        elif (self.vault_launcher_id is not None or self.expires_at is None
+                or not 0<self.expires_at-self.issued_at<=48*3600):
+            raise ValueError('windowed identity authority requires an expiry within 48 hours')
+        if (len(set(self.fee_coin_ids))!=len(self.fee_coin_ids)
                 or self.base_daily_fee_wei<self.base_max_fee_wei
                 or self.maximum_stamp_fee_mojos>self.maximum_fee_parent_mojos):
             raise ValueError('identity authority must be finite and internally consistent')
         return self
 
+    def active_at(self,now):
+        return type(now)is int and now>=self.issued_at and (self.expires_at is None or now<self.expires_at)
+
+    def require_vault(self,launcher):
+        if self.vault_launcher_id is not None and launcher!=self.vault_launcher_id:
+            raise ValueError('CURRENT_ID_VAULT_OUTSIDE_TEST')
+
     def require_live(self,profile,now):
-        if (type(now)is not int or not self.issued_at<=now<self.expires_at
+        if (not self.active_at(now)
                 or self.generation_id!=profile.generation_id or self.identity_profile_hash!=profile.commitment
                 or self.relayer_address!=profile.trusted_direct_relayer):
             raise ValueError('CURRENT_ID_AUTHORITY_EXPIRED_OR_CHANGED')
@@ -54,7 +73,7 @@ def load_current_identity_authority(settings,profile,*,now,allow_expired_read_co
     if '0x'+sha256(raw).hexdigest()!=settings.generation_customer_identity_authority_hash:
         raise ValueError('CURRENT_ID_AUTHORITY_SOURCE_CHANGED')
     policy=CurrentIdentityAuthority.model_validate_json(raw)
-    if allow_expired_read_context:now=max(policy.issued_at,min(now,policy.expires_at-1))
+    if allow_expired_read_context and not policy.active_at(now):now=policy.issued_at
     return policy.require_live(profile,now)
 
 
@@ -87,7 +106,8 @@ class CurrentIdentityFeeFaucet:
         deadlines=[v for v in values if v.first().as_int()==85]
         if len(deadlines)!=1:raise ValueError('CURRENT_ID_FEE_DEADLINE_REQUIRED')
         deadline=deadlines[0].rest().first().as_int()
-        if not int(self.clock())<deadline<=min(int(self.clock())+120,self.authority.expires_at):
+        now=int(self.clock())
+        if not now<deadline<=now+120 or (self.authority.expires_at is not None and deadline>self.authority.expires_at):
             raise ValueError('CURRENT_ID_FEE_DEADLINE_REJECTED')
         exact=[]
         if coin.amount>fee:exact.append(Program.to([51,self.address_puzzle_hash,int(coin.amount)-fee]))
@@ -95,6 +115,7 @@ class CurrentIdentityFeeFaucet:
         from .protocol_submission import ProtocolBundleSubmitter
         matched=False
         for key,record in self.ledger.all_enrollments().items():
+            if self.authority.vault_launcher_id is not None and key!=self.authority.vault_launcher_id:continue
             binding=record.get('identityDeployment') or {}
             if (binding.get('generationId')!=self.profile.generation_id
                     or binding.get('identityProfileHash')!=self.profile.commitment):continue
@@ -102,6 +123,7 @@ class CurrentIdentityFeeFaucet:
             if not attempt or not attempt['bundle_hex']:continue
             claim=json.loads(attempt['claim_json'])
             if (claim.get('claim_version')!='solslot.current-customer-identity-claim.v1'
+                    or claim.get('vault_launcher_id')!=key
                     or claim.get('generation_id')!=self.profile.generation_id
                     or claim.get('identity_profile_hash')!=self.profile.commitment):continue
             bundle=SpendBundle.from_bytes(bytes.fromhex(attempt['bundle_hex']))

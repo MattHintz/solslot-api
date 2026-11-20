@@ -94,6 +94,28 @@ def test_expired_or_foreign_identity_authority_cannot_be_reused():
     with pytest.raises(ValueError):authority(pins,relayerAddress='0x'+'92'*20).require_live(pins,1000)
 
 
+def test_standing_authority_only_admits_one_vault_and_one_fee_coin_after_the_original_window():
+    pins=CurrentCustomerIdentityProfile.model_validate(profile()[0])
+    vault='0x'+'81'*32
+    args=dict(schema='solslot.single-vault-identity-authority.v1',vaultLauncherId=vault,
+        expiresAt=None,baseDailyFeeWei=10_000_000_000_000)
+    policy=authority(pins,**args)
+    now=1000+365*86400
+    policy.require_live(pins,now)
+    reads=CurrentIdentityReads(vault,None,pins,{},None,now,lambda:now,authority=policy)
+    reads.require_relay(SimpleNamespace(profile=pins,launcher=vault))
+    with pytest.raises(ValueError,match='VAULT_OUTSIDE_TEST'):
+        reads.require_relay(SimpleNamespace(profile=pins,launcher='0x'+'82'*32))
+    with pytest.raises(ValueError):
+        policy.require_live(pins,999)
+    for broader in ({'vaultLauncherId':None},{'vaultLauncherId':'0x'+'00'*32},
+            {'feeCoinIds':['0x'+'62'*32,'0x'+'63'*32]}, {'baseDailyFeeWei':100_000_000_000_000},
+            {'expiresAt':2000},{'schema':'solslot.current-customer-identity-authority.v1'}):
+        with pytest.raises(ValueError):authority(pins,**{**args,**broader})
+    with pytest.raises(ValueError):authority(pins,expiresAt=None)
+    assert 'vaultLauncherId' not in authority(pins).model_dump(by_alias=True)
+
+
 def test_primary_read_set_has_no_fallback_and_cannot_mutate_retained_records():
     pins=CurrentCustomerIdentityProfile.model_validate(profile()[0]);coin=pins.bridge_coins[0]
     raw={'coin':Coin(bytes32.from_hexstr(coin.parent_id),bytes32.from_hexstr(pins.bridge_policy_hash),uint64(1)).to_json_dict(),
@@ -157,6 +179,15 @@ async def test_current_identity_get_is_pure_and_mutations_require_exact_generati
         service.compatibility={'status':'READY','checkedAt':1000,'profileHash':pins.commitment,
             'proofVersions':list(pins.accepted_proof_versions),'blockNumber':123}
         assert (await client.get('/customer/identity/profile')).json()['enrollmentEnabled'] is True
+        old_authority=service.authority
+        service.authority=authority(pins,schema='solslot.single-vault-identity-authority.v1',
+            vaultLauncherId='0x'+'91'*32,expiresAt=None,baseDailyFeeWei=10_000_000_000_000)
+        summary=(await client.get('/customer/identity/profile')).json()
+        assert summary['authorityExpiresAt'] is None and summary['sponsorshipMode']=='single-vault-fixed-budget'
+        assert service.authority.vault_launcher_id not in str(summary)
+        declined=await client.post('/customer/identity/enrollments/'+launcher,json={'generationId':pins.generation_id})
+        assert declined.status_code==409 and declined.json()['detail']['code']=='CURRENT_ID_VAULT_OUTSIDE_TEST'
+        service.authority=old_authority
         service.compatibility['checkedAt']=939
         assert (await client.get('/customer/identity/profile')).json()['enrollmentEnabled'] is False
         for _ in range(3):

@@ -57,6 +57,11 @@ def failure(exc):
     safe=code if isinstance(code,str) and re.fullmatch(r'CURRENT_ID_[A-Z_]{1,80}',code) else 'CURRENT_ID_STEP_UNAVAILABLE'
     message={
         'CURRENT_ID_UNAVAILABLE':'Current Testnet ID setup is not ready yet.',
+        'CURRENT_ID_NOT_STARTED':'A private ID check has not been started for this vault.',
+        'CURRENT_ID_NOT_AUTHORIZED':'New private ID checks are paused until Solslot reopens testing.',
+        'CURRENT_ID_VAULT_OUTSIDE_TEST':'This vault is outside the current private ID test.',
+        'CURRENT_ID_AUTHORITY_EXPIRED_OR_CHANGED':'Private ID testing is paused until Solslot renews the verification window.',
+        'CURRENT_ID_BRIDGE_CAPACITY_UNAVAILABLE':'All private ID testing slots are in use. Your vault is saved.',
         'CURRENT_ID_OWNER_CHANGED':'Reconnect the owner wallet for this vault before continuing your saved check.',
         'CURRENT_ID_RUNTIME_CHANGED':'ID setup is updating. Your vault and saved check are preserved; try again shortly.',
         'CURRENT_ID_FEE_CAP_EXCEEDED':'Chia Testnet11 is busy and the required fee exceeds the approved limit. Your approval is saved; resume it when fees fall. No transaction was sent.',
@@ -109,6 +114,7 @@ async def profile(request:Request,response:Response,settings:Configured):
             'profile':pins.model_dump(mode='json',by_alias=True),'enrollmentEnabled':enabled,
             'stampEnabled':enabled and service.fee_submitter is not None,
             'authorityExpiresAt':service.authority.expires_at if service.authority else None,
+            **({'sponsorshipMode':'single-vault-fixed-budget'} if service.authority and service.authority.vault_launcher_id else {}),
             'compatibility':getattr(service,'compatibility',{}),
             'observer':service.health}
     except Exception as exc:raise failure(exc) from exc
@@ -142,6 +148,7 @@ async def reserve(launcher:Identity,body:CurrentGeneration,request:Request,respo
         service=runtime(request,settings);verified=owner(request,settings,launcher)
         if service.authority is None:raise ValueError('CURRENT_ID_NOT_AUTHORIZED')
         service.authority.require_live(service.profile(),int(service.clock()))
+        service.authority.require_vault(launcher)
         return await service.reserve(launcher,verified)
     except Exception as exc:raise failure(exc) from exc
 
