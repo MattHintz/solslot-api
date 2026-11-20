@@ -67,6 +67,7 @@ class CurrentIdentityReads:
         self.live()
         if self.authority is None:raise ValueError('CURRENT_ID_RELAY_NOT_AUTHORIZED')
         self.authority.require_live(scope.profile, int(self.clock()))
+        self.authority.require_vault(scope.launcher)
 
     def require_stamp(self,scope):
         self.require_relay(scope)

@@ -16,7 +16,7 @@ def configured_current_customer_identity(settings,customers,*,clock=time.time):
         raise ValueError('CURRENT_ID_GENERATION_CHANGED')
     authority=load_current_identity_authority(settings,profile,now=int(clock()),allow_expired_read_context=True)
     runtime=CurrentCustomerIdentityRuntime(settings,customers,authority=authority,clock=clock)
-    if not authority.issued_at<=int(clock())<authority.expires_at:return runtime
+    if not authority.active_at(int(clock())):return runtime
     from .generation_customer_factory import protected_customer_faucet
     from .protocol_submission import ProtocolBundleSubmitter,ProtocolFeePolicy
     from .generation_storage import generation_path

@@ -19,6 +19,19 @@ def test_approved_code_never_reflects_arbitrary_provider_fields():
     assert 'SYNTHETIC_PRIVATE'not in str(error.detail)
 
 
+@pytest.mark.parametrize('code,description',[
+    ('CURRENT_ID_AUTHORITY_EXPIRED_OR_CHANGED','renews the verification window'),
+    ('CURRENT_ID_NOT_AUTHORIZED','reopens testing'),
+    ('CURRENT_ID_BRIDGE_CAPACITY_UNAVAILABLE','slots are in use'),
+])
+def test_unavailable_enrollment_explains_the_reason_without_claiming_a_saved_check(code,description):
+    error=routes.failure(ValueError(code))
+    assert error.status_code==409
+    assert error.detail['code']==code
+    assert description in error.detail['message']
+    assert 'saved check' not in error.detail['message'].lower()
+
+
 def test_fee_cap_rejection_explains_that_authorization_is_saved_and_nothing_was_sent():
     error=routes.failure(HTTPException(503,detail={'code':'CURRENT_ID_FEE_CAP_EXCEEDED'}))
     assert error.status_code==503

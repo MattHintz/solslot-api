@@ -46,8 +46,8 @@ ID='/protocol-api/next/customer/identity'
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('recover',[False,True])
-async def test_current_id_http_requires_fresh_vault_preserves_work_and_confirms_native_stamp(customer,tmp_path,monkeypatch,recover):
+@pytest.mark.parametrize('recover,standing',[(False,False),(True,False),(False,True)])
+async def test_current_id_http_requires_fresh_vault_preserves_work_and_confirms_native_stamp(customer,tmp_path,monkeypatch,recover,standing):
     p=customer;generation=p.settings.deployment_generation_id
     defaults=Settings(_env_file=None,runtime_environment='test',alpha_writes_enabled=False).model_dump()
     original=dict(vars(p.settings));p.settings.__dict__.update(defaults);p.settings.__dict__.update(original)
@@ -86,7 +86,11 @@ async def test_current_id_http_requires_fresh_vault_preserves_work_and_confirms_
     p.settings.generation_customer_identity_profile_hash='0x'+sha256(profile_path.read_bytes()).hexdigest()
     fees=[r.coin for r in await p.c.client.get_coin_records_by_puzzle_hash(p.c.faucet.address_puzzle_hash)
         if not r.spent and '0x'+r.coin.name().hex() not in p.runtime.policy.allowed_parent_ids|p.runtime.policy.allowed_fee_ids]
-    policy=authority(pins,issuedAt=p.now[0]-1,expiresAt=p.now[0]+7200,
+    window=dict(issuedAt=p.now[0]-1,expiresAt=p.now[0]+7200)
+    if standing:
+        window=dict(schema='solslot.single-vault-identity-authority.v1',issuedAt=p.now[0]-90*86400,
+            expiresAt=None,vaultLauncherId=launcher,baseDailyFeeWei=10_000_000_000_000)
+    policy=authority(pins,**window,
         fundingPuzzleHash=p.c.faucet.address_hex,feeCoinIds=['0x'+fees[0].name().hex()],
         maximumFeeParentMojos=int(fees[0].amount),maximumStampFeeMojos=100)
     policy_path=tmp_path/'current-id-authority.json';policy_path.write_text(policy.model_dump_json(by_alias=True))
