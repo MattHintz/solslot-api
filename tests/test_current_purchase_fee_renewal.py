@@ -86,7 +86,8 @@ def test_renewal_rejects_unpinned_file_and_prior_policy(renewal):
         read_purchase_fee_renewal(path, digest, renewal.prior, renewal.original)
 
 
-def test_renewal_reopens_existing_journal_and_closes_at_expiry(tmp_path, renewal, monkeypatch):
+@pytest.fixture
+def renewal_runtime(tmp_path, renewal, monkeypatch):
     original, policy, prior = renewal.original, renewal.policy, renewal.prior
     store = CurrentPurchaseExecutionStore(tmp_path/'renewed-payments.db', original.generation_id)
     claim = CurrentReservationClaim.model_validate({**body(), 'issuerPolicyHash': prior.commitment})
@@ -152,27 +153,36 @@ def test_renewal_reopens_existing_journal_and_closes_at_expiry(tmp_path, renewal
         )
 
     try:
-        # A renewal must never create the original journal binding.
-        with pytest.raises(ValueError, match='RECOVERY_(JOURNAL|POLICY)_REQUIRED'):
-            start(250)
-        assert reads == []
-        activate_checkout_journal(store.path, funding.path, settings=settings, prior=prior, policy=policy)
-        assert start(249).submitter.policy.enabled is False
-        live = start(250)
-        assert live.submitter.policy.enabled is True
-        assert live.submitter.faucet.available_fee_ids() == set(original.fee_coin_ids[:1])
-        with funding.db:
-            funding.db.execute(
-                'INSERT INTO funded_protocol_input_history VALUES (?,?,?)',
-                ('testnet11', original.fee_coin_ids[0], '0x' + '56' * 32),
-            )
-        assert live.submitter.faucet.available_fee_ids() == set()
-        assert start(400).submitter.policy.enabled is False
-        assert reads == ['/synthetic/test-only-key']
-        with closing(sqlite3.connect(store.path)) as db:
-            assert db.execute('SELECT policy_hash,cutover_hash,fee_cap FROM current_purchase_collection_execution').fetchall() == [
-                (policy.commitment, cutover_hash, 10),
-            ]
-            assert db.execute('SELECT intent_id FROM current_customer_purchase_reviews').fetchall() == [(saved_intent,)]
+        yield SimpleNamespace(settings=settings, start=start, reads=reads, store=store, funding=funding,
+                              cutover=evidence, saved_intent=saved_intent)
     finally:
         funding.close()
+
+
+def test_renewal_reopens_existing_journal_and_closes_at_expiry(renewal, renewal_runtime):
+    settings, start, reads = renewal_runtime.settings, renewal_runtime.start, renewal_runtime.reads
+    store, funding = renewal_runtime.store, renewal_runtime.funding
+    policy, prior, original = renewal.policy, renewal.prior, renewal.original
+    cutover_hash, saved_intent = settings.generation_customer_purchase_cutover_hash, renewal_runtime.saved_intent
+    # A renewal must never create the original journal binding.
+    with pytest.raises(ValueError, match='RECOVERY_(JOURNAL|POLICY)_REQUIRED'):
+        start(250)
+    assert reads == []
+    activate_checkout_journal(store.path, funding.path, settings=settings, prior=prior, policy=policy)
+    assert start(249).submitter.policy.enabled is False
+    live = start(250)
+    assert live.submitter.policy.enabled is True
+    assert live.submitter.faucet.available_fee_ids() == set(original.fee_coin_ids[:1])
+    with funding.db:
+        funding.db.execute(
+            'INSERT INTO funded_protocol_input_history VALUES (?,?,?)',
+            ('testnet11', original.fee_coin_ids[0], '0x' + '56' * 32),
+        )
+    assert live.submitter.faucet.available_fee_ids() == set()
+    assert start(400).submitter.policy.enabled is False
+    assert reads == ['/synthetic/test-only-key']
+    with closing(sqlite3.connect(store.path)) as db:
+        assert db.execute('SELECT policy_hash,cutover_hash,fee_cap FROM current_purchase_collection_execution').fetchall() == [
+            (policy.commitment, cutover_hash, 10),
+        ]
+        assert db.execute('SELECT intent_id FROM current_customer_purchase_reviews').fetchall() == [(saved_intent,)]

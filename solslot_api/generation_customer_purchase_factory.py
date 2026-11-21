@@ -50,8 +50,16 @@ def configured_current_customer_purchase(settings,*,customers,funding_store,cloc
             raise ValueError('CURRENT_PURCHASE_FEE_CUTOVER_BUDGET_CHANGED')
     renewal_path = getattr(settings, 'generation_customer_purchase_fee_renewal_path', '')
     renewal_hash = getattr(settings, 'generation_customer_purchase_fee_renewal_hash', '')
+    original_fee_authority = authority
     if renewal_path or renewal_hash:
         authority = read_purchase_fee_renewal(renewal_path, renewal_hash, policy, authority)
+    successor_digest = getattr(settings, 'generation_customer_purchase_fee_successor_hash', '')
+    if successor_digest or getattr(settings, 'generation_customer_purchase_fee_successor_path', ''):
+        from .generation_customer_purchase_fee_successor import read_fee_successor, require_fee_successor
+        grant = read_fee_successor(settings, policy, cutover, original_fee_authority, authority)
+        with funding_store.lock:
+            require_fee_successor(funding_store.db, settings.deployment_generation_id, successor_digest)
+        authority = grant.authority
     if collection or not authority.issued_at<=now<authority.expires_at:
         path=Path(generation_path(settings.payment_purchase_db_path,settings.deployment_generation_id))
         if not path.is_file() or path.is_symlink():
@@ -72,6 +80,8 @@ def configured_current_customer_purchase(settings,*,customers,funding_store,cloc
                     row=db.execute('SELECT maximum_purchases,fee_cap FROM current_purchase_execution_policies '
                         'WHERE policy_hash=?',(policy.commitment,)).fetchone() if required<=tables else None
                     expected = (policy.maximum_purchases, authority.maximum_stage_fee_mojos)
+                if successor_digest:
+                    require_fee_successor(db, settings.deployment_generation_id, successor_digest)
                 if row != expected:
                     raise ValueError('CURRENT_PURCHASE_RECOVERY_POLICY_REQUIRED')
         except sqlite3.Error as exc:raise ValueError('CURRENT_PURCHASE_RECOVERY_JOURNAL_REQUIRED')from exc
@@ -88,7 +98,7 @@ def configured_current_customer_purchase(settings,*,customers,funding_store,cloc
         faucet.add_coin_reservation_source(customers.journal.reserved_input_coin_ids)
         faucet.add_coin_reservation_source(funding_store.reserved_coin_ids)
         guarded=CurrentPurchaseFeeFaucet(faucet,authority,policy,store,clock=clock,
-            funding_store=funding_store,cutover=cutover)
+            funding_store=funding_store,cutover=cutover,successor_digest=successor_digest)
         sender=CurrentPurchaseBundleSubmitter(execution_store=store,clock=clock,provider=customers.provider,faucet=guarded,funding_store=funding_store,
             policy=ProtocolFeePolicy(enabled=True,minimum_mojos=1,
                 maximum_mojos=authority.maximum_stage_fee_mojos,
