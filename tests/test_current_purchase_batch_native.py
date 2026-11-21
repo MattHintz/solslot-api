@@ -43,6 +43,73 @@ async def test_current_two_and_three_deeds_one_native_payment(core,tmp_path,monk
     await native_scenario(core,tmp_path,real_synthetic_identity_policy,monkeypatch)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('real_synthetic_identity_policy', ['forwarding'], indirect=True)
+async def test_two_deeds_with_ten_sponsor_inputs(core, tmp_path, monkeypatch, real_synthetic_identity_policy):
+    core.checkout_batch_quantity = 2
+    core.checkout_nominal_candidate = True
+    core.checkout_paired_fees = True
+    await native_scenario(core, tmp_path, real_synthetic_identity_policy, monkeypatch)
+
+
+async def simulator_paired_funding(c, service, funding, now, monkeypatch):
+    """Exercise normal selection and signing against ten confirmed simulator outputs."""
+    from chia.types.blockchain_format.program import Program
+    from chia.types.coin_spend import make_spend
+    from chia_rs.sized_bytes import bytes32
+
+    puzzle = Program.to(1)
+    amounts = range(1500, 1510)
+    inputs = await c.client.get_coin_records_by_puzzle_hash(puzzle.get_tree_hash())
+    parent = next(record.coin for record in inputs if not record.spent and record.coin.amount > sum(amounts))
+    conditions = [[51, c.faucet.address_puzzle_hash, amount] for amount in amounts]
+    conditions.append([51, puzzle.get_tree_hash(), int(parent.amount) - sum(amounts)])
+    setup = SpendBundle([make_spend(parent, puzzle, Program.to(conditions))], G2Element())
+    assert await c.client.push_tx(setup) == (MempoolInclusionStatus.SUCCESS, None)
+    await c.sim.farm_block()
+
+    async def records(puzzle_hash, *, include_spent=False):
+        rows = await c.client.get_coin_records_by_puzzle_hash(bytes32.from_hexstr(puzzle_hash), include_spent_coins=include_spent)
+        return [row.to_json_dict() for row in rows]
+
+    async def pending(coin_id):
+        return list(c.sim.mempool_manager.mempool.get_items_by_coin_id(bytes32.from_hexstr(coin_id)))
+
+    monkeypatch.setattr(c.provider, 'get_coin_records_by_puzzle_hash_primary', records, raising=False)
+    monkeypatch.setattr(c.provider, 'get_coin_records_by_puzzle_hash', records, raising=False)
+    monkeypatch.setattr(c.provider, 'get_mempool_items_by_coin_name', pending, raising=False)
+    rows = await c.client.get_coin_records_by_parent_ids([parent.name()])
+    ids = sorted(h(row.coin.name()) for row in rows if row.coin.puzzle_hash == c.faucet.address_puzzle_hash)
+    assert len(ids) == 10
+    base = service.submitter.faucet.authority
+    authority = CurrentPurchaseFeeAuthority.model_validate({
+        **base.model_dump(by_alias=True), 'feeCoinIds': ids, 'maximumStageFeeMojos': 2, 'maximumTotalFeeMojos': 20,
+        'maximumFeeParentMojos': max(amounts),
+    })
+    digest = h(sha256(authority.model_dump_json(by_alias=True).encode()).digest())
+    # Start from the installed grant state. The migration suite tests how both journals reach it.
+    with service.store._connect() as db:
+        db.execute('CREATE TABLE current_purchase_fee_successor (id INTEGER PRIMARY KEY, grant_hash TEXT, intent_id TEXT)')
+        db.execute('INSERT INTO current_purchase_fee_successor VALUES (1,?,NULL)', (digest,))
+        db.execute('CREATE TABLE current_purchase_fee_pairs (grant_hash TEXT, pair_index INTEGER, intent_id TEXT, '
+                   'PRIMARY KEY(grant_hash,pair_index), UNIQUE(grant_hash,intent_id))')
+        db.commit()
+    with funding.db:
+        funding.db.execute('CREATE TABLE current_purchase_fee_successor (id INTEGER PRIMARY KEY, grant_hash TEXT, intent_id TEXT)')
+        funding.db.execute('INSERT INTO current_purchase_fee_successor VALUES (1,?,NULL)', (digest,))
+    faucet = CurrentPurchaseFeeFaucet(c.faucet, authority, service.policy, service.store, clock=now,
+                                     funding_store=funding, cutover=service.cutover, successor_digest=digest, paired_grant=True)
+    sender = CurrentPurchaseBundleSubmitter(execution_store=service.store, clock=now, provider=c.provider,
+        faucet=faucet, funding_store=funding, policy=ProtocolFeePolicy(enabled=True, minimum_mojos=1,
+        maximum_mojos=2, native_admission_enabled=True))
+
+    async def estimate(_):
+        return 1
+
+    monkeypatch.setattr(sender, '_estimate_fee', estimate)
+    service.submitter = sender
+
+
 async def collection_checkout(c, settings, prior, inventory, store, service, tmp_path, now):
     policy = TestnetCollectionIssuerPolicy(prior.generation, prior.collection, prior.edition, prior.metadata_root,
         prior.proceeds_puzzle, prior.fee_puzzle, prior.issuer_public_key,
@@ -129,12 +196,15 @@ async def exercise_batch(c,ctx,built,inventory,vault,pay_coin,payment_key,synthe
     store=CurrentPurchaseExecutionStore(tmp_path/'batch-payments.db',c.prep.generation_id)
     service=CurrentNativePurchaseExecution(settings=settings,anchor=built.anchor,provider=c.provider,
         policy=policy,store=store,fee_cap=10,clock=now)
-    collection_test = quantity > 3
+    paired = getattr(c, 'checkout_paired_fees', False)
+    collection_test = quantity > 3 or paired
     funding = None
     issuer = None
     receiver = {}
     if collection_test:
         service, issuer, funding = await collection_checkout(c, settings, policy, inventory, store, service, tmp_path, now)
+        if paired:
+            await simulator_paired_funding(c, service, funding, now, monkeypatch)
         policy = service.policy
         receiver = {'receiving_launcher':vault.launcher,
             'receiving_owner':h(list(vault.inner.uncurry()[1].as_iter())[1].as_atom())}
@@ -154,7 +224,7 @@ async def exercise_batch(c,ctx,built,inventory,vault,pay_coin,payment_key,synthe
     async def submit(phase, original):
         if collection_test:
             prepared = await service.submitter._prepare_locked(original.to_json_dict(), bind_protocol=phase=='DELIVERY')
-            assert prepared.fee_mojos == 5
+            assert prepared.fee_mojos == (1 if paired else 5)
             funding.reserve('testnet11',bundle_id(original),service._funding_context(),
                 {**prepared.to_json(),'protocolSpendBundle':original.to_json_dict()})
             assert prepared.fee_coin_id not in service.submitter.faucet.available_fee_ids()
@@ -168,6 +238,9 @@ async def exercise_batch(c,ctx,built,inventory,vault,pay_coin,payment_key,synthe
     review=await service.quote('one-customer-order',ids,browser_hash=binding,**receiver);identity=review['intentId']
     progress('quote')
     assert review['quantity']==quantity and review['deedLauncherIds']==ids
+    if paired:
+        assert review['feeCapMojosPerStage'] == '2'
+        assert review['maximumNetworkFeeMojos'] == '4'
     assert int(review['amountMojos'])==quantity*101_000_000_000
     assert int(review['baseAmountUsdMinor'])==quantity*300_000
     assert (await service.quote('one-customer-order',list(reversed(ids)),browser_hash=binding,**receiver))==review
@@ -235,7 +308,7 @@ async def exercise_batch(c,ctx,built,inventory,vault,pay_coin,payment_key,synthe
     assert issuer.db.execute('SELECT count(*) FROM issuer_forwarding').fetchone()[0]==quantity
     def no_key():raise AssertionError('retry must recover issuer signatures')
     assert await sign_current_issuer(packet,settings=settings,anchor=built.anchor,provider=c.provider,journal=issuer,load_key=no_key,clock=now)==issuer_signature
-    if quantity == 2:
+    if quantity == 2 and not collection_test:
         # Exercise the collection issuer against the same real native batch. The
         # scope and closure receipt are synthetic; no production cutover occurs.
         collection=TestnetCollectionIssuerPolicy(policy.generation,policy.collection,policy.edition,policy.metadata_root,
@@ -286,7 +359,13 @@ async def exercise_batch(c,ctx,built,inventory,vault,pay_coin,payment_key,synthe
     delivery_funded = await submit('DELIVERY', final)
     assert (await c.client.push_tx(delivery_funded.bundle))[0]!=MempoolInclusionStatus.SUCCESS
     if collection_test:
-        assert not service.submitter.faucet.available_fee_ids()
+        faucet = service.submitter.faucet
+        if paired:
+            assert reservation_funded.fee_coin_id == faucet.authority.fee_coin_ids[0]
+            assert delivery_funded.fee_coin_id == faucet.authority.fee_coin_ids[1]
+            assert faucet.admissible_fee_ids(faucet.available_fee_ids()) == set(faucet.authority.fee_coin_ids[2:])
+        else:
+            assert not faucet.available_fee_ids()
         assert delivery_funded.fee_coin_id != reservation_funded.fee_coin_id
     # Every exact NFT settlement output is present, with unique current coins.
     from chia.wallet.util.compute_additions import compute_additions

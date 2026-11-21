@@ -33,22 +33,30 @@ class RenewedPurchaseFeeSuccessor(PurchaseFeeSuccessor):
     previous_successor_hash: Hash = Field(alias='previousSuccessorHash')
 
 
+class PairedPurchaseFeeSuccessor(RenewedPurchaseFeeSuccessor):
+    schema_version: Literal['solslot.testnet-checkout-fee-successor.v3'] = Field(alias='schema')
+
+
 def read_fee_successor(settings, policy, cutover, original, renewal):
     raw = _bounded_file(settings.generation_customer_purchase_fee_successor_path, 16384)
     if '0x' + sha256(raw).hexdigest() != settings.generation_customer_purchase_fee_successor_hash:
         raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_CHANGED')
-    grant = TypeAdapter(PurchaseFeeSuccessor | RenewedPurchaseFeeSuccessor).validate_json(raw)
+    grant = TypeAdapter(PurchaseFeeSuccessor | RenewedPurchaseFeeSuccessor | PairedPurchaseFeeSuccessor).validate_json(raw)
     authority = grant.authority.require_policy(policy)
+    paired = isinstance(grant, PairedPurchaseFeeSuccessor)
+    input_count = 10 if paired else 2
+    stage_in_scope = (authority.maximum_stage_fee_mojos <= min(400_000_000, renewal.maximum_stage_fee_mojos)
+                      if paired else authority.maximum_stage_fee_mojos == renewal.maximum_stage_fee_mojos)
     if (not isinstance(policy, TestnetCollectionIssuerPolicy) or cutover is None
             or grant.renewal_hash != settings.generation_customer_purchase_fee_renewal_hash
             or grant.cutover_hash != settings.generation_customer_purchase_cutover_hash
             or authority.funding_puzzle_hash != renewal.funding_puzzle_hash
             or authority.maximum_fee_parent_mojos != renewal.maximum_fee_parent_mojos
             or not renewal.issued_at <= authority.issued_at < authority.expires_at <= renewal.expires_at
-            or len(authority.fee_coin_ids) != 2 or set(authority.fee_coin_ids).intersection(original.fee_coin_ids)
-            or authority.maximum_stage_fee_mojos != renewal.maximum_stage_fee_mojos
+            or len(authority.fee_coin_ids) != input_count or set(authority.fee_coin_ids).intersection(original.fee_coin_ids)
+            or not stage_in_scope
             or authority.maximum_stage_fee_mojos > 900_000_000
-            or authority.maximum_total_fee_mojos != 2 * authority.maximum_stage_fee_mojos
+            or authority.maximum_total_fee_mojos != input_count * authority.maximum_stage_fee_mojos
             or grant.prior_commitment < cutover.inherited_fee_mojos
             or grant.prior_commitment + authority.maximum_total_fee_mojos > cutover.fee_limit_mojos):
         raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_SCOPE_CHANGED')
@@ -91,6 +99,48 @@ def claim_fee_successor_intent(store, digest, intent, phase, issued_at):
         db.commit()
 
 
+def _free_pairs(db, digest, ordered_ids, usable_ids):
+    assigned = {row[0] for row in db.execute(
+        'SELECT pair_index FROM current_purchase_fee_pairs WHERE grant_hash=?', (digest,))}
+    for index in range(len(ordered_ids) // 2):
+        pair = ordered_ids[2 * index:2 * index + 2]
+        if index not in assigned and set(pair) <= usable_ids:
+            yield index, pair
+
+
+def available_order_pairs(store, digest, ordered_ids, usable_ids):
+    with store._connect() as db:
+        require_fee_successor(db, store.generation_id, digest)
+        return {coin for _, pair in _free_pairs(db, digest, ordered_ids, usable_ids) for coin in pair}
+
+
+def order_fee_coin(store, digest, ordered_ids, intent, phase, issued_at, *, usable_ids=None):
+    if phase not in ('RESERVATION', 'DELIVERY', 'RELEASE') or len(ordered_ids) != 10:
+        raise ValueError('CURRENT_PURCHASE_FEE_PAIR_SCOPE_CHANGED')
+    with store._connect() as db:
+        db.execute('BEGIN IMMEDIATE' if usable_ids is not None else 'BEGIN')
+        require_fee_successor(db, store.generation_id, digest)
+        requested = db.execute('SELECT requested_at FROM current_customer_reservation_requests WHERE intent_id=?',
+                               (intent,)).fetchone()
+        if requested is None or requested[0] < issued_at:
+            raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_ORDER_CHANGED')
+        row = db.execute('SELECT pair_index FROM current_purchase_fee_pairs WHERE grant_hash=? AND intent_id=?',
+                         (digest, intent)).fetchone()
+        if row is None:
+            if usable_ids is None or phase != 'RESERVATION':
+                raise ValueError('CURRENT_PURCHASE_FEE_PAIR_NOT_ASSIGNED')
+            free_pair = next(_free_pairs(db, digest, ordered_ids, usable_ids), None)
+            if free_pair is None:
+                raise ValueError('CURRENT_PURCHASE_FEE_PAIRS_EXHAUSTED')
+            index, _ = free_pair
+            db.execute('INSERT INTO current_purchase_fee_pairs (grant_hash,pair_index,intent_id) VALUES (?,?,?)',
+                       (digest, index, intent))
+        else:
+            index = row[0]
+        db.commit()
+    return ordered_ids[2 * index + (phase != 'RESERVATION')]
+
+
 async def reconcile_fee_successor(purchase, funding, *, submitter, node, cutover, original, renewal, next_ids, previous=None):
     """Collect a stable snapshot and verify confirmed fees against the primary Chia node."""
     for db in (purchase, funding):
@@ -113,6 +163,7 @@ async def reconcile_fee_successor(purchase, funding, *, submitter, node, cutover
     if set(next_ids).intersection(previous_ids):
         raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_INPUT_USED')
     previous_stages = []
+    previous_spent = 0
     for coin in (*original.fee_coin_ids, *previous_ids, *next_ids):
         rows = funding.execute('SELECT original_id FROM funded_protocol_input_history WHERE network=? AND coin_id=?',
                                ('testnet11', coin)).fetchall()
@@ -131,6 +182,7 @@ async def reconcile_fee_successor(purchase, funding, *, submitter, node, cutover
             exact = await _confirmed_execution(funding, submitter, row, _stored_bundle(row), peak)
             exposure += exact.maximum_mojos
             if coin in previous_ids:
+                previous_spent += exact.maximum_mojos
                 previous_stages.append((row['intent_id'], row['phase']))
     if previous_ids:
         intents = {intent for intent, _ in previous_stages}
@@ -138,6 +190,10 @@ async def reconcile_fee_successor(purchase, funding, *, submitter, node, cutover
         if len(intents) != 1 or phases not in ({'RESERVATION', 'RELEASE'}, {'RESERVATION', 'DELIVERY'}):
             raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_PREVIOUS_ORDER_CHANGED')
         _require_previous_order(purchase, previous, intents.pop())
+        if previous.prior_commitment is not None:
+            if previous.prior_commitment < exposure - previous_spent:
+                raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_PREVIOUS_EXPOSURE_CHANGED')
+            exposure = previous.prior_commitment + previous_spent
     return {'purchaseJournalSnapshot': snapshots[0], 'fundingJournalSnapshot': snapshots[1],
             'priorFeeExposureMojos': exposure}
 
@@ -146,15 +202,17 @@ async def reconcile_fee_successor(purchase, funding, *, submitter, node, cutover
 class PreviousFeeGrant:
     digest: str
     authority: CurrentPurchaseFeeAuthority
+    prior_commitment: int | None = None
+    version: str = 'solslot.testnet-checkout-fee-successor.v1'
 
     @classmethod
     def from_bytes(cls, raw, *, digest, renewal_hash, cutover_hash):
         if not raw or '0x' + sha256(raw).hexdigest() != digest:
             raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_PREVIOUS_BYTES_CHANGED')
-        grant = PurchaseFeeSuccessor.model_validate_json(raw)
+        grant = TypeAdapter(PurchaseFeeSuccessor | RenewedPurchaseFeeSuccessor).validate_json(raw)
         if grant.renewal_hash != renewal_hash or grant.cutover_hash != cutover_hash:
             raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_PREVIOUS_SCOPE_CHANGED')
-        return cls(digest, grant.authority)
+        return cls(digest, grant.authority, grant.prior_commitment, grant.schema_version)
 
 
 def _require_previous_order(db, previous, intent):
@@ -187,6 +245,10 @@ async def install_fee_successor(settings, purchase_path, funding_path, *, policy
     if isinstance(grant, RenewedPurchaseFeeSuccessor):
         previous = PreviousFeeGrant.from_bytes(previous_bytes, digest=grant.previous_successor_hash,
             renewal_hash=grant.renewal_hash, cutover_hash=grant.cutover_hash)
+        expected_previous = ('solslot.testnet-checkout-fee-successor.v2' if isinstance(grant, PairedPurchaseFeeSuccessor)
+                             else 'solslot.testnet-checkout-fee-successor.v1')
+        if previous.version != expected_previous:
+            raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_PREVIOUS_SCOPE_CHANGED')
         if previous.digest == digest or previous.authority.issued_at >= grant.authority.issued_at:
             raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_PREVIOUS_SCOPE_CHANGED')
     allowed = (None, digest) if previous is None else (previous.digest, digest)
@@ -216,6 +278,10 @@ async def install_fee_successor(settings, purchase_path, funding_path, *, policy
             if row != (grant.cutover_hash,) or checkout_journal_snapshots(purchase, funding) != (
                     grant.purchase_snapshot, grant.funding_snapshot):
                 raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_EVIDENCE_CHANGED')
+            if isinstance(grant, PairedPurchaseFeeSuccessor):
+                purchase.execute('''CREATE TABLE IF NOT EXISTS current_purchase_fee_pairs (
+                    grant_hash TEXT NOT NULL, pair_index INTEGER NOT NULL CHECK(pair_index BETWEEN 0 AND 4),
+                    intent_id TEXT NOT NULL, PRIMARY KEY(grant_hash,pair_index), UNIQUE(grant_hash,intent_id))''')
             for db in (purchase, funding):
                 bound = _stored_grant(db)
                 if bound not in allowed:

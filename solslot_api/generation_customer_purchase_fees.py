@@ -6,6 +6,7 @@ this adapter cannot fund a different action or pay a different destination.
 """
 from hashlib import sha256
 from types import SimpleNamespace
+from contextvars import ContextVar
 from typing import Literal
 
 from chia.types.blockchain_format.program import Program
@@ -89,7 +90,7 @@ def read_purchase_fee_renewal(path, expected_hash, policy, original):
 
 
 class CurrentPurchaseFeeFaucet:
-    def __init__(self,faucet,authority,policy,store,*,clock,funding_store=None,cutover=None,successor_digest=None):
+    def __init__(self,faucet,authority,policy,store,*,clock,funding_store=None,cutover=None,successor_digest=None,paired_grant=False):
         from .generation_customer_purchase_execution_store import CurrentPurchaseExecutionStore
         authority.require_policy(policy)
         if (not isinstance(store,CurrentPurchaseExecutionStore) or store.generation_id!=authority.generation_id
@@ -103,6 +104,8 @@ class CurrentPurchaseFeeFaucet:
         self._faucet,self.authority,self.policy,self.store,self.clock=faucet,authority,policy,store,clock
         self.funding_store = funding_store
         self.successor_digest = successor_digest
+        self.paired_grant = paired_grant
+        self.order_coin = ContextVar("current_purchase_fee_coin", default=None)
         self.network=faucet.network;self.address_hex=faucet.address_hex
         self.address_puzzle_hash=faucet.address_puzzle_hash
         self.key=SimpleNamespace(puzzle=faucet.key.puzzle)
@@ -122,9 +125,34 @@ class CurrentPurchaseFeeFaucet:
             allowed.difference_update(row[0] for row in used)
         return allowed
 
+    def admissible_fee_ids(self, usable):
+        if not self.paired_grant:
+            return usable
+        from .generation_customer_purchase_fee_successor import available_order_pairs
+        return available_order_pairs(self.store, self.successor_digest, self.authority.fee_coin_ids, usable)
+
+    def confirmed_fee_ids(self, records):
+        allowed = self.available_fee_ids()
+        confirmed = set()
+        for record in records:
+            coin = Coin.from_json_dict(record['coin'])
+            coin_id = '0x' + coin.name().hex()
+            if (coin_id in allowed and coin.puzzle_hash == self.address_puzzle_hash
+                    and record['confirmed_block_index'] > 0 and record['spent_block_index'] == 0
+                    and self.authority.maximum_stage_fee_mojos <= coin.amount <= self.authority.maximum_fee_parent_mojos):
+                confirmed.add(coin_id)
+        return confirmed
+
+    def expected_order_coin(self, intent, phase, *, usable_ids=None):
+        from .generation_customer_purchase_fee_successor import order_fee_coin
+        return order_fee_coin(self.store, self.successor_digest, self.authority.fee_coin_ids,
+                              intent, phase, self.authority.issued_at, usable_ids=usable_ids)
+
     def select_coin(self,records,**kwargs):
         self.authority.require_live(self.policy,int(self.clock()))
         allowed = self.available_fee_ids()
+        if self.paired_grant:
+            allowed.intersection_update([self.order_coin.get()])
         selected=[r for r in records if '0x'+Coin.from_json_dict(r.get('coin')or r).name().hex()
             in allowed]
         return self._faucet.select_coin(selected,**kwargs)
@@ -167,7 +195,11 @@ class CurrentPurchaseFeeFaucet:
                 matched=row
                 break
         if matched is None:raise ValueError('CURRENT_PURCHASE_FEE_SAVED_EXECUTION_REQUIRED')
-        if self.successor_digest:
+        if self.paired_grant:
+            expected = self.expected_order_coin(matched['intent_id'], matched['phase'])
+            if expected != self.order_coin.get() or expected != '0x' + coin.name().hex():
+                raise ValueError('CURRENT_PURCHASE_FEE_PAIR_COIN_CHANGED')
+        elif self.successor_digest:
             from .generation_customer_purchase_fee_successor import claim_fee_successor_intent
             claim_fee_successor_intent(self.store, self.successor_digest, matched['intent_id'],
                                        matched['phase'], self.authority.issued_at)
@@ -193,14 +225,27 @@ class CurrentPurchaseBundleSubmitter(ProtocolBundleSubmitter):
         self.faucet.authority.require_live(self.faucet.policy,int(self.clock()))
         original=SpendBundle.from_json_dict(protocol_bundle_json)
         with self.execution_store._connect()as db:
-            rows=db.execute('SELECT protocol_bundle,expires_at FROM current_purchase_executions WHERE original_id=?',
+            rows=db.execute('SELECT protocol_bundle,expires_at,intent_id,phase FROM current_purchase_executions WHERE original_id=?',
                 ('0x'+original.name().hex(),)).fetchall()
         if len(rows)!=1 or rows[0]['protocol_bundle']!=bytes(original):
             raise ValueError('CURRENT_PURCHASE_FEE_SAVED_EXECUTION_REQUIRED')
         self._purchase_deadline=min(rows[0]['expires_at'],self.faucet.authority.expires_at,int(self.clock())+120)
         if self._purchase_deadline<=int(self.clock()):raise ValueError('CURRENT_PURCHASE_FEE_WINDOW_CLOSED')
-        try:return await super()._prepare_locked(protocol_bundle_json,**kwargs)
-        finally:self._purchase_deadline=None
+        token = None
+        try:
+            if self.faucet.paired_grant:
+                phase = rows[0]['phase']
+                usable = None
+                if phase == 'RESERVATION':
+                    records = await self.provider.get_coin_records_by_puzzle_hash_primary(self.faucet.address_hex)
+                    usable = self.faucet.confirmed_fee_ids(records)
+                fee_coin = self.faucet.expected_order_coin(rows[0]['intent_id'], phase, usable_ids=usable)
+                token = self.faucet.order_coin.set(fee_coin)
+            return await super()._prepare_locked(protocol_bundle_json, **kwargs)
+        finally:
+            if token is not None:
+                self.faucet.order_coin.reset(token)
+            self._purchase_deadline = None
 
     def _fee_bundle(self,coin,fee,*,selection_purpose,backing_mojos=0,backing_conditions=()):
         if self._purchase_deadline is None:raise ValueError('CURRENT_PURCHASE_FEE_PREPARATION_REQUIRED')

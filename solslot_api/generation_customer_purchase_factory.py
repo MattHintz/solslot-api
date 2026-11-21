@@ -53,13 +53,16 @@ def configured_current_customer_purchase(settings,*,customers,funding_store,cloc
     original_fee_authority = authority
     if renewal_path or renewal_hash:
         authority = read_purchase_fee_renewal(renewal_path, renewal_hash, policy, authority)
+    journal_fee_cap = authority.maximum_stage_fee_mojos
+    paired_grant = False
     successor_digest = getattr(settings, 'generation_customer_purchase_fee_successor_hash', '')
     if successor_digest or getattr(settings, 'generation_customer_purchase_fee_successor_path', ''):
-        from .generation_customer_purchase_fee_successor import read_fee_successor, require_fee_successor
+        from .generation_customer_purchase_fee_successor import PairedPurchaseFeeSuccessor, read_fee_successor, require_fee_successor
         grant = read_fee_successor(settings, policy, cutover, original_fee_authority, authority)
         with funding_store.lock:
             require_fee_successor(funding_store.db, settings.deployment_generation_id, successor_digest)
         authority = grant.authority
+        paired_grant = isinstance(grant, PairedPurchaseFeeSuccessor)
     if collection or not authority.issued_at<=now<authority.expires_at:
         path=Path(generation_path(settings.payment_purchase_db_path,settings.deployment_generation_id))
         if not path.is_file() or path.is_symlink():
@@ -75,7 +78,7 @@ def configured_current_customer_purchase(settings,*,customers,funding_store,cloc
                     row = db.execute('SELECT policy_hash,cutover_hash,fee_cap FROM current_purchase_collection_execution '
                                      'WHERE id=1').fetchone() if required <= tables else None
                     expected = (policy.commitment, settings.generation_customer_purchase_cutover_hash,
-                                authority.maximum_stage_fee_mojos)
+                                journal_fee_cap)
                 else:
                     row=db.execute('SELECT maximum_purchases,fee_cap FROM current_purchase_execution_policies '
                         'WHERE policy_hash=?',(policy.commitment,)).fetchone() if required<=tables else None
@@ -98,7 +101,7 @@ def configured_current_customer_purchase(settings,*,customers,funding_store,cloc
         faucet.add_coin_reservation_source(customers.journal.reserved_input_coin_ids)
         faucet.add_coin_reservation_source(funding_store.reserved_coin_ids)
         guarded=CurrentPurchaseFeeFaucet(faucet,authority,policy,store,clock=clock,
-            funding_store=funding_store,cutover=cutover,successor_digest=successor_digest)
+            funding_store=funding_store,cutover=cutover,successor_digest=successor_digest,paired_grant=paired_grant)
         sender=CurrentPurchaseBundleSubmitter(execution_store=store,clock=clock,provider=customers.provider,faucet=guarded,funding_store=funding_store,
             policy=ProtocolFeePolicy(enabled=True,minimum_mojos=1,
                 maximum_mojos=authority.maximum_stage_fee_mojos,
@@ -106,7 +109,7 @@ def configured_current_customer_purchase(settings,*,customers,funding_store,cloc
                 # Use the primary node estimate and admission floor within the approved fee cap.
                 cost_fee_tiers_enabled=False))
     return CurrentNativePurchaseExecution(settings=settings,anchor=customers.index.anchor,
-        provider=customers.provider,policy=policy,store=store,fee_cap=authority.maximum_stage_fee_mojos,
+        provider=customers.provider,policy=policy,store=store,fee_cap=journal_fee_cap,
         submitter=sender,clock=clock,cutover=cutover)
 
 

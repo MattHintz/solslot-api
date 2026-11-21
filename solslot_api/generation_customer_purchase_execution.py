@@ -198,7 +198,8 @@ class CurrentNativePurchaseExecution:
             try:
                 self._funding_context(until=now + 300)
                 faucet = self.submitter.faucet
-                if len(faucet.available_fee_ids()) < 2:
+                permitted = faucet.available_fee_ids()
+                if len(permitted) < 2 or len(faucet.admissible_fee_ids(permitted)) < 2:
                     # The retained journal can rule out a new purchase immediately.
                     # The normal path still verifies both inputs on the primary node.
                     result = {'status': 'UNAVAILABLE', 'code': 'CURRENT_EXECUTION_FEE_CAPACITY',
@@ -214,15 +215,8 @@ class CurrentNativePurchaseExecution:
                     issuer, records = await asyncio.gather(
                         worker.issuer_sign.status(self.policy, now=now),
                         self.provider.get_coin_records_by_puzzle_hash_primary(faucet.address_hex))
-                permitted = faucet.available_fee_ids()
-                usable = set()
-                for record in records:
-                    coin = Coin.from_json_dict(record['coin'])
-                    if (h(coin.name()) in permitted and coin.puzzle_hash == faucet.address_puzzle_hash
-                            and record['confirmed_block_index'] > 0 and record['spent_block_index'] == 0
-                            and self.fee_cap <= coin.amount <= faucet.authority.maximum_fee_parent_mojos):
-                        usable.add(coin.name())
-                if len(usable) < 2:
+                usable = faucet.confirmed_fee_ids(records)
+                if len(faucet.admissible_fee_ids(usable)) < 2:
                     code = 'CURRENT_EXECUTION_FEE_CAPACITY'
                 elif issuer['canSign'] and int(self.clock()) + 300 <= faucet.authority.expires_at:
                     status, code = 'READY', 'CURRENT_EXECUTION_READY'
@@ -440,6 +434,11 @@ class CurrentNativePurchaseExecution:
             if row is None:
                 raise ValueError('CURRENT_EXECUTION_RETIRED_REVIEW_CHANGED')
             return row['fee_cap']
+        faucet = getattr(self.submitter, 'faucet', None)
+        if getattr(faucet, 'paired_grant', False):
+            authority = faucet.authority
+            if self.store.saved(identity, browser_hash=browser_hash)['createdAt'] >= authority.issued_at:
+                return authority.maximum_stage_fee_mojos
         return self.fee_cap
 
     def _existing(self, identity, phase, browser_hash):

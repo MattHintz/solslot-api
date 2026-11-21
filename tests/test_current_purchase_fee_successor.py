@@ -185,3 +185,90 @@ async def test_reconciliation_rejects_reusing_predecessor_coins(staged,monkeypat
         with pytest.raises(ValueError,match='INPUT_USED'):
             await successor.reconcile_fee_successor(purchase,funding,submitter=None,node=None,cutover=rt.cutover,
                 original=staged.scope['original'],renewal=staged.scope['renewal'],next_ids=previous.authority.fee_coin_ids,previous=previous)
+
+
+@pytest.mark.asyncio
+async def test_ten_inputs_allocate_five_durable_pairs(staged, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from pathlib import Path
+
+    rt, data = staged.rt, staged.data
+    evidence = {key: data[key] for key in ('purchaseJournalSnapshot', 'fundingJournalSnapshot', 'priorFeeExposureMojos')}
+    monkeypatch.setattr(successor, 'reconcile_fee_successor', AsyncMock(return_value=evidence))
+
+    async def install(previous=None):
+        return await successor.install_fee_successor(rt.settings, rt.store.path, rt.funding.path, **staged.scope,
+                                                     submitter=None, node=None, now=329, previous_bytes=previous)
+
+    def transition(schema, ids, cap, issued_at):
+        previous = Path(rt.settings.generation_customer_purchase_fee_successor_path).read_bytes()
+        prior_hash = rt.settings.generation_customer_purchase_fee_successor_hash
+        with closing(_open_read_only(rt.store.path)) as purchase, closing(_open_read_only(rt.funding.path)) as funding:
+            evidence['purchaseJournalSnapshot'], evidence['fundingJournalSnapshot'] = checkout_journal_snapshots(purchase, funding)
+        data.update(evidence, schema=schema, previousSuccessorHash=prior_hash)
+        data['authority'].update(issuedAt=issued_at, feeCoinIds=ids, maximumStageFeeMojos=cap,
+                                 maximumTotalFeeMojos=cap*len(ids))
+        staged.write()
+        return previous
+
+    await install()
+    first = transition('solslot.testnet-checkout-fee-successor.v2', ['0x'+'90'*32, '0x'+'91'*32], 10, 310)
+    await install(first)
+    ids = ['0x'+bytes([v]).hex()*32 for v in range(100, 110)]
+    previous = transition('solslot.testnet-checkout-fee-successor.v3', ids, 1, 320)
+    with pytest.raises(ValueError, match='PREVIOUS_BYTES_CHANGED'):
+        await install(first)
+    await install(previous)
+    await install(previous)
+    service = rt.start(330)
+    faucet = service.submitter.faucet
+    assert service.fee_cap == 10 and faucet.authority.maximum_stage_fee_mojos == service.submitter.policy.maximum_mojos == 1
+    assert faucet.admissible_fee_ids(set(ids[1:])) == set(ids[2:])
+    assert faucet.select_coin([], min_amount=1, max_amount=100, purpose=None) == []
+    from solslot_api.generation_customer_purchase_reservation import CurrentReservationClaim
+    from tests.test_current_purchase_store import BROWSER
+    from tests.test_generation_customer_purchase_reservation_claim import body
+    intents = []
+    for number in range(7):
+        claim = CurrentReservationClaim.model_validate({**body(), 'issuerPolicyHash': service.policy.commitment,
+                                                        'availableCoinId': '0x'+bytes([130+number]).hex()*32})
+        intents.append(rt.store.save_review(claim, browser_hash=BROWSER, request_key=f'order-{number}',
+                                            now=319 if number == 6 else 325))
+    assert service.review_fee_cap(intents[0], BROWSER) == 1
+    assert service.review_fee_cap(intents[6], BROWSER) == 10
+    with rt.store._connect() as db:
+        db.executemany('INSERT INTO current_customer_reservation_requests VALUES (?,?)',
+                       [(intent, 319 if i==6 else 325) for i,intent in enumerate(intents)])
+        db.commit()
+    with pytest.raises(ValueError, match='SUCCESSOR_ORDER_CHANGED'):
+        faucet.expected_order_coin(intents[6], 'RESERVATION', usable_ids=set(ids))
+    with pytest.raises(ValueError, match='NOT_ASSIGNED'):
+        faucet.expected_order_coin(intents[0], 'DELIVERY', usable_ids=set(ids))
+    # Skip a pair if either of its inputs is unavailable.
+    assert faucet.expected_order_coin(intents[0], 'RESERVATION', usable_ids=set(ids[1:])) == ids[2]
+    with ThreadPoolExecutor(max_workers=7) as pool:
+        starts = list(pool.map(lambda intent: faucet.expected_order_coin(intent, 'RESERVATION', usable_ids=set(ids)),
+                               [*intents[:5], *intents[:2]]))
+    assert set(starts[:5]) == set(ids[::2])
+    assert starts[:2] == starts[-2:]
+    restarted = rt.start(330).submitter.faucet
+    assert not restarted.admissible_fee_ids(set(ids))
+    for intent, first_coin in zip(intents[:5],starts[:5]):
+        last_coin = ids[ids.index(first_coin)+1]
+        for phase in ('DELIVERY', 'RELEASE'):
+            assert restarted.expected_order_coin(intent, phase) == last_coin
+    with pytest.raises(ValueError, match='PAIRS_EXHAUSTED'):
+        restarted.expected_order_coin(intents[5], 'RESERVATION', usable_ids=set(ids))
+    with pytest.raises(ValueError, match='PAIR_SCOPE_CHANGED'):
+        restarted.expected_order_coin(intents[0], 'UNSUPPORTED')
+
+
+@pytest.mark.parametrize('count,stage,total', [(9,1,9),(11,1,11),(10,11,110),(10,1,11)])
+def test_ten_input_grant_enforces_count_and_caps(staged, count, stage, total):
+    data = staged.data
+    data.update(schema='solslot.testnet-checkout-fee-successor.v3',previousSuccessorHash='0x'+'12'*32)
+    data['authority'].update(feeCoinIds=['0x'+bytes([v]).hex()*32 for v in range(100,100+count)],
+                             maximumStageFeeMojos=stage,maximumTotalFeeMojos=total)
+    staged.write()
+    with pytest.raises(ValueError):
+        successor.read_fee_successor(staged.rt.settings, **staged.scope)
