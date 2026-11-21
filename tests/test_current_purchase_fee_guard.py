@@ -137,6 +137,7 @@ def test_factory_reopens_saved_journal_without_keys_when_funding_closed(guarded,
     authority_path,authority_hash=pinned('fees.json',g.authority.model_dump(mode='json',by_alias=True))
     settings=SimpleNamespace(network='testnet11',deployment_generation_id=g.authority.generation_id,
         alpha_writes_enabled=False,generation_customer_purchase_enabled=True,
+        protocol_fee_cost_tiers_enabled=True,
         generation_customer_purchase_funding_enabled=funding_enabled,
         generation_customer_purchase_policy_path=policy_path,generation_customer_purchase_policy_hash=policy_hash,
         generation_customer_purchase_fee_authority_path=authority_path,
@@ -158,6 +159,7 @@ def test_factory_reopens_saved_journal_without_keys_when_funding_closed(guarded,
         assert len(reads)==expected_key_reads
         assert service.submitter.funding_store is funding and service.store.path==g.store.path
         assert service.submitter.policy.enabled is bool(expected_key_reads)
+        assert service.submitter.policy.cost_fee_tiers_enabled is False
         if now>g.authority.expires_at:
             settings.payment_purchase_db_path=str(tmp_path/'missing-payments.db')
             with pytest.raises(ValueError,match='RECOVERY_JOURNAL_REQUIRED'):
