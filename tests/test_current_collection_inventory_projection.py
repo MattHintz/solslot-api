@@ -52,3 +52,16 @@ async def test_public_sale_uses_collection_inventory_and_actual_readiness(state,
     assert sale['status'] == status and sale['availableDeeds'] == count
     assert sale['paymentRails'] == (['CHIA_XCH'] if status == 'OPEN' else [])
     assert not {'limitedTest', 'expiresAt'} & sale.keys()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_fee_journal_overrides_cached_readiness_without_network_calls():
+    service = CurrentNativePurchaseExecution.__new__(CurrentNativePurchaseExecution)
+    service.clock = lambda: 1234
+    service._readiness_lock = asyncio.Lock()
+    service._last_readiness = {'status': 'READY', 'checkedAt': 1233}
+    service._funding_context = lambda **_: None
+    service.submitter = SimpleNamespace(faucet=SimpleNamespace(available_fee_ids=lambda: set()))
+    inventory = SimpleNamespace(evidence=SimpleNamespace(registry=SimpleNamespace(state=SimpleNamespace(pause_mask=0))))
+    assert await service.collection_readiness(inventory) == {
+        'status': 'UNAVAILABLE', 'code': 'CURRENT_EXECUTION_FEE_CAPACITY', 'checkedAt': 1234}
