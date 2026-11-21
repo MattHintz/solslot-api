@@ -1,11 +1,12 @@
 """Install a finite additional Testnet checkout fee grant against reconciled journals."""
 from contextlib import closing
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 import sqlite3
 from typing import Literal
 
-from pydantic import Field, StrictInt
+from pydantic import Field, StrictInt, TypeAdapter
 
 from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy
 from .generation_customer_purchase_cutover_evidence import (
@@ -27,11 +28,16 @@ class PurchaseFeeSuccessor(PreparationModel):
     authority: CurrentPurchaseFeeAuthority
 
 
+class RenewedPurchaseFeeSuccessor(PurchaseFeeSuccessor):
+    schema_version: Literal['solslot.testnet-checkout-fee-successor.v2'] = Field(alias='schema')
+    previous_successor_hash: Hash = Field(alias='previousSuccessorHash')
+
+
 def read_fee_successor(settings, policy, cutover, original, renewal):
     raw = _bounded_file(settings.generation_customer_purchase_fee_successor_path, 16384)
     if '0x' + sha256(raw).hexdigest() != settings.generation_customer_purchase_fee_successor_hash:
         raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_CHANGED')
-    grant = PurchaseFeeSuccessor.model_validate_json(raw)
+    grant = TypeAdapter(PurchaseFeeSuccessor | RenewedPurchaseFeeSuccessor).validate_json(raw)
     authority = grant.authority.require_policy(policy)
     if (not isinstance(policy, TestnetCollectionIssuerPolicy) or cutover is None
             or grant.renewal_hash != settings.generation_customer_purchase_fee_renewal_hash
@@ -85,7 +91,7 @@ def claim_fee_successor_intent(store, digest, intent, phase, issued_at):
         db.commit()
 
 
-async def reconcile_fee_successor(purchase, funding, *, submitter, node, cutover, original, renewal, next_ids):
+async def reconcile_fee_successor(purchase, funding, *, submitter, node, cutover, original, renewal, next_ids, previous=None):
     """Collect a stable snapshot and verify confirmed fees against the primary Chia node."""
     for db in (purchase, funding):
         _binding(db, cutover.generation_id)
@@ -103,13 +109,19 @@ async def reconcile_fee_successor(purchase, funding, *, submitter, node, cutover
 
     _, peak, _ = await _primary_peak(submitter, node)
     exposure = cutover.inherited_fee_mojos
-    for coin in (*original.fee_coin_ids, *next_ids):
+    previous_ids = () if previous is None else previous.authority.fee_coin_ids
+    if set(next_ids).intersection(previous_ids):
+        raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_INPUT_USED')
+    previous_stages = []
+    for coin in (*original.fee_coin_ids, *previous_ids, *next_ids):
         rows = funding.execute('SELECT original_id FROM funded_protocol_input_history WHERE network=? AND coin_id=?',
                                ('testnet11', coin)).fetchall()
         if coin in next_ids:
             if rows:
                 raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_INPUT_USED')
             continue
+        if coin in previous_ids and len(rows) != 1:
+            raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_PREVIOUS_INPUT_UNSETTLED')
         if not rows and coin in renewal.fee_coin_ids:
             raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_PRIOR_GRANT_OPEN')
         for (identity,) in rows:
@@ -118,16 +130,66 @@ async def reconcile_fee_successor(purchase, funding, *, submitter, node, cutover
                 raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_ORPHAN_FUNDING')
             exact = await _confirmed_execution(funding, submitter, row, _stored_bundle(row), peak)
             exposure += exact.maximum_mojos
+            if coin in previous_ids:
+                previous_stages.append((row['intent_id'], row['phase']))
+    if previous_ids:
+        intents = {intent for intent, _ in previous_stages}
+        phases = {phase for _, phase in previous_stages}
+        if len(intents) != 1 or phases not in ({'RESERVATION', 'RELEASE'}, {'RESERVATION', 'DELIVERY'}):
+            raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_PREVIOUS_ORDER_CHANGED')
+        _require_previous_order(purchase, previous, intents.pop())
     return {'purchaseJournalSnapshot': snapshots[0], 'fundingJournalSnapshot': snapshots[1],
             'priorFeeExposureMojos': exposure}
 
 
+@dataclass(frozen=True)
+class PreviousFeeGrant:
+    digest: str
+    authority: CurrentPurchaseFeeAuthority
+
+    @classmethod
+    def from_bytes(cls, raw, *, digest, renewal_hash, cutover_hash):
+        if not raw or '0x' + sha256(raw).hexdigest() != digest:
+            raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_PREVIOUS_BYTES_CHANGED')
+        grant = PurchaseFeeSuccessor.model_validate_json(raw)
+        if grant.renewal_hash != renewal_hash or grant.cutover_hash != cutover_hash:
+            raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_PREVIOUS_SCOPE_CHANGED')
+        return cls(digest, grant.authority)
+
+
+def _require_previous_order(db, previous, intent):
+    digest = previous.digest
+    row = db.execute('SELECT intent_id FROM current_purchase_fee_successor WHERE id=1 AND grant_hash=?',
+                     (digest,)).fetchone()
+    if row is None and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='current_purchase_fee_grant_history'").fetchone():
+        row = db.execute('SELECT intent_id FROM current_purchase_fee_grant_history WHERE grant_hash=?',
+                         (digest,)).fetchone()
+    if row is None or row[0] != intent:
+        raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_PREVIOUS_ORDER_CHANGED')
+
+
+def replace_consumed_grant(db, bound, digest):
+    row = db.execute('SELECT intent_id FROM current_purchase_fee_successor WHERE id=1 AND grant_hash=?', (bound,)).fetchone()
+    if row is None:
+        raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_ALREADY_BOUND')
+    db.execute('CREATE TABLE IF NOT EXISTS current_purchase_fee_grant_history (grant_hash TEXT PRIMARY KEY, intent_id TEXT, next_hash TEXT NOT NULL UNIQUE)')
+    db.execute('INSERT INTO current_purchase_fee_grant_history VALUES (?,?,?)', (bound, row[0], digest))
+    db.execute('UPDATE current_purchase_fee_successor SET grant_hash=?,intent_id=NULL WHERE id=1 AND grant_hash=?', (digest,bound))
+
+
 async def install_fee_successor(settings, purchase_path, funding_path, *, policy, cutover, original, renewal,
-                                submitter, node, now):
+                                submitter, node, now, previous_bytes=None):
     """Offline installation. A partial installation can retry with the same pinned grant."""
     grant = read_fee_successor(settings, policy, cutover, original, renewal)
     grant.authority.require_live(policy, now)
     digest = settings.generation_customer_purchase_fee_successor_hash
+    previous = None
+    if isinstance(grant, RenewedPurchaseFeeSuccessor):
+        previous = PreviousFeeGrant.from_bytes(previous_bytes, digest=grant.previous_successor_hash,
+            renewal_hash=grant.renewal_hash, cutover_hash=grant.cutover_hash)
+        if previous.digest == digest or previous.authority.issued_at >= grant.authority.issued_at:
+            raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_PREVIOUS_SCOPE_CHANGED')
+    allowed = (None, digest) if previous is None else (previous.digest, digest)
     paths = [Path(purchase_path), Path(funding_path)]
     if any(path.is_symlink() or not path.is_file() for path in paths):
         raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_JOURNALS_REQUIRED')
@@ -135,12 +197,12 @@ async def install_fee_successor(settings, purchase_path, funding_path, *, policy
         for db in (purchase, funding):
             _binding(db, cutover.generation_id)
         bindings = [_stored_grant(db) for db in (purchase, funding)]
-        if any(binding not in (None, digest) for binding in bindings):
+        if any(binding not in allowed for binding in bindings):
             raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_ALREADY_BOUND')
         if bindings == [digest, digest]:
             return grant
         evidence = await reconcile_fee_successor(purchase, funding, submitter=submitter, node=node, cutover=cutover,
-                                                 original=original, renewal=renewal, next_ids=grant.authority.fee_coin_ids)
+                                                 original=original, renewal=renewal, next_ids=grant.authority.fee_coin_ids, previous=previous)
         if evidence != {key: grant.model_dump(by_alias=True)[key] for key in evidence}:
             raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_EVIDENCE_CHANGED')
 
@@ -156,7 +218,11 @@ async def install_fee_successor(settings, purchase_path, funding_path, *, policy
                 raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_EVIDENCE_CHANGED')
             for db in (purchase, funding):
                 bound = _stored_grant(db)
-                if bound is None:
+                if bound not in allowed:
+                    raise ValueError('CURRENT_PURCHASE_FEE_SUCCESSOR_ALREADY_BOUND')
+                if previous is not None and bound == previous.digest:
+                    replace_consumed_grant(db, bound, digest)
+                elif bound is None:
                     db.execute('CREATE TABLE current_purchase_fee_successor (id INTEGER PRIMARY KEY CHECK(id=1), grant_hash TEXT NOT NULL, intent_id TEXT)')
                     db.execute('INSERT INTO current_purchase_fee_successor (id,grant_hash) VALUES (1,?)', (digest,))
                 elif bound != digest:

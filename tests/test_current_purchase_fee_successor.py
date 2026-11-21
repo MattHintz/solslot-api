@@ -134,3 +134,54 @@ async def test_both_fee_inputs_are_reserved_for_one_new_order(staged, monkeypatc
         successor.claim_fee_successor_intent(rt.store, digest, rt.saved_intent, phase, 300)
     with pytest.raises(ValueError, match='ORDER_CHANGED'):
         successor.claim_fee_successor_intent(rt.store, digest, '0x'+'99'*32, 'RESERVATION', 300)
+
+
+@pytest.mark.asyncio
+async def test_renew_consumed_grant_archives_old_binding_and_retries_exact_install(staged, monkeypatch):
+    rt, data = staged.rt, staged.data
+    evidence = {key: data[key] for key in ('purchaseJournalSnapshot','fundingJournalSnapshot','priorFeeExposureMojos')}
+    verify = AsyncMock(return_value=evidence)
+    monkeypatch.setattr(successor, 'reconcile_fee_successor', verify)
+    async def install(raw=None):
+        return await successor.install_fee_successor(rt.settings, rt.store.path, rt.funding.path, **staged.scope,
+                                                    submitter=None, node=None, now=315, previous_bytes=raw)
+    await install()
+    prev_hash = rt.settings.generation_customer_purchase_fee_successor_hash
+    from pathlib import Path
+    prev_raw = Path(rt.settings.generation_customer_purchase_fee_successor_path).read_bytes()
+    with rt.store._connect() as db:
+        db.execute('INSERT INTO current_customer_reservation_requests VALUES (?,?)', (rt.saved_intent, 301))
+        db.commit()
+    successor.claim_fee_successor_intent(rt.store,prev_hash,rt.saved_intent,'RESERVATION',300)
+    with closing(_open_read_only(rt.store.path)) as purchase, closing(_open_read_only(rt.funding.path)) as funding:
+        evidence['purchaseJournalSnapshot'],evidence['fundingJournalSnapshot']=checkout_journal_snapshots(purchase,funding)
+    data.update(evidence,schema='solslot.testnet-checkout-fee-successor.v2',previousSuccessorHash=prev_hash)
+    data['authority'].update(issuedAt=310,feeCoinIds=['0x'+'90'*32,'0x'+'91'*32])
+    staged.write()
+    next_hash=rt.settings.generation_customer_purchase_fee_successor_hash
+    with pytest.raises(ValueError,match='PREVIOUS_BYTES_CHANGED'):
+        await install(b'{}')
+    with pytest.raises(ValueError,match='BINDING_MISSING'):
+        rt.start(315)
+    await install(prev_raw)
+    assert verify.await_args.kwargs['previous'].digest==prev_hash
+    with rt.store._connect() as db:
+        assert tuple(db.execute('SELECT grant_hash,intent_id,next_hash FROM current_purchase_fee_grant_history').fetchone())==(prev_hash,rt.saved_intent,next_hash)
+        assert tuple(db.execute('SELECT grant_hash,intent_id FROM current_purchase_fee_successor').fetchone())==(next_hash,None)
+    assert rt.start(315).submitter.faucet.available_fee_ids()==set(data['authority']['feeCoinIds'])
+    await install(prev_raw)
+    assert verify.await_count==2
+    with pytest.raises(ValueError,match='ORDER_CHANGED'):
+        successor.claim_fee_successor_intent(rt.store,next_hash,rt.saved_intent,'RESERVATION',310)
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_rejects_reusing_predecessor_coins(staged,monkeypatch):
+    rt,data=staged.rt,staged.data
+    previous=successor.PreviousFeeGrant(rt.settings.generation_customer_purchase_fee_successor_hash,
+                                       CurrentPurchaseFeeAuthority.model_validate(data['authority']))
+    monkeypatch.setattr(successor,'_primary_peak',AsyncMock(return_value=(None,12345,315)))
+    with closing(_open_read_only(rt.store.path)) as purchase, closing(_open_read_only(rt.funding.path)) as funding:
+        with pytest.raises(ValueError,match='INPUT_USED'):
+            await successor.reconcile_fee_successor(purchase,funding,submitter=None,node=None,cutover=rt.cutover,
+                original=staged.scope['original'],renewal=staged.scope['renewal'],next_ids=previous.authority.fee_coin_ids,previous=previous)
