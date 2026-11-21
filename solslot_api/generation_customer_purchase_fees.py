@@ -89,7 +89,7 @@ def read_purchase_fee_renewal(path, expected_hash, policy, original):
 
 
 class CurrentPurchaseFeeFaucet:
-    def __init__(self,faucet,authority,policy,store,*,clock,funding_store=None,cutover=None):
+    def __init__(self,faucet,authority,policy,store,*,clock,funding_store=None,cutover=None,successor_digest=None):
         from .generation_customer_purchase_execution_store import CurrentPurchaseExecutionStore
         authority.require_policy(policy)
         if (not isinstance(store,CurrentPurchaseExecutionStore) or store.generation_id!=authority.generation_id
@@ -102,6 +102,7 @@ class CurrentPurchaseFeeFaucet:
                 raise ValueError('CURRENT_PURCHASE_FEE_CUTOVER_BUDGET_REQUIRED')
         self._faucet,self.authority,self.policy,self.store,self.clock=faucet,authority,policy,store,clock
         self.funding_store = funding_store
+        self.successor_digest = successor_digest
         self.network=faucet.network;self.address_hex=faucet.address_hex
         self.address_puzzle_hash=faucet.address_puzzle_hash
         self.key=SimpleNamespace(puzzle=faucet.key.puzzle)
@@ -152,7 +153,7 @@ class CurrentPurchaseFeeFaucet:
                 JOIN current_customer_purchase_reviews r ON r.intent_id=e.intent_id
                 WHERE r.generation_id=?''',(self.store.generation_id,)).fetchall()
         from .generation_customer_purchase_batch import reservation_from_json
-        matched=False
+        matched=None
         for row in rows:
             claim=reservation_from_json(row['canonical_claim'])
             if claim.issuer_policy_hash!=self.policy.commitment or int(self.clock())>=row['expires_at']:continue
@@ -162,8 +163,14 @@ class CurrentPurchaseFeeFaucet:
             # concurrently; delivery additionally commits its announcements.
             backing=ProtocolBundleSubmitter._backing_conditions(original,require_announcements=row['phase']=='DELIVERY')
             exact=Program.to([*prefix,*backing,Program.to([85,deadline])])
-            if bytes(conditions)==bytes(exact):matched=True;break
-        if not matched:raise ValueError('CURRENT_PURCHASE_FEE_SAVED_EXECUTION_REQUIRED')
+            if bytes(conditions)==bytes(exact):
+                matched=row
+                break
+        if matched is None:raise ValueError('CURRENT_PURCHASE_FEE_SAVED_EXECUTION_REQUIRED')
+        if self.successor_digest:
+            from .generation_customer_purchase_fee_successor import claim_fee_successor_intent
+            claim_fee_successor_intent(self.store, self.successor_digest, matched['intent_id'],
+                                       matched['phase'], self.authority.issued_at)
         return self._faucet.sign_delegated_spend(coin,conditions)
 
 
