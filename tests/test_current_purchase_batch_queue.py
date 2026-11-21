@@ -54,6 +54,17 @@ def scalar_queue(batch_queue):
     return SimpleNamespace(store=q.store,claim=claim,identity=identity,service=q.service)
 
 
+def test_only_a_new_durable_reservation_wakes_the_worker(batch_queue):
+    q = batch_queue
+    notifications = []
+    def notify():
+        notifications.append(q.store.reservation_request(q.identity, browser_hash=BROWSER))
+    q.service.purchase_worker = SimpleNamespace(notify_work=notify)
+    first = q.service.request_reservation(q.identity, browser_hash=BROWSER)
+    retry = q.service.request_reservation(q.identity, browser_hash=BROWSER)
+    assert len(notifications) == 1 and notifications[0] is not None
+    assert first == retry
+
 def test_scalar_request_receipt_and_review_survive_lost_response_and_restart(scalar_queue):
     q=scalar_queue
     assert q.service.review(q.identity,browser_hash=BROWSER)['reservationRequested']is False

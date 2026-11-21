@@ -198,6 +198,13 @@ class CurrentNativePurchaseExecution:
             try:
                 self._funding_context(until=now + 300)
                 faucet = self.submitter.faucet
+                if len(faucet.available_fee_ids()) < 2:
+                    # The retained journal can rule out a new purchase immediately.
+                    # The normal path still verifies both inputs on the primary node.
+                    result = {'status': 'UNAVAILABLE', 'code': 'CURRENT_EXECUTION_FEE_CAPACITY',
+                              'checkedAt': now}
+                    self._last_readiness = result
+                    return result
                 worker = self.purchase_worker
                 if worker is None or (worker.health() or {}).get('status') != 'HEALTHY':
                     raise ValueError('CURRENT_EXECUTION_WORKER_UNAVAILABLE')
@@ -215,7 +222,9 @@ class CurrentNativePurchaseExecution:
                             and record['confirmed_block_index'] > 0 and record['spent_block_index'] == 0
                             and self.fee_cap <= coin.amount <= faucet.authority.maximum_fee_parent_mojos):
                         usable.add(coin.name())
-                if issuer['canSign'] and len(usable) >= 2 and int(self.clock()) + 300 <= faucet.authority.expires_at:
+                if len(usable) < 2:
+                    code = 'CURRENT_EXECUTION_FEE_CAPACITY'
+                elif issuer['canSign'] and int(self.clock()) + 300 <= faucet.authority.expires_at:
                     status, code = 'READY', 'CURRENT_EXECUTION_READY'
             except Exception:
                 # A node, signer, fee, or worker outage does not change physical inventory.
@@ -345,6 +354,9 @@ class CurrentNativePurchaseExecution:
                 now>=quote_deadline(self.policy,selected[0].quote_expires_at)):
             raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_CLOSED')
         requested = self.store.request_reservation(identity, browser_hash=browser_hash, now=now)
+        worker = getattr(self, 'purchase_worker', None)
+        if prior is None and worker is not None:
+            worker.notify_work()
         return {'schema':'solslot.current-reservation-request.v1', 'intentId':identity,
             'generationId':self.store.generation_id, 'receivingVaultLauncherId':h(selected[0].vault_launcher_id),
             'reservationClaimHash':claim.digest(), 'quantity':len(selected), 'requestedAt':requested}

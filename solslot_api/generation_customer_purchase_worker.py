@@ -119,6 +119,7 @@ class CurrentPurchaseWorker:
             raise ValueError('CURRENT_PURCHASE_FINITE_WORKER_REQUIRED')
         self.service=service;self.store=service.store;self.issuer_sign=issuer_sign
         self.batch_size=batch_size;self.interval=interval;self.clock=clock;self.running=False
+        self._work_available = asyncio.Event()
         self._action_stage='CONTINUATION'
         with self.store._connect() as db:
             db.executescript('''CREATE TABLE IF NOT EXISTS current_purchase_worker_jobs (
@@ -129,6 +130,9 @@ class CurrentPurchaseWorker:
                 generation_id TEXT PRIMARY KEY, document TEXT NOT NULL);''')
             if 'expiry_document'not in {row[1]for row in db.execute('PRAGMA table_info(current_purchase_worker_jobs)')}:
                 db.execute('ALTER TABLE current_purchase_worker_jobs ADD COLUMN expiry_document TEXT')
+
+    def notify_work(self):
+        self._work_available.set()
 
     def health(self):
         with self.store._connect() as db:
@@ -374,10 +378,15 @@ class CurrentPurchaseWorker:
                     job=db.execute('SELECT attempts FROM current_purchase_worker_jobs WHERE intent_id=? AND lease_token=?',(identity,token)).fetchone()
                     if job:
                         delay=min(60,self.interval*2**min(job['attempts']-1,3))if error else self.interval
+                        prepared = error is None and state == 'WAITING' and self._action_stage == 'RESERVATION_PREPARATION'
+                        if prepared:
+                            delay = 0
                         db.execute('''UPDATE current_purchase_worker_jobs SET state=?,
                             error_code=CASE WHEN ? IS NULL AND ? IN ('CLOSED','REVIEW_REQUIRED') THEN error_code ELSE ? END,next_attempt=?,
                             lease_token=NULL,lease_until=0 WHERE intent_id=? AND lease_token=?''',
                             (state,error,state,error,int(self.clock())+delay,identity,token))
+                        if prepared:
+                            self.notify_work()
             with self.store._connect()as db:
                 review_required=db.execute("SELECT count(*) FROM current_purchase_worker_jobs WHERE state='REVIEW_REQUIRED'").fetchone()[0]
             value={'schema':'solslot.current-purchase-worker-health.v1','generationId':self.store.generation_id,
@@ -394,9 +403,23 @@ class CurrentPurchaseWorker:
         finally:self.running=False
 
     async def run(self,stop):
-        while not stop.is_set():
-            try:await self.tick()
-            except asyncio.CancelledError:raise
-            except Exception:pass  # Old health expires; never reset evidence.
-            try:await asyncio.wait_for(stop.wait(),timeout=self.interval)
-            except TimeoutError:pass
+        stopped = asyncio.create_task(stop.wait())
+        try:
+            while not stop.is_set():
+                self._work_available.clear()
+                try:
+                    await self.tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass  # Old health expires; never reset evidence.
+                pending = asyncio.create_task(self._work_available.wait())
+                try:
+                    await asyncio.wait((stopped, pending), timeout=self.interval,
+                                       return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
+        finally:
+            stopped.cancel()
+            await asyncio.gather(stopped, return_exceptions=True)
