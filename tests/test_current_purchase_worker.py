@@ -200,8 +200,30 @@ async def test_reservation_preparation_is_a_durable_cycle_before_dispatch(recove
  r.service._existing=existing;r.service.prepare_reservation=prepare;r.service.reconcile=reconcile;r.service.dispatch=dispatch
  w=CurrentPurchaseWorker(r.service,issuer_sign=no_issuer,clock=lambda:r.clock[0]);w.ACTION_TIMEOUT_SECONDS=.2
  assert (await w.tick())['errors']==0 and calls==['prepare']
- r.clock[0]+=11
+ # A separate, freshly leased dispatch cycle is immediately eligible.
  assert (await w.tick())['errors']==0 and calls==['prepare','dispatch']
+
+@pytest.mark.asyncio
+async def test_new_work_wakes_an_idle_worker_without_another_poll_or_overlapping_ticks(recover):
+    worker = CurrentPurchaseWorker(recover.service, issuer_sign=no_issuer, interval=60)
+    scanned, advanced, stop = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    cycles = []
+
+    async def tick():
+        cycles.append(len(cycles) + 1)
+        (scanned if len(cycles) == 1 else advanced).set()
+
+    worker.tick = tick
+    task = asyncio.create_task(worker.run(stop))
+    try:
+        await asyncio.wait_for(scanned.wait(), 1)
+        worker.notify_work()
+        worker.notify_work()
+        await asyncio.wait_for(advanced.wait(), 1)
+        assert cycles == [1, 2]
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, 1)
 
 @pytest.mark.asyncio
 async def test_stage_timeout_survives_later_proven_terminal_expiry(recover):
