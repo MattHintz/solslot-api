@@ -434,7 +434,7 @@ class CurrentNativePurchaseExecution:
             if row is None:
                 raise ValueError('CURRENT_EXECUTION_RETIRED_REVIEW_CHANGED')
             return row['fee_cap']
-        faucet = getattr(self.submitter, 'faucet', None)
+        faucet = getattr(getattr(self, 'submitter', None), 'faucet', None)
         if getattr(faucet, 'paired_grant', False):
             authority = faucet.authority
             if self.store.saved(identity, browser_hash=browser_hash)['createdAt'] >= authority.issued_at:
