@@ -4,6 +4,7 @@ One review binds every child. Evidence is reconstructed for every deed before
 wallet or private signing; completion remains one atomic native transaction.
 There is no new key, price authority, token, or deployed puzzle in this adapter.
 """
+import asyncio
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Literal
@@ -126,9 +127,16 @@ async def fresh_children(children,provider):
             raise ValueError('CURRENT_PURCHASE_BATCH_CONTEXT_CHANGED_DURING_READ')
     if not await current_evidence_unchanged(first.inventory.evidence,provider=provider):
         raise ValueError('CURRENT_PURCHASE_BATCH_AUTHORITY_CHANGED')
-    await unspent(provider,first.vault.coin)
-    for child in children:
-        await unspent(provider,child.transition.reserved_coin if hasattr(child,'artifact')else child.item.current.coin)
+    coins = [first.vault.coin]
+    coins.extend(child.transition.reserved_coin if hasattr(child, 'artifact') else child.item.current.coin
+                 for child in children)
+    # Keep primary-node pressure bounded even for the largest permitted cart.
+    for start in range(0, len(coins), 4):
+        results = await asyncio.gather(*(unspent(provider, coin) for coin in coins[start:start + 4]),
+                                       return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
 
 async def verify_current_batch_reservation(claim,**arguments):

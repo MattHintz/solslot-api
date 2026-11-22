@@ -96,6 +96,19 @@ class CurrentNativePurchaseExecution:
         except Exception:
             return {'scope':'unavailable','lastCompleted':None,'latestAttempt':None,'stages':{stage:None for stage in STAGES}}
 
+    def _new_quote_window(self):
+        # Start the five minutes after the vault and inventory reads. Check the
+        # current sponsor/issuer deadline before committing the price and nonce.
+        now = int(self.clock())
+        expires = now + 300
+        if isinstance(self.policy, TestnetCollectionIssuerPolicy):
+            self._funding_context(until=expires)
+        elif not self.policy.issued_at <= now < self.policy.expires_at:
+            raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_CLOSED')
+        elif expires > self.policy.expires_at:
+            raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_ENDING')
+        return now, expires
+
     async def quote(self, request_key, deed_launcher_id, *, browser_hash, receiving_launcher=None, receiving_owner=None):
         if isinstance(deed_launcher_id,(list,tuple)):
             if len(deed_launcher_id)==1:deed_launcher_id=deed_launcher_id[0]
@@ -109,23 +122,17 @@ class CurrentNativePurchaseExecution:
         prior = self.store.review_for_request(request_key, browser_hash=browser_hash)
         if prior is not None:
             return self._same_quote(prior['intentId'], deed, browser_hash,receiving_launcher=receiving_launcher)
-        now = int(self.clock())
-        expires = now + 300
         if isinstance(self.policy,TestnetIssuerPolicy):
-            if not self.policy.issued_at <= now < self.policy.expires_at:
-                raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_CLOSED')
-            if expires>self.policy.expires_at:
-                raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_ENDING')
             launcher=self.policy.buyer_vault
             if receiving_launcher is not None and receiving_launcher!=launcher:
                 raise ValueError('CURRENT_EXECUTION_RECEIVING_VAULT_CHANGED')
         elif isinstance(self.policy,TestnetCollectionIssuerPolicy) and isinstance(receiving_launcher,bytes32) and receiving_launcher!=bytes32.zeros:
             launcher=receiving_launcher
-            self._funding_context(until=expires)
         else:
             raise ValueError('CURRENT_EXECUTION_RECEIVING_VAULT_REQUIRED')
         if deed not in self.policy.deed_launchers:
             raise ValueError('CURRENT_EXECUTION_DEED_OUTSIDE_REVIEWED_POLICY')
+        self._new_quote_window()  # Reject a closing grant before any chain reads.
         inventory = await self.inventory_snapshot()
         bindings = customer_bindings_from_evidence(read_generation_preparation(self.settings),
             self.anchor, inventory.evidence)
@@ -136,6 +143,7 @@ class CurrentNativePurchaseExecution:
         # Reservation confirmation, wallet review and delivery are separate
         # native steps. Admit their full existing five-minute review window;
         # never send a customer into a nearly expired price or authorization.
+        now, expires = self._new_quote_window()
         price,price_evidence=configured_price(self.settings,self.policy,now=now,expires_at=expires)
         if expires>price.round.valid_until:
             raise ValueError('CURRENT_PURCHASE_FRESH_PRICE_WINDOW_REQUIRED')
@@ -516,7 +524,10 @@ class CurrentNativePurchaseExecution:
                 raise ValueError('CURRENT_EXECUTION_SAVED_DELIVERY_CHANGED')
             return self.review(identity, browser_hash=browser_hash)
         await verify_current_delivery(claim, **self._arguments())
-        self.store.save_delivery(identity, claim, browser_hash=browser_hash, now=int(self.clock()))
+        inserted = self.store.save_delivery(identity, claim, browser_hash=browser_hash, now=int(self.clock()))
+        worker = getattr(self, 'purchase_worker', None)
+        if inserted and worker is not None:
+            worker.payer_approved(identity)
         return self.review(identity, browser_hash=browser_hash)
 
     async def delivery_issuer_review(self, identity, claim, *, browser_hash):

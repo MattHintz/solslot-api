@@ -44,19 +44,16 @@ async def quote_batch(s,request_key,deeds,browser_hash,receiving_launcher=None,r
         if isinstance(s.policy,TestnetCollectionIssuerPolicy) and any(a.vault_launcher_id!=receiving_launcher for a in artifacts(claim)):
             raise ValueError('CURRENT_EXECUTION_RECEIVING_VAULT_CHANGED')
         return s.review(prior['intentId'],browser_hash=browser_hash)
-    now=int(s.clock());expires=now+300
     if isinstance(s.policy,TestnetIssuerPolicy):
-        if not s.policy.issued_at<=now<expires<=s.policy.expires_at:
-            raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_CLOSED')
         launcher=s.policy.buyer_vault
         if receiving_launcher is not None and receiving_launcher!=launcher:
             raise ValueError('CURRENT_EXECUTION_RECEIVING_VAULT_CHANGED')
     elif isinstance(s.policy,TestnetCollectionIssuerPolicy) and isinstance(receiving_launcher,bytes32) and receiving_launcher!=bytes32.zeros:
         launcher=receiving_launcher
-        s._funding_context(until=expires)
     else:raise ValueError('CURRENT_EXECUTION_RECEIVING_VAULT_REQUIRED')
     if any(d not in s.policy.deed_launchers for d in ordered):
         raise ValueError('CURRENT_EXECUTION_DEED_OUTSIDE_REVIEWED_POLICY')
+    s._new_quote_window()  # Reject a closing grant before any chain reads.
     if collection:
         inventory = await s.inventory_snapshot()
     else:
@@ -66,6 +63,7 @@ async def quote_batch(s,request_key,deeds,browser_hash,receiving_launcher=None,r
     vault=await resolve_native_identity_vault(bindings=bindings,launcher=launcher,provider=s.provider)
     if isinstance(s.policy, TestnetCollectionIssuerPolicy):
         s.policy.require_verified_vault(vault, launcher=launcher, auth_type='chia_bls', owner_key=receiving_owner)
+    now, expires = s._new_quote_window()
     price,evidence=configured_price(s.settings,s.policy,now=now,expires_at=expires)
     nonce=bytes32(secrets.token_bytes(32));children=[];purchases=[]
     for deed in ordered:

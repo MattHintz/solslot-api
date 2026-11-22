@@ -134,6 +134,14 @@ class CurrentPurchaseWorker:
     def notify_work(self):
         self._work_available.set()
 
+    def payer_approved(self, identity):
+        # Only the first committed offer makes the job due. Its existing lease
+        # still serializes delivery against reconciliation and expiry.
+        with self.store._connect() as db:
+            db.execute("UPDATE current_purchase_worker_jobs SET next_attempt=0 "
+                       "WHERE intent_id=? AND state IN ('WAITING','RETRY')", (identity,))
+        self.notify_work()
+
     def health(self):
         with self.store._connect() as db:
             row=db.execute('SELECT document FROM current_purchase_worker_health WHERE generation_id=?',
@@ -163,7 +171,7 @@ class CurrentPurchaseWorker:
                 LEFT JOIN current_purchase_worker_jobs j ON j.intent_id=r.intent_id
                 WHERE r.generation_id=?
                 AND (e.intent_id IS NOT NULL OR q.intent_id IS NOT NULL)
-                AND (f.stage IS NULL OR f.stage!='CONFIRMED')
+                AND (f.stage IS NULL OR f.stage!='CONFIRMED' OR j.state IN ('WAITING','RETRY'))
                 AND (j.intent_id IS NULL OR
                     (j.state NOT IN ('COMPLETE','RELEASED','REVIEW_REQUIRED') AND j.lease_until<=?
                      AND j.next_attempt<=? AND (j.state!='CLOSED' OR
@@ -317,7 +325,10 @@ class CurrentPurchaseWorker:
             self._action_stage='RELEASE_DISPATCH'
             await s.dispatch(identity,'RELEASE',browser_hash=binding)
             return 'WAITING'
-        if claim is None or current is not None and current['stage']=='MEMPOOL':return 'WAITING'
+        if claim is None:
+            self._action_stage = 'WAITING_FOR_BUYER'
+            return 'WAITING'
+        if current is not None and current['stage']=='MEMPOOL':return 'WAITING'
         s._funding_context()
         if current is None:
             self._action_stage='DELIVERY_PREPARATION'
@@ -337,6 +348,7 @@ class CurrentPurchaseWorker:
             if isinstance(saved['reservationClaim'],CurrentReservationBatch):
                 from .generation_customer_purchase_batch_execution import save_reviewed_delivery
                 await save_reviewed_delivery(s,identity,claim,signature,binding,checked,signed,companion,pair)
+                self._action_stage = 'DELIVERY_PREPARED'
                 # A separate durable cycle funds and dispatches this exact
                 # checkpoint. Do not repeat the slow private quorum review.
                 return 'WAITING'
@@ -381,14 +393,22 @@ class CurrentPurchaseWorker:
                     job=db.execute('SELECT attempts FROM current_purchase_worker_jobs WHERE intent_id=? AND lease_token=?',(identity,token)).fetchone()
                     if job:
                         delay=min(60,self.interval*2**min(job['attempts']-1,3))if error else self.interval
-                        prepared = error is None and state == 'WAITING' and self._action_stage == 'RESERVATION_PREPARATION'
-                        if prepared:
+                        ready = self._action_stage in ('RESERVATION_PREPARATION', 'DELIVERY_PREPARED')
+                        if self._action_stage == 'WAITING_FOR_BUYER':
+                            # The buyer may have approved while this cycle was reading Chia.
+                            # Serialize this read and the lease update with the approval wakeup.
+                            db.execute('BEGIN IMMEDIATE')
+                            ready = db.execute('SELECT 1 FROM current_customer_purchase_delivery WHERE intent_id=?',
+                                               (identity,)).fetchone() is not None
+                        continue_now = error is None and state == 'WAITING' and ready
+                        if continue_now:
                             delay = 0
                         db.execute('''UPDATE current_purchase_worker_jobs SET state=?,
                             error_code=CASE WHEN ? IS NULL AND ? IN ('CLOSED','REVIEW_REQUIRED') THEN error_code ELSE ? END,next_attempt=?,
                             lease_token=NULL,lease_until=0 WHERE intent_id=? AND lease_token=?''',
                             (state,error,state,error,int(self.clock())+delay,identity,token))
-                        if prepared:
+                        db.commit()
+                        if continue_now:
                             self.notify_work()
             with self.store._connect()as db:
                 review_required=db.execute("SELECT count(*) FROM current_purchase_worker_jobs WHERE state='REVIEW_REQUIRED'").fetchone()[0]
