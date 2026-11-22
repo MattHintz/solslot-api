@@ -288,11 +288,14 @@ class CurrentPurchaseWorker:
         self._action_stage='RESERVATION_RECONCILIATION'
         status=await s.reconcile(identity,'RESERVATION',browser_hash=binding)
         if status['stage']!='CONFIRMED':
+            if status['stage']=='MEMPOOL':
+                # A submitted reservation can confirm after the buyer's quote expires.
+                # Continue the existing bounded status checks without submitting again.
+                return 'WAITING'
             if int(self.clock())>=quote_deadline(s.policy, artifact.quote_expires_at):
                 return 'CLOSED' if await self._prove_unsubmitted_expiry(identity,binding,token) else 'REVIEW_REQUIRED'
-            if status['stage']!='MEMPOOL':
-                self._action_stage='RESERVATION_DISPATCH'
-                await s.dispatch(identity,'RESERVATION',browser_hash=binding)
+            self._action_stage='RESERVATION_DISPATCH'
+            await s.dispatch(identity,'RESERVATION',browser_hash=binding)
             return 'WAITING'
         claim=saved['deliveryClaim']
         current=s._existing(identity,'DELIVERY',binding)

@@ -251,6 +251,30 @@ async def exercise_batch(c,ctx,built,inventory,vault,pay_coin,payment_key,synthe
     assert adapter.request_reservation(service,identity,binding)==acknowledgement
     await service.prepare_reservation(identity,browser_hash=binding)
     progress('reservation prepared')
+    async def check_customer_receipt(phase, expected_stage):
+        from fastapi import Response
+        from solslot_api import generation_customer_purchase_routes as routes
+        monkeypatch.setattr(routes, 'context', lambda *_: (service, binding, None))
+        receipt = await routes.status(h(vault.launcher), identity, None, Response(), settings)
+        assert receipt[phase]['stage'] == expected_stage
+        assert receipt[phase]['feeCapMojos'] == receipt['feeCapMojosPerStage'] == '2'
+        assert store.execution_status(identity, phase.upper(), browser_hash=binding)['feeCapMojos'] == '10'
+
+    if paired:
+        async def observe_farmed_bundle(document):
+            heights = set()
+            for spend in SpendBundle.from_json_dict(document).coin_spends:
+                name = h(spend.coin.name())
+                record = await c.provider.get_coin_record_by_name_primary(name)
+                height = record['spent_block_index']
+                assert height > 0
+                actual = await c.provider.get_puzzle_and_solution_primary(name, height)
+                assert type(spend).from_json_dict(actual) == spend
+                heights.add(height)
+            assert len(heights) == 1
+            return {'status': 'CONFIRMED', 'confirmed_height': heights.pop()}
+        monkeypatch.setattr(service.provider, 'observe_exact_protocol_bundle', observe_farmed_bundle, raising=False)
+        await check_customer_receipt('reservation', 'PREPARED')
     reservation=store.execution_bundle(identity,'RESERVATION',browser_hash=binding)
     await service._revalidate_prepared(store.saved(identity,browser_hash=binding),'RESERVATION',reservation)
     assert len(reservation.coin_spends)==quantity
@@ -261,6 +285,8 @@ async def exercise_batch(c,ctx,built,inventory,vault,pay_coin,payment_key,synthe
     store.observe_execution(identity,'RESERVATION',browser_hash=binding,transaction_id=h(reservation_funded.bundle.name()),status='CONFIRMED',
         confirmed_height=record['confirmed_block_index'],now=now())
     assert service.review(identity,browser_hash=binding)['reservedCoinIds']==list(coins)
+    if paired:
+        await check_customer_receipt('reservation', 'CONFIRMED')
     request=CurrentBatchPaymentRequest(reservation=store.saved(identity,browser_hash=binding)['reservationClaim'],
         reservedCoinIds=coins,paymentCoinId=h(pay_coin.name()),paymentPublicKey=h(payment_key.get_g1()))
     prepared=await service.prepare_wallet(identity,request,browser_hash=binding);wallet=prepared.review()
@@ -357,6 +383,9 @@ async def exercise_batch(c,ctx,built,inventory,vault,pay_coin,payment_key,synthe
     final=store.execution_bundle(identity,'DELIVERY',browser_hash=binding)
     await service._revalidate_prepared(store.saved(identity,browser_hash=binding),'DELIVERY',final)
     delivery_funded = await submit('DELIVERY', final)
+    if paired:
+        store.save_execution_funding(identity, 'DELIVERY', delivery_funded, browser_hash=binding, now=now())
+        await check_customer_receipt('delivery', 'CONFIRMED')
     assert (await c.client.push_tx(delivery_funded.bundle))[0]!=MempoolInclusionStatus.SUCCESS
     if collection_test:
         faucet = service.submitter.faucet
