@@ -175,6 +175,32 @@ def test_status_get_only_observes_existing_phases(checkout):
     assert response.json()['release']['stage']=='CONFIRMED'
 
 
+@pytest.mark.parametrize(('recorded_cap', 'funded_fee', 'http_status'), [
+    ('900000000', None, 200),
+    ('900000000', 400000000, 200),
+    ('900000000', 400000001, 409),
+    ('899999999', None, 409),
+])
+def test_status_keeps_paired_fee_terms_and_rejects_inconsistent_funding(checkout, recorded_cap, funded_fee, http_status):
+    service = checkout.service
+    service.fee_cap = 900000000
+    service.submitter = SimpleNamespace(faucet=SimpleNamespace(
+        paired_grant=True, authority=SimpleNamespace(maximum_stage_fee_mojos=400000000)))
+    service.review = lambda *args, **kwargs: {'feeCapMojosPerStage': '400000000'}
+    service.review_fee_cap = lambda *_: 400000000
+    service._existing = lambda _, phase, __: {} if phase == 'RELEASE' else None
+    stage = {'stage': 'CONFIRMED' if funded_fee is not None else 'PREPARED', 'feeCapMojos': recorded_cap}
+    async def reconcile(*args, **kwargs):
+        return stage
+    service.reconcile = reconcile
+    service.store.execution_funding = lambda *args, **kwargs: None if funded_fee is None else {'feeMojos': str(funded_fee)}
+    response = checkout.client.get(url())
+    assert response.status_code == http_status
+    if http_status == 200:
+        assert response.json()['release']['feeCapMojos'] == response.json()['feeCapMojosPerStage']
+    assert stage['feeCapMojos'] == recorded_cap
+
+
 def test_status_exposes_expiry_only_after_reconciliation_and_bound_proof(checkout,monkeypatch):
     from solslot_api import generation_customer_purchase_worker as worker
     c=checkout

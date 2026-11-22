@@ -200,6 +200,24 @@ async def payer_coins(launcher:Identity,identity:Identity,body:PayerKeysBody,
     except Exception as exc:raise failure(exc) from exc
 
 
+def customer_stage_receipt(service, identity, phase, binding, stage):
+    """Report the buyer's sponsored limit while preserving the bound journal ceiling."""
+    faucet = getattr(getattr(service, 'submitter', None), 'faucet', None)
+    if not getattr(faucet, 'paired_grant', False):
+        return stage
+    quoted_cap = str(service.review_fee_cap(identity, binding))
+    if stage['feeCapMojos'] == quoted_cap:
+        return stage
+    if (stage['feeCapMojos'] != str(service.fee_cap)
+            or quoted_cap != str(faucet.authority.maximum_stage_fee_mojos)
+            or int(quoted_cap) >= service.fee_cap):
+        raise ValueError('CURRENT_EXECUTION_STAGE_FEE_CAP_CHANGED')
+    funded = service.store.execution_funding(identity, phase, browser_hash=binding)
+    if funded is not None and not 0 <= int(funded['feeMojos']) <= int(quoted_cap):
+        raise ValueError('CURRENT_EXECUTION_FUNDED_FEE_EXCEEDS_QUOTE')
+    return {**stage, 'feeCapMojos': quoted_cap}
+
+
 @router.get('/{launcher}/{identity}')
 async def status(launcher:Identity,identity:Identity,request:Request,response:Response,settings:Configured):
     response.headers['Cache-Control']='no-store'
@@ -209,7 +227,9 @@ async def status(launcher:Identity,identity:Identity,request:Request,response:Re
         for phase in ('RESERVATION','DELIVERY','RELEASE'):
             current=service._existing(identity,phase,binding)
             if current is not None:
-                result[phase.lower()]=await service.reconcile(identity,phase,browser_hash=binding)
+                stage = await service.reconcile(identity, phase, browser_hash=binding)
+                result[phase.lower()] = customer_stage_receipt(
+                    service, identity, phase, binding, stage)
         unchanged(request,settings,launcher,service,binding)
         # Only a durable, exact-bundle expiry proof may end an unpaid PREPARED
         # checkout. The original reservation and journals remain intact.
@@ -314,5 +334,6 @@ async def deliver(launcher:Identity,identity:Identity,body:DeliveryBody,
         signature=G2Element.from_bytes(bytes.fromhex(body.issuer_signature[2:]))
         await service.prepare_delivery(identity,claim,signature,browser_hash=binding)
         unchanged(request,settings,launcher,service,binding)
-        return await service.dispatch(identity,'DELIVERY',browser_hash=binding)
+        stage = await service.dispatch(identity, 'DELIVERY', browser_hash=binding)
+        return customer_stage_receipt(service, identity, 'DELIVERY', binding, stage)
     except Exception as exc:raise failure(exc) from exc

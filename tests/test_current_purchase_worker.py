@@ -10,6 +10,35 @@ from tests.test_native_purchases import _context,_b32
 
 async def no_issuer(_):raise AssertionError('No payer authorization permits an issuer call')
 
+
+@pytest.mark.asyncio
+async def test_expired_mempool_reservation_observes_then_releases_after_confirmation(recover, monkeypatch):
+    r = recover
+    monkeypatch.setattr('solslot_api.generation_customer_purchase_worker.purchase_artifact_v3_from_json',
+                        lambda _: SimpleNamespace(quote_expires_at=140))
+    r.clock[0] = 150
+    r.retain()
+    r.node.receipt = {'status': 'MEMPOOL', 'confirmed_height': None}
+    releases = []
+    async def prepare_release(identity, *, browser_hash):
+        assert (identity, browser_hash) == (r.identity, BROWSER)
+        releases.append('prepare')
+    async def dispatch_release(identity, phase, *, browser_hash):
+        assert (identity, phase, browser_hash) == (r.identity, 'RELEASE', BROWSER)
+        releases.append('dispatch')
+    monkeypatch.setattr(r.service, 'prepare_timeout', prepare_release)
+    monkeypatch.setattr(r.service, 'dispatch', dispatch_release)
+    monkeypatch.setattr(r.service, '_funding_context', lambda: {})
+    worker = CurrentPurchaseWorker(r.service, issuer_sign=no_issuer, clock=lambda: r.clock[0])
+    assert (await worker.tick())['errors'] == 0
+    with r.store._connect() as db:
+        assert db.execute('SELECT state FROM current_purchase_worker_jobs').fetchone()[0] == 'WAITING'
+    assert releases == []
+    r.clock[0] += worker.interval
+    r.node.receipt = {'status': 'CONFIRMED', 'confirmed_height': 123}
+    assert (await worker.tick())['errors'] == 0
+    assert releases == ['prepare', 'dispatch']
+
 @pytest.fixture(autouse=True)
 def fixture_artifact(monkeypatch):
  # Recovery fixtures deliberately contain an opaque claim. Native artifact,
