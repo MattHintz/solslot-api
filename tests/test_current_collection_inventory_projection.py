@@ -57,6 +57,7 @@ async def test_public_sale_uses_collection_inventory_and_actual_readiness(state,
 @pytest.mark.asyncio
 async def test_exhausted_fee_journal_overrides_cached_readiness_without_network_calls():
     service = CurrentNativePurchaseExecution.__new__(CurrentNativePurchaseExecution)
+    service.settings = SimpleNamespace(generation_customer_purchase_atomic_enabled=False)
     service.clock = lambda: 1234
     service._readiness_lock = asyncio.Lock()
     service._last_readiness = {'status': 'READY', 'checkedAt': 1233}
