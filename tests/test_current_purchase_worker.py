@@ -5,7 +5,7 @@ import pytest
 from solslot_api.generation_customer_purchase_worker import CurrentPurchaseWorker,expired_unsubmitted_reservation
 from solslot_api.generation_operations import bundle_id
 from tests.test_current_purchase_execution_recovery import recover
-from tests.test_current_purchase_store import BROWSER
+from tests.test_current_purchase_store import BROWSER, delivery
 from tests.test_native_purchases import _context,_b32
 
 async def no_issuer(_):raise AssertionError('No payer authorization permits an issuer call')
@@ -231,6 +231,29 @@ async def test_reservation_preparation_is_a_durable_cycle_before_dispatch(recove
  assert (await w.tick())['errors']==0 and calls==['prepare']
  # A separate, freshly leased dispatch cycle is immediately eligible.
  assert (await w.tick())['errors']==0 and calls==['prepare','dispatch']
+
+@pytest.mark.asyncio
+async def test_approval_during_reservation_observation_is_due_at_lease_release(recover, monkeypatch):
+    r = recover
+    r.clock[0] = 150
+    worker = CurrentPurchaseWorker(r.service, issuer_sign=no_issuer, interval=60, clock=lambda: r.clock[0])
+    claim = delivery(r.store.saved(r.identity, browser_hash=BROWSER)['reservationClaim'])
+
+    async def observe_reservation(identity, phase, *, browser_hash):
+        assert phase == 'RESERVATION'
+        assert r.store.save_delivery(identity, claim, browser_hash=browser_hash, now=r.clock[0])
+        worker.payer_approved(identity)
+        assert not worker._claim()  # The running cycle still owns the lease.
+        return {'stage': 'CONFIRMED'}
+
+    monkeypatch.setattr(r.service, 'reconcile', observe_reservation)
+    result = await worker.tick()
+    assert (result['examined'], result['errors']) == (1, 0)
+    with r.store._connect() as db:
+        job = db.execute('SELECT state, next_attempt, lease_token FROM current_purchase_worker_jobs').fetchone()
+        assert tuple(job) == ('WAITING', r.clock[0], None)
+    assert [row[0] for row in worker._claim()] == [r.identity]
+
 
 @pytest.mark.asyncio
 async def test_new_work_wakes_an_idle_worker_without_another_poll_or_overlapping_ticks(recover):

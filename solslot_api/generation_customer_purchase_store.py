@@ -140,6 +140,7 @@ class CurrentCustomerPurchaseStore(PaymentPurchaseStore):
                     db.execute('INSERT INTO current_customer_purchase_delivery VALUES (?,?,?,?)',
                         (identity, digest, document, now))
                 db.execute('COMMIT')
+                return old is None
             except BaseException:
                 db.execute('ROLLBACK')
                 raise

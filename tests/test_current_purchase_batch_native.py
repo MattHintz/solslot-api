@@ -306,6 +306,16 @@ async def exercise_batch(c,ctx,built,inventory,vault,pay_coin,payment_key,synthe
     claim=prepared.signed_delivery(payment.aggregated_signature)
     assert isinstance(claim,CurrentDeliveryBatch)
     with pytest.raises(ValueError):await service.accept_payer(identity,claim.model_copy(update={'reserved_coin_ids':tuple(reversed(coins))}),browser_hash=binding)
+    if paired:
+        async def worker_issuer(payload):
+            return await sign_current_issuer(CurrentIssuerRequest.model_validate(payload), settings=settings,
+                anchor=built.anchor, provider=c.provider, journal=issuer,
+                load_key=lambda:c.faucet.key.wallet_sk, clock=now)
+        worker_clock = [now()]
+        worker = CurrentPurchaseWorker(service, issuer_sign=worker_issuer, interval=60, clock=lambda:worker_clock[0])
+        service.purchase_worker = worker
+        assert (await worker.tick())['errors']==0
+        assert (await worker.tick())['examined']==0  # Idle until a saved approval wakes it.
     assert (await service.accept_payer(identity,claim,browser_hash=binding))['payerAuthorizationSaved']
     # Closing/reopening the existing journal recovers the one batch and offer.
     restored=CurrentPurchaseExecutionStore(store.path,c.prep.generation_id)
@@ -378,14 +388,33 @@ async def exercise_batch(c,ctx,built,inventory,vault,pay_coin,payment_key,synthe
         single.close()
     # The worker checkpoints this independently verified issuer review before
     # its next funding cycle; no second quorum or signature request is needed.
-    await adapter.save_reviewed_delivery(service,identity,claim,issuer_signature,binding,evidence,bundle,companions,pairs)
+    if paired:
+        # The durable approval wakes the waiting job, independent of the buyer's tab.
+        first = await worker.tick()
+        assert first['errors'] == 0 and first['examined'] == 1
+    else:
+        await adapter.save_reviewed_delivery(service,identity,claim,issuer_signature,binding,evidence,bundle,companions,pairs)
     progress('delivery prepared')
     final=store.execution_bundle(identity,'DELIVERY',browser_hash=binding)
     await service._revalidate_prepared(store.saved(identity,browser_hash=binding),'DELIVERY',final)
-    delivery_funded = await submit('DELIVERY', final)
     if paired:
-        store.save_execution_funding(identity, 'DELIVERY', delivery_funded, browser_hash=binding, now=now())
+        pushed = []
+        async def dispatch_to_simulator(order, phase, *, browser_hash):
+            assert (order, phase, browser_hash) == (identity, 'DELIVERY', binding)
+            funded = await submit(phase, store.execution_bundle(order, phase, browser_hash=binding))
+            store.save_execution_funding(order, phase, funded, browser_hash=binding, now=now())
+            pushed.append(funded)
+        monkeypatch.setattr(service, 'dispatch', dispatch_to_simulator)
+        # No clock advance or status request is required to dispatch the saved delivery.
+        second = await worker.tick()
+        assert second['examined'] == 1 and second['errors'] == 0
+        delivery_funded, = pushed
         await check_customer_receipt('delivery', 'CONFIRMED')
+        worker_clock[0] += worker.interval
+        assert (await worker.tick())['completed'] == 1
+        assert (await worker.tick())['examined'] == 0
+    else:
+        delivery_funded = await submit('DELIVERY', final)
     assert (await c.client.push_tx(delivery_funded.bundle))[0]!=MempoolInclusionStatus.SUCCESS
     if collection_test:
         faucet = service.submitter.faucet
