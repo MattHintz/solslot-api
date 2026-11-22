@@ -62,12 +62,12 @@ class CurrentNativePaymentPreparation:
             'baseAmountUsdMinor': str(artifact.base_amount_minor),
             'technologyFeeUsdMinor': str(artifact.technology_fee_minor),
             'totalAmountUsdMinor': str(artifact.subtotal_minor),
-            'changeMojos': str(int(p.coin_spend.coin.amount) - int(artifact.rail_amount)),
+            'changeMojos': str(int(p.coin_spend.coin.amount) - int(artifact.rail_amount) - p.offer.fees()),
             'changePuzzleHash': h(p.payment_puzzle.get_tree_hash()),
             'payerCoin': {'parentCoinInfo':h(p.coin_spend.coin.parent_coin_info),
                 'puzzleHash':h(p.coin_spend.coin.puzzle_hash),'amount':str(p.coin_spend.coin.amount)},
             'payerConfirmedHeight':self.payment_record.confirmed_height,'observedAt':self.observed_at,
-            'walletFeeMojos': '0', 'quoteExpiresAt': artifact.quote_expires_at,
+            'walletFeeMojos': str(p.offer.fees()), 'quoteExpiresAt': artifact.quote_expires_at,
             'buyerOffer': p.offer.to_bech32(),
             'coinSpends': [p.coin_spend.to_json_dict()]}
         return {**document, 'reviewHash': '0x'+sha256(canonical(document).encode()).hexdigest()}

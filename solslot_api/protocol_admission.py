@@ -10,6 +10,10 @@ from .faucet import AGG_SIG_ME_DATA
 from .protocol_submission import ProtocolSubmissionError
 
 
+def mempool_fee_floor(cost: int, used: int, capacity: int) -> int:
+    return 5 * cost + 1 if used + cost > capacity else 0
+
+
 def primary_admission_state(response):
     def integer(key, minimum=0):
         value = response.get(key)

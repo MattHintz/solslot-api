@@ -86,6 +86,17 @@ from .generation_customer_purchase_reservation import CurrentReservationClaim
 from .generation_customer_purchase_delivery import CurrentDeliveryClaim
 from .generation_customer_purchase_batch import CurrentReservationBatch,CurrentDeliveryBatch
 from .generation_customer_purchase_issuer import CurrentIssuerRequest
+from .generation_customer_purchase_atomic_signing import AtomicBuyerApproval
+
+class AtomicSignRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    claim: AtomicBuyerApproval
+    claimHash: str = Field(pattern=r'^0x[0-9a-f]{64}$')
+
+
+class AtomicIssuerRequest(AtomicSignRequest):
+    quorumSignature: str = Field(pattern=r'^0x[0-9a-f]{192}$')
+
 
 class CurrentReservationSignRequest(BaseModel):
     model_config=ConfigDict(extra='forbid')
@@ -315,6 +326,12 @@ def create_validator_app(
             if current_settings().generation_customer_purchase_issuer_enabled:
                 permitted.add(('POST','/v1/generation/purchase/issuer/sign'))
                 permitted.add(('GET','/v1/generation/purchase/issuer/status'))
+            if getattr(current_settings(),'generation_customer_purchase_atomic_enabled',False):
+                permitted.add(('GET','/v1/generation/purchase/atomic/status'))
+                if current_settings().generation_customer_purchase_enabled:
+                    permitted.add(('POST','/v1/generation/purchase/atomic/sign'))
+                if current_settings().generation_customer_purchase_issuer_enabled:
+                    permitted.add(('POST','/v1/generation/purchase/atomic/issuer-sign'))
             if (request.method, request.url.path) not in permitted:
                 return JSONResponse({'detail': 'CURRENT_SIGNER_ACTION_DISABLED'}, status_code=404)
         return await call_next(request)
@@ -341,6 +358,71 @@ def create_validator_app(
                     expected_issuer_policy_hash=policy.commitment)
         except Exception as exc:
             raise HTTPException(409,detail='CURRENT_PURCHASE_INDEPENDENT_EVIDENCE_REJECTED')from exc
+
+    @application.get('/v1/generation/purchase/atomic/status')
+    async def atomic_status():
+        import time
+        from .generation_customer_purchase_policy import selected_purchase_policy
+        configured = current_settings()
+        if not configured.generation_customer_purchase_atomic_enabled or configured.network != 'testnet11':
+            raise HTTPException(404, detail='CURRENT_PURCHASE_ACTION_DISABLED')
+        policy = selected_purchase_policy(configured)
+        index = configured.signer_index
+        if index == 2:
+            ready = configured.generation_customer_purchase_issuer_enabled and getattr(application.state,'current_issuer',None) is not None
+        else:
+            ready = configured.generation_customer_purchase_enabled and getattr(application.state,'validator_ledger',None) is not None
+        return {'generationId': '0x' + policy.generation.hex(), 'policyHash': policy.commitment, 'signerIndex': index,
+                'ready': bool(ready and getattr(application.state,'generation_provider',None) is not None), 'checkedAt': int(time.time())}
+
+    @application.post('/v1/generation/purchase/atomic/sign', response_model=ValidatorSignatureResponse)
+    async def atomic_quorum_response(body: AtomicSignRequest):
+        import asyncio
+        from .generation_customer_purchase_atomic_signing import sign_atomic_purchase
+        from .generation_customer_purchase_policy import selected_purchase_policy
+        from .generation_sols_batch_validators import generation_settings
+        from .generation_index import load_generation_read_anchor
+        configured=current_settings()
+        if not configured.generation_customer_purchase_atomic_enabled or not configured.generation_customer_purchase_enabled:
+            raise HTTPException(404,detail='CURRENT_PURCHASE_ACTION_DISABLED')
+        provider=getattr(application.state,'generation_provider',None)
+        if provider is None:
+            raise HTTPException(503,detail='CURRENT_PURCHASE_SIGNER_NOT_READY')
+        try:
+            policy=selected_purchase_policy(configured)
+            anchor=load_generation_read_anchor(generation_settings(configured))
+            async with asyncio.timeout(45):
+                return await sign_atomic_purchase(body.claim,body.claimHash,settings=configured,anchor=anchor,
+                    provider=provider,ledger=application.state.validator_ledger,issuer_policy=policy,
+                    expected_issuer_policy_hash=policy.commitment)
+        except Exception as exc:
+            raise HTTPException(409,detail='CURRENT_PURCHASE_INDEPENDENT_EVIDENCE_REJECTED') from exc
+
+    @application.post('/v1/generation/purchase/atomic/issuer-sign')
+    async def atomic_issuer_response(body: AtomicIssuerRequest):
+        import asyncio
+        from chia_rs import G2Element
+        from .generation_customer_purchase_atomic_signing import sign_atomic_issuer
+        from .generation_customer_purchase_issuer import load_fixed_issuer_key
+        from .generation_sols_batch_validators import generation_settings
+        from .generation_index import load_generation_read_anchor
+        configured=current_settings()
+        if not configured.generation_customer_purchase_atomic_enabled or not configured.generation_customer_purchase_issuer_enabled or configured.signer_index!=2:
+            raise HTTPException(404,detail='CURRENT_ISSUER_ACTION_DISABLED')
+        provider=getattr(application.state,'generation_provider',None)
+        journal=getattr(application.state,'current_issuer',None)
+        if provider is None or journal is None:
+            raise HTTPException(503,detail='CURRENT_PURCHASE_SIGNER_NOT_READY')
+        try:
+            anchor=load_generation_read_anchor(generation_settings(configured))
+            async with asyncio.timeout(45):
+                bundle=await sign_atomic_issuer(body.claim,body.claimHash,G2Element.from_bytes(bytes.fromhex(body.quorumSignature[2:])),
+                    settings=configured,anchor=anchor,provider=provider,journal=journal,
+                    journal_lock=application.state.validator_ledger._lock,load_key=lambda:load_fixed_issuer_key(configured))
+            return {'claimHash':body.claimHash,'spendBundleId':'0x'+bundle.name().hex(),
+                    'signature':'0x'+bytes(bundle.aggregated_signature).hex()}
+        except Exception as exc:
+            raise HTTPException(409,detail='CURRENT_ISSUER_INDEPENDENT_EVIDENCE_REJECTED') from exc
 
     @application.post('/v1/generation/purchase/reservation/sign',response_model=ValidatorSignatureResponse)
     async def sign_current_purchase_reservation(body:CurrentReservationSignRequest):

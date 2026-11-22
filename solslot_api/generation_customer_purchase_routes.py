@@ -33,6 +33,7 @@ Configured=Annotated[Settings,Depends(get_settings)]
 
 
 class QuoteBody(CurrentGeneration):
+    checkout_mode: Literal['BUYER_PAID'] | None = Field(default=None, alias='checkoutMode')
     request_key:str=Field(alias='requestKey',pattern=r'^[A-Za-z0-9_:-]{1,128}$')
     deed_launcher_id:Identity|None=Field(default=None,alias='deedLauncherId')
     deed_launcher_ids:list[Identity]|None=Field(default=None,alias='deedLauncherIds',min_length=1,max_length=25)
@@ -135,6 +136,10 @@ def failure(exc):
         'CURRENT_EXECUTION_REQUEST_KEY_DEED_CHANGED':'This saved checkout belongs to a different deed. Resume it or start a new checkout.',
         'CURRENT_EXECUTION_DISPATCH_WINDOW_CLOSED':'This payment window ended. Your saved work is preserved; check its status before starting another checkout.',
         'CURRENT_EXECUTION_RESERVATION_NOT_CONFIRMED':'Your deed reservation is waiting for confirmation. No payment approval is needed yet.',
+        'CURRENT_CHECKOUT_REFRESH_REQUIRED':'Refresh checkout to review the current payment options.',
+        'CURRENT_CHECKOUT_HOLD_EXPIRED':'Your hold expired. Check availability to get a new total.',
+        'CURRENT_PAYMENT_NETWORK_FEE_INCREASED':'The minimum network fee changed. Review the updated fee before paying.',
+        'CURRENT_PAYMENT_INSUFFICIENT_FUNDS':'Your selected coin has insufficient funds for the purchase and network fee.',
         'CURRENT_PRIMARY_DEED_NOT_AVAILABLE':'This deed is no longer available. Check its saved purchase status before choosing another.',
         'CURRENT_EXECUTION_OPERATIONAL_PAUSED':'Checkout is temporarily paused. Check the status of any saved purchase.',
     }.get(code,'Your saved checkout is preserved. Check its progress before trying again.')
@@ -162,13 +167,23 @@ async def quote(launcher:Identity,body:QuoteBody,request:Request,response:Respon
             if sorted(selected)!=sorted(retained):raise wallet_denied()
             unchanged(request,settings,launcher,service,binding)
             return result
+        buyer_paid = body.checkout_mode == 'BUYER_PAID'
+        enabled = getattr(settings, 'generation_customer_purchase_atomic_enabled', False)
+        prior = service.store.review_for_request(body.request_key, browser_hash=binding)
+        if buyer_paid and (not enabled or (prior is None and not settings.generation_customer_purchase_atomic_accepting)):
+            raise ValueError('CURRENT_CHECKOUT_BUYER_PAID_UNAVAILABLE')
+        if enabled and not buyer_paid and prior is None:
+            raise ValueError('CURRENT_CHECKOUT_REFRESH_REQUIRED')
         selected=body.deed_launcher_ids if body.deed_launcher_ids is not None else body.deed_launcher_id
         if isinstance(service.policy,TestnetCollectionIssuerPolicy):
             verified = owner(request, settings, launcher)
             result = await service.quote(body.request_key, selected, browser_hash=binding,
-                receiving_launcher=bytes32.from_hexstr(launcher), receiving_owner=verified.owner_key)
+                receiving_launcher=bytes32.from_hexstr(launcher), receiving_owner=verified.owner_key, **({'buyer_paid': True} if buyer_paid else {}))
         else:
-            result=await service.quote(body.request_key,selected,browser_hash=binding)
+            result=await service.quote(body.request_key,selected,browser_hash=binding, **({'buyer_paid': True} if buyer_paid else {}))
+        if buyer_paid:
+            from .generation_customer_native_cart_checkout import recover_cart_quote
+            result = await recover_cart_quote(service, result['intentId'], binding)
         unchanged(request,settings,launcher,service,binding)
         return result
     except Exception as exc:raise failure(exc) from exc
@@ -223,7 +238,11 @@ async def status(launcher:Identity,identity:Identity,request:Request,response:Re
     response.headers['Cache-Control']='no-store'
     try:
         service,binding,_=context(request,settings,launcher)
-        result=service.review(identity,browser_hash=binding)
+        from .generation_customer_native_cart_checkout import cart_review
+        result = cart_review(service, identity, binding) if hasattr(service.store, '_connect') else service.review(identity,browser_hash=binding)
+        if 'cart' in result:
+            unchanged(request,settings,launcher,service,binding)
+            return result
         for phase in ('RESERVATION','DELIVERY','RELEASE'):
             current=service._existing(identity,phase,binding)
             if current is not None:
@@ -254,6 +273,9 @@ async def reserve(launcher:Identity,identity:Identity,body:CurrentGeneration,
     mutation(request,settings,body);response.headers['Cache-Control']='no-store'
     try:
         service,binding=native_context(request,settings,launcher)
+        if (getattr(settings, 'generation_customer_purchase_atomic_enabled', False)
+                and service.store.reservation_request(identity, browser_hash=binding) is None):
+            raise ValueError('CURRENT_CHECKOUT_REFRESH_REQUIRED')
         service._funding_context()
         result=service.request_reservation(identity,browser_hash=binding)
         unchanged(request,settings,launcher,service,binding)
@@ -337,3 +359,58 @@ async def deliver(launcher:Identity,identity:Identity,body:DeliveryBody,
         stage = await service.dispatch(identity, 'DELIVERY', browser_hash=binding)
         return customer_stage_receipt(service, identity, 'DELIVERY', binding, stage)
     except Exception as exc:raise failure(exc) from exc
+
+
+class CartPaymentBody(PaymentBody):
+    network_fee_mojos: str = Field(alias='networkFeeMojos', pattern=r'^(0|[1-9][0-9]{0,19})$')
+
+
+def cart_context(request, settings, launcher):
+    if not getattr(settings, 'generation_customer_purchase_atomic_enabled', False):
+        raise HTTPException(503, detail={'code': 'CURRENT_CHECKOUT_BUYER_PAID_UNAVAILABLE'})
+    return native_context(request, settings, launcher)
+
+
+@router.post('/{launcher}/{identity}/cart/fees')
+async def cart_fees(launcher: Identity, identity: Identity, body: PaymentBody, request: Request,
+                    response: Response, settings: Configured):
+    from .generation_customer_native_cart_checkout import fee_options
+    mutation(request, settings, body)
+    response.headers['Cache-Control'] = 'no-store'
+    try:
+        service, binding = cart_context(request, settings, launcher)
+        result = await fee_options(service, identity, binding, body)
+        unchanged(request, settings, launcher, service, binding)
+        return result
+    except Exception as exc:
+        raise failure(exc) from exc
+
+
+@router.post('/{launcher}/{identity}/cart/payment-review')
+async def cart_wallet_review(launcher: Identity, identity: Identity, body: CartPaymentBody, request: Request,
+                             response: Response, settings: Configured):
+    from .generation_customer_native_cart_checkout import payment_review
+    mutation(request, settings, body)
+    response.headers['Cache-Control'] = 'no-store'
+    try:
+        service, binding = cart_context(request, settings, launcher)
+        result = await payment_review(service, identity, binding, body)
+        unchanged(request, settings, launcher, service, binding)
+        return result
+    except Exception as exc:
+        raise failure(exc) from exc
+
+
+@router.post('/{launcher}/{identity}/cart/approval')
+async def cart_approval(launcher: Identity, identity: Identity, body: PayerBody, request: Request,
+                        response: Response, settings: Configured):
+    from .generation_customer_native_cart_checkout import approve_payment
+    mutation(request, settings, body)
+    response.headers['Cache-Control'] = 'no-store'
+    try:
+        service, binding = cart_context(request, settings, launcher)
+        result = await approve_payment(service, identity, binding, body.buyer_offer)
+        unchanged(request, settings, launcher, service, binding)
+        return result
+    except Exception as exc:
+        raise failure(exc) from exc

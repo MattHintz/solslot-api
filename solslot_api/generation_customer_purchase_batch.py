@@ -230,9 +230,9 @@ class CurrentBatchPaymentPreparation:
             'reservedCoinIds':list(r.reserved_coin_ids),'paymentCoinId':r.payment_coin_id,'paymentPublicKey':r.payment_public_key,'paymentPublicKeyKind':r.payment_public_key_kind,
             'amountMojos':str(b.total_rail_amount),'baseAmountUsdMinor':str(b.total_base_amount_minor),
             'technologyFeeUsdMinor':str(b.total_technology_fee_minor),'totalAmountUsdMinor':str(b.total_subtotal_minor),
-            'changeMojos':str(int(p.coin_spend.coin.amount)-b.total_rail_amount),'changePuzzleHash':h(p.payment_puzzle.get_tree_hash()),
+            'changeMojos':str(int(p.coin_spend.coin.amount)-b.total_rail_amount-p.offer.fees()),'changePuzzleHash':h(p.payment_puzzle.get_tree_hash()),
             'payerCoin':{'parentCoinInfo':h(p.coin_spend.coin.parent_coin_info),'puzzleHash':h(p.coin_spend.coin.puzzle_hash),'amount':str(p.coin_spend.coin.amount)},
-            'payerConfirmedHeight':self.payment_record.confirmed_height,'observedAt':self.observed_at,'walletFeeMojos':'0',
+            'payerConfirmedHeight':self.payment_record.confirmed_height,'observedAt':self.observed_at,'walletFeeMojos':str(p.offer.fees()),
             'quoteExpiresAt':first.quote_expires_at,'buyerOffer':p.offer.to_bech32(),'coinSpends':[p.coin_spend.to_json_dict()]}
         return {**value,'reviewHash':'0x'+sha256(canonical(value).encode()).hexdigest()}
 

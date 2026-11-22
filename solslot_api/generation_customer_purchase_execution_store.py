@@ -12,6 +12,8 @@ from chia_rs import SpendBundle
 from .generation_customer_purchase_store import CurrentCustomerPurchaseStore
 from .generation_operations import canonical, bundle_id
 from .protocol_submission import PreparedProtocolBundle
+from .generation_customer_purchase_holds import migrate_native_holds, guard_legacy_reservation
+from .generation_customer_purchase_settlement_receipt import migrate_settlement_receipts
 
 
 class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
@@ -20,6 +22,8 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
     def __init__(self, path, generation_id):
         super().__init__(path, generation_id)
         with self._connect() as db:
+            migrate_native_holds(db)
+            migrate_settlement_receipts(db)
             db.execute('''CREATE TABLE IF NOT EXISTS current_purchase_execution_policies (
                 policy_hash TEXT PRIMARY KEY, maximum_purchases INTEGER NOT NULL,
                 fee_cap INTEGER NOT NULL)''')
@@ -151,6 +155,14 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
         used = db.execute('''SELECT coalesce(sum(length(protocol_bundle)+
             coalesce(length(CAST(funded_document AS BLOB)),0)+512),0)
             FROM current_purchase_executions''').fetchone()[0]
+        used += db.execute('SELECT coalesce(sum(length(signed_bundle)+length(outputs_json)+256),0) FROM current_native_settlements').fetchone()[0]
+        used += db.execute('SELECT coalesce(sum(coalesce(length(offer),0)+256),0) FROM current_native_carts').fetchone()[0]
+        used += db.execute('SELECT coalesce(sum(length(approval_json)+256),0) FROM current_native_cart_approvals').fetchone()[0]
+        used += db.execute('SELECT coalesce(sum(length(proof_json)+64),0) FROM current_native_expiries').fetchone()[0]
+        used += db.execute('SELECT coalesce(sum(length(wallet_selection)+64),0) FROM current_native_payment_reviews').fetchone()[0]
+        used += db.execute('SELECT coalesce(sum(length(output_ids)+64),0) FROM current_native_cart_outputs').fetchone()[0]
+        used += db.execute('SELECT count(*)*128 FROM current_native_quote_modes').fetchone()[0]
+        used += db.execute('SELECT count(*)*128 FROM current_native_cart_items').fetchone()[0]
         if used + additional > self.MAX_CURRENT_RETAINED_BYTES:
             raise ValueError('CURRENT_EXECUTION_RETENTION_FULL')
         self._admit(db, used + additional)
@@ -208,6 +220,13 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
         rows = self._active_reservation_rows(db, identity, exclude_delivered=False)
         claims=[(r,reservation_from_json(r['canonical_claim'])) for r in rows]
         used=sum(quantity(c) for r,c in claims if c.issuer_policy_hash==reservation.issuer_policy_hash and not self._expired_unsubmitted_for_capacity(db,r,c))
+        carts = db.execute('''SELECT r.canonical_claim FROM current_native_carts c
+            JOIN current_customer_purchase_reviews r ON r.intent_id=c.intent_id
+            WHERE c.intent_id!=? AND c.state IN ('HELD','APPROVED','CONFIRMED')''',(identity,))
+        for row in carts:
+            cart_claim = reservation_from_json(row[0])
+            if cart_claim.issuer_policy_hash == reservation.issuer_policy_hash:
+                used += quantity(cart_claim)
         if used+quantity(reservation)>maximum:raise ValueError('CURRENT_EXECUTION_POLICY_CAPACITY_EXHAUSTED')
 
     def reservation_request(self,identity,*,browser_hash):
@@ -242,6 +261,7 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
                     db.commit();return row[0]
                 if type(now)is not int or not 0<now<artifacts(claim)[0].quote_expires_at:
                     raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_CLOSED')
+                guard_legacy_reservation(db, identity, claim, now)
                 self._admit_reservation(db, identity, claim, check_inventory=True)
                 self._execution_capacity(db,128)
                 db.execute('INSERT INTO current_customer_reservation_requests VALUES(?,?)',(identity,now))
@@ -265,6 +285,7 @@ class CurrentPurchaseExecutionStore(CurrentCustomerPurchaseStore):
                 _, reservation = self._row(db, identity, browser_hash)
                 self._admit_reservation(db, identity, reservation, fee_cap=fee_cap)
                 if phase == 'RESERVATION':
+                    guard_legacy_reservation(db, identity, reservation, now)
                     expected_claim = reservation.digest()
                 elif phase == 'DELIVERY':
                     prior = db.execute('SELECT claim_hash FROM current_customer_purchase_delivery WHERE intent_id=?',

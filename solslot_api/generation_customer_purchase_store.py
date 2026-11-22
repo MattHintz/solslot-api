@@ -88,7 +88,7 @@ class CurrentCustomerPurchaseStore(PaymentPurchaseStore):
             raise ValueError('CURRENT_CHECKOUT_SAVED_REVIEW_CHANGED')
         return row, claim
 
-    def save_review(self, claim, *, browser_hash, request_key, now):
+    def save_review(self, claim, *, browser_hash, request_key, now, buyer_paid=False):
         if (not isinstance(claim, (CurrentReservationClaim,CurrentReservationBatch))
                 or claim.generation_id != self.generation_id
                 or re.fullmatch(r'[0-9a-f]{64}', browser_hash or '') is None
@@ -114,6 +114,8 @@ class CurrentCustomerPurchaseStore(PaymentPurchaseStore):
                     self._admit(db, len(document.encode()) + 512)
                     db.execute('INSERT INTO current_customer_purchase_reviews VALUES (?,?,?,?,?,?,?)',
                         (identity, self.generation_id, browser_hash, request_key, digest, document, now))
+                    if buyer_paid:
+                        db.execute('INSERT INTO current_native_quote_modes VALUES(?)', (identity,))
                 db.execute('COMMIT')
             except BaseException:
                 db.execute('ROLLBACK')

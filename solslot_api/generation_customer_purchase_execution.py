@@ -96,24 +96,25 @@ class CurrentNativePurchaseExecution:
         except Exception:
             return {'scope':'unavailable','lastCompleted':None,'latestAttempt':None,'stages':{stage:None for stage in STAGES}}
 
-    def _new_quote_window(self):
+    def _new_quote_window(self, *, buyer_paid=False):
         # Start the five minutes after the vault and inventory reads. Check the
         # current sponsor/issuer deadline before committing the price and nonce.
         now = int(self.clock())
         expires = now + 300
         if isinstance(self.policy, TestnetCollectionIssuerPolicy):
-            self._funding_context(until=expires)
+            if not buyer_paid:
+                self._funding_context(until=expires)
         elif not self.policy.issued_at <= now < self.policy.expires_at:
             raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_CLOSED')
         elif expires > self.policy.expires_at:
             raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_ENDING')
         return now, expires
 
-    async def quote(self, request_key, deed_launcher_id, *, browser_hash, receiving_launcher=None, receiving_owner=None):
+    async def quote(self, request_key, deed_launcher_id, *, browser_hash, receiving_launcher=None, receiving_owner=None, buyer_paid=False):
         if isinstance(deed_launcher_id,(list,tuple)):
             if len(deed_launcher_id)==1:deed_launcher_id=deed_launcher_id[0]
             else:return await batch_execution.quote_batch(self,request_key,deed_launcher_id,browser_hash,
-                receiving_launcher=receiving_launcher,receiving_owner=receiving_owner)
+                receiving_launcher=receiving_launcher,receiving_owner=receiving_owner,buyer_paid=buyer_paid)
         deed = bytes32.from_hexstr(deed_launcher_id)
         if isinstance(self.policy,TestnetCollectionIssuerPolicy) and (
                 not isinstance(receiving_launcher,bytes32) or receiving_launcher==bytes32.zeros
@@ -132,7 +133,7 @@ class CurrentNativePurchaseExecution:
             raise ValueError('CURRENT_EXECUTION_RECEIVING_VAULT_REQUIRED')
         if deed not in self.policy.deed_launchers:
             raise ValueError('CURRENT_EXECUTION_DEED_OUTSIDE_REVIEWED_POLICY')
-        self._new_quote_window()  # Reject a closing grant before any chain reads.
+        self._new_quote_window(buyer_paid=buyer_paid)  # Reject a closing grant before any chain reads.
         inventory = await self.inventory_snapshot()
         bindings = customer_bindings_from_evidence(read_generation_preparation(self.settings),
             self.anchor, inventory.evidence)
@@ -143,7 +144,7 @@ class CurrentNativePurchaseExecution:
         # Reservation confirmation, wallet review and delivery are separate
         # native steps. Admit their full existing five-minute review window;
         # never send a customer into a nearly expired price or authorization.
-        now, expires = self._new_quote_window()
+        now, expires = self._new_quote_window(buyer_paid=buyer_paid)
         price,price_evidence=configured_price(self.settings,self.policy,now=now,expires_at=expires)
         if expires>price.round.valid_until:
             raise ValueError('CURRENT_PURCHASE_FRESH_PRICE_WINDOW_REQUIRED')
@@ -156,11 +157,11 @@ class CurrentNativePurchaseExecution:
             availableCoinId=h(inventory.require_available(deed).current.coin.name()),
             currentVaultCoinId=h(vault.coin.name()), signerIndices=(0,1))
         quote_started = start()
-        await verify_current_reservation(claim, **self._arguments())
+        evidence = await verify_current_reservation(claim, **self._arguments())
         quote_finished = start()
         try:
             identity = self.store.save_review(claim, browser_hash=browser_hash,
-                request_key=request_key, now=int(self.clock()))
+                request_key=request_key, now=int(self.clock()), **({'buyer_paid':True} if buyer_paid else {}))
         except ValueError as exc:
             if str(exc) != 'CURRENT_CHECKOUT_RETRY_CHANGES_REVIEW':
                 raise
@@ -170,6 +171,9 @@ class CurrentNativePurchaseExecution:
             if prior is None:
                 raise
             return self._same_quote(prior['intentId'], deed, browser_hash,receiving_launcher=receiving_launcher)
+        if buyer_paid:
+            from .generation_customer_purchase_holds import hold_verified_cart
+            hold_verified_cart(self.store, identity, evidence, browser_hash=browser_hash, now=int(self.clock()))
         if quote_finished is not None:
             record(self, identity, 'quote_verification', quote_started, quote_finished)
         return self.review(identity, browser_hash=browser_hash)
@@ -199,6 +203,20 @@ class CurrentNativePurchaseExecution:
         if inventory.evidence.registry.state.pause_mask & 8:
             return {'status': 'PAUSED', 'code': 'CURRENT_EXECUTION_OPERATIONAL_PAUSED',
                     'checkedAt': int(self.clock())}
+        if getattr(self.settings, 'generation_customer_purchase_atomic_enabled', False):
+            if not getattr(self.settings, 'generation_customer_purchase_atomic_accepting', False):
+                return {'status': 'PAUSED', 'code': 'CURRENT_EXECUTION_OPERATIONAL_PAUSED',
+                        'checkoutMode': 'BUYER_PAID', 'checkedAt': int(self.clock())}
+            worker = getattr(self, 'cart_worker', None)
+            ready = False
+            if worker is not None and worker.healthy():
+                try:
+                    ready = await worker.issuer.atomic_ready(self.policy, now=int(self.clock()))
+                except Exception:
+                    pass
+            return {'status': 'READY' if ready else 'UNAVAILABLE',
+                    'code': 'CURRENT_EXECUTION_READY' if ready else 'CURRENT_EXECUTION_WORKER_UNAVAILABLE',
+                    'checkoutMode': 'BUYER_PAID', 'checkedAt': int(self.clock())}
         async with self._readiness_lock:
             now = int(self.clock())
             cached = self._last_readiness
@@ -246,6 +264,18 @@ class CurrentNativePurchaseExecution:
                        smartDeedInnerHash=h(terms.smart_deed_inner_hash))
             if not collection:
                 row['withinTestPolicy'] = terms.deed_launcher_id in self.policy.deed_launchers
+        if getattr(self.settings, 'generation_customer_purchase_atomic_enabled', False):
+            from .generation_customer_purchase_holds import expire_unsigned
+            with self.store._connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                expire_unsigned(db, int(self.clock()))
+                held = {row[0] for row in db.execute('SELECT coin_id FROM current_native_cart_items WHERE active=1')}
+                db.commit()
+            for item in value['items']:
+                if item['currentInventoryCoinId'] in held:
+                    item['status'] = 'NOT_AVAILABLE'
+                    item['currentInventoryCoinId'] = None
+            value['availableDeeds'] = sum(item['status'] == 'AVAILABLE' for item in value['items'])
         if collection:
             if not isinstance(receiving_launcher, bytes32) or receiving_launcher == bytes32.zeros:
                 raise ValueError('CURRENT_EXECUTION_RECEIVING_VAULT_REQUIRED')
