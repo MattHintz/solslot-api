@@ -46,6 +46,7 @@ class ValidatorSettings(BaseSettings):
     generation_sols_batch_enabled:bool=False
     generation_customer_identity_enabled:bool=False
     generation_customer_identity_recovery_enabled:bool=False
+    generation_customer_purchase_atomic_enabled: bool = False
     generation_customer_purchase_enabled:bool=False
     generation_customer_purchase_issuer_enabled:bool=False
     generation_customer_purchase_issuer_key_path:str=''

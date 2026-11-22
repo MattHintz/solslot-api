@@ -20,7 +20,15 @@ async def collect_current_purchase_quorum(settings,evidence,*,client=None,retain
     from .generation_customer_purchase_batch import CurrentBatchEvidence,CurrentReservationBatch
     from .generation_customer_purchase_batch_signing import batch_messages
     multi=isinstance(evidence,CurrentBatchEvidence)
-    if multi:
+    from .generation_customer_purchase_atomic_signing import ApprovedSettlement, settlement_messages
+    if isinstance(evidence, ApprovedSettlement):
+        claim = evidence.claim
+        indices = claim.reservation.signer_indices
+        pairs = settlement_messages(evidence, tuple(roster))
+        messages = {index: [message for pair in rows for message in pair] for index, rows in pairs.items()}
+        multi = True
+        route = '/v1/generation/purchase/atomic/sign'
+    elif multi:
         claim=evidence.claim
         reserve=isinstance(claim,CurrentReservationBatch)
         indices=claim.signer_indices if reserve else claim.reservation.signer_indices

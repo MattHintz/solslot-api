@@ -729,6 +729,13 @@ async def lifespan(app: FastAPI):
     generation_delivery_stop=asyncio.Event()
     generation_delivery_task=(asyncio.create_task(app.state.generation_customer_purchase_worker.run(generation_delivery_stop),
         name='generation-current-purchase-delivery') if app.state.generation_customer_purchase_worker is not None else None)
+    cart_task = None
+    if settings.generation_customer_purchase_atomic_enabled:
+        from .generation_customer_purchase_cart_worker import NativeCartWorker
+        from .generation_customer_purchase_issuer_client import PrivateCurrentIssuerClient
+        cart_worker = NativeCartWorker(app.state.generation_customer_purchase, PrivateCurrentIssuerClient(settings))
+        app.state.generation_customer_purchase.cart_worker = cart_worker
+        cart_task = asyncio.create_task(cart_worker.run(generation_delivery_stop), name='native-buyer-paid-settlements')
     from .generation_recipient_execution import GenerationRecipientObserver
     recipient_observer = (GenerationRecipientObserver(app.state.generation_preparation,
         app.state.generation_operations, app.state.coinset) if app.state.generation_preparation is not None else None)
@@ -768,6 +775,11 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if cart_task is not None:
+            generation_delivery_stop.set()
+            cart_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await cart_task
         if generation_delivery_task is not None:
             generation_delivery_stop.set();generation_delivery_task.cancel()
             with suppress(asyncio.CancelledError):await generation_delivery_task

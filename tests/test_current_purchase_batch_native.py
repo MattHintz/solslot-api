@@ -235,17 +235,29 @@ async def exercise_batch(c,ctx,built,inventory,vault,pay_coin,payment_key,synthe
         return prepared
     monkeypatch.setattr(adapter,'collect_current_purchase_quorum',transport)
     ids=[h(i.original.terms.deed_launcher_id)for i in selected[:quantity]];binding='ab'*32
+    if getattr(c, 'buyer_paid_settlement', False):
+        receiver['buyer_paid'] = True
     review=await service.quote('one-customer-order',ids,browser_hash=binding,**receiver);identity=review['intentId']
     progress('quote')
-    assert review['quantity']==quantity and review['deedLauncherIds']==ids
+    if quantity == 1:
+        assert review['deedLauncherId'] == ids[0]
+    else:
+        assert review['quantity']==quantity and review['deedLauncherIds']==ids
     if paired:
         assert review['feeCapMojosPerStage'] == '2'
         assert review['maximumNetworkFeeMojos'] == '4'
     assert int(review['amountMojos'])==quantity*101_000_000_000
     assert int(review['baseAmountUsdMinor'])==quantity*300_000
     assert (await service.quote('one-customer-order',list(reversed(ids)),browser_hash=binding,**receiver))==review
-    with pytest.raises(ValueError):await service.quote('one-customer-order',ids[:1],browser_hash=binding,**receiver)
+    different_ids = ids[:1] if quantity > 1 else [h(selected[1].original.terms.deed_launcher_id)]
+    with pytest.raises(ValueError):await service.quote('one-customer-order',different_ids,browser_hash=binding,**receiver)
     assert store.reservation_request(identity,browser_hash=binding)is None
+    if getattr(c, 'buyer_paid_settlement', False):
+        from tests.test_buyer_paid_atomic_purchase import settle_in_simulator
+        await settle_in_simulator(c, service, store, identity, binding, pay_coin, synthetic, validators, arguments, monkeypatch)
+        for ledger in ledgers:
+            ledger.close()
+        return
     acknowledgement=adapter.request_reservation(service,identity,binding)
     assert acknowledgement['quantity']==quantity
     assert adapter.request_reservation(service,identity,binding)==acknowledgement

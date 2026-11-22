@@ -1512,6 +1512,8 @@ class Settings(BaseSettings):
     generation_customer_pricing_socket: str = '/run/solslot-price-demand/input.sock'
     generation_customer_pricing_socket_gid: int = Field(default=-1,ge=-1)
     # Separate finite Testnet purchase policy; no legacy write gate enables it.
+    generation_customer_purchase_atomic_enabled: bool = False
+    generation_customer_purchase_atomic_accepting: bool = False
     generation_customer_purchase_enabled: bool = False
     generation_customer_purchase_funding_enabled: bool = False
     generation_customer_purchase_worker_enabled: bool = False
@@ -1642,6 +1644,12 @@ class Settings(BaseSettings):
                 or self.generation_customer_pricing_socket!='/run/solslot-price-demand/input.sock'
                 or self.generation_customer_pricing_socket_gid<0):
             raise ValueError('Testnet price demand requires the current identity context and exact local socket')
+        if self.generation_customer_purchase_atomic_accepting and not self.generation_customer_purchase_atomic_enabled:
+            raise ValueError('New buyer-paid holds require the settlement worker')
+        if self.generation_customer_purchase_atomic_enabled and (self.network != 'testnet11'
+                or not self.generation_customer_purchase_enabled
+                or self.zkpassport_validator_urls != ['https://10.77.0.10:9544','https://10.77.0.11:9544','https://10.77.0.12:9544']):
+            raise ValueError('Buyer-paid checkout requires the current Testnet11 deployment and its three private signers')
         if self.generation_customer_purchase_funding_enabled and not self.generation_customer_purchase_enabled:
             raise ValueError('purchase fees require the separately enabled current checkout')
         if bool(self.generation_customer_purchase_cutover_path)!=bool(self.generation_customer_purchase_cutover_hash):

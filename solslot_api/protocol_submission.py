@@ -520,7 +520,7 @@ class ProtocolBundleSubmitter:
         fee = max((estimate * self.policy.estimate_buffer_bps + 9_999) // 10_000,
                   self.policy.minimum_mojos)
         if self.policy.native_admission_enabled:
-            from .protocol_admission import admission_conditions, primary_admission_state, require_absolute_admission, require_relative_admission
+            from .protocol_admission import admission_conditions, mempool_fee_floor, primary_admission_state, require_absolute_admission, require_relative_admission
             height, used, capacity, peak_time = primary_admission_state(response)
             conditions = admission_conditions(bundle, height, self.faucet.network)
             require_absolute_admission(conditions, height=height, peak_time=peak_time)
@@ -537,7 +537,7 @@ class ProtocolBundleSubmitter:
                         advice.source, advice.tier.name, cost, advice.tier.fee_mojos)
             # Historical confirmation estimates do not enforce Chia's busy
             # mempool floor. Price the whole bundle, including its sponsor.
-            floor = 5 * cost + 1 if used + cost > capacity else 0
+            floor = mempool_fee_floor(cost, used, capacity)
             fee = max(fee, floor)
             logger.info("protocol_admission bundle_id=%s cost=%d used=%d capacity=%d floor_mojos=%d",
                         "0x" + bundle.name().hex(), cost, used, capacity, floor)

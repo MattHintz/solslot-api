@@ -27,7 +27,7 @@ from .faucet import AGG_SIG_ME_DATA
 def h(v):return '0x'+bytes(v).hex()
 
 
-async def quote_batch(s,request_key,deeds,browser_hash,receiving_launcher=None,receiving_owner=None):
+async def quote_batch(s,request_key,deeds,browser_hash,receiving_launcher=None,receiving_owner=None,buyer_paid=False):
     if (not isinstance(deeds,(list,tuple))or not 2<=len(deeds)<=25
             or len(set(deeds))!=len(deeds)):
         raise ValueError('CURRENT_PURCHASE_BATCH_QUANTITY_INVALID')
@@ -53,7 +53,7 @@ async def quote_batch(s,request_key,deeds,browser_hash,receiving_launcher=None,r
     else:raise ValueError('CURRENT_EXECUTION_RECEIVING_VAULT_REQUIRED')
     if any(d not in s.policy.deed_launchers for d in ordered):
         raise ValueError('CURRENT_EXECUTION_DEED_OUTSIDE_REVIEWED_POLICY')
-    s._new_quote_window()  # Reject a closing grant before any chain reads.
+    s._new_quote_window(buyer_paid=buyer_paid)  # Reject a closing grant before any chain reads.
     if collection:
         inventory = await s.inventory_snapshot()
     else:
@@ -63,7 +63,7 @@ async def quote_batch(s,request_key,deeds,browser_hash,receiving_launcher=None,r
     vault=await resolve_native_identity_vault(bindings=bindings,launcher=launcher,provider=s.provider)
     if isinstance(s.policy, TestnetCollectionIssuerPolicy):
         s.policy.require_verified_vault(vault, launcher=launcher, auth_type='chia_bls', owner_key=receiving_owner)
-    now, expires = s._new_quote_window()
+    now, expires = s._new_quote_window(buyer_paid=buyer_paid)
     price,evidence=configured_price(s.settings,s.policy,now=now,expires_at=expires)
     nonce=bytes32(secrets.token_bytes(32));children=[];purchases=[]
     for deed in ordered:
@@ -78,13 +78,16 @@ async def quote_batch(s,request_key,deeds,browser_hash,receiving_launcher=None,r
     batch=build_purchase_batch_v1(batch_nonce=bytes32(secrets.token_bytes(32)),artifacts=purchases)
     claim=CurrentReservationBatch(purchaseBatch=purchase_batch_to_json(batch),children=tuple(children))
     quote_started=start()
-    await verify_current_batch_reservation(claim,**s._arguments())
+    verified = await verify_current_batch_reservation(claim,**s._arguments())
     quote_finished=start()
-    try:identity=s.store.save_review(claim,browser_hash=browser_hash,request_key=request_key,now=int(s.clock()))
+    try:identity=s.store.save_review(claim,browser_hash=browser_hash,request_key=request_key,now=int(s.clock()), **({'buyer_paid':True} if buyer_paid else {}))
     except ValueError as exc:
         if str(exc)!='CURRENT_CHECKOUT_RETRY_CHANGES_REVIEW':raise
         return await quote_batch(s,request_key,deeds,browser_hash,
-            receiving_launcher=receiving_launcher,receiving_owner=receiving_owner)
+            receiving_launcher=receiving_launcher,receiving_owner=receiving_owner,buyer_paid=buyer_paid)
+    if buyer_paid:
+        from .generation_customer_purchase_holds import hold_verified_cart
+        hold_verified_cart(s.store, identity, verified, browser_hash=browser_hash, now=int(s.clock()))
     if quote_finished is not None:record(s,identity,'quote_verification',quote_started,quote_finished)
     return s.review(identity,browser_hash=browser_hash)
 
