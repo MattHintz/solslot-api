@@ -196,7 +196,10 @@ def _standard_inner(puzzle: Program, solution: Program) -> tuple[Program, Progra
 def validate_standard_payment(decoded: DecodedOffer, *, asset_id: bytes32 | None) -> None:
     if len(decoded.real_spends) != 1:
         raise ValueError("payment requires exactly one wallet input")
-    spend = decoded.real_spends[0]
+    validate_standard_payment_spend(decoded.real_spends[0], asset_id=asset_id)
+
+
+def validate_standard_payment_spend(spend, *, asset_id: bytes32 | None) -> None:
     puzzle = Program.from_serialized(spend.puzzle_reveal)
     solution = Program.from_serialized(spend.solution)
     if asset_id is None:

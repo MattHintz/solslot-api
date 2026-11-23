@@ -7,7 +7,7 @@ from chia_rs.sized_bytes import bytes32
 from .buyer_network_fees import buyer_fee_choices
 from .generation_coin_evidence import read_confirmed_coin
 from .generation_customer_purchase_atomic import prepare_buyer_payment, purchase_inputs, unsigned_settlement_cost
-from .generation_customer_purchase_atomic_signing import AtomicBuyerApproval, verify_approval
+from .generation_customer_purchase_atomic_signing import AtomicBuyerApproval, cat_wallet_inputs, verify_approval
 from .generation_customer_purchase_batch import (CurrentBatchPaymentPreparation, CurrentBatchPaymentRequest,
     CurrentReservationBatch, artifacts, h, verify_current_batch_reservation)
 from .generation_customer_purchase_cart_worker import forwarding_spends
@@ -59,6 +59,9 @@ async def payment_inputs(service, identity, binding, body):
         raise ValueError('CURRENT_PAYMENT_CONFIRMED_UNSPENT_COIN_REQUIRED')
     wallet = dict(payment_coin=payer.coin, payment_public_key=bytes.fromhex(body.payment_public_key[2:]),
                   payment_public_key_kind=body.payment_public_key_kind)
+    asset = artifacts(claim)[0].rail_asset_id
+    wallet.update(await cat_wallet_inputs(service.provider, payer.coin, wallet['payment_public_key'],
+        body.payment_public_key_kind, asset, getattr(body,'fee_coin_id',None),getattr(body,'fee_public_key',None)))
     return claim, evidence, payer, wallet
 
 
@@ -83,19 +86,27 @@ async def fee_options(service, identity, binding, body):
     surplus = int(payer.coin.amount) - sum(int(a.rail_amount) for a in artifacts(claim))
     if surplus < 0:
         raise ValueError('CURRENT_PAYMENT_INSUFFICIENT_FUNDS')
+    if wallet.get('cat_lineage_proof') is not None:
+        fee_coin = wallet.get('fee_input')
+        if fee_coin is None:
+            raise ValueError('CURRENT_PAYMENT_NATIVE_FEE_INPUT_REQUIRED')
+        surplus = int(fee_coin.coin.amount)
     height = await primary_height(service.provider)
     # Keep both the fee condition and the change output in the priced template whenever possible.
-    exemplar = max(0, surplus - 1)
+    exemplar = max(1 if wallet.get('fee_input') else 0, surplus - 1)
     cost = cost_for(service, evidence, wallet, exemplar, height)
     options = await buyer_fee_choices(service.provider, cost=cost)
     return {'intentId': identity, 'paymentCoinId': body.payment_coin_id, 'expiresAt': artifacts(claim)[0].quote_expires_at,
             'minimumMojos': str(options.minimum_mojos), 'standardMojos': str(options.standard_mojos),
-            'priorityMojos': str(options.priority_mojos), 'availableForFeeMojos': str(surplus)}
+            'priorityMojos': str(options.priority_mojos), 'availableForFeeMojos': str(surplus),
+            **({'feeCoinId':body.fee_coin_id} if wallet.get('fee_input') else {})}
 
 
 async def payment_review(service, identity, binding, body):
     claim, evidence, payer, wallet = await payment_inputs(service, identity, binding, body)
     fee = int(body.network_fee_mojos)
+    if not fee:
+        wallet.pop('fee_input', None)
     if fee >= 2**64:
         raise ValueError('CURRENT_PAYMENT_NETWORK_FEE_INVALID')
     height = await primary_height(service.provider)
@@ -115,8 +126,21 @@ async def payment_review(service, identity, binding, body):
     else:
         request = CurrentNativePaymentRequest(**inputs, reservedCoinId=targets[0])
         result = CurrentNativePaymentPreparation(request, SimpleNamespace(artifact=artifacts(claim)[0]), prepared, payer, now).review()
-    spend_hash = sha256(bytes(prepared.coin_spend)).hexdigest()
-    selection = canonical({**{k:v for k,v in inputs.items() if k != 'reservation'}, 'networkFeeMojos': fee})
+    if wallet.get('cat_lineage_proof') is not None:
+        result.pop('reviewHash')
+        amount = int(result.pop('amountMojos'))
+        result.pop('changeMojos')
+        result.update(rail='CHIA_CAT',assetId=h(artifacts(claim)[0].rail_asset_id),
+                      amountAtomicUnits=str(amount),changeAtomicUnits=str(payer.coin.amount-amount),
+                      coinSpends=[spend.to_json_dict() for spend in prepared.offer.coin_spends()])
+        if wallet.get('fee_input'):
+            coin = wallet['fee_input'].coin
+            result.update(feeCoinId=h(coin.name()),feePublicKey=body.fee_public_key,
+                          feeInputMojos=str(coin.amount),feeChangeMojos=str(coin.amount-fee))
+        result['reviewHash'] = '0x'+sha256(canonical(result).encode()).hexdigest()
+    spend_hash = review_spend_hash(prepared.offer.coin_spends())
+    selected_fee = {'feeCoinId':body.fee_coin_id,'feePublicKey':body.fee_public_key} if wallet.get('fee_input') else {}
+    selection = canonical({**{k:v for k,v in inputs.items() if k != 'reservation'}, **selected_fee, 'networkFeeMojos': fee})
     with service.store._connect() as db:
         db.execute('BEGIN IMMEDIATE')
         service.store._row(db, identity, binding)
@@ -134,6 +158,15 @@ async def payment_review(service, identity, binding, body):
     return result
 
 
+def review_spend_hash(spends):
+    if len(spends) == 1:
+        return sha256(bytes(spends[0])).hexdigest()
+    if len(spends) != 2:
+        raise ValueError('Unexpected number of wallet inputs')
+    return sha256(b'SOLSLOT_CAT_WALLET_SPENDS_V1' +
+                  b''.join(sha256(bytes(spend)).digest() for spend in spends)).hexdigest()
+
+
 async def approve_payment(service, identity, binding, offer):
     retained = saved_approval(service.store, identity, browser_hash=binding)
     if retained is not None:
@@ -143,9 +176,14 @@ async def approve_payment(service, identity, binding, offer):
         from .wallet_offer_validation import decode_offer
         claim = service._saved(identity, binding)['reservationClaim']
         items = artifacts(claim)
-        decoded = decode_offer(offer, real_spends=1, dummy_spends=len(items),
-                               expected_assets=frozenset(a.deed_launcher_id for a in items), allow_signed=True)
-        spend_hash = sha256(bytes(decoded.real_spends[0])).hexdigest()
+        decode_args = dict(dummy_spends=len(items), expected_assets=frozenset(a.deed_launcher_id for a in items), allow_signed=True)
+        try:
+            decoded = decode_offer(offer, real_spends=1, **decode_args)
+        except ValueError:
+            if items[0].rail_asset_id == bytes32.zeros:
+                raise
+            decoded = decode_offer(offer, real_spends=2, **decode_args)
+        spend_hash = review_spend_hash(decoded.real_spends)
         with service.store._connect() as db:
             row = db.execute('SELECT wallet_selection FROM current_native_payment_reviews WHERE intent_id=? AND spend_hash=?',
                              (identity, spend_hash)).fetchone()

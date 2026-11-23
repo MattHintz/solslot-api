@@ -14,7 +14,7 @@ from .generation_customer_purchase_quorum import collect_current_purchase_quorum
 from .generation_customer_inventory import resolve_current_primary_inventory
 from .generation_customer_context import customer_bindings_from_evidence
 from .generation_customer_vault import resolve_native_identity_vault
-from .generation_customer_quote import current_customer_xch_quote
+from .generation_customer_quote import current_customer_xch_quote, quote_amount
 from .generation_customer_issuer import TestnetIssuerPolicy
 from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy
 from .generation_customer_purchase_scope import quote_deadline
@@ -27,7 +27,7 @@ from .faucet import AGG_SIG_ME_DATA
 def h(v):return '0x'+bytes(v).hex()
 
 
-async def quote_batch(s,request_key,deeds,browser_hash,receiving_launcher=None,receiving_owner=None,buyer_paid=False):
+async def quote_batch(s,request_key,deeds,browser_hash,receiving_launcher=None,receiving_owner=None,buyer_paid=False,payment_asset=bytes32.zeros):
     if (not isinstance(deeds,(list,tuple))or not 2<=len(deeds)<=25
             or len(set(deeds))!=len(deeds)):
         raise ValueError('CURRENT_PURCHASE_BATCH_QUANTITY_INVALID')
@@ -41,6 +41,8 @@ async def quote_batch(s,request_key,deeds,browser_hash,receiving_launcher=None,r
         claim=s._review_saved(prior['intentId'],browser_hash)['reservationClaim']
         if not isinstance(claim,CurrentReservationBatch) or tuple(a.deed_launcher_id for a in artifacts(claim))!=ordered:
             raise ValueError('CURRENT_EXECUTION_REQUEST_KEY_DEED_CHANGED')
+        if any(a.rail_asset_id != payment_asset for a in artifacts(claim)):
+            raise ValueError('CURRENT_EXECUTION_REQUEST_KEY_ASSET_CHANGED')
         if isinstance(s.policy,TestnetCollectionIssuerPolicy) and any(a.vault_launcher_id!=receiving_launcher for a in artifacts(claim)):
             raise ValueError('CURRENT_EXECUTION_RECEIVING_VAULT_CHANGED')
         return s.review(prior['intentId'],browser_hash=browser_hash)
@@ -64,7 +66,7 @@ async def quote_batch(s,request_key,deeds,browser_hash,receiving_launcher=None,r
     if isinstance(s.policy, TestnetCollectionIssuerPolicy):
         s.policy.require_verified_vault(vault, launcher=launcher, auth_type='chia_bls', owner_key=receiving_owner)
     now, expires = s._new_quote_window(buyer_paid=buyer_paid)
-    price,evidence=configured_price(s.settings,s.policy,now=now,expires_at=expires)
+    price,evidence=configured_price(s.settings,s.policy,now=now,expires_at=expires,asset=payment_asset)
     nonce=bytes32(secrets.token_bytes(32));children=[];purchases=[]
     for deed in ordered:
         purchase=current_customer_xch_quote(inventory=inventory,vault=vault,deed_launcher=deed,
@@ -84,7 +86,7 @@ async def quote_batch(s,request_key,deeds,browser_hash,receiving_launcher=None,r
     except ValueError as exc:
         if str(exc)!='CURRENT_CHECKOUT_RETRY_CHANGES_REVIEW':raise
         return await quote_batch(s,request_key,deeds,browser_hash,
-            receiving_launcher=receiving_launcher,receiving_owner=receiving_owner,buyer_paid=buyer_paid)
+            receiving_launcher=receiving_launcher,receiving_owner=receiving_owner,buyer_paid=buyer_paid,payment_asset=payment_asset)
     if buyer_paid:
         from .generation_customer_purchase_holds import hold_verified_cart
         hold_verified_cart(s.store, identity, verified, browser_hash=browser_hash, now=int(s.clock()))
@@ -97,11 +99,11 @@ def review_batch(s,identity,saved,binding):
     existing=s._existing(identity,'RESERVATION',binding)
     fee_cap = s.review_fee_cap(identity, binding)
     return {'schema':'solslot.current-primary-checkout-batch.v1','intentId':identity,'generationId':s.store.generation_id,
-        'network':'testnet11','receivingVaultLauncherId':h(first.vault_launcher_id),'rail':'CHIA_XCH',
+        'network':'testnet11','receivingVaultLauncherId':h(first.vault_launcher_id),**quote_amount(first,batch.total_rail_amount,s.policy),
         'purchaseBatch':claim.purchase_batch,'quantity':len(batch.artifacts),
         'deedLauncherIds':[h(a.deed_launcher_id)for a in batch.artifacts],
         'purchaseId':h(batch.purchase_id),'purchaseArtifactHash':h(batch.batch_hash),
-        'amountMojos':str(batch.total_rail_amount),'baseAmountUsdMinor':str(batch.total_base_amount_minor),
+        'baseAmountUsdMinor':str(batch.total_base_amount_minor),
         'technologyFeeUsdMinor':str(batch.total_technology_fee_minor),'totalAmountUsdMinor':str(batch.total_subtotal_minor),
         'quoteExpiresAt':first.quote_expires_at,'feeCapMojosPerStage':str(fee_cap),'maximumNetworkFeeMojos':str(2*fee_cap),
         'quoteExpired':int(s.clock())>=first.quote_expires_at,'reservationClaimHash':claim.digest(),

@@ -214,15 +214,17 @@ class TestnetIssuerJournal:
         """
         policy=self.policy
         policy.require_terms(terms,now=now)
+        from .generation_customer_collection_policy import approved_forwarding_asset
+        asset = approved_forwarding_asset(policy, artifact, terms)
         if ((isinstance(policy,TestnetIssuerPolicy) and artifact.vault_launcher_id!=policy.buyer_vault)
-                or not 1<int(artifact.rail_amount)<=policy.maximum_gross_mojos
+                or (asset is None and not 1<int(artifact.rail_amount)<=policy.maximum_gross_mojos)
                 or not now<artifact.quote_expires_at<=artifact.authorization_expires_at
                 or (isinstance(policy,TestnetIssuerPolicy) and artifact.authorization_expires_at>policy.expires_at)
                 or not isinstance(fees,PrimaryFeeSplitter) or fees.bindings.generation!=policy.generation
                 or fees.inner().get_tree_hash()!=policy.fee_puzzle):
             raise ValueError('CURRENT_ISSUER_PURCHASE_SCOPE_CHANGED')
         companion=build_testnet_primary_forwarding(bundle=bundle,artifact=artifact,terms=terms,
-            issuer_public_key=policy.issuer_public_key,fees=fees)
+            issuer_public_key=policy.issuer_public_key,fees=fees,approved_cat_asset=asset)
         spend=companion.issuer_signature_spend
         conditions=conditions_dict_for_solution(spend.puzzle_reveal,spend.solution,100_000_000)
         pairs=pkm_pairs_for_conditions_dict(conditions,spend.coin,AGG_SIG_ME_DATA['testnet11'])

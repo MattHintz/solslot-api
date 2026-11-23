@@ -36,6 +36,7 @@ class PrivateCurrentIssuerClient:
                 data = response.json()
                 return (data.get('generationId') == '0x' + policy.generation.hex()
                         and data.get('policyHash') == policy.commitment and data.get('signerIndex') == index
+                        and data.get('assetPolicyHash') == (policy.asset_policy_hash if getattr(policy, 'checkout_cats', ()) else None)
                         and data.get('ready') is True and type(data.get('checkedAt')) is int
                         and abs(now - data['checkedAt']) <= 10)
             return all(await asyncio.gather(*(check(index) for index in range(3))))

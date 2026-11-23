@@ -9,13 +9,26 @@ from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import MOD as _P2_
 from chia_rs.sized_bytes import bytes32
 from solslot_puzzles.generation_primary_price import SignedPrimaryPrice
 from solslot_puzzles.generation_statutes import GenerationStatutes
-from solslot_puzzles.payment_artifacts_v3 import build_xch_purchase_artifact
+from solslot_puzzles.payment_artifacts_v3 import build_cat_purchase_artifact, build_xch_purchase_artifact
 from solslot_puzzles.vault_driver import puzzle_for_p2_vault
 from .generation_customer_inventory import CurrentPrimaryInventory
 from .generation_customer_vault import CurrentCustomerVault
 from .generation_customer_test_conversion import FixedTestnetConversion
 
 _P2_MOD_BYTES=bytes(_P2_MOD)
+
+
+def quote_amount(artifact, amount, policy):
+    from solslot_puzzles.payment_artifacts_v2 import PaymentRail
+    if artifact.rail == PaymentRail.CHIA_XCH:
+        return {'rail':'CHIA_XCH','amountMojos':str(amount)}
+    if artifact.rail != PaymentRail.CHIA_CAT:
+        raise ValueError('CURRENT_CHECKOUT_ASSET_UNAVAILABLE')
+    asset = policy.cat(artifact.rail_asset_id)
+    if asset.decimals != artifact.rail_asset_decimals:
+        raise ValueError('CURRENT_CHECKOUT_ASSET_CHANGED')
+    return {'rail':'CHIA_CAT','assetId':'0x'+asset.asset_id.hex(),'assetSymbol':asset.symbol,
+            'assetDecimals':asset.decimals,'amountAtomicUnits':str(amount)}
 
 
 def current_customer_xch_quote(*,inventory:CurrentPrimaryInventory,vault:CurrentCustomerVault,
@@ -98,7 +111,11 @@ def current_customer_xch_quote(*,inventory:CurrentPrimaryInventory,vault:Current
             or (forwarding_policy is None and proceeds.inner().get_tree_hash()!=terms.protocol_puzhash)
             or tuple(statutes[0].values[2:5])!=(100,70,30)):
         raise ValueError('CURRENT_PURCHASE_FEE_ROUTE_CHANGED')
-    quote=build_xch_purchase_artifact(network='testnet11',collection_id=terms.collection_id,
+    round_ = price.round
+    cat = round_.asset_id != bytes32.zeros
+    build = build_cat_purchase_artifact if cat else build_xch_purchase_artifact
+    cat_args = dict(cat_asset_id=round_.asset_id,cat_asset_decimals=round_.asset_decimals) if cat else {}
+    quote=build(**cat_args,network='testnet11',collection_id=terms.collection_id,
         deed_launcher_id=terms.deed_launcher_id,metadata_root=terms.metadata_root,
         metadata_anchor_id=terms.metadata_anchor_id,share_ppm=terms.share_ppm,
         base_amount_minor=terms.base_amount_minor,technology_fee_bps=terms.technology_fee_bps,
@@ -106,9 +123,9 @@ def current_customer_xch_quote(*,inventory:CurrentPrimaryInventory,vault:Current
         zkpassport_root=vault.root,vault_launcher_id=vault.launcher,
         vault_p2_puzzle_hash=puzzle_for_p2_vault(vault.launcher).get_tree_hash(),
         authorization_nonce=nonce,authorization_expires_at=expires_at,
-        quote_expires_at=expires_at,oracle_round=price.round)
+        quote_expires_at=expires_at,oracle_round=round_)
     if forwarding_policy is not None and isinstance(forwarding_policy,TestnetCollectionIssuerPolicy):
         forwarding_policy.require_purchase(quote,terms,vault,launcher=vault.launcher,auth_type='chia_bls',now=now)
-    if forwarding_policy is not None and int(quote.rail_amount)>forwarding_policy.maximum_gross_mojos:
+    if not cat and forwarding_policy is not None and int(quote.rail_amount)>forwarding_policy.maximum_gross_mojos:
         raise ValueError('CURRENT_PURCHASE_ISSUER_AMOUNT_CAP')
     return quote

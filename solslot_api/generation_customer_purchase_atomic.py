@@ -54,23 +54,27 @@ def purchase_inputs(evidence):
     return children, terms, structures
 
 
-def prepare_buyer_payment(evidence, *, payment_coin, payment_public_key, payment_public_key_kind, network_fee_mojos):
+def prepare_buyer_payment(evidence, *, payment_coin, payment_public_key, payment_public_key_kind, network_fee_mojos,
+                          cat_lineage_proof=None, fee_input=None):
     children, terms, structures = purchase_inputs(evidence)
     wallet = dict(payment_coin=payment_coin, payment_public_key=payment_public_key,
-                  payment_public_key_kind=payment_public_key_kind, network_fee_mojos=network_fee_mojos)
+                  payment_public_key_kind=payment_public_key_kind, network_fee_mojos=network_fee_mojos,
+                  cat_lineage_proof=cat_lineage_proof, fee_input=fee_input)
     if len(children) == 1:
         return prepare_chia_buyer_offer_v3(artifact=artifacts(evidence.claim)[0], terms=terms[0],
                                            deed_singleton_struct=structures[0], **wallet)
     return prepare_chia_buyer_batch_offer_v3(batch=evidence.batch, terms=terms, deed_singleton_structs=structures, **wallet)
 
 
-def assemble_purchase(evidence, *, buyer_signature, payment_coin, payment_public_key, payment_public_key_kind, network_fee_mojos):
+def assemble_purchase(evidence, *, buyer_signature, payment_coin, payment_public_key, payment_public_key_kind,
+                      network_fee_mojos, cat_lineage_proof=None, fee_input=None):
     if not isinstance(buyer_signature, G2Element):
         raise ValueError('Buyer signature required')
     prepared = prepare_buyer_payment(evidence, payment_coin=payment_coin, payment_public_key=payment_public_key,
-                                     payment_public_key_kind=payment_public_key_kind, network_fee_mojos=network_fee_mojos)
+                                     payment_public_key_kind=payment_public_key_kind, network_fee_mojos=network_fee_mojos,
+                                     cat_lineage_proof=cat_lineage_proof, fee_input=fee_input)
     original = prepared.offer
-    buyer = Offer(original.requested_payments, WalletSpendBundle([prepared.coin_spend], buyer_signature), original.driver_dict)
+    buyer = Offer(original.requested_payments, WalletSpendBundle(original.coin_spends(), buyer_signature), original.driver_dict)
     verify_order_signature(buyer)
     return _build_purchase(evidence, buyer, network_fee_mojos)
 
