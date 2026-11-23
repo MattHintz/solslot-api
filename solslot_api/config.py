@@ -1472,6 +1472,8 @@ class Settings(BaseSettings):
     # ── Chain-verifiable collection minting ──────────────────────────────
     # Metadata authoring and proposal publication are independently gated.
     # Both default off so an API upgrade cannot expose an unfinished desk.
+    # Operator-reviewed canonical consent request for a single unsigned Testnet valuation.
+    generation_valuation_request_digest: Optional[str] = Field(default=None, pattern=r"^0x[0-9a-f]{64}$")
     deployment_generation_id: Optional[str] = Field(default=None, pattern=r"^0x[0-9a-f]{64}$")
     generation_preparation_path: Optional[str] = None
     generation_preparation_hash: Optional[str] = Field(default=None,pattern=r"^0x[0-9a-f]{64}$")

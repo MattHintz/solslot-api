@@ -47,6 +47,47 @@ def request():
         'expectedInputs':{name:'0x'+'45'*32 for name in ('registry','governance','holdings')}}
 
 
+def test_single_reviewed_valuation_requires_current_grant_and_assigned_admin(monkeypatch):
+    from solslot_api.generation_consents import ConsentRequest
+    from solslot_puzzles.protocol_statutes_v1 import CollectionStatute, keyed_root
+    from chia_rs.sized_bytes import bytes32
+
+    c=context(monkeypatch)
+    record=CollectionStatute(bytes32.from_hexstr(PACKAGE),75_000_000_000,75_000_000_000,1,100,200,1)
+    intent={'componentId':PACKAGE,'launcherId':PACKAGE,'revision':0,'recordKind':'COLLECTION','key':PACKAGE,
+        'record':[PACKAGE,75_000_000_000,75_000_000_000,1,100,200,1],
+        'previousRoot':'0x'+keyed_root(()).hex(),'nextRoot':'0x'+keyed_root((record,)).hex(),'currentRecords':[]}
+    body={**request(),'kind':'PUBLICATION_APPROVAL','proposalKind':'STATUTES','statutes':intent}
+    body.pop('scope')
+    url='/admin/generation/consents/collection-valuation/prepare'
+    # A local clock and synthetic receipts keep this an unsigned route test.
+    clock=SimpleNamespace(time=lambda:100)
+    monkeypatch.setattr('solslot_api.generation_consent_routes.time',clock)
+    with TestClient(c.app) as client:
+        c.settings.generation_valuation_request_digest=None
+        assert client.post(url,json=body).status_code==403
+        c.settings.generation_valuation_request_digest=ConsentRequest.model_validate(body).digest
+        assert client.post(url,json={**body,'feeCapMojos':1001}).status_code==403
+        assert client.post(url,json={**body,'requestKey':'other'}).status_code==403
+        c.claims.authority_slot=2
+        assert client.post(url,json=body).status_code==403
+        c.claims.authority_slot=1
+        c.settings.network='mainnet'
+        assert client.post(url,json=body).status_code==403
+        c.settings.network='testnet11'
+        for now in (99,200):
+            clock.time=lambda:now
+            assert client.post(url,json=body).status_code==409
+        c.prepare.assert_not_called()
+        clock.time=lambda:150
+        assert client.post(url,json=body).json()==c.saved
+        c.prepare.assert_awaited_once()
+        c.sign.assert_not_called()
+        c.auth.side_effect=HTTPException(401)
+        assert client.post(url,json=body).status_code==401
+        c.prepare.assert_awaited_once()
+
+
 def test_cached_reads_are_authenticated_and_work_with_node_and_builder_absent(monkeypatch):
     c=context(monkeypatch)
     c.app.state.generation_index=None;c.app.state.coinset=None

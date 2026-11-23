@@ -41,6 +41,34 @@ def test_authenticated_reads_preserve_original_transaction_and_generation(tmp_pa
         assert client.get('/admin/generation/operations/bad-id').status_code==422
 
 
+def test_committee_history_filters_customer_receipts_before_pagination(tmp_path):
+    journal=GenerationOperationJournal(str(tmp_path/'operations.db'),GENERATION)
+    committee=journal.prepare(operation(),'committee-review',100,1000)
+    # Historical receipt rows are sufficient for this read-path test.
+    with journal._db() as db:
+        for index in range(21):
+            identity='0x'+format(index+1,'064x')
+            db.execute('''INSERT INTO generation_operations
+                (operation_id,request_key,intent_hash,kind,protocol_bundle,original_id,
+                 fee_cap,stage,created_at,updated_at)
+                SELECT ?,?,intent_hash,'CREATE_CUSTOMER_VAULT',protocol_bundle,?,
+                       fee_cap,'CONFIRMED',?,? FROM generation_operations WHERE operation_id=?''',
+                (identity,'customer-'+str(index),identity,1001+index,1001+index,committee))
+    app=FastAPI()
+    app.include_router(router)
+    app.state.generation_operations=journal
+    app.dependency_overrides[get_settings]=lambda: SimpleNamespace(deployment_generation_id=GENERATION,network='testnet11')
+    authenticated=[]
+    app.dependency_overrides[require_admin_jwt]=lambda: authenticated.append(True)
+    url='/admin/generation/operations'
+    with TestClient(app) as client:
+        recent=client.get(url).json()['operations']
+        assert len(recent)==20 and all(row['kind']=='CREATE_CUSTOMER_VAULT' for row in recent)
+        assert client.get(url,params={'view':'committee'}).json()['operations']==[journal.status(committee)]
+        assert len(authenticated)==2
+        assert client.get(url,params={'view':'other'}).status_code==422
+
+
 @pytest.mark.asyncio
 async def test_background_resume_observes_original_bytes_never_dispatches(tmp_path):
     faucet=Faucet.from_seed_hex('01'*32,'testnet11');node=Node(faucet)

@@ -60,6 +60,21 @@ async def prepare_review(body:ConsentRequest,request:Request,settings:Annotated[
     except (ValueError,CollectionStoreError,OSError,TimeoutError,RuntimeError,sqlite3.Error) as exc:raise _failure(exc) from exc
 
 
+@router.post('/collection-valuation/prepare')
+async def prepare_collection_valuation(body:ConsentRequest,request:Request,
+        claims:Annotated[AdminClaims,Depends(require_admin_jwt)],settings:Annotated[Settings,Depends(get_settings)]):
+    if (settings.network!='testnet11' or body.generation_id!=settings.deployment_generation_id
+            or body.digest!=settings.generation_valuation_request_digest or body.statutes is None
+            or body.statutes.record_kind!='COLLECTION' or body.proposal_kind!='STATUTES'):
+        raise HTTPException(403,detail={'code':'VALUATION_REVIEW_NOT_ENABLED'})
+    if claims.generation_id!=body.generation_id or claims.authority_slot not in (0,body.coadministrator_slot):
+        raise HTTPException(403,detail={'code':'VALUATION_ADMINISTRATOR_REQUIRED'})
+    record=body.statutes.replacement()
+    if not record.valid_after<=int(time.time())<record.valid_until:
+        raise HTTPException(409,detail={'code':'VALUATION_OUTSIDE_REVIEW_WINDOW'})
+    return await prepare_review(body,request,settings)
+
+
 class ConsentSignature(Model):
     signature:str=Field(pattern=r'^0x[0-9a-fA-F]{128}([0-9a-fA-F]{2})?$')
 
