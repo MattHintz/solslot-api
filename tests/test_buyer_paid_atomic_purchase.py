@@ -24,7 +24,31 @@ async def test_one_buyer_paid_transaction(core, tmp_path, real_synthetic_identit
     await scenario(core, tmp_path, real_synthetic_identity_policy, monkeypatch)
 
 
-async def settle_in_simulator(c, service, store, identity, binding, pay_coin, synthetic, validators, arguments, monkeypatch):
+@pytest.mark.asyncio
+@pytest.mark.parametrize('real_synthetic_identity_policy', ['forwarding'], indirect=True)
+async def test_two_deeds_with_funded_standard_cat(core, tmp_path, real_synthetic_identity_policy, monkeypatch):
+    core.checkout_batch_quantity = 2
+    core.checkout_nominal_candidate = True
+    core.buyer_paid_settlement = True
+    core.buyer_paid_cat = True
+    await scenario(core, tmp_path, real_synthetic_identity_policy, monkeypatch)
+
+
+async def fund_checkout_cat(c, source, synthetic):
+    from solslot_api.generation_customer_collection_policy import CheckoutCat
+    from solslot_api.generation_customer_test_cat import prepare_test_cat
+    issuance = prepare_test_cat(funding_coin=source, funding_public_key=synthetic.get_g1(),
+        funding_public_key_kind='synthetic', recipient_inner_hash=source.puzzle_hash, network='testnet11')
+    bundle = signed(SpendBundle([issuance.funding_spend, issuance.eve_spend], G2Element()), [synthetic], c.faucet.agg_sig_me_data)
+    assert await c.client.push_tx(bundle) == (MempoolInclusionStatus.SUCCESS, None)
+    await c.sim.farm_block()
+    [c.buyer_fee_coin] = [coin for coin in compute_additions(issuance.funding_spend) if coin.puzzle_hash == source.puzzle_hash]
+    c.checkout_cats = (CheckoutCat(issuance.asset_id, 'SLTC', 3, 100, 3_030_000),)
+    [recipient] = compute_additions(issuance.eve_spend)
+    return recipient
+
+
+async def settle_in_simulator(c, service, store, identity, binding, pay_coin, synthetic, validators, arguments, monkeypatch, collection_issuer=None):
     from solslot_api.generation_customer_purchase_atomic import unsigned_settlement_cost
     from solslot_api.generation_customer_purchase_holds import hold_cart, retain_approved_cart
     hold = hold_cart(store, identity, browser_hash=binding, now=int(c.sim.timestamp))
@@ -39,14 +63,21 @@ async def settle_in_simulator(c, service, store, identity, binding, pay_coin, sy
     children,_,_ = purchase_inputs(evidence)
     fee = 7100
     args = dict(payment_coin=pay_coin, payment_public_key=bytes(synthetic.get_g1()), payment_public_key_kind='synthetic', network_fee_mojos=fee)
+    fee_selection = {}
+    if getattr(c, 'buyer_paid_cat', False):
+        from solslot_api.generation_customer_purchase_atomic_signing import cat_wallet_inputs
+        from solslot_api.generation_customer_purchase_batch import h
+        fee_selection = {'feeCoinId': h(c.buyer_fee_coin.name()), 'feePublicKey': h(synthetic.get_g1())}
+        args.update(await cat_wallet_inputs(c.provider, pay_coin, bytes(synthetic.get_g1()), 'synthetic',
+            c.checkout_cats[0].asset_id, fee_selection['feeCoinId'], fee_selection['feePublicKey']))
     measured = unsigned_settlement_cost(evidence, wallet={k:v for k,v in args.items() if k!='network_fee_mojos'},
         network_fee_mojos=fee, height=c.sim.block_height,
         forwarding_builder=lambda delivery: forwarding_spends(service,evidence,delivery))
     assert 0 < measured < 11_000_000_000
     reviewed = prepare_buyer_payment(evidence, **args)
     assert reviewed.offer.fees() == fee
-    assert len(reviewed.offer.coin_spends()) == 1
-    buyer_signature = signed(SpendBundle([reviewed.coin_spend], G2Element()), [synthetic], c.faucet.agg_sig_me_data).aggregated_signature
+    assert len(reviewed.offer.coin_spends()) == (2 if fee_selection else 1)
+    buyer_signature = signed(SpendBundle(reviewed.offer.coin_spends(), G2Element()), [synthetic], c.faucet.agg_sig_me_data).aggregated_signature
     with pytest.raises(ValueError, match='ORDER_SIGNATURE_INVALID'):
         assemble_purchase(evidence, buyer_signature=buyer_signature, **{**args, 'network_fee_mojos':fee+1})
     settlement = assemble_purchase(evidence, buyer_signature=buyer_signature, **args)
@@ -56,7 +87,7 @@ async def settle_in_simulator(c, service, store, identity, binding, pay_coin, sy
     from solslot_api.validator_ledger import ValidatorLedger
     from solslot_api.generation_customer_purchase_batch import h
     authorization = AtomicBuyerApproval(reservation=claim,paymentCoinId=h(pay_coin.name()),paymentPublicKey=h(synthetic.get_g1()),
-        paymentPublicKeyKind='synthetic',networkFeeMojos=fee,buyerOffer=settlement.buyer_offer.to_bech32())
+        paymentPublicKeyKind='synthetic',networkFeeMojos=fee,buyerOffer=settlement.buyer_offer.to_bech32(), **fee_selection)
     from solslot_api.generation_customer_purchase_atomic_signing import verify_approval
     from solslot_api.generation_customer_purchase_holds import saved_approval
     from solslot_api import protocol_admission
@@ -81,6 +112,9 @@ async def settle_in_simulator(c, service, store, identity, binding, pay_coin, sy
     monkeypatch.setattr(c.provider, 'get_fee_estimate', estimate, raising=False)
     body = SimpleNamespace(payment_coin_id=h(pay_coin.name()), payment_public_key=h(synthetic.get_g1()),
                 payment_public_key_kind='synthetic', network_fee_mojos=str(fee))
+    if fee_selection:
+        body.fee_coin_id = fee_selection['feeCoinId']
+        body.fee_public_key = fee_selection['feePublicKey']
     prices = await fee_options(service, identity, binding, body)
     assert prices['standardMojos']=='100' and prices['priorityMojos']==str(fee)
     review = await payment_review(service, identity, binding, body)
@@ -124,14 +158,18 @@ async def settle_in_simulator(c, service, store, identity, binding, pay_coin, sy
 
     class Issuer:
         async def atomic_signature(self, approval, quorum_signature):
-            journal=TestnetIssuerJournal(Path(store.path).parent/'atomic-issuer.db',service.policy)
+            if fee_selection:
+                journal = collection_issuer
+            else:
+                journal=TestnetIssuerJournal(Path(store.path).parent/'atomic-issuer.db',service.policy)
             try:
                 final=await sign_atomic_issuer(approval, approval.digest(),quorum_signature,
                     settings=SimpleNamespace(**{**base,'signer_index':2}),journal=journal,journal_lock=nullcontext(),
                     load_key=lambda:c.faucet.key.wallet_sk,**common)
                 return bundle_id(final),final.aggregated_signature
             finally:
-                journal.close()
+                if journal is not collection_issuer:
+                    journal.close()
 
     worker=NativeCartWorker(service,Issuer(),collect_quorum=quorum)
     service.cart_worker=worker
@@ -166,5 +204,11 @@ async def settle_in_simulator(c, service, store, identity, binding, pay_coin, sy
         intermediate = await c.client.get_coin_record_by_name(child.transition.reserved_coin.name())
         assert intermediate.confirmed_block_index == intermediate.spent_block_index == payer.spent_block_index
     change = [coin for coin in compute_additions(reviewed.coin_spend) if coin.puzzle_hash == pay_coin.puzzle_hash]
-    assert sum(coin.amount for coin in change) == pay_coin.amount - sum(a.rail_amount for a in artifacts(claim)) - fee
+    assert sum(coin.amount for coin in change) == pay_coin.amount - sum(a.rail_amount for a in artifacts(claim)) - (0 if fee_selection else fee)
+    if fee_selection:
+        fee_record = await c.client.get_coin_record_by_name(c.buyer_fee_coin.name())
+        assert fee_record.spent_block_index == payer.spent_block_index
+        fee_spend = next(spend for spend in final.coin_spends if spend.coin == c.buyer_fee_coin)
+        [fee_change] = compute_additions(fee_spend)
+        assert fee_change.amount == c.buyer_fee_coin.amount - fee and fee_change.puzzle_hash == c.buyer_fee_coin.puzzle_hash
     assert (await c.client.push_tx(final))[0] != MempoolInclusionStatus.SUCCESS

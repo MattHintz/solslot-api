@@ -86,6 +86,7 @@ async def _collection_sale(service, pricing, fixed):
             status = 'OPEN'
             code = 'CURRENT_PRIMARY_SALE_OPEN'
             reason = 'Available on Chia Testnet11 with a verified Chia vault.'
+    assets = execution.get('paymentAssets', []) if status == 'OPEN' else []
     checked = int(time.time())
     return {
         'checkedAt': checked,
@@ -98,7 +99,8 @@ async def _collection_sale(service, pricing, fixed):
             'availableDeeds': count,
             'code': code,
             'reason': reason,
-            'paymentRails': ['CHIA_XCH'] if status == 'OPEN' else [],
+            'paymentRails': (['CHIA_XCH', 'CHIA_CAT'] if assets else ['CHIA_XCH']) if status == 'OPEN' else [],
+            **({'paymentAssets': assets} if assets else {}),
             'checkedAt': checked,
         },
     }

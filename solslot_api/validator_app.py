@@ -373,6 +373,7 @@ def create_validator_app(
         else:
             ready = configured.generation_customer_purchase_enabled and getattr(application.state,'validator_ledger',None) is not None
         return {'generationId': '0x' + policy.generation.hex(), 'policyHash': policy.commitment, 'signerIndex': index,
+                **({'assetPolicyHash':policy.asset_policy_hash} if getattr(policy,'checkout_cats',()) else {}),
                 'ready': bool(ready and getattr(application.state,'generation_provider',None) is not None), 'checkedAt': int(time.time())}
 
     @application.post('/v1/generation/purchase/atomic/sign', response_model=ValidatorSignatureResponse)

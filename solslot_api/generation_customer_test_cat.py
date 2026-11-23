@@ -11,7 +11,7 @@ from chia.consensus.condition_tools import conditions_dict_for_solution, pkm_pai
 from chia.types.blockchain_format.program import Program
 from chia.types.coin_spend import make_spend
 from chia.wallet.cat_wallet.cat_utils import CAT_MOD, SpendableCAT, construct_cat_puzzle, unsigned_spend_bundle_for_spendable_cats
-from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import puzzle_for_pk, solution_for_conditions
+from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import puzzle_for_pk, puzzle_for_synthetic_public_key, solution_for_conditions
 from chia.wallet.puzzles.tails import GENESIS_BY_ID_MOD
 from chia_rs import AugSchemeMPL, Coin, G1Element, G2Element, SpendBundle
 from chia_rs.sized_bytes import bytes32
@@ -33,13 +33,14 @@ class TestCatPreparation:
     eve_spend:object
     asset_id:bytes32
     recipient_inner_hash:bytes32
+    network_fee_mojos:int=0
 
     def review(self):
         return {'schema':'solslot.fixed-test-cat-preparation.v1','network':'testnet11',
             'name':'Solslot Test CAT','symbol':'SLTC','decimals':TEST_CAT_DECIMALS,
             'wholeUnits':str(TEST_CAT_UNITS),'atomicUnits':str(TEST_CAT_ATOMIC_UNITS),
             'assetId':h(self.asset_id),'fundingCoinId':h(self.funding_spend.coin.name()),
-            'nativeIssuanceMojos':str(TEST_CAT_ATOMIC_UNITS),'networkFeeMojos':'0',
+            'nativeIssuanceMojos':str(TEST_CAT_ATOMIC_UNITS),'networkFeeMojos':str(self.network_fee_mojos),
             'recipientInnerPuzzleHash':h(self.recipient_inner_hash),
             'walletCoinSpends':[self.funding_spend.to_json_dict()],
             'singleIssuance':True,'priceOrPegAsserted':False,'poolBackingAuthorized':False,
@@ -55,20 +56,28 @@ class TestCatPreparation:
         return SpendBundle([self.funding_spend,self.eve_spend],signature)
 
 
-def prepare_test_cat(*,funding_coin,funding_public_key,recipient_inner_hash,network):
+def prepare_test_cat(*,funding_coin,funding_public_key,recipient_inner_hash,network,
+                     funding_public_key_kind="raw",network_fee_mojos=0):
     if (network!='testnet11' or not isinstance(funding_coin,Coin)
             or not isinstance(funding_public_key,G1Element) or funding_public_key==G1Element()
             or not isinstance(recipient_inner_hash,bytes32) or recipient_inner_hash==bytes32.zeros):
         raise ValueError('TEST_CAT_EXACT_TESTNET_INPUTS_REQUIRED')
-    wallet=puzzle_for_pk(funding_public_key)
-    if funding_coin.puzzle_hash!=wallet.get_tree_hash() or funding_coin.amount<TEST_CAT_ATOMIC_UNITS:
+    if type(network_fee_mojos) is not int or not 0 <= network_fee_mojos < 2**64:
+        raise ValueError('TEST_CAT_INVALID_NETWORK_FEE')
+    if funding_public_key_kind not in ('raw', 'synthetic'):
+        raise ValueError('TEST_CAT_PUBLIC_KEY_KIND_REQUIRED')
+    wallet = (puzzle_for_pk(funding_public_key) if funding_public_key_kind == 'raw'
+              else puzzle_for_synthetic_public_key(funding_public_key))
+    if funding_coin.puzzle_hash!=wallet.get_tree_hash() or funding_coin.amount<TEST_CAT_ATOMIC_UNITS+network_fee_mojos:
         raise ValueError('TEST_CAT_WALLET_FUNDING_REQUIRED')
     tail=GENESIS_BY_ID_MOD.curry(funding_coin.name())
     asset=tail.get_tree_hash();eve_inner=Program.to(1)
     eve=Coin(funding_coin.name(),construct_cat_puzzle(CAT_MOD,asset,eve_inner).get_tree_hash(),
         uint64(TEST_CAT_ATOMIC_UNITS))
     conditions=[[51,eve.puzzle_hash,TEST_CAT_ATOMIC_UNITS]]
-    change=int(funding_coin.amount)-TEST_CAT_ATOMIC_UNITS
+    if network_fee_mojos:
+        conditions.append([52, network_fee_mojos])
+    change=int(funding_coin.amount)-TEST_CAT_ATOMIC_UNITS-network_fee_mojos
     if change:conditions.append([51,wallet.get_tree_hash(),change])
     source=make_spend(funding_coin,wallet,solution_for_conditions(conditions))
     issued=unsigned_spend_bundle_for_spendable_cats(CAT_MOD,[SpendableCAT(eve,asset,eve_inner,
@@ -76,4 +85,4 @@ def prepare_test_cat(*,funding_coin,funding_public_key,recipient_inner_hash,netw
         limitations_program_reveal=tail)])
     if len(issued.coin_spends)!=1 or issued.aggregated_signature!=G2Element():
         raise ValueError('TEST_CAT_EXACT_UNSIGNED_EVE_REQUIRED')
-    return TestCatPreparation(source,issued.coin_spends[0],asset,recipient_inner_hash)
+    return TestCatPreparation(source,issued.coin_spends[0],asset,recipient_inner_hash,network_fee_mojos)

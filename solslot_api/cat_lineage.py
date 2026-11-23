@@ -11,7 +11,7 @@ from chia_rs.sized_bytes import bytes32
 
 
 async def confirmed_cat_receipt_lineage(*, provider, coin: Coin, expected_inner_hash: bytes32,
-    expected_tail_hash: bytes32, asset_label: str = 'CAT') -> LineageProof:
+    expected_tail_hash: bytes32, asset_label: str = 'CAT', primary_only: bool = False) -> LineageProof:
     """Authenticate both sides of a confirmed CAT transfer, allowing owner changes.
 
 The child's owner is pinned by its full puzzle hash. The lineage proof carries
@@ -23,8 +23,9 @@ the actual parent's inner hash, which differs after a grant, sale or unlock.
     if coin.puzzle_hash != expected_full_hash:
         raise ValueError(f'{asset_label} receipt does not belong to the expected vault')
     parent_id = '0x' + coin.parent_coin_info.hex()
-    parent_record = await provider.get_coin_record_by_name(parent_id)
-    child_record = await provider.get_coin_record_by_name('0x' + coin.name().hex())
+    read_coin = provider.get_coin_record_by_name_primary if primary_only else provider.get_coin_record_by_name
+    parent_record = await read_coin(parent_id)
+    child_record = await read_coin('0x' + coin.name().hex())
     parent = _coin_from_record(parent_record)
     child = _coin_from_record(child_record)
     height = int((child_record or {}).get('confirmed_block_index') or 0)
@@ -33,7 +34,8 @@ the actual parent's inner hash, which differs after a grant, sale or unlock.
         or int((child_record or {}).get('spent_block_index') or 0) != 0
         or bool((child_record or {}).get('spent'))):
         raise ValueError(f'{asset_label} receipt lineage is not a confirmed unspent atomic transfer')
-    raw = await provider.get_puzzle_and_solution(parent_id, height)
+    read_spend = provider.get_puzzle_and_solution_primary if primary_only else provider.get_puzzle_and_solution
+    raw = await read_spend(parent_id, height)
     if not isinstance(raw, Mapping):
         raise ValueError(f'{asset_label} parent spend is unavailable')
     reveal = Program.from_bytes(bytes.fromhex(str(raw['puzzle_reveal']).removeprefix('0x')))

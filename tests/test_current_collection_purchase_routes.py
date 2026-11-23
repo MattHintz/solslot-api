@@ -29,11 +29,13 @@ def test_retained_single_quote_rejects_other_launcher_even_with_same_binding(mon
     from tests.test_native_purchases import _b32
     from solslot_api.generation_customer_purchase_execution import CurrentNativePurchaseExecution
     service=CurrentNativePurchaseExecution.__new__(CurrentNativePurchaseExecution);service.policy=make_policy()[0]
-    artifact=SimpleNamespace(deed_launcher_id=_b32(10),vault_launcher_id=_b32(11))
+    artifact=SimpleNamespace(deed_launcher_id=_b32(10),vault_launcher_id=_b32(11),rail_asset_id=_b32(0))
     service._review_saved=lambda *_:{'reservationClaim':SimpleNamespace(purchase_artifact={})}
     service.review=lambda *_args,**_kwargs:{'ok':True}
     monkeypatch.setattr('solslot_api.generation_customer_purchase_execution.purchase_artifact_v3_from_json',lambda _:artifact)
     assert service._same_quote('id',_b32(10),'binding',receiving_launcher=_b32(11))=={'ok':True}
+    with pytest.raises(ValueError, match='REQUEST_KEY_ASSET_CHANGED'):
+        service._same_quote('id',_b32(10),'binding',receiving_launcher=_b32(11),payment_asset=_b32(12))
     with pytest.raises(ValueError,match='RECEIVING_VAULT_CHANGED'):
         service._same_quote('id',_b32(10),'binding',receiving_launcher=_b32(12))
 

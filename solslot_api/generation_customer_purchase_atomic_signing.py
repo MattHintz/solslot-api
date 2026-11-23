@@ -15,12 +15,13 @@ from .generation_coin_evidence import read_confirmed_coin
 from .generation_execution import Hash, Model
 from .generation_operations import canonical
 from .generation_customer_purchase_atomic import assemble_purchase, purchase_inputs
+from .generation_customer_collection_policy import approved_forwarding_asset
 from .generation_customer_purchase_batch import CurrentReservationBatch, artifacts, fresh_children, h, verify_current_batch_reservation
 from .generation_customer_purchase_reservation import CurrentReservationClaim, verify_current_reservation
 from .generation_customer_purchase_validators import native_messages, sign_verified_current_reservation
 from .generation_sols_batch_execution import unspent
 from .validator_quorum import ValidatorSignatureResponse
-from .wallet_offer_validation import decode_offer, validate_standard_payment
+from .wallet_offer_validation import decode_offer, validate_standard_payment_spend
 
 
 class AtomicBuyerApproval(Model):
@@ -29,11 +30,17 @@ class AtomicBuyerApproval(Model):
     payment_coin_id: Hash = Field(alias='paymentCoinId')
     payment_public_key: str = Field(alias='paymentPublicKey', pattern=r'^0x[0-9a-f]{96}$')
     payment_public_key_kind: Literal['raw','synthetic'] = Field(alias='paymentPublicKeyKind')
+    fee_coin_id: Hash | None = Field(default=None, alias='feeCoinId')
+    fee_public_key: str | None = Field(default=None, alias='feePublicKey', pattern=r'^0x[0-9a-f]{96}$')
     network_fee_mojos: StrictInt = Field(alias='networkFeeMojos', ge=0, lt=2**64)
     buyer_offer: str = Field(alias='buyerOffer', min_length=16, max_length=2_000_000)
 
     def canonical(self):
-        return canonical(self.model_dump(mode='json', by_alias=True))
+        document = self.model_dump(mode='json', by_alias=True)
+        for name in ('feeCoinId','feePublicKey'):
+            if document[name] is None:
+                del document[name]
+        return canonical(document)
 
     def digest(self):
         return '0x'+sha256(self.canonical().encode()).hexdigest()
@@ -45,6 +52,33 @@ class ApprovedSettlement:
     evidence: object
     purchase: object
     payer_coin: object
+    fee_coin: object = None
+
+
+async def cat_wallet_inputs(provider, payer_coin, payment_key, key_kind, asset, fee_coin_id, fee_public_key):
+    from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import puzzle_for_pk, puzzle_for_synthetic_public_key
+    from solslot_puzzles.stripe_settlement_v1_driver import CatNetworkFeeInput
+    from .cat_lineage import confirmed_cat_receipt_lineage
+    if asset == bytes32.zeros:
+        if fee_coin_id is not None or fee_public_key is not None:
+            raise ValueError('A native payment uses its own fee input')
+        return {}
+    key = G1Element.from_bytes(payment_key)
+    owner = puzzle_for_pk(key) if key_kind == 'raw' else puzzle_for_synthetic_public_key(key)
+    lineage = await confirmed_cat_receipt_lineage(provider=provider, coin=payer_coin,
+        expected_inner_hash=owner.get_tree_hash(), expected_tail_hash=asset, primary_only=True)
+    if fee_coin_id is None and fee_public_key is None:
+        return {'cat_lineage_proof': lineage}
+    if not fee_coin_id or not fee_public_key:
+        raise ValueError('CAT checkout requires the native fee coin and its key together')
+    record = read_confirmed_coin(await provider.get_coin_record_by_name_primary(fee_coin_id), bytes32.from_hexstr(fee_coin_id))
+    fee_key = G1Element.from_bytes(bytes.fromhex(fee_public_key[2:]))
+    if key_kind == 'raw':
+        from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import calculate_synthetic_public_key, DEFAULT_HIDDEN_PUZZLE_HASH
+        fee_key = calculate_synthetic_public_key(fee_key, DEFAULT_HIDDEN_PUZZLE_HASH)
+    if record.spent_height or record.coin.puzzle_hash != puzzle_for_synthetic_public_key(fee_key).get_tree_hash():
+        raise ValueError('Native fee coin does not belong to the selected public key')
+    return {'cat_lineage_proof': lineage, 'fee_input': CatNetworkFeeInput(record.coin, fee_key)}
 
 
 async def verify_approval(claim, *, settings, anchor, provider, issuer_policy, expected_issuer_policy_hash, clock=time.time):
@@ -55,23 +89,34 @@ async def verify_approval(claim, *, settings, anchor, provider, issuer_policy, e
                 expected_issuer_policy_hash=expected_issuer_policy_hash, clock=clock)
     verifier = verify_current_batch_reservation if isinstance(claim.reservation,CurrentReservationBatch) else verify_current_reservation
     evidence = await verifier(claim.reservation, **args)
-    decoded = decode_offer(claim.buyer_offer, real_spends=1, dummy_spends=len(inputs),
+    asset = inputs[0].rail_asset_id
+    separate_fee = asset != bytes32.zeros and claim.network_fee_mojos > 0
+    if separate_fee != (claim.fee_coin_id is not None) or separate_fee != (claim.fee_public_key is not None):
+        raise ValueError('Fee input differs from the selected asset and network fee')
+    decoded = decode_offer(claim.buyer_offer, real_spends=2 if separate_fee else 1, dummy_spends=len(inputs),
         expected_assets=frozenset(a.deed_launcher_id for a in inputs), allow_signed=True)
-    validate_standard_payment(decoded, asset_id=None)
+    validate_standard_payment_spend(decoded.real_spends[0], asset_id=asset if asset != bytes32.zeros else None)
+    if separate_fee:
+        validate_standard_payment_spend(decoded.real_spends[1], asset_id=None)
     offer=Offer.from_spend_bundle(decoded.bundle)
     payer=read_confirmed_coin(await provider.get_coin_record_by_name_primary(claim.payment_coin_id), bytes32.from_hexstr(claim.payment_coin_id))
     if payer.spent_height:
         raise ValueError('Selected payer coin is no longer available')
+    extra = await cat_wallet_inputs(provider,payer.coin,bytes.fromhex(claim.payment_public_key[2:]),
+        claim.payment_public_key_kind,asset,claim.fee_coin_id,claim.fee_public_key)
     purchase=assemble_purchase(evidence, buyer_signature=offer.aggregated_signature(), payment_coin=payer.coin,
         payment_public_key=bytes.fromhex(claim.payment_public_key[2:]), payment_public_key_kind=claim.payment_public_key_kind,
-        network_fee_mojos=claim.network_fee_mojos)
+        network_fee_mojos=claim.network_fee_mojos,**extra)
     if bytes(purchase.buyer_offer.to_spend_bundle())!=bytes(decoded.bundle):
         raise ValueError('Signed offer differs from the independently rebuilt purchase')
     await fresh_children(purchase_inputs(evidence)[0],provider)
     await unspent(provider,payer.coin)
+    fee_coin = extra['fee_input'].coin if separate_fee else None
+    if fee_coin:
+        await unspent(provider, fee_coin)
     if int(clock()) >= min(a.quote_expires_at for a in inputs):
         raise ValueError('Buyer approval expired during verification')
-    return ApprovedSettlement(claim,evidence,purchase,payer.coin)
+    return ApprovedSettlement(claim,evidence,purchase,payer.coin,fee_coin)
 
 
 def settlement_messages(verified, roster):
@@ -118,6 +163,8 @@ async def sign_atomic_purchase(claim, claim_hash, *, settings, anchor, provider,
     signatures=[]
     await fresh_children(children,provider)
     await unspent(provider,verified.payer_coin)
+    if verified.fee_coin is not None:
+        await unspent(provider, verified.fee_coin)
     for digest, (_,message) in zip(hashes,pairs,strict=True):
         old=ledger.primary_purchase_authorization(digest)
         if old is not None:
@@ -182,7 +229,8 @@ async def sign_atomic_issuer(claim, claim_hash, quorum_signature, *, settings, a
     children,terms,_=purchase_inputs(verified.evidence)
     items=artifacts(claim.reservation)
     companions=[build_testnet_primary_forwarding(bundle=approved,artifact=a,terms=t,
-                issuer_public_key=policy.issuer_public_key,fees=fees) for a,t in zip(items,terms,strict=True)]
+                issuer_public_key=policy.issuer_public_key,fees=fees,
+                approved_cat_asset=approved_forwarding_asset(policy,a,t)) for a,t in zip(items,terms,strict=True)]
     permitted=set()
     for companion in companions:
         spend=companion.issuer_signature_spend
@@ -193,6 +241,8 @@ async def sign_atomic_issuer(claim, claim_hash, quorum_signature, *, settings, a
         permitted.add(bytes(messages[0][1]))
     await fresh_children(children,provider)
     await unspent(provider,verified.payer_coin)
+    if verified.fee_coin is not None:
+        await unspent(provider, verified.fee_coin)
     private=None
     def sign_proceeds(message):
         nonlocal private

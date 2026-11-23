@@ -36,7 +36,7 @@ class CurrentReservationClaim(Model):
     anchor_hash:Hash=Field(alias='anchorHash')
     issuer_policy_hash:Hash=Field(alias='issuerPolicyHash')
     purchase_artifact:dict=Field(alias='purchaseArtifact',max_length=64)
-    signed_price:dict=Field(alias='signedPrice',max_length=3)
+    signed_price:dict=Field(alias='signedPrice',max_length=4)
     available_coin_id:Hash=Field(alias='availableCoinId')
     current_vault_coin_id:Hash=Field(alias='currentVaultCoinId')
     signer_indices:tuple[StrictInt,StrictInt]=Field(alias='signerIndices')

@@ -52,7 +52,8 @@ def test_wrong_network_is_rejected_before_any_preparation(network):
 
 
 @pytest.mark.asyncio
-async def test_native_issue_has_exact_fixed_supply_and_duplicate_broadcast_cannot_mint_again(core):
+@pytest.mark.parametrize('kind,fee', [('raw', 0), ('synthetic', 36)])
+async def test_native_issue_has_exact_fixed_supply_and_duplicate_broadcast_cannot_mint_again(core,kind,fee):
     c=core;key,wallet,_=setup();acs=Program.to(1)
     origins=[r.coin for r in await c.client.get_coin_records_by_puzzle_hash(acs.get_tree_hash()) if not r.spent]
     origin=origins[0];amount=TEST_CAT_ATOMIC_UNITS+123
@@ -61,8 +62,10 @@ async def test_native_issue_has_exact_fixed_supply_and_duplicate_broadcast_canno
         [51,acs.get_tree_hash(),int(origin.amount)-amount]]))
     assert await c.client.push_tx(SpendBundle([fund],G2Element()))==(MempoolInclusionStatus.SUCCESS,None)
     await c.sim.farm_block()
-    prepared=prepare_test_cat(funding_coin=coin,funding_public_key=key.get_g1(),
-        recipient_inner_hash=wallet.get_tree_hash(),network='testnet11')
+    public = key.get_g1() if kind == 'raw' else calculate_synthetic_secret_key(key, DEFAULT_HIDDEN_PUZZLE_HASH).get_g1()
+    prepared=prepare_test_cat(funding_coin=coin,funding_public_key=public,
+        recipient_inner_hash=wallet.get_tree_hash(),network='testnet11',funding_public_key_kind=kind,network_fee_mojos=fee)
+    assert prepared.review()['networkFeeMojos'] == str(fee)
     signed=prepared.signed_bundle(sign(prepared,key))
     assert await c.client.push_tx(signed)==(MempoolInclusionStatus.SUCCESS,None)
     await c.sim.farm_block()

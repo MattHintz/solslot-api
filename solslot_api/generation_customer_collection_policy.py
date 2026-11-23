@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 import json
 import stat
+import re
 from pathlib import Path
 
 from chia.types.blockchain_format.program import Program
@@ -16,6 +17,47 @@ from chia_rs import G1Element
 from chia_rs.sized_bytes import bytes32
 
 _MOD_BYTES=bytes(MOD)
+@dataclass(frozen=True)
+class CheckoutCat:
+    asset_id: bytes32
+    symbol: str
+    decimals: int
+    usd_minor_per_unit: int
+    max_per_deed: int
+
+    def validate(self):
+        if (not isinstance(self.asset_id, bytes32) or self.asset_id == bytes32.zeros
+                or not isinstance(self.symbol,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,15}',self.symbol)
+                or type(self.decimals) is not int or not 0 <= self.decimals <= 18
+                or type(self.usd_minor_per_unit) is not int or not 1 <= self.usd_minor_per_unit <= 10**15
+                or type(self.max_per_deed) is not int or not 1 < self.max_per_deed < 2**64):
+            raise ValueError('Invalid Testnet CAT pricing')
+        return self
+
+    def public(self):
+        return {'assetId': _hex(self.asset_id), 'symbol':self.symbol, 'decimals':self.decimals,
+                'testUsdMinorPerUnit':str(self.usd_minor_per_unit),'maximumGrossAtomicUnitsPerDeed':str(self.max_per_deed)}
+
+    @classmethod
+    def from_public(cls, row):
+        value = cls(bytes32.from_hexstr(row['assetId']),row['symbol'],row['decimals'],
+                    int(row['testUsdMinorPerUnit']),int(row['maximumGrossAtomicUnitsPerDeed'])).validate()
+        if value.public() != row:
+            raise ValueError('CAT pricing differs from its canonical policy')
+        return value
+
+
+def approved_forwarding_asset(policy, artifact, terms):
+    from solslot_puzzles.payment_artifacts_v2 import PaymentRail
+    if artifact.rail == PaymentRail.CHIA_XCH and artifact.rail_asset_id == bytes32.zeros:
+        return None
+    if not isinstance(policy, TestnetCollectionIssuerPolicy) or artifact.rail != PaymentRail.CHIA_CAT:
+        raise ValueError('CURRENT_COLLECTION_ISSUER_PURCHASE_SCOPE_CHANGED')
+    asset = policy.cat(artifact.rail_asset_id)
+    amount = (terms.subtotal_minor * 10**asset.decimals + asset.usd_minor_per_unit - 1) // asset.usd_minor_per_unit
+    if artifact.rail_asset_decimals != asset.decimals or artifact.rail_amount != amount or not 1 < amount <= asset.max_per_deed:
+        raise ValueError('CURRENT_COLLECTION_ISSUER_PURCHASE_SCOPE_CHANGED')
+    return asset.asset_id
 
 
 def _hex(value):
@@ -34,10 +76,22 @@ class TestnetCollectionIssuerPolicy:
     deed_launchers: frozenset[bytes32]
     maximum_gross_mojos: int
     test_usd_minor_per_txch: int | None = None
+    checkout_cats: tuple[CheckoutCat,...] = ()
+
+    def cat(self, asset_id):
+        for asset in self.checkout_cats:
+            if asset.asset_id == asset_id:
+                return asset
+        raise ValueError('CURRENT_CHECKOUT_ASSET_UNAVAILABLE')
 
     def validate(self):
         if not isinstance(self.deed_launchers,frozenset) or not 1<=len(self.deed_launchers)<=25:
             raise ValueError('CURRENT_COLLECTION_ISSUER_POLICY_INVALID')
+        if (not isinstance(self.checkout_cats,tuple) or len(self.checkout_cats)>32
+                or any(not isinstance(c,CheckoutCat) for c in self.checkout_cats)
+                or len({c.validate().asset_id for c in self.checkout_cats}) != len(self.checkout_cats)
+                or tuple(c.asset_id for c in self.checkout_cats) != tuple(sorted(c.asset_id for c in self.checkout_cats))):
+            raise ValueError('Invalid collection CAT list')
         fields=(self.generation,self.collection,self.edition,self.metadata_root,
                 self.proceeds_puzzle,self.fee_puzzle,*self.deed_launchers)
         if (any(not isinstance(v,bytes32) or v==bytes32.zeros for v in fields)
@@ -53,7 +107,7 @@ class TestnetCollectionIssuerPolicy:
             raise ValueError('CURRENT_COLLECTION_ISSUER_POLICY_INVALID') from exc
         return self
 
-    def public(self):
+    def _custody_document(self):
         value={'schema':'solslot.testnet-collection-issuer-policy.v1','network':'testnet11',
             'generationId':_hex(self.generation),'collectionHash':_hex(self.collection),
             'editionHash':_hex(self.edition),'metadataRoot':_hex(self.metadata_root),
@@ -68,8 +122,22 @@ class TestnetCollectionIssuerPolicy:
             value['pricing']={'mode':'FIXED_TESTNET_CONVERSION','usdMinorPerTxch':str(self.test_usd_minor_per_txch)}
         return value
 
+    def public(self):
+        value = self._custody_document()
+        if self.checkout_cats:
+            value['schema'] = 'solslot.testnet-collection-issuer-policy.v2'
+            value['testCats'] = [asset.public() for asset in self.checkout_cats]
+        return value
+
     @property
     def commitment(self):
+        """Standing custody grant used by the durable journals and existing native orders."""
+        self.validate()
+        return '0x'+sha256(json.dumps(self._custody_document(),sort_keys=True,separators=(',',':')).encode()).hexdigest()
+
+    @property
+    def asset_policy_hash(self):
+        """Full independently installed policy, including the approved CATs and their prices."""
         self.validate()
         return '0x'+sha256(json.dumps(self.public(),sort_keys=True,separators=(',',':')).encode()).hexdigest()
 
@@ -101,10 +169,11 @@ class TestnetCollectionIssuerPolicy:
         self.require_verified_vault(vault,launcher=launcher,auth_type=auth_type)
         try:
             assert_artifact_matches_terms(artifact,terms)
+            cat = approved_forwarding_asset(self, artifact, terms)
             valid=(artifact.vault_launcher_id==launcher and artifact.zkpassport_root==vault.root
-                and artifact.rail==PaymentRail.CHIA_XCH and type(now)is int
+                and type(now)is int
                 and now<artifact.quote_expires_at<=artifact.authorization_expires_at
-                and 1<int(artifact.rail_amount)<=self.maximum_gross_mojos)
+                and (cat is not None or 1<int(artifact.rail_amount)<=self.maximum_gross_mojos))
         except Exception as exc:
             raise ValueError('CURRENT_COLLECTION_ISSUER_PURCHASE_SCOPE_CHANGED') from exc
         if not valid:raise ValueError('CURRENT_COLLECTION_ISSUER_PURCHASE_SCOPE_CHANGED')
@@ -169,7 +238,11 @@ def read_collection_issuer_policy(path,expected_file_hash):
                 or pricing['mode']!='FIXED_TESTNET_CONVERSION' or not isinstance(pricing['usdMinorPerTxch'],str)
                 or not pricing['usdMinorPerTxch'].isdigit() or str(int(pricing['usdMinorPerTxch']))!=pricing['usdMinorPerTxch']):
             raise ValueError('CURRENT_COLLECTION_ISSUER_PRICING_INVALID')
-    if (not isinstance(q,dict) or set(q)!=keys or q['schema']!='solslot.testnet-collection-issuer-policy.v1'
+    with_cat = isinstance(q, dict) and q.get('schema') == 'solslot.testnet-collection-issuer-policy.v2'
+    if with_cat:
+        keys.add('testCats')
+    if (not isinstance(q,dict) or set(q)!=keys
+            or q['schema'] not in ('solslot.testnet-collection-issuer-policy.v1','solslot.testnet-collection-issuer-policy.v2')
             or q['network']!='testnet11' or q['mainnetEnabled'] is not False
             or q['masterKeyExportAuthorized'] is not False
             or q['scope']!='NEW_EPHEMERAL_PRIMARY_PROCEEDS_ONLY'
@@ -184,7 +257,7 @@ def read_collection_issuer_policy(path,expected_file_hash):
         policy=TestnetCollectionIssuerPolicy(b('generationId'),b('collectionHash'),b('editionHash'),b('metadataRoot'),
             b('proceedsPuzzleHash'),b('feePuzzleHash'),bytes.fromhex(q['issuerPublicKey'].removeprefix('0x')),
             frozenset(bytes32.from_hexstr(x) for x in q['deedLauncherIds']),int(q['maximumGrossMojos']),
-            int(pricing['usdMinorPerTxch']) if pricing is not None else None).validate()
+            int(pricing['usdMinorPerTxch']) if pricing is not None else None, checkout_cats=tuple(CheckoutCat.from_public(row) for row in q['testCats']) if with_cat else ()).validate()
     except (TypeError,ValueError,KeyError) as exc:
         raise ValueError('CURRENT_COLLECTION_ISSUER_POLICY_FIELDS_CHANGED') from exc
     if policy.public()!=q:raise ValueError('CURRENT_COLLECTION_ISSUER_POLICY_CANONICAL_REQUIRED')

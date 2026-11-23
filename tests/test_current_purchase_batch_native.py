@@ -114,7 +114,7 @@ async def collection_checkout(c, settings, prior, inventory, store, service, tmp
     policy = TestnetCollectionIssuerPolicy(prior.generation, prior.collection, prior.edition, prior.metadata_root,
         prior.proceeds_puzzle, prior.fee_puzzle, prior.issuer_public_key,
         frozenset(item.original.terms.deed_launcher_id for item in inventory.items),
-        prior.maximum_gross_mojos, prior.test_usd_minor_per_txch)
+        prior.maximum_gross_mojos, prior.test_usd_minor_per_txch, checkout_cats=getattr(c, "checkout_cats", ()))
     # Reuse the existing runtime's empty ledger schema before the offline transition.
     async def unused_issuer(_):
         raise AssertionError('Staging must never call an issuer')
@@ -197,7 +197,10 @@ async def exercise_batch(c,ctx,built,inventory,vault,pay_coin,payment_key,synthe
     service=CurrentNativePurchaseExecution(settings=settings,anchor=built.anchor,provider=c.provider,
         policy=policy,store=store,fee_cap=10,clock=now)
     paired = getattr(c, 'checkout_paired_fees', False)
-    collection_test = quantity > 3 or paired
+    if getattr(c, 'buyer_paid_cat', False):
+        from tests.test_buyer_paid_atomic_purchase import fund_checkout_cat
+        pay_coin = await fund_checkout_cat(c, pay_coin, synthetic)
+    collection_test = quantity > 3 or paired or getattr(c, 'buyer_paid_cat', False)
     funding = None
     issuer = None
     receiver = {}
@@ -237,6 +240,8 @@ async def exercise_batch(c,ctx,built,inventory,vault,pay_coin,payment_key,synthe
     ids=[h(i.original.terms.deed_launcher_id)for i in selected[:quantity]];binding='ab'*32
     if getattr(c, 'buyer_paid_settlement', False):
         receiver['buyer_paid'] = True
+    if getattr(c, 'buyer_paid_cat', False):
+        receiver['payment_asset'] = c.checkout_cats[0].asset_id
     review=await service.quote('one-customer-order',ids,browser_hash=binding,**receiver);identity=review['intentId']
     progress('quote')
     if quantity == 1:
@@ -246,7 +251,11 @@ async def exercise_batch(c,ctx,built,inventory,vault,pay_coin,payment_key,synthe
     if paired:
         assert review['feeCapMojosPerStage'] == '2'
         assert review['maximumNetworkFeeMojos'] == '4'
-    assert int(review['amountMojos'])==quantity*101_000_000_000
+    if getattr(c, 'buyer_paid_cat', False):
+        assert review['assetId'] == h(c.checkout_cats[0].asset_id)
+        assert review['amountAtomicUnits'] == str(quantity * 3_030_000)
+    else:
+        assert int(review['amountMojos'])==quantity*101_000_000_000
     assert int(review['baseAmountUsdMinor'])==quantity*300_000
     assert (await service.quote('one-customer-order',list(reversed(ids)),browser_hash=binding,**receiver))==review
     different_ids = ids[:1] if quantity > 1 else [h(selected[1].original.terms.deed_launcher_id)]
@@ -254,9 +263,13 @@ async def exercise_batch(c,ctx,built,inventory,vault,pay_coin,payment_key,synthe
     assert store.reservation_request(identity,browser_hash=binding)is None
     if getattr(c, 'buyer_paid_settlement', False):
         from tests.test_buyer_paid_atomic_purchase import settle_in_simulator
-        await settle_in_simulator(c, service, store, identity, binding, pay_coin, synthetic, validators, arguments, monkeypatch)
+        await settle_in_simulator(c, service, store, identity, binding, pay_coin, synthetic, validators, arguments, monkeypatch, issuer)
         for ledger in ledgers:
             ledger.close()
+        if issuer:
+            issuer.close()
+        if funding:
+            funding.close()
         return
     acknowledgement=adapter.request_reservation(service,identity,binding)
     assert acknowledgement['quantity']==quantity

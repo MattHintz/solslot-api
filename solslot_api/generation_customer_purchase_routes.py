@@ -33,6 +33,7 @@ Configured=Annotated[Settings,Depends(get_settings)]
 
 
 class QuoteBody(CurrentGeneration):
+    payment_asset_id: Identity | None = Field(default=None, alias='paymentAssetId')
     checkout_mode: Literal['BUYER_PAID'] | None = Field(default=None, alias='checkoutMode')
     request_key:str=Field(alias='requestKey',pattern=r'^[A-Za-z0-9_:-]{1,128}$')
     deed_launcher_id:Identity|None=Field(default=None,alias='deedLauncherId')
@@ -40,6 +41,8 @@ class QuoteBody(CurrentGeneration):
 
     @model_validator(mode='after')
     def exact_selection(self):
+        if self.payment_asset_id is not None and self.checkout_mode != 'BUYER_PAID':
+            raise ValueError('A CAT purchase requires a buyer-paid cart')
         if (self.deed_launcher_id is None)==(self.deed_launcher_ids is None):
             raise ValueError('CURRENT_PURCHASE_EXACT_SELECTION_REQUIRED')
         if self.deed_launcher_ids is not None and len(set(self.deed_launcher_ids))!=len(self.deed_launcher_ids):
@@ -138,6 +141,9 @@ def failure(exc):
         'CURRENT_EXECUTION_RESERVATION_NOT_CONFIRMED':'Your deed reservation is waiting for confirmation. No payment approval is needed yet.',
         'CURRENT_CHECKOUT_REFRESH_REQUIRED':'Refresh checkout to review the current payment options.',
         'CURRENT_CHECKOUT_HOLD_EXPIRED':'Your hold expired. Check availability to get a new total.',
+        'CURRENT_CHECKOUT_ASSET_UNAVAILABLE':'This token is unavailable for this checkout.',
+        'CURRENT_EXECUTION_REQUEST_KEY_ASSET_CHANGED':'Resume this checkout with the payment asset you selected.',
+        'CURRENT_PAYMENT_NATIVE_FEE_INPUT_REQUIRED':'Your wallet needs confirmed TXCH for the network fee.',
         'CURRENT_PAYMENT_NETWORK_FEE_INCREASED':'The minimum network fee changed. Review the updated fee before paying.',
         'CURRENT_PAYMENT_INSUFFICIENT_FUNDS':'Your selected coin has insufficient funds for the purchase and network fee.',
         'CURRENT_PRIMARY_DEED_NOT_AVAILABLE':'This deed is no longer available. Check its saved purchase status before choosing another.',
@@ -164,7 +170,7 @@ async def quote(launcher:Identity,body:QuoteBody,request:Request,response:Respon
             result=service.review(prior['intentId'],browser_hash=binding)
             selected=body.deed_launcher_ids if body.deed_launcher_ids is not None else [body.deed_launcher_id]
             retained=result.get('deedLauncherIds') or [result.get('deedLauncherId')]
-            if sorted(selected)!=sorted(retained):raise wallet_denied()
+            if sorted(selected)!=sorted(retained) or body.payment_asset_id!=result.get('assetId'):raise wallet_denied()
             unchanged(request,settings,launcher,service,binding)
             return result
         buyer_paid = body.checkout_mode == 'BUYER_PAID'
@@ -175,12 +181,17 @@ async def quote(launcher:Identity,body:QuoteBody,request:Request,response:Respon
         if enabled and not buyer_paid and prior is None:
             raise ValueError('CURRENT_CHECKOUT_REFRESH_REQUIRED')
         selected=body.deed_launcher_ids if body.deed_launcher_ids is not None else body.deed_launcher_id
+        payment_args = {'buyer_paid': True} if buyer_paid else {}
+        if body.payment_asset_id is not None:
+            if not isinstance(service.policy, TestnetCollectionIssuerPolicy):
+                raise ValueError('CURRENT_CHECKOUT_ASSET_UNAVAILABLE')
+            payment_args['payment_asset'] = service.policy.cat(bytes32.from_hexstr(body.payment_asset_id)).asset_id
         if isinstance(service.policy,TestnetCollectionIssuerPolicy):
             verified = owner(request, settings, launcher)
             result = await service.quote(body.request_key, selected, browser_hash=binding,
-                receiving_launcher=bytes32.from_hexstr(launcher), receiving_owner=verified.owner_key, **({'buyer_paid': True} if buyer_paid else {}))
+                receiving_launcher=bytes32.from_hexstr(launcher), receiving_owner=verified.owner_key, **payment_args)
         else:
-            result=await service.quote(body.request_key,selected,browser_hash=binding, **({'buyer_paid': True} if buyer_paid else {}))
+            result=await service.quote(body.request_key,selected,browser_hash=binding, **payment_args)
         if buyer_paid:
             from .generation_customer_native_cart_checkout import recover_cart_quote
             result = await recover_cart_quote(service, result['intentId'], binding)
@@ -361,7 +372,12 @@ async def deliver(launcher:Identity,identity:Identity,body:DeliveryBody,
     except Exception as exc:raise failure(exc) from exc
 
 
-class CartPaymentBody(PaymentBody):
+class CartFundingBody(PaymentBody):
+    fee_coin_id: Identity | None = Field(default=None, alias='feeCoinId')
+    fee_public_key: str | None = Field(default=None, alias='feePublicKey', pattern=r'^0x[0-9a-f]{96}$')
+
+
+class CartPaymentBody(CartFundingBody):
     network_fee_mojos: str = Field(alias='networkFeeMojos', pattern=r'^(0|[1-9][0-9]{0,19})$')
 
 
@@ -372,7 +388,7 @@ def cart_context(request, settings, launcher):
 
 
 @router.post('/{launcher}/{identity}/cart/fees')
-async def cart_fees(launcher: Identity, identity: Identity, body: PaymentBody, request: Request,
+async def cart_fees(launcher: Identity, identity: Identity, body: CartFundingBody, request: Request,
                     response: Response, settings: Configured):
     from .generation_customer_native_cart_checkout import fee_options
     mutation(request, settings, body)

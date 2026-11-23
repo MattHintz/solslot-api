@@ -35,7 +35,7 @@ from .generation_operations import bundle_id
 from .generation_storage import generation_path
 from .protocol_submission import PreparedProtocolBundle, ProtocolSubmissionError
 from .generation_customer_inventory import resolve_current_primary_inventory
-from .generation_customer_quote import current_customer_xch_quote
+from .generation_customer_quote import current_customer_xch_quote, quote_amount
 from .generation_customer_context import customer_bindings_from_evidence
 from .generation_customer_vault import resolve_native_identity_vault
 from .generation_preparation import read_generation_preparation
@@ -110,11 +110,14 @@ class CurrentNativePurchaseExecution:
             raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_ENDING')
         return now, expires
 
-    async def quote(self, request_key, deed_launcher_id, *, browser_hash, receiving_launcher=None, receiving_owner=None, buyer_paid=False):
+    async def quote(self, request_key, deed_launcher_id, *, browser_hash, receiving_launcher=None, receiving_owner=None,
+                    buyer_paid=False, payment_asset=bytes32.zeros):
+        if payment_asset != bytes32.zeros and not buyer_paid:
+            raise ValueError('CURRENT_CHECKOUT_BUYER_PAID_REQUIRED')
         if isinstance(deed_launcher_id,(list,tuple)):
             if len(deed_launcher_id)==1:deed_launcher_id=deed_launcher_id[0]
             else:return await batch_execution.quote_batch(self,request_key,deed_launcher_id,browser_hash,
-                receiving_launcher=receiving_launcher,receiving_owner=receiving_owner,buyer_paid=buyer_paid)
+                receiving_launcher=receiving_launcher,receiving_owner=receiving_owner,buyer_paid=buyer_paid,payment_asset=payment_asset)
         deed = bytes32.from_hexstr(deed_launcher_id)
         if isinstance(self.policy,TestnetCollectionIssuerPolicy) and (
                 not isinstance(receiving_launcher,bytes32) or receiving_launcher==bytes32.zeros
@@ -122,7 +125,7 @@ class CurrentNativePurchaseExecution:
             raise ValueError('CURRENT_EXECUTION_RECEIVING_VAULT_REQUIRED')
         prior = self.store.review_for_request(request_key, browser_hash=browser_hash)
         if prior is not None:
-            return self._same_quote(prior['intentId'], deed, browser_hash,receiving_launcher=receiving_launcher)
+            return self._same_quote(prior['intentId'], deed, browser_hash,receiving_launcher=receiving_launcher,payment_asset=payment_asset)
         if isinstance(self.policy,TestnetIssuerPolicy):
             launcher=self.policy.buyer_vault
             if receiving_launcher is not None and receiving_launcher!=launcher:
@@ -145,7 +148,7 @@ class CurrentNativePurchaseExecution:
         # native steps. Admit their full existing five-minute review window;
         # never send a customer into a nearly expired price or authorization.
         now, expires = self._new_quote_window(buyer_paid=buyer_paid)
-        price,price_evidence=configured_price(self.settings,self.policy,now=now,expires_at=expires)
+        price,price_evidence=configured_price(self.settings,self.policy,now=now,expires_at=expires,asset=payment_asset)
         if expires>price.round.valid_until:
             raise ValueError('CURRENT_PURCHASE_FRESH_PRICE_WINDOW_REQUIRED')
         quote = current_customer_xch_quote(inventory=inventory, vault=vault, deed_launcher=deed,
@@ -170,7 +173,7 @@ class CurrentNativePurchaseExecution:
             prior = self.store.review_for_request(request_key, browser_hash=browser_hash)
             if prior is None:
                 raise
-            return self._same_quote(prior['intentId'], deed, browser_hash,receiving_launcher=receiving_launcher)
+            return self._same_quote(prior['intentId'], deed, browser_hash,receiving_launcher=receiving_launcher,payment_asset=payment_asset)
         if buyer_paid:
             from .generation_customer_purchase_holds import hold_verified_cart
             hold_verified_cart(self.store, identity, evidence, browser_hash=browser_hash, now=int(self.clock()))
@@ -178,11 +181,13 @@ class CurrentNativePurchaseExecution:
             record(self, identity, 'quote_verification', quote_started, quote_finished)
         return self.review(identity, browser_hash=browser_hash)
 
-    def _same_quote(self, identity, deed, browser_hash, *, receiving_launcher=None):
+    def _same_quote(self, identity, deed, browser_hash, *, receiving_launcher=None,payment_asset=bytes32.zeros):
         saved = self._review_saved(identity, browser_hash)
         if isinstance(saved['reservationClaim'],CurrentReservationBatch):
             raise ValueError('CURRENT_EXECUTION_REQUEST_KEY_DEED_CHANGED')
         artifact = purchase_artifact_v3_from_json(saved['reservationClaim'].purchase_artifact)
+        if artifact.rail_asset_id != payment_asset:
+            raise ValueError('CURRENT_EXECUTION_REQUEST_KEY_ASSET_CHANGED')
         if artifact.deed_launcher_id != deed:
             raise ValueError('CURRENT_EXECUTION_REQUEST_KEY_DEED_CHANGED')
         if isinstance(self.policy,TestnetCollectionIssuerPolicy) and artifact.vault_launcher_id!=receiving_launcher:
@@ -216,7 +221,8 @@ class CurrentNativePurchaseExecution:
                     pass
             return {'status': 'READY' if ready else 'UNAVAILABLE',
                     'code': 'CURRENT_EXECUTION_READY' if ready else 'CURRENT_EXECUTION_WORKER_UNAVAILABLE',
-                    'checkoutMode': 'BUYER_PAID', 'checkedAt': int(self.clock())}
+                    'checkoutMode': 'BUYER_PAID', 'checkedAt': int(self.clock()),
+                    'paymentAssets': [cat.public() for cat in getattr(self.policy, 'checkout_cats', ())] if ready else []}
         async with self._readiness_lock:
             now = int(self.clock())
             cached = self._last_readiness
@@ -324,7 +330,7 @@ class CurrentNativePurchaseExecution:
         if network_info.get('network_name') != 'testnet11':
             raise ValueError('CURRENT_PAYMENT_PRIMARY_NETWORK_CHANGED')
         limit = asyncio.Semaphore(4)
-        async def read_key(public,puzzle):
+        async def read_key(public,puzzle,minimum,units):
             async with limit:
                 try:
                     records = await self.provider.get_coin_records_by_puzzle_hash_primary(h(puzzle),include_spent=False)
@@ -338,13 +344,25 @@ class CurrentNativePurchaseExecution:
                 record = read_confirmed_coin(raw,coin.name())
                 if record.coin.puzzle_hash != puzzle:
                     raise ValueError('CURRENT_PAYMENT_COIN_OWNER_CHANGED')
-                if not record.spent_height and amount <= record.coin.amount <= 2**53-1:
+                if not record.spent_height and minimum <= record.coin.amount <= 2**53-1:
                     candidates.append({'paymentCoinId':h(record.coin.name()),'paymentPublicKey':public,
-                        'paymentPublicKeyKind':public_key_kind,'amountMojos':str(record.coin.amount),'confirmedHeight':record.confirmed_height})
+                        'paymentPublicKeyKind':public_key_kind,units:str(record.coin.amount),'confirmedHeight':record.confirmed_height})
             return candidates
+        from chia.wallet.cat_wallet.cat_utils import CAT_MOD, construct_cat_puzzle
+        cat = artifact.rail_asset_id != bytes32.zeros
+        units = 'amountAtomicUnits' if cat else 'amountMojos'
+        fee_candidates = []
         try:
             async with asyncio.timeout(15):
-                groups = await asyncio.gather(*(read_key(public,puzzle)for public,puzzle in keys))
+                if cat:
+                    cat_owners = [(public, construct_cat_puzzle(CAT_MOD,artifact.rail_asset_id,puzzle).get_tree_hash_precalc(puzzle))
+                                  for public,puzzle in keys]
+                    groups, fee_groups = await asyncio.gather(
+                        asyncio.gather(*(read_key(public,puzzle,amount,units) for public,puzzle in cat_owners)),
+                        asyncio.gather(*(read_key(public,puzzle,1,'amountMojos') for public,puzzle in keys)))
+                    fee_candidates = [row for group in fee_groups for row in group]
+                else:
+                    groups = await asyncio.gather(*(read_key(public,puzzle,amount,units) for public,puzzle in keys))
         except TimeoutError as exc:
             raise ValueError('CURRENT_PAYMENT_PRIMARY_UNAVAILABLE') from exc
         candidates = [row for group in groups for row in group]
@@ -353,9 +371,11 @@ class CurrentNativePurchaseExecution:
         unique = {r['paymentCoinId']:r for r in candidates}
         return {'schema':'solslot.current-payer-coins.v1','generationId':self.store.generation_id,
             'network':'testnet11','intentId':identity,'receivingVaultLauncherId':h(artifact.vault_launcher_id),
-            'amountMojos':str(amount),'lastCheckedAt':int(self.clock()),
+            units:str(amount),'lastCheckedAt':int(self.clock()),
+            **({'assetId':h(artifact.rail_asset_id),'feeCandidates':sorted(fee_candidates,key=lambda r:(
+                -int(r['amountMojos']),r['paymentCoinId']))[:32]} if cat else {}),
             'diagnostic':{'status':'eligible_found' if unique else 'no_eligible_coin','keysChecked':len(keys)},
-            'candidates':sorted(unique.values(),key=lambda r:(int(r['amountMojos']),r['paymentCoinId']))[:32]}
+            'candidates':sorted(unique.values(),key=lambda r:(int(r[units]),r['paymentCoinId']))[:32]}
 
     def review(self, identity, *, browser_hash):
         saved = self._review_saved(identity, browser_hash)
@@ -366,7 +386,7 @@ class CurrentNativePurchaseExecution:
         return {'intentId':identity, 'generationId':self.store.generation_id, 'network':'testnet11',
             'receivingVaultLauncherId':h(artifact.vault_launcher_id), 'deedLauncherId':h(artifact.deed_launcher_id),
             'purchaseId':h(artifact.purchase_id), 'purchaseArtifactHash':h(artifact.artifact_hash),
-            'rail':'CHIA_XCH', 'amountMojos':str(artifact.rail_amount),
+            **quote_amount(artifact,artifact.rail_amount,self.policy),
             'baseAmountUsdMinor':str(artifact.base_amount_minor),
             'technologyFeeUsdMinor':str(artifact.technology_fee_minor),
             'totalAmountUsdMinor':str(artifact.subtotal_minor),

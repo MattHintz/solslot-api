@@ -18,25 +18,36 @@ from .generation_customer_collection_policy import TestnetCollectionIssuerPolicy
 class FixedTestnetConversion:
     policy:TestnetIssuerPolicy
     expires_at:int
+    asset:bytes32 = bytes32.zeros
+
+    @property
+    def policy_hash(self):
+        return self.policy.commitment if self.asset == bytes32.zeros else self.policy.asset_policy_hash
 
     def evidence(self):
-        return {'schema':'solslot.fixed-testnet-conversion.v1',
-            'issuerPolicyHash':self.policy.commitment,'expiresAt':self.expires_at}
+        binding = {'assetId': '0x' + self.asset.hex()} if self.asset != bytes32.zeros else {}
+        return {**binding,'schema':'solslot.fixed-testnet-conversion.v1',
+            'issuerPolicyHash':self.policy_hash,'expiresAt':self.expires_at}
 
     @property
     def round(self):
         self.verify_policy(self.policy,now=self.expires_at-300,expires_at=self.expires_at)
         def digest(domain):
-            return bytes32(sha256(domain+self.policy.commitment.encode()+str(self.expires_at).encode()).digest())
-        return SimpleNamespace(network='testnet11',asset_id=bytes32.zeros,asset_decimals=12,
+            asset_binding = b'CAT' + self.asset if self.asset != bytes32.zeros else b''
+            return bytes32(sha256(domain+asset_binding+self.policy_hash.encode()+str(self.expires_at).encode()).digest())
+        cat = self.policy.cat(self.asset) if self.asset != bytes32.zeros else None
+        return SimpleNamespace(network='testnet11',asset_id=self.asset,asset_decimals=cat.decimals if cat else 12,
             valid_from=self.expires_at-300,valid_until=self.expires_at,
-            price_usd_minor_per_asset=self.policy.test_usd_minor_per_txch,
+            price_usd_minor_per_asset=cat.usd_minor_per_unit if cat else self.policy.test_usd_minor_per_txch,
             round_hash=digest(b'SOLSLOT_FIXED_TESTNET_CONVERSION_V1'),
             source_evidence_root=digest(b'SOLSLOT_APPROVED_TEST_POLICY_V1'))
 
     def verify_policy(self,policy,*,now,expires_at):
-        if (not isinstance(policy,(TestnetIssuerPolicy,TestnetCollectionIssuerPolicy))or policy.test_usd_minor_per_txch is None
-                or policy.commitment!=self.policy.commitment or type(now)is not int
+        allowed = ((self.asset == bytes32.zeros and getattr(policy,'test_usd_minor_per_txch',None) is not None)
+                   or (isinstance(policy,TestnetCollectionIssuerPolicy) and any(c.asset_id == self.asset for c in policy.checkout_cats)))
+        if (not isinstance(policy,(TestnetIssuerPolicy,TestnetCollectionIssuerPolicy))or not allowed
+                or policy.commitment!=self.policy.commitment
+                or (self.asset!=bytes32.zeros and policy.asset_policy_hash!=self.policy_hash) or type(now)is not int
                 or type(expires_at)is not int or expires_at!=self.expires_at
                 or not expires_at-300<=now<expires_at
                 or (isinstance(policy,TestnetIssuerPolicy) and not (policy.issued_at<=expires_at-300 and expires_at<=policy.expires_at))):
@@ -46,6 +57,13 @@ class FixedTestnetConversion:
 
 
 def claim_price(evidence,policy):
+    if isinstance(evidence, dict) and evidence.get('schema') == 'solslot.fixed-testnet-conversion.v1' and 'assetId' in evidence:
+        if (set(evidence) != {'schema','issuerPolicyHash','expiresAt','assetId'}
+                or not isinstance(policy,TestnetCollectionIssuerPolicy)
+                or evidence['issuerPolicyHash'] != policy.asset_policy_hash or type(evidence['expiresAt']) is not int):
+            raise ValueError('CURRENT_PURCHASE_FIXED_TEST_CONVERSION_CHANGED')
+        asset = policy.cat(bytes32.from_hexstr(evidence['assetId']))
+        return FixedTestnetConversion(policy,evidence['expiresAt'],asset.asset_id)
     if getattr(policy,'test_usd_minor_per_txch',None) is None:
         from .generation_sols_batch_execution import signed_price
         return signed_price(evidence)
@@ -56,11 +74,11 @@ def claim_price(evidence,policy):
     return FixedTestnetConversion(policy,evidence['expiresAt'])
 
 
-def configured_price(settings,policy,*,now,expires_at):
+def configured_price(settings,policy,*,now,expires_at,asset=bytes32.zeros):
     if settings.network!='testnet11' or settings.deployment_generation_id!='0x'+policy.generation.hex():
         raise ValueError('CURRENT_PURCHASE_FIXED_TEST_NETWORK_CHANGED')
-    if getattr(policy,'test_usd_minor_per_txch',None) is not None:
-        price=FixedTestnetConversion(policy,expires_at).verify_policy(policy,now=now,expires_at=expires_at)
+    if asset != bytes32.zeros or getattr(policy,'test_usd_minor_per_txch',None) is not None:
+        price=FixedTestnetConversion(policy,expires_at,asset).verify_policy(policy,now=now,expires_at=expires_at)
         return price,price.evidence()
     from .payment_quotes import load_authorized_oracle_round
     from solslot_puzzles.generation_primary_price import SignedPrimaryPrice

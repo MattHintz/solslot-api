@@ -9,6 +9,7 @@ from solslot_puzzles.testnet_primary_forwarding import build_testnet_primary_for
 
 from .generation_coin_evidence import read_confirmed_coin
 from .generation_customer_purchase_atomic import purchase_inputs
+from .generation_customer_collection_policy import approved_forwarding_asset
 from .generation_customer_purchase_atomic_signing import verify_approval
 from .generation_customer_purchase_batch import artifacts
 from .generation_customer_purchase_holds import cart_inputs, saved_approval
@@ -28,7 +29,8 @@ def forwarding_spends(service, evidence, delivery):
     fees = service._fees(evidence)
     return tuple(spend for artifact, term in zip(artifacts(claim), terms, strict=True)
                  for spend in build_testnet_primary_forwarding(bundle=delivery, artifact=artifact,
-                     terms=term, issuer_public_key=service.policy.issuer_public_key, fees=fees).operation.spends)
+                     terms=term, issuer_public_key=service.policy.issuer_public_key, fees=fees,
+                     approved_cat_asset=approved_forwarding_asset(service.policy, artifact, term)).operation.spends)
 
 
 async def expire_approved_cart(store, identity, approval, provider, binding):
