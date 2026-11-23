@@ -1,7 +1,7 @@
 """Explicit prepare/submit actions, with strictly cached and side-effect-free GETs."""
 import sqlite3
 import time
-from typing import Annotated
+from typing import Annotated,Literal
 from fastapi import APIRouter,Depends,HTTPException,Path,Request
 from .admin_auth import require_admin_jwt
 from .config import Settings,get_settings
@@ -23,9 +23,13 @@ def _journal(request,settings):
 
 
 @router.get('')
-def list_operations(request:Request,settings:Annotated[Settings,Depends(get_settings)]):
+def list_operations(request:Request,settings:Annotated[Settings,Depends(get_settings)],
+                    view:Literal['committee']|None=None):
     journal=_journal(request,settings)
-    try:operations=journal.recent() if journal is not None else []
+    try:
+        operations=[]
+        if journal is not None:
+            operations=journal.recent(committee_only=True) if view=='committee' else journal.recent()
     except (OSError,ValueError,sqlite3.Error) as exc:
         raise HTTPException(503,detail={'code':'GENERATION_OPERATION_STORE_UNAVAILABLE',
             'message':'Saved progress is temporarily unavailable. Wait for the next check; do not repeat the transaction.'}) from exc

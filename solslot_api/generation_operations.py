@@ -319,10 +319,12 @@ class GenerationOperationJournal:
             ids=[row[0] for row in db.execute("SELECT operation_id FROM generation_operations WHERE kind='PRIMARY_SOLS_BATCH' ORDER BY created_at,operation_id")]
         return tuple(self.status(identity) for identity in ids)
 
-    def recent(self, limit=20):
+    def recent(self, limit=20, *, committee_only=False):
         if type(limit) is not int or not 1<=limit<=50:raise ValueError('operation read limit is out of bounds')
+        scope = "WHERE kind <> 'CREATE_CUSTOMER_VAULT'" if committee_only else ""
         with self._db() as db:
-            ids=[row[0] for row in db.execute('SELECT operation_id FROM generation_operations ORDER BY created_at DESC,operation_id LIMIT ?', (limit,))]
+            ids=[row[0] for row in db.execute(
+                f'SELECT operation_id FROM generation_operations {scope} ORDER BY created_at DESC,operation_id LIMIT ?', (limit,))]
         return [self.status(identity) for identity in ids]
 
     def pending_ids(self, limit=4):
