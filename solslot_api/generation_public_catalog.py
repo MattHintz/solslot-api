@@ -67,12 +67,18 @@ def _bound_context(request: Request, settings: Settings):
 
 async def _collection_sale(service, pricing, fixed):
     inventory = await service.inventory_snapshot()
-    execution = await service.collection_readiness(inventory)
+    private_test = getattr(getattr(service, 'policy', None), 'test_window', None) is not None
+    execution = {} if private_test else await service.collection_readiness(inventory)
     count = sum(item.available for item in inventory.items)
     status = 'UNAVAILABLE'
     code = 'PRIMARY_OFFERING_STATUS_UNAVAILABLE'
     reason = 'Purchase availability could not be checked for this edition.'
-    if execution['status'] == 'PAUSED' or count == 0:
+    if private_test:
+        count = 0
+        status = 'NOT_OPEN'
+        code = 'CURRENT_PRIMARY_SALE_NOT_OPEN'
+        reason = 'This edition is configured for private Testnet checkout.'
+    elif execution['status'] == 'PAUSED' or count == 0:
         status = 'NOT_OPEN'
         code = 'CURRENT_PRIMARY_SALE_NOT_OPEN'
         reason = 'Purchases are currently unavailable for this edition.'
@@ -99,6 +105,7 @@ async def _collection_sale(service, pricing, fixed):
             'availableDeeds': count,
             'code': code,
             'reason': reason,
+            **({'limitedTest': True} if private_test else {}),
             'paymentRails': (['CHIA_XCH', 'CHIA_CAT'] if assets else ['CHIA_XCH']) if status == 'OPEN' else [],
             **({'paymentAssets': assets} if assets else {}),
             'checkedAt': checked,
@@ -113,7 +120,10 @@ async def _catalog_settings(request: Request, settings: Settings = Depends(get_s
     service=getattr(request.app.state,'generation_customer_purchase',None)
     worker=getattr(request.app.state,'generation_customer_purchase_worker',None)
     pricing=getattr(request.app.state,'generation_price_demand',None)
-    fixed=getattr(getattr(service,'policy',None),'test_usd_minor_per_txch',None)is not None
+    policy = getattr(service, 'policy', None)
+    fixed = getattr(policy, 'test_usd_minor_per_txch', None) is not None
+    if isinstance(policy, TestnetCollectionIssuerPolicy) and getattr(settings, 'generation_customer_purchase_atomic_enabled', False):
+        worker = getattr(service, 'cart_worker', None)
     if service is not None and worker is not None and worker.service is service and (pricing is not None or fixed):
         # This read-only projection never requests prices or invokes a signer.
         # Cache only recent independently reconstructed inventory and private
