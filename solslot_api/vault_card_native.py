@@ -27,6 +27,10 @@ from .generation_sols_batch_execution import unspent
 from .vault_card_store import VaultCardRecord
 
 Hash = Annotated[str, Field(pattern=r'^0x[0-9a-f]{64}$')]
+R3_SENDER = '8c7d9f78c173ac2e4f38115592c6158173d20534'
+R3_PREPARATION_SENDER = 'f2194a3be59cd9f218fa4f5332381dfedb5e8ca5'
+# Canonical SHA-256 of the reviewed native scope, excluding its opening/closing times and sender amendment.
+R3_ORDER_SCOPE = 'e70b044c0c02b1be722ac9455e8a8acab87d061209e9b48825ee2672d77e6638'
 
 
 class VaultCardRelease(BaseModel):
@@ -53,6 +57,7 @@ class VaultCardRelease(BaseModel):
     credentialPolicyVersion: int = Field(ge=2)
     maximumFeePerStageMojos: int = Field(gt=0,lt=2**64,strict=True)
     maximumTotalFeeMojos: int = Field(gt=0,lt=2**64,strict=True)
+    senderSourceCommit: str | None = None
 
     @model_validator(mode='after')
     def check(self):
@@ -65,7 +70,19 @@ class VaultCardRelease(BaseModel):
                 or self.maximumTotalFeeMojos < self.maximumFeePerStageMojos*5
                 or not 0 < self.validFrom < self.expiresAt):
             raise ValueError('Invalid vault card scope')
+        if self.senderSourceCommit is not None:
+            fixed=self.model_dump(mode='json',exclude={'validFrom','expiresAt','senderSourceCommit'})
+            digest=hashlib.sha256(json.dumps(fixed,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+            if self.senderSourceCommit!=R3_SENDER or digest!=R3_ORDER_SCOPE or self.expiresAt-self.validFrom!=7200:
+                raise ValueError('Sender amendment requires the exact approved two-hour card release')
         return self
+
+    def executor_source(self, historical):
+        if self.senderSourceCommit is None:
+            return historical
+        if historical!=R3_PREPARATION_SENDER:
+            raise ValueError('Historical generation sender differs from reviewed predecessor')
+        return self.senderSourceCommit
 
 
 @dataclass(frozen=True)

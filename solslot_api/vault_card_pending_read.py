@@ -105,14 +105,20 @@ def register(app, provider, slots, *, lease=None, clock=time.time):
             raise HTTPException(503, "Primary card observation unavailable") from None
 
 
+async def direct_card_coin_pending(primary, coin_id):
+    if isinstance(primary, PrimaryReadClient):
+        raise ValueError("A direct primary is required for the protected sponsor")
+    if isinstance(primary, CoinsetClient):
+        return await native_coin_pending(primary, coin_id)
+    rows = await primary.get_mempool_items_by_coin_name(coin_id)
+    if type(rows) is not list:
+        raise ValueError("Primary pending observation unavailable")
+    return bool(rows)
+
+
 async def card_coin_pending(primary, order, coin_id):
     if not isinstance(primary, PrimaryReadClient):
-        if isinstance(primary, CoinsetClient):
-            return await native_coin_pending(primary, coin_id)
-        rows = await primary.get_mempool_items_by_coin_name(coin_id)
-        if type(rows) is not list:
-            raise ValueError("Primary pending observation unavailable")
-        return bool(rows)
+        return await direct_card_coin_pending(primary, coin_id)
     request = {"releaseId": order.release_id, "purchaseId": order.purchase_id, "coinId": coin_id}
     response = await primary.card_pending_read(request)
     if (type(response) is not dict or set(response) != {"schema", *request, "pending", "readUntil"}

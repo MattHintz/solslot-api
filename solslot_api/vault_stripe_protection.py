@@ -102,6 +102,7 @@ def records(worker):
 
 
 async def unspent(worker, coin):
+    from .vault_card_pending_read import direct_card_coin_pending
     row = read_confirmed_coin(
         await worker.provider.get_coin_record_by_name_primary(hx(coin.name())),
         coin.name(),
@@ -109,10 +110,7 @@ async def unspent(worker, coin):
     check(
         row.coin == coin
         and not row.spent_height
-        and await worker.provider.primary.get_mempool_items_by_coin_name(
-            hx(coin.name())
-        )
-        == [],
+        and not await direct_card_coin_pending(worker.provider.primary,hx(coin.name())),
         "Allocated coin is spent, pending, or changed",
     )
 
@@ -200,13 +198,22 @@ def reservation_fee(worker, order, scope):
     return cap
 
 
-async def precharge_services(settings, worker, order):
-    from .vault_card_settlement import current_card_artifact, validator_coverage
+def executor_source(settings,order):
+    from .vault_card_native import VaultCardNative
+    from .vault_card_settlement import current_card_artifact
 
-    artifact = current_card_artifact(settings, order)
+    native=VaultCardNative.configured(settings)
+    check(native.release_id==order.release_id, "Runtime sender requires the original protected card release")
+    historic=current_card_artifact(settings,order)["sourceShas"]["keyOfSolomon"]
+    return native.scope.executor_source(historic)
+
+
+async def precharge_services(settings, worker, order):
+    from .vault_card_settlement import validator_coverage
+
     check(
         await worker.exact_executor.release_ready(
-            artifact["sourceShas"]["keyOfSolomon"]
+            executor_source(settings,order)
         ),
         "Pinned exact executor is unavailable",
     )
@@ -337,7 +344,7 @@ async def signable(worker, row, role):
 async def verify_paid_dispatch(worker, operation, prepared=None):
     from .generation_index import load_generation_read_anchor
     from .vault_card_native import VaultCardNative
-    from .vault_card_settlement import confirmed, current_card_artifact
+    from .vault_card_settlement import confirmed
 
     row = paid(worker, operation)
     if not row:
@@ -350,9 +357,7 @@ async def verify_paid_dispatch(worker, operation, prepared=None):
         "Card delivery release has expired or changed",
     )
     if prepared is not None:
-        executor_sha = current_card_artifact(worker.settings, order)["sourceShas"][
-            "keyOfSolomon"
-        ]
+        executor_sha = executor_source(worker.settings,order)
         check(
             await worker.exact_executor.release_ready(executor_sha),
             "Pinned exact executor is unavailable",
