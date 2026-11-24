@@ -1583,6 +1583,7 @@ async def collect_stripe_settlement_quorum(
     claim: StripeSettlementClaim,
     *,
     client: httpx.AsyncClient | None = None,
+    current_generation: bool = False,
 ) -> ValidatorQuorumResult:
     """Collect signatures for both receipt authorization and deed delivery."""
 
@@ -1599,7 +1600,7 @@ async def collect_stripe_settlement_quorum(
     ) -> tuple[int, G2Element] | None:
         try:
             response = await client.post(
-                url.rstrip("/") + "/v1/stripe-settlement/sign",
+                url.rstrip("/") + ("/v1/generation/vault-card/settlement" if current_generation else "/v1/stripe-settlement/sign"),
                 json={
                     "claim": claim.model_dump(mode="json"),
                     "claimHash": claim_hash,

@@ -76,6 +76,10 @@ class ProtocolFundingStore:
                 PRIMARY KEY(network, original_id));
         ''')
 
+        from .vault_card_funding_store import SCHEMA, CardFundingJournal
+        self.db.executescript(SCHEMA)
+        self.cards = CardFundingJournal(self)
+
     def lookup(self, network, original_id, context):
         with self.lock:
             row = self.db.execute(
@@ -111,6 +115,8 @@ class ProtocolFundingStore:
                 # changed protocol bytes cannot sponsor the same spend again.
                 for coin in bundle.removals():
                     coin_id = "0x" + coin.name().hex()
+                    if self.db.execute("SELECT 1 FROM vault_card_inputs WHERE id=? AND locked=1", (coin_id,)).fetchone():
+                        raise ValueError("Protocol input reserved by an active card order")
                     active = self.db.execute("""SELECT h.original_id FROM funded_protocol_input_history h
                         LEFT JOIN funded_protocol_releases r ON h.network=r.network AND h.original_id=r.original_id
                         WHERE h.network=? AND h.coin_id=? AND r.original_id IS NULL""", (network, coin_id)).fetchone()
@@ -149,7 +155,7 @@ class ProtocolFundingStore:
         with self.lock:
             return {row[0] for row in self.db.execute("""SELECT h.coin_id FROM funded_protocol_input_history h
                 LEFT JOIN funded_protocol_releases r ON h.network=r.network AND h.original_id=r.original_id
-                WHERE r.original_id IS NULL""")}
+                WHERE r.original_id IS NULL UNION SELECT id FROM vault_card_inputs WHERE locked=1""")}
 
     def is_released(self, network, original_id):
         with self.lock:

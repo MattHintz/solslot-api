@@ -101,6 +101,9 @@ async def advance_inventory_timeout(*, store: PaymentPurchaseStore, node: Any, s
     if network != "testnet11":
         raise PaymentPurchaseConflict("timeout dispatch is available only on testnet11")
     stored = store.get(purchase_id)
+    release_id=stored.offer_artifact.get('vaultCardReleaseId')
+    if release_id is not None and (not release_id or release_binding.get('cardReleaseId')!=release_id):
+        raise PaymentPurchaseConflict('Generation card return requires its original exact release')
     raw = stored.purchase_artifact
     purchases = (purchase_batch_from_json(raw).artifacts if raw.get("schema") == "solslot.purchase-batch.v1"
                  else (purchase_artifact_v3_from_json(raw),))
@@ -127,11 +130,23 @@ async def advance_inventory_timeout(*, store: PaymentPurchaseStore, node: Any, s
         validators = [bytes.fromhex(k.removeprefix("0x")) for k in release_binding["validatorPubkeys"]]
         if len(treasury) != 32 or len(validators) != 3 or any(len(k) != 48 for k in validators):
             raise ValueError("incomplete deployment coordinates")
+        proceeds=treasury
+        if release_binding.get('cardReleaseId'):
+            from .vault_card_store import VaultCardStore
+            order=VaultCardStore(store.path).get(purchase_id)
+            if (not order or stored.offer_artifact.get('vaultCardReleaseId')!=order.release_id
+                or release_binding['cardReleaseId']!=order.release_id or order.generation_anchor_hash!=release_binding['artifactHash']
+                or release_binding.get('cardPrimaryProceedsPuzzleHash')!=order.primary_proceeds_puzzle_hash
+                or release_binding['protocolTreasuryPuzzleHash']!=order.technology_fee_puzzle_hash
+                or stored.purchase_artifact!=order.batch or tuple(hx(x.release_spend.coin.name()) for x in items)!=order.reserved_coin_ids
+                or tuple(hx(x.reservation_spend.coin.name()) for x in items)!=order.original_coin_ids):
+                raise ValueError('Current card return release differs')
+            proceeds=bytes.fromhex(order.primary_proceeds_puzzle_hash.removeprefix('0x'))
         for item in items:
             _, outer = Program.from_bytes(bytes(item.reservation_spend.puzzle_reveal)).uncurry()
             _, args = list(outer.as_iter())[1].uncurry()
             values = list(args.as_iter())
-            if values[19].as_atom() != treasury or values[20].as_atom() != treasury or [k.as_atom() for k in values[21].as_iter()] != validators:
+            if values[19].as_atom() != treasury or values[20].as_atom() != proceeds or [k.as_atom() for k in values[21].as_iter()] != validators:
                 raise ValueError("reservation belongs to another deployment")
     except (KeyError, IndexError, TypeError, ValueError, AttributeError) as exc:
         raise PaymentPurchaseConflict("timeout source does not match the signed deployment") from exc

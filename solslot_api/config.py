@@ -111,7 +111,14 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
             "SOLSLOT_PROTOCOL_ARTIFACT_API_TOKEN must contain at least 32 "
             "characters in staging/production."
         )
-    if settings.stripe_settlement_enabled:
+    if settings.vault_card_delivery_enabled and (
+            settings.network!='testnet11' or settings.stripe_mode!='test' or settings.stripe_settlement_enabled
+            or not settings.generation_customer_enabled or settings.alpha_writes_enabled or settings.minting_enabled
+            or settings.stripe_delivery_worker_enabled or settings.voucher_issuance_worker_enabled or settings.protocol_fee_funding_enabled
+            or not all((settings.vault_card_release_file,settings.vault_card_release_sha256,settings.vault_card_fee_seed_file,
+                        settings.vault_card_fee_puzzle_hash,settings.chia_primary_url))):
+        raise RuntimeError("Current card worker requires an isolated Testnet sponsor and current release")
+    if settings.stripe_settlement_enabled or settings.vault_card_delivery_enabled:
         if not (settings.stripe_account_id or "").startswith("acct_"):
             raise RuntimeError(
                 "SOLSLOT_STRIPE_SETTLEMENT_ENABLED requires a configured "
@@ -222,7 +229,7 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
                 "Stripe settlement or the reviewed omnichain rail."
             )
     if (
-        settings.stripe_delivery_worker_enabled
+        settings.vault_card_delivery_enabled or settings.stripe_delivery_worker_enabled
         or settings.voucher_issuance_worker_enabled
     ):
         worker_name = (
@@ -230,7 +237,7 @@ def validate_server_hardening_at_startup(settings: "Settings") -> None:
             if settings.stripe_delivery_worker_enabled
             else "SOLSLOT_VOUCHER_ISSUANCE_WORKER_ENABLED"
         )
-        if not settings.protocol_fee_funding_enabled:
+        if not settings.vault_card_delivery_enabled and not settings.protocol_fee_funding_enabled:
             raise RuntimeError(
                 f"{worker_name} requires "
                 "SOLSLOT_PROTOCOL_FEE_FUNDING_ENABLED."
@@ -1282,6 +1289,14 @@ class Settings(BaseSettings):
     stripe_account_id: Optional[str] = None
     stripe_mode: Literal["test", "live"] = "test"
     stripe_restricted_key_file: Optional[str] = None
+    vault_card_checkout_enabled: bool = False
+    vault_card_delivery_enabled: bool = False
+    vault_card_fee_seed_file: Optional[str] = None
+    vault_card_fee_puzzle_hash: Optional[str] = Field(default=None,pattern=r"^0x[0-9a-f]{64}$")
+    vault_card_release_file: Optional[str] = None
+    vault_card_release_sha256: Optional[str] = Field(default=None, pattern=r'^0x[0-9a-f]{64}$')
+    vault_card_return_origin: Optional[str] = None
+    vault_card_webhook_key_file: Optional[str] = None
     stripe_api_url: str = "https://api.stripe.com"
     stripe_delivery_db_path: str = "./state/stripe_deliveries_v1.db"
     stripe_delivery_worker_enabled: bool = False

@@ -716,6 +716,8 @@ async def reserve_smartdeed_inventory(
     except PaymentPurchaseNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    if stored.offer_artifact.get('vaultCardReleaseId'):
+        raise HTTPException(409,'Current vault card reservations require their original generation checkout.')
     if stored.inventory_state in {"RELEASED", "AUTHORIZATION_EXPIRED"}:
         raise HTTPException(status_code=409, detail="This reservation has ended. Start a new purchase with a fresh quote.")
     if stored.inventory_state in {"SUBMITTED", "CONFIRMED"}:
@@ -1457,6 +1459,8 @@ async def _load_context_group(
             status_code=409,
             detail="The native purchase quote is missing, invalid, or expired.",
         ) from exc
+    if stored.offer_artifact.get('vaultCardReleaseId'):
+        raise HTTPException(409,'Current vault card settlement requires its original generation checkout.')
     contexts = []
     for purchase in purchases:
         launcher = _hex32(purchase.deed_launcher_id).casefold()

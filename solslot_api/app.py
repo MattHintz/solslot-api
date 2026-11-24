@@ -540,7 +540,7 @@ async def lifespan(app: FastAPI):
     app.state.stripe_delivery_worker = None
     app.state.kos_exact_executor = None
     if (
-        settings.stripe_delivery_worker_enabled
+        settings.vault_card_delivery_enabled or settings.stripe_delivery_worker_enabled
         or settings.voucher_issuance_worker_enabled
     ):
         app.state.kos_exact_executor = KeyOfSolomonExactExecutor(
@@ -592,6 +592,12 @@ async def lifespan(app: FastAPI):
         )
         await stripe_worker.start()
         app.state.stripe_delivery_worker = stripe_worker
+    if settings.vault_card_delivery_enabled:
+        from .vault_card_runtime import build_worker
+        stripe_worker=build_worker(app,settings,app.state.kos_exact_executor)
+        app.state.kos_exact_executor=None
+        await stripe_worker.start()
+        app.state.stripe_delivery_worker=stripe_worker
     if settings.voucher_issuance_worker_enabled:
         from .voucher_issuance_worker import (
             VoucherIssuanceWorker,
@@ -772,9 +778,25 @@ async def lifespan(app: FastAPI):
             name='generation-operation-observer') if app.state.generation_operations is not None else None)
     generation_admission_task = (asyncio.create_task(app.state.generation_admission.run(),
         name='generation-administrator-observer') if app.state.generation_admission is not None else None)
+    from .vault_card_checkout import VaultCardCheckout
+    app.state.vault_card_checkout = VaultCardCheckout.configured(settings)
+    card_prepare_task = (asyncio.create_task(app.state.vault_card_checkout.run(app),name='vault-card-reservation')
+                         if app.state.vault_card_checkout is not None else None)
+    from .vault_card_events import run_card_events
+    card_events_task = None
+    if settings.vault_card_webhook_key_file:
+        card_events_task = asyncio.create_task(run_card_events(app, settings), name='vault-card-events')
     try:
         yield
     finally:
+        if card_prepare_task is not None:
+            card_prepare_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await card_prepare_task
+        if card_events_task is not None:
+            card_events_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await card_events_task
         if cart_task is not None:
             generation_delivery_stop.set()
             cart_task.cancel()
@@ -935,6 +957,10 @@ app.include_router(collection_endpoints_router)
 app.include_router(admin_sales_router)
 app.include_router(protocol_artifacts_router)
 app.include_router(native_purchases_router)
+from .vault_card_checkout import router as vault_card_checkout_router
+app.include_router(vault_card_checkout_router)
+from .vault_card_events import router as vault_card_event_router
+app.include_router(vault_card_event_router)
 app.include_router(stripe_deliveries_router)
 app.include_router(presale_router)
 app.include_router(alpha_observability_router)
@@ -960,6 +986,7 @@ app.include_router(current_customer_purchase_router)
 
 # zkPassport gasless relayer (ERC-2771 meta-tx; 503 when relayer key is unset).
 app.include_router(zkpassport_relay_router)
+
 
 
 # ─── Dependency injectors ───────────────────────────────────────────────

@@ -1302,8 +1302,10 @@ def canonical_stripe_settlement_claim_json(
     )
 
 
-def load_stripe_restricted_key(settings: ValidatorSettings) -> str:
-    if not settings.stripe_settlement_enabled:
+def load_stripe_restricted_key(settings: ValidatorSettings, *, current_card=False) -> str:
+    enabled=(getattr(settings,'vault_card_settlement_enabled',False) and not settings.stripe_settlement_enabled
+             and settings.network=='testnet11' and settings.stripe_mode=='test') if current_card else settings.stripe_settlement_enabled
+    if not enabled:
         raise ValidatorEvidenceError("Stripe settlement signing is disabled")
     path = Path(settings.stripe_restricted_key_file)
     if path.is_symlink() or not path.is_file():
@@ -1332,6 +1334,7 @@ def load_stripe_restricted_key(settings: ValidatorSettings) -> str:
 def _verify_stripe_provider_evidence(
     settings: ValidatorSettings,
     claim: StripeSettlementClaim,
+    *, current_order=None,
 ) -> None:
     evidence = stripe_settlement_evidence_from_json(claim.stripe_evidence)
     if (
@@ -1341,9 +1344,11 @@ def _verify_stripe_provider_evidence(
         raise ValidatorEvidenceError(
             "Stripe evidence does not match this validator's account and mode"
         )
+    from .vault_card_provider import VERSION as card_version, metadata as card_metadata
+    secret=(load_stripe_restricted_key(settings,current_card=True) if current_order is not None else load_stripe_restricted_key(settings))
     headers = {
-        "authorization": f"Bearer {load_stripe_restricted_key(settings)}",
-        "stripe-version": "2024-06-20",
+        "authorization": f"Bearer {secret}",
+        "stripe-version": card_version if current_order is not None else "2024-06-20",
     }
     try:
         with httpx.Client(
@@ -1375,6 +1380,14 @@ def _verify_stripe_provider_evidence(
         event.get("data"), Mapping
     ) else None
     metadata = intent.get("metadata")
+    if current_order is not None:
+        if (metadata!=card_metadata(current_order) or intent.get("amount")!=current_order.amount_minor
+            or event.get("account",current_order.account_id)!=current_order.account_id
+            or evidence.method_family!=StripeMethodFamily.CARD or not isinstance(charge,Mapping)
+            or charge.get("payment_intent")!=evidence.payment_intent_id or charge.get("paid") is not True
+            or charge.get("status")!="succeeded" or charge.get("amount")!=current_order.amount_minor
+            or charge.get("currency")!=current_order.currency or charge.get("livemode") is not (current_order.mode=="live")):
+            raise ValidatorEvidenceError("Card payment does not match the independently scoped vault order")
     if claim.purchase_artifact.get("schema") == "solslot.purchase-batch.v1":
         purchase_document = purchase_batch_from_json(claim.purchase_artifact)
         purchase_id = purchase_document.purchase_id
@@ -1603,12 +1616,20 @@ def verify_stripe_settlement_claim(
     settings: ValidatorSettings,
     claim: StripeSettlementClaim,
     claim_hash: str,
+    *,current=None,
 ) -> None:
     if claim.canonical_hash() != claim_hash.lower():
         raise ValidatorEvidenceError(
             "Stripe claim hash does not match canonical evidence"
         )
-    artifact, _release = load_validator_artifact(settings)
+    if current is None:
+        artifact, _release = load_validator_artifact(settings)
+    else:
+        from .vault_card_settlement import CurrentCardSignerProof,current_card_artifact
+        if not isinstance(current,CurrentCardSignerProof) or not settings.vault_card_settlement_enabled:
+            raise ValidatorEvidenceError("Current-generation card settlement is disabled")
+        current.require_claim(claim)
+        artifact=current_card_artifact(settings,current.evidence.order)
     if claim.network != settings.network or claim.genesis_artifact_hash != str(
         artifact.get("artifactHash", "")
     ).lower():
@@ -1688,7 +1709,10 @@ def verify_stripe_settlement_claim(
         ) from exc
     base_result_puzzle_hash = bytes32.zeros
     if purchase.rail == PaymentRail.STRIPE:
-        _verify_stripe_provider_evidence(settings, claim)
+        if current is None:
+            _verify_stripe_provider_evidence(settings, claim)
+        else:
+            _verify_stripe_provider_evidence(settings, claim, current_order=current.evidence.order)
     else:
         assert claim.base_evidence is not None
         depositor = str(claim.base_evidence.get("depositor") or "").lower()
@@ -1756,14 +1780,10 @@ def verify_stripe_settlement_claim(
             "signed artifact purchase coordinates are incomplete"
         )
     raw_pubkeys = validator_set.get("pubkeys")
-    if (
-        validator_set.get("threshold") != 2
-        or raw_pubkeys != settings.roster_pubkeys
-        or claim.protocol_puzzle_hash
-        != str(puzzle_hashes.get("protocolTreasuryPuzzleHash", "")).lower()
-        or purchase.protocol_treasury_puzzle_hash
-        != bytes32.fromhex(claim.protocol_puzzle_hash.removeprefix("0x"))
-    ):
+    fee_destination=str(puzzle_hashes.get("protocolTreasuryPuzzleHash","")).lower()
+    proceeds=(current.evidence.order.primary_proceeds_puzzle_hash if current is not None else fee_destination)
+    if (validator_set.get("threshold") != 2 or raw_pubkeys != settings.roster_pubkeys
+        or claim.protocol_puzzle_hash!=proceeds or purchase.protocol_treasury_puzzle_hash!=bytes32.from_hexstr(fee_destination)):
         raise ValidatorEvidenceError(
             "Stripe delivery differs from the signed treasury or validator roster"
         )
@@ -1773,41 +1793,47 @@ def verify_stripe_settlement_claim(
         != bytes32.fromhex(claim.credential_identity_root.removeprefix("0x"))
         or claim.credential_identity_root
         == "0x" + bytes(DEFAULT_IDENTITY_ATTEST_ROOT).hex()
-        or claim.credential_policy_version != 2
-        or claim.credential_bridge_policy_hash != settings.bridge_policy_hash
+        or claim.credential_policy_version != (current.evidence.order.policy_version if current is not None else 2)
+        or claim.credential_bridge_policy_hash != (current.evidence.order.bridge_policy_hash if current is not None else settings.bridge_policy_hash)
     ):
         raise ValidatorEvidenceError(
             "Stripe delivery has no matching zkPassport-approved vault root"
         )
-    owner_key = bytes.fromhex(claim.credential_owner_key.removeprefix("0x"))
-    try:
-        pool_launcher = bytes32.fromhex(
-            str(launchers["pool"]).removeprefix("0x")
-        )
-        expected_credential_puzzle = puzzle_for_vault_full(
-            purchase.vault_launcher_id,
-            owner_key,
-            claim.credential_owner_auth_type,
-            one_leaf_merkle_root(owner_key),
-            pool_launcher,
-            identity_attest_root=purchase.zkpassport_root,
+    if current is not None:
+        from .vault_card_settlement import CurrentCardSignerProof
+        if not isinstance(current,CurrentCardSignerProof) or not settings.vault_card_settlement_enabled:
+            raise ValidatorEvidenceError("Scoped generation settlement proof required")
+        current.require_claim(claim)
+    else:
+        owner_key = bytes.fromhex(claim.credential_owner_key.removeprefix("0x"))
+        try:
+            pool_launcher = bytes32.fromhex(
+                str(launchers["pool"]).removeprefix("0x")
+            )
+            expected_credential_puzzle = puzzle_for_vault_full(
+                purchase.vault_launcher_id,
+                owner_key,
+                claim.credential_owner_auth_type,
+                one_leaf_merkle_root(owner_key),
+                pool_launcher,
+                identity_attest_root=purchase.zkpassport_root,
+                zkpassport_bridge_policy_hash=bytes32.fromhex(
+                    claim.credential_bridge_policy_hash.removeprefix("0x")
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValidatorEvidenceError(
+                "Stripe vault ownership evidence is malformed"
+            ) from exc
+        unstamped_puzzle = puzzle_for_vault_full(
+            purchase.vault_launcher_id, owner_key, claim.credential_owner_auth_type,
+            one_leaf_merkle_root(owner_key), pool_launcher,
+            identity_attest_root=DEFAULT_IDENTITY_ATTEST_ROOT,
             zkpassport_bridge_policy_hash=bytes32.fromhex(
-                claim.credential_bridge_policy_hash.removeprefix("0x")
-            ),
+                claim.credential_bridge_policy_hash.removeprefix("0x")),
         )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValidatorEvidenceError(
-            "Stripe vault ownership evidence is malformed"
-        ) from exc
-    unstamped_puzzle = puzzle_for_vault_full(
-        purchase.vault_launcher_id, owner_key, claim.credential_owner_auth_type,
-        one_leaf_merkle_root(owner_key), pool_launcher,
-        identity_attest_root=DEFAULT_IDENTITY_ATTEST_ROOT,
-        zkpassport_bridge_policy_hash=bytes32.fromhex(
-            claim.credential_bridge_policy_hash.removeprefix("0x")),
-    )
-    _verify_purchase_vault_history(settings, claim, purchase.vault_launcher_id,
-                                   unstamped_puzzle, expected_credential_puzzle)
+        _verify_purchase_vault_history(settings, claim, purchase.vault_launcher_id,
+                                       unstamped_puzzle, expected_credential_puzzle)
 
     try:
         validator_pubkeys = tuple(
@@ -1842,11 +1868,12 @@ def verify_stripe_settlement_claim(
         ) from exc
     if claim.receipt_puzzle_hash != "0x" + receipt_puzzle.get_tree_hash().hex():
         raise ValidatorEvidenceError("Stripe receipt puzzle hash changed")
-    receipt_record = _fetch_coin(
-        settings,
-        claim.receipt_coin_id,
-        "Stripe settlement receipt coin",
-    )
+    if current is None:
+        receipt_record = _fetch_coin(settings,claim.receipt_coin_id,"Stripe settlement receipt coin")
+    else:
+        receipt_record=current.receipt_record
+        if not isinstance(receipt_record,Mapping):
+            raise ValidatorEvidenceError("Current primary receipt proof required")
     receipt_coin = _coin_from_record(
         receipt_record,
         "Stripe settlement receipt coin",
@@ -1861,6 +1888,12 @@ def verify_stripe_settlement_claim(
         raise ValidatorEvidenceError(
             "Stripe settlement receipt coin is not exact and unspent"
         )
+
+    if current is not None:
+        # The independently reconstructed CLVM transitions and current stamped vault above
+        # implement the current generation. Common provider, amount, receipt and roster
+        # checks still precede this point. Legacy settlement retains its own puzzle proof.
+        return
 
     if purchase.delivery_kind == PurchaseDeliveryKind.SGT:
         if batch is not None:
@@ -1946,8 +1979,12 @@ def sign_stripe_settlement_claim(
     ledger: ValidatorLedger,
     claim: StripeSettlementClaim,
     claim_hash: str,
+    *,current=None,
 ) -> str:
-    verify_stripe_settlement_claim(settings, claim, claim_hash)
+    if current is None:
+        verify_stripe_settlement_claim(settings,claim,claim_hash)
+    else:
+        verify_stripe_settlement_claim(settings,claim,claim_hash,current=current)
     pubkeys = tuple(
         bytes.fromhex(value.removeprefix("0x"))
         for value in settings.roster_pubkeys

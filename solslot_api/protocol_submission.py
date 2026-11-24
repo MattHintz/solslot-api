@@ -433,6 +433,9 @@ class ProtocolBundleSubmitter:
         protocol_input_ids = {
             bytes(coin.name()) for coin in protocol_bundle.removals()
         }
+        if self.funding_store is not None and hasattr(self.funding_store,"cards"):
+            if self.funding_store.cards.protected_input(protocol_input_ids):
+                raise ProtocolSubmissionError("Protocol input is reserved by a protected card purchase")
         fee_coin = await self._select_fee_coin(
             preliminary_fee + expected_backing_mojos - expected_protocol_fee_mojos,
             excluded_coin_ids=protocol_input_ids,

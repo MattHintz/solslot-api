@@ -82,6 +82,7 @@ class PrimaryBatchSignRequest(BaseModel):
     claimHash:str
 
 
+from .vault_card_reservations import ReservationRequest as VaultCardReservationRequest
 from .generation_customer_purchase_reservation import CurrentReservationClaim
 from .generation_customer_purchase_delivery import CurrentDeliveryClaim
 from .generation_customer_purchase_batch import CurrentReservationBatch,CurrentDeliveryBatch
@@ -215,6 +216,8 @@ def create_validator_app(
         load_validator_private_key(signer_settings)
         if signer_settings.stripe_settlement_enabled:
             load_stripe_restricted_key(signer_settings)
+        if getattr(signer_settings,"vault_card_settlement_enabled",False):
+            load_stripe_restricted_key(signer_settings,current_card=True)
         active_ledger = configured_ledger or ValidatorLedger(
             signer_settings.ledger_db_path
         )
@@ -251,7 +254,8 @@ def create_validator_app(
             )
         application.state.generation_provider=None
         generation_provider=None
-        if signer_settings.generation_sols_batch_enabled or signer_settings.generation_customer_identity_enabled:
+        if (signer_settings.generation_sols_batch_enabled or signer_settings.generation_customer_identity_enabled
+                or getattr(signer_settings,'vault_card_reservations_enabled',False) or getattr(signer_settings,'vault_card_settlement_enabled',False)):
             from .generation_sols_batch_validators import generation_settings
             from .generation_index import load_generation_read_anchor
             load_generation_read_anchor(generation_settings(signer_settings))
@@ -319,6 +323,10 @@ def create_validator_app(
         from fastapi.responses import JSONResponse
         if getattr(current_settings(), 'generation_customer_identity_enabled', False):
             permitted = {('GET', '/health'), ('POST', '/v1/generation/identity/sign')}
+            if getattr(current_settings(),'vault_card_settlement_enabled',False) and getattr(application.state,'checkout_test_window',None) is None:
+                permitted.update({('GET','/v1/generation/vault-card/ready'),('POST','/v1/generation/vault-card/settlement')})
+            if getattr(current_settings(),'vault_card_reservations_enabled',False) and getattr(application.state,'checkout_test_window',None) is None:
+                permitted.add(('POST','/v1/generation/vault-card/reservation'))
             if getattr(current_settings(),'generation_customer_identity_recovery_enabled',False):
                 permitted.add(('POST','/v1/generation/identity/recover'))
             if current_settings().generation_customer_purchase_enabled:
@@ -339,6 +347,54 @@ def create_validator_app(
             if (request.method, request.url.path) not in permitted:
                 return JSONResponse({'detail': 'CURRENT_SIGNER_ACTION_DISABLED'}, status_code=404)
         return await call_next(request)
+
+    async def card_proof():
+        from .vault_card_settlement import validator_proof
+        settings=current_settings()
+        if (not getattr(settings,'vault_card_settlement_enabled',False) or
+                getattr(application.state,'checkout_test_window',None) is not None):
+            raise HTTPException(404,'Current card settlement is disabled')
+        ledger=application.state.validator_ledger
+        if not ledger or not ledger.healthcheck():
+            raise HTTPException(503,'Current signer journal unavailable')
+        try:return await validator_proof(settings,application.state.generation_provider)
+        except (RuntimeError,ValueError,OSError,KeyError,TypeError) as exc:
+            raise HTTPException(409,'Current card mint or vault evidence differs') from exc
+
+    @application.get('/v1/generation/vault-card/ready')
+    async def card_signer_ready():
+        proof=await card_proof()
+        order=proof.evidence.order
+        settings=current_settings()
+        return dict(releaseId=proof.release,purchaseId=order.purchase_id,batchHash=order.batch_hash,
+                    reservedCoinIds=list(order.reserved_coin_ids),network=order.network,signerIndex=settings.signer_index,
+                    validatorPubkey=settings.roster_pubkeys[settings.signer_index])
+
+    @application.post('/v1/generation/vault-card/settlement',response_model=ValidatorSignatureResponse)
+    async def sign_current_card_settlement(request: StripeSettlementSignRequest):
+        from starlette.concurrency import run_in_threadpool
+        proof=await card_proof()
+        settings=current_settings()
+        try:
+            proof=await proof.bind_receipt(request.claim,application.state.generation_provider)
+            signature=await run_in_threadpool(sign_stripe_settlement_claim,settings,application.state.validator_ledger,
+                                              request.claim,request.claimHash,current=proof)
+        except (ValidatorEvidenceError,ValueError) as exc:
+            raise HTTPException(409,'Current card settlement proof differs') from exc
+        return ValidatorSignatureResponse(claimHash=request.claim.canonical_hash(),signerIndex=settings.signer_index,
+            validatorPubkey=settings.roster_pubkeys[settings.signer_index],signature=signature)
+
+    @application.post('/v1/generation/vault-card/reservation')
+    async def sign_vault_card_reservation(body: VaultCardReservationRequest):
+        from .vault_card_reservations import sign_reservation
+        if (not getattr(current_settings(),'vault_card_reservations_enabled',False)
+                or getattr(application.state,'checkout_test_window',None) is not None):
+            raise HTTPException(404,'Card reservation signer is disabled')
+        try:
+            return await sign_reservation(current_settings(),application.state.validator_ledger,
+                                          application.state.generation_provider,body)
+        except (ValueError,KeyError,RuntimeError,OSError,TimeoutError) as exc:
+            raise HTTPException(409,'Original reservation could not be proved') from exc
 
     async def current_purchase_response(body,*,delivery=False):
         import asyncio
