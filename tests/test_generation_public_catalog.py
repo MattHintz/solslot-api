@@ -39,6 +39,60 @@ async def test_sale_projection_uses_read_only_health_and_inventory_then_caches(m
     assert request.state.current_sale is None
 
 
+@pytest.mark.asyncio
+async def test_buyer_paid_collection_uses_its_cart_worker_with_sponsorship_closed(monkeypatch):
+    import solslot_api.generation_public_catalog as module
+    from tests.test_current_collection_issuer_policy import make_policy
+
+    policy, _ = make_policy()
+    service = SimpleNamespace(policy=policy)
+    service.cart_worker = SimpleNamespace(service=service)
+    state = SimpleNamespace(
+        generation_mint_reviews=SimpleNamespace(generation_id=GEN),
+        generation_operations=SimpleNamespace(generation_id=GEN),
+        generation_index=object(), generation_customer_purchase=service,
+        generation_customer_purchase_worker=None, generation_price_demand=object(),
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=state), state=SimpleNamespace())
+    settings = SimpleNamespace(network='testnet11', deployment_generation_id=GEN,
+                               generation_customer_purchase_atomic_enabled=True)
+    projection = {'checkedAt': int(module.time.time()), 'sale': {'status': 'OPEN'}}
+
+    async def observed(instance, pricing, fixed):
+        assert instance is service
+        return projection
+
+    monkeypatch.setattr(module, '_collection_sale', observed)
+    await module._catalog_settings(request, settings)
+    assert request.state.current_sale is projection
+
+    service.cart_worker = None
+    await module._catalog_settings(request, settings)
+    assert request.state.current_sale is None
+
+
+@pytest.mark.asyncio
+async def test_private_cat_window_does_not_advertise_general_sale():
+    from chia_rs.sized_bytes import bytes32
+    from solslot_api.generation_customer_cat_test_window import CatTestWindow
+    from solslot_api.generation_public_catalog import _collection_sale
+    from unittest.mock import AsyncMock
+
+    inventory = SimpleNamespace(edition=bytes(32), metadata_root=bytes(32),
+                                items=[SimpleNamespace(available=True)])
+    window = CatTestWindow(bytes32(b'v'*32), bytes32(b'c'*32), 3_030_000, 1_000, 4_600)
+    service = SimpleNamespace(inventory_snapshot=AsyncMock(return_value=inventory), store=SimpleNamespace(generation_id=GEN),
+                              policy=SimpleNamespace(test_window=window), collection_readiness=AsyncMock())
+    result = await _collection_sale(service, None, False)
+
+    assert result['sale']['limitedTest'] is True
+    assert result['sale']['status'] == 'NOT_OPEN'
+    assert result['sale']['availableDeeds'] == 0
+    assert result['sale']['paymentRails'] == []
+    assert 'paymentAssets' not in result['sale']
+    service.collection_readiness.assert_not_awaited()
+
+
 def fixture():
     metadata={'purpose':'TEST_ONLY','network':'testnet11','generationId':GEN,'revision':14,
         'collectionId':'TEST-EXAMPLE','title':'A reviewed edition — Testnet Edition','deedAllocation':[{'deedId':'A'},{'deedId':'B'}],
