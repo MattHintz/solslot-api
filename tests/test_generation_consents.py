@@ -72,12 +72,37 @@ async def test_canonical_fact_review_uses_real_admin_signatures_without_bypassin
         reviewed=await sign_consent(review['packageId'],challenge['slot'],signature,
             anchor=built.anchor,provider=c.provider,store=store,clock=lambda:now+1)
     assert reviewed['stage']=='READY'
+    from solslot_api.generation_holder_ballots import GenerationBallotStore, _publication_bill, assemble_holder_ballot, prepare_holder_ballot
+    from solslot_api.generation_holder_evidence import preparation_custody_anchors
+    from tests.test_generation_holder_ballots import request as holder_request, sign_all
+    ballots=GenerationBallotStore(str(tmp_path/'ballots.db'),c.prep.generation_id)
+    selected=holder_request(c,chain,review['proposalId'],[1],consent_id=review['packageId'])
+    holder=await prepare_holder_ballot(selected,anchor=built.anchor,provider=c.provider,store=ballots,
+        consents=store,custodies=preparation_custody_anchors(c.prep),clock=lambda:now+2)
+    assert holder['stage']=='AWAITING_HOLDER_SIGNATURES' and holder['signatures']==[]
+    assert holder['selectedWeight']==10000 and holder['proposal']==review['proposal']
+    assert holder['proposalId']==review['proposalId'] and holder['requiredVotes']==15000
+    assert ballots.reviewed_request(selected,now+3)['packageId']==holder['packageId']
+    original=store.document(review['packageId'])
+    changed=original['review']['proposal']|{'billHash':h(bytes32(b'x'*32))}
+    with pytest.raises(ValueError,match='collection valuation differs'):
+        _publication_bill(original|{'review':original['review']|{'proposal':changed}},chain)
     execution=MaintenanceRequest.model_validate(dict(generationId=c.prep.generation_id,requestKey='cannot-fast-track',
         kind='APPLY_STATUTES',proposalId=review['proposalId'],feeCapMojos=1000,expectedInputs=inputs,statutes=intent))
     journal=GenerationOperationJournal(str(tmp_path/'ops.db'),c.prep.generation_id)
     with pytest.raises(ValueError):
         await prepare_maintenance(execution,anchor=built.anchor,provider=c.provider,journal=journal,clock=lambda:now+2)
     assert (await resolve_generation_chain(built.anchor,provider=c.provider)).economic_components[state.component_id].state.state()==state.state()
+    async def assemble():
+        return await assemble_holder_ballot(holder['packageId'],anchor=built.anchor,provider=c.provider,
+            store=ballots,consents=store,journal=journal,clock=lambda:now+4)
+    with pytest.raises(ValueError,match='holder signatures'):
+        await assemble()
+    await sign_all(c,holder,ballots,now+3)
+    opening=await assemble()
+    assert await c.client.push_tx(journal.protocol_bundle(opening['operationId']))==(MempoolInclusionStatus.SUCCESS,None)
+    await c.sim.farm_block()
+    assert h((await resolve_generation_chain(built.anchor,provider=c.provider)).governance.state.active.proposal_id)==holder['proposalId']
 
 
 @pytest.mark.asyncio
