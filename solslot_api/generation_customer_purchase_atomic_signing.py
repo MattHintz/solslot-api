@@ -85,6 +85,9 @@ async def verify_approval(claim, *, settings, anchor, provider, issuer_policy, e
     if not isinstance(claim, AtomicBuyerApproval) or settings.network!='testnet11':
         raise ValueError('Testnet buyer approval required')
     inputs = artifacts(claim.reservation)
+    window = getattr(issuer_policy, 'test_window', None)
+    if window is not None:
+        window.require_artifacts(inputs, buyer_paid=True, now=int(clock()))
     args = dict(settings=settings, anchor=anchor, provider=provider, issuer_policy=issuer_policy,
                 expected_issuer_policy_hash=expected_issuer_policy_hash, clock=clock)
     verifier = verify_current_batch_reservation if isinstance(claim.reservation,CurrentReservationBatch) else verify_current_reservation
@@ -258,7 +261,7 @@ async def sign_atomic_issuer(claim, claim_hash, quorum_signature, *, settings, a
         if len(items) == 1:
             final = journal.authorize(artifact=items[0], terms=terms[0], **args)
         else:
-            final = journal.authorize_batch(artifacts=items, terms=terms, **args)
+            final = journal.authorize_batch(artifacts=items, terms=terms, buyer_paid=True, **args)
     expected=purchase.bundle([s for companion in companions for s in companion.operation.spends])
     if final.coin_spends!=expected.coin_spends:
         raise ValueError('Issuer returned different settlement spends')

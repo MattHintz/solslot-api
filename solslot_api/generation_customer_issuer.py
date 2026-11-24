@@ -166,16 +166,21 @@ class TestnetIssuerJournal:
                 raise ValueError('CURRENT_ISSUER_ACTIVE_LINEAGE_REQUIRED')
 
     def authorize(self,*,bundle,artifact,terms,fees,now,sign_message):
+        if getattr(self.policy, 'test_window', None) is not None:
+            raise ValueError('CURRENT_CHECKOUT_OUTSIDE_TEST_WINDOW')
         with self._lock:
             self._require_binding()
             return self._authorize(bundle=bundle,artifact=artifact,terms=terms,fees=fees,now=now,sign_message=sign_message)
 
-    def authorize_batch(self,*,bundle,artifacts,terms,fees,now,sign_message):
+    def authorize_batch(self,*,bundle,artifacts,terms,fees,now,sign_message,buyer_paid=False):
         """Reserve all original deed-budget slots before any key callback.
 
         Reuses the original per-deed append-only rows, so a mixed single/batch
         sequence, partial signer failure or restart cannot reset capacity.
         """
+        window = getattr(self.policy, 'test_window', None)
+        if window is not None:
+            window.require_artifacts(artifacts, buyer_paid=buyer_paid, now=now)
         if not 2<=len(artifacts)<=25 or len(artifacts)!=len(terms):
             raise ValueError('CURRENT_ISSUER_BATCH_BOUNDS_INVALID')
         with self._lock:
@@ -190,6 +195,11 @@ class TestnetIssuerJournal:
                     row=self.db.execute('SELECT * FROM issuer_forwarding WHERE artifact_hash=?',(identity,)).fetchone()
                     if row is None:missing.append((identity,expected))
                     elif any(row[k]!=v for k,v in expected.items()):raise ValueError('CURRENT_ISSUER_SAVED_PURCHASE_CHANGED')
+                if window is not None and missing:
+                    used_window = self.db.execute('SELECT 1 FROM issuer_forwarding WHERE created_at>=? LIMIT 1',
+                                                  (window.starts_at,)).fetchone()
+                    if used_window or len(missing) != len(artifacts):
+                        raise ValueError('CURRENT_CHECKOUT_TEST_ORDER_ALREADY_USED')
                 used=self.db.execute('SELECT COUNT(*) FROM issuer_forwarding').fetchone()[0]
                 if hasattr(self.policy,'maximum_purchases') and used+len(missing)>self.policy.maximum_purchases:raise ValueError('CURRENT_ISSUER_PURCHASE_BUDGET_EXHAUSTED')
                 for identity,expected in missing:

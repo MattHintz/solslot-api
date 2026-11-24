@@ -108,10 +108,17 @@ class CurrentNativePurchaseExecution:
             raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_CLOSED')
         elif expires > self.policy.expires_at:
             raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_ENDING')
+        window = getattr(self.policy, 'test_window', None)
+        if window is not None and expires > window.ends_at:
+            raise ValueError('CURRENT_EXECUTION_PURCHASE_WINDOW_ENDING')
         return now, expires
 
     async def quote(self, request_key, deed_launcher_id, *, browser_hash, receiving_launcher=None, receiving_owner=None,
                     buyer_paid=False, payment_asset=bytes32.zeros):
+        window = getattr(self.policy, 'test_window', None)
+        if window is not None:
+            quantity = len(deed_launcher_id) if isinstance(deed_launcher_id, (list, tuple)) else 1
+            window.require_order(receiving_launcher, payment_asset, quantity, buyer_paid, int(self.clock()))
         if payment_asset != bytes32.zeros and not buyer_paid:
             raise ValueError('CURRENT_CHECKOUT_BUYER_PAID_REQUIRED')
         if isinstance(deed_launcher_id,(list,tuple)):

@@ -88,7 +88,7 @@ class CurrentCustomerPurchaseStore(PaymentPurchaseStore):
             raise ValueError('CURRENT_CHECKOUT_SAVED_REVIEW_CHANGED')
         return row, claim
 
-    def save_review(self, claim, *, browser_hash, request_key, now, buyer_paid=False):
+    def save_review(self, claim, *, browser_hash, request_key, now, buyer_paid=False, test_window=None):
         if (not isinstance(claim, (CurrentReservationClaim,CurrentReservationBatch))
                 or claim.generation_id != self.generation_id
                 or re.fullmatch(r'[0-9a-f]{64}', browser_hash or '') is None
@@ -109,6 +109,13 @@ class CurrentCustomerPurchaseStore(PaymentPurchaseStore):
                     if row['canonical_claim'] != document or row['claim_hash'] != digest:
                         raise ValueError('CURRENT_CHECKOUT_RETRY_CHANGES_REVIEW')
                 else:
+                    if test_window is not None:
+                        from .generation_customer_purchase_batch import artifacts
+                        test_window.require_artifacts(artifacts(claim), buyer_paid=buyer_paid, now=now)
+                        taken = db.execute('SELECT 1 FROM current_customer_purchase_reviews WHERE generation_id=? '
+                                           'AND created_at>=? LIMIT 1', (self.generation_id, test_window.starts_at))
+                        if taken.fetchone():
+                            raise ValueError('CURRENT_CHECKOUT_TEST_ORDER_ALREADY_USED')
                     if db.execute('SELECT 1 FROM current_customer_purchase_reviews WHERE claim_hash=?', (digest,)).fetchone():
                         raise ValueError('CURRENT_CHECKOUT_REVIEW_ALREADY_BOUND')
                     self._admit(db, len(document.encode()) + 512)

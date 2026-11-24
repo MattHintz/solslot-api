@@ -16,6 +16,8 @@ from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import MOD
 from chia_rs import G1Element
 from chia_rs.sized_bytes import bytes32
 
+from .generation_customer_cat_test_window import CatTestWindow
+
 _MOD_BYTES=bytes(MOD)
 @dataclass(frozen=True)
 class CheckoutCat:
@@ -78,6 +80,8 @@ class TestnetCollectionIssuerPolicy:
     test_usd_minor_per_txch: int | None = None
     checkout_cats: tuple[CheckoutCat,...] = ()
 
+    test_window: CatTestWindow | None = None
+
     def cat(self, asset_id):
         for asset in self.checkout_cats:
             if asset.asset_id == asset_id:
@@ -92,6 +96,10 @@ class TestnetCollectionIssuerPolicy:
                 or len({c.validate().asset_id for c in self.checkout_cats}) != len(self.checkout_cats)
                 or tuple(c.asset_id for c in self.checkout_cats) != tuple(sorted(c.asset_id for c in self.checkout_cats))):
             raise ValueError('Invalid collection CAT list')
+        if self.test_window is not None:
+            window = self.test_window.validate()
+            if window.amount_per_deed > self.cat(window.asset).max_per_deed:
+                raise ValueError('Single-order price exceeds the approved asset limit')
         fields=(self.generation,self.collection,self.edition,self.metadata_root,
                 self.proceeds_puzzle,self.fee_puzzle,*self.deed_launchers)
         if (any(not isinstance(v,bytes32) or v==bytes32.zeros for v in fields)
@@ -127,6 +135,9 @@ class TestnetCollectionIssuerPolicy:
         if self.checkout_cats:
             value['schema'] = 'solslot.testnet-collection-issuer-policy.v2'
             value['testCats'] = [asset.public() for asset in self.checkout_cats]
+        if self.test_window is not None:
+            value['schema'] = 'solslot.testnet-collection-issuer-policy.v3'
+            value['singleCatOrder'] = self.test_window.public()
         return value
 
     @property
@@ -238,11 +249,14 @@ def read_collection_issuer_policy(path,expected_file_hash):
                 or pricing['mode']!='FIXED_TESTNET_CONVERSION' or not isinstance(pricing['usdMinorPerTxch'],str)
                 or not pricing['usdMinorPerTxch'].isdigit() or str(int(pricing['usdMinorPerTxch']))!=pricing['usdMinorPerTxch']):
             raise ValueError('CURRENT_COLLECTION_ISSUER_PRICING_INVALID')
-    with_cat = isinstance(q, dict) and q.get('schema') == 'solslot.testnet-collection-issuer-policy.v2'
+    scoped = isinstance(q, dict) and q.get('schema') == 'solslot.testnet-collection-issuer-policy.v3'
+    if scoped:
+        keys.add('singleCatOrder')
+    with_cat = scoped or (isinstance(q, dict) and q.get('schema') == 'solslot.testnet-collection-issuer-policy.v2')
     if with_cat:
         keys.add('testCats')
     if (not isinstance(q,dict) or set(q)!=keys
-            or q['schema'] not in ('solslot.testnet-collection-issuer-policy.v1','solslot.testnet-collection-issuer-policy.v2')
+            or q['schema'] not in ('solslot.testnet-collection-issuer-policy.v1','solslot.testnet-collection-issuer-policy.v2','solslot.testnet-collection-issuer-policy.v3')
             or q['network']!='testnet11' or q['mainnetEnabled'] is not False
             or q['masterKeyExportAuthorized'] is not False
             or q['scope']!='NEW_EPHEMERAL_PRIMARY_PROCEEDS_ONLY'
@@ -257,7 +271,8 @@ def read_collection_issuer_policy(path,expected_file_hash):
         policy=TestnetCollectionIssuerPolicy(b('generationId'),b('collectionHash'),b('editionHash'),b('metadataRoot'),
             b('proceedsPuzzleHash'),b('feePuzzleHash'),bytes.fromhex(q['issuerPublicKey'].removeprefix('0x')),
             frozenset(bytes32.from_hexstr(x) for x in q['deedLauncherIds']),int(q['maximumGrossMojos']),
-            int(pricing['usdMinorPerTxch']) if pricing is not None else None, checkout_cats=tuple(CheckoutCat.from_public(row) for row in q['testCats']) if with_cat else ()).validate()
+            int(pricing['usdMinorPerTxch']) if pricing is not None else None, checkout_cats=tuple(CheckoutCat.from_public(row) for row in q['testCats']) if with_cat else (),
+            test_window=CatTestWindow.parse(q['singleCatOrder']) if scoped else None).validate()
     except (TypeError,ValueError,KeyError) as exc:
         raise ValueError('CURRENT_COLLECTION_ISSUER_POLICY_FIELDS_CHANGED') from exc
     if policy.public()!=q:raise ValueError('CURRENT_COLLECTION_ISSUER_POLICY_CANONICAL_REQUIRED')

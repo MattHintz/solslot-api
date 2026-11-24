@@ -26,7 +26,9 @@ async def test_one_buyer_paid_transaction(core, tmp_path, real_synthetic_identit
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('real_synthetic_identity_policy', ['forwarding'], indirect=True)
-async def test_two_deeds_with_funded_standard_cat(core, tmp_path, real_synthetic_identity_policy, monkeypatch):
+@pytest.mark.parametrize('scoped', [False, True], ids=['collection', 'single-order'])
+async def test_two_deeds_with_funded_standard_cat(core, tmp_path, real_synthetic_identity_policy, monkeypatch, scoped):
+    core.single_cat_window = scoped
     core.checkout_batch_quantity = 2
     core.checkout_nominal_candidate = True
     core.buyer_paid_settlement = True
