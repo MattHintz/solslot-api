@@ -6,7 +6,7 @@ timeout spends may advance the available-coin cursor.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Mapping
 
@@ -168,7 +168,12 @@ def timeout_items(store: PaymentPurchaseStore, purchase_id: str) -> tuple[Timeou
             struct, inner = list(arguments.as_iter())
             _, arguments = inner.uncurry()
             args = list(arguments.as_iter())
-            if len(args) != 23:
+            # Generation V4 appends the exact batch bindings to its immutable mint terms.
+            # Only a vault-card order retains the release that admitted this shape.
+            card_v4 = (len(args) == 24 and stored.rail == 'stripe'
+                       and stored.purchase_intent_id == 'vault-card-'+purchase_id.removeprefix('0x')
+                       and isinstance(stored.offer_artifact.get('vaultCardReleaseId'),str))
+            if len(args) != 23 and not card_v4:
                 raise ValueError("unsupported inventory puzzle")
             terms = PrimaryMintTermsV3.for_artifact(
                 artifact=purchase, smart_deed_inner_hash=bytes32(args[2].as_atom()),
@@ -177,7 +182,11 @@ def timeout_items(store: PaymentPurchaseStore, purchase_id: str) -> tuple[Timeou
                 validator_pubkeys=tuple(value.as_atom() for value in args[21].as_iter()),
                 provider_id=bytes32(args[22].as_atom()),
             )
+            if card_v4:
+                terms = replace(terms,inventory_version=4,generation_batch_bindings=bytes(args[23]))
             terms = inventory_terms_for_puzzle_hash(terms, struct, spend.coin.puzzle_hash)
+            if card_v4 and terms.inventory_version != 4:
+                raise ValueError('generation inventory shape changed')
             if (mod != SINGLETON_MOD or inner != make_inventory_available_inner(terms)
                     or deed_launcher_puzzle_hash_from_struct(struct, purchase.deed_launcher_id) != terms.deed_launcher_puzzle_hash
                     or row.deed_launcher_id != hx(purchase.deed_launcher_id)

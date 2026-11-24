@@ -43,6 +43,10 @@ class ValidatorSettings(BaseSettings):
     identity_network_artifact_path: str = ""
     identity_network_plan_hash: str = ""
 
+    vault_card_settlement_enabled: bool = False
+    vault_card_reservations_enabled: bool = False
+    vault_card_release_file: str = ''
+    vault_card_release_sha256: str = Field(default='', pattern=r'^(|0x[0-9a-f]{64})$')
     generation_sols_batch_enabled:bool=False
     generation_customer_identity_enabled:bool=False
     generation_customer_identity_recovery_enabled:bool=False
@@ -138,6 +142,10 @@ class ValidatorSettings(BaseSettings):
 
     @model_validator(mode="after")
     def _permit_deployment(self) -> "ValidatorSettings":
+        if self.vault_card_settlement_enabled and (self.network!='testnet11' or self.stripe_mode!='test'
+                or self.stripe_settlement_enabled or not self.generation_customer_identity_enabled
+                or not all((self.vault_card_release_file,self.vault_card_release_sha256,self.stripe_restricted_key_file,self.stripe_account_id))):
+            raise ValueError("Private card signing requires independent current Testnet authority")
         if self.generation_customer_identity_recovery_enabled and not self.generation_customer_identity_enabled:
             raise ValueError('identity signature recovery requires the current identity boundary')
         if self.generation_customer_identity_recovery_enabled and not self.generation_customer_identity_recovery_expires_at:

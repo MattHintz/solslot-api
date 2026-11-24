@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
 import math
+import time
 from typing import Any, Mapping
 
 from fastapi import HTTPException
@@ -13,6 +14,8 @@ from chia.types.blockchain_format.coin import Coin
 from chia.types.blockchain_format.program import Program
 from chia.types.coin_spend import make_spend
 from chia.wallet.cat_wallet.cat_utils import CAT_MOD, construct_cat_puzzle
+from chia.wallet.conditions import CreateCoin
+from chia.wallet.trading.offer import OFFER_MOD_HASH, Offer
 from chia.wallet.puzzles.singleton_top_layer_v1_1 import SINGLETON_MOD
 from chia.wallet.wallet_spend_bundle import WalletSpendBundle
 from chia_rs import AugSchemeMPL, G2Element, SpendBundle
@@ -61,7 +64,7 @@ from .external_settlement import (
 )
 from .faucet import Faucet
 from .launch_gates import require_operation_gate
-from .native_purchases import _load_context_group
+from .native_purchases import NativePurchaseContext, _load_context_group
 from .omnichain_evidence import load_omnichain_evidence
 from .governance_queue import GovernanceQueueStore
 from .governance_sale_offer import (
@@ -87,6 +90,7 @@ from .protocol_submission import PreparedProtocolBundle, ProtocolBundleSubmitter
 from .public_artifact import load_signed_public_artifact
 from .state import get_registry
 from .stripe_delivery_store import (
+    StripeDeliveryNotFound,
     DELIVERY_PREPARED,
     DELIVERY_SUBMITTED,
     EXTERNAL_SETTLEMENT_PENDING,
@@ -158,6 +162,7 @@ class StripeDeliveryWorker:
         )
         self.config = config
         self._task: asyncio.Task[None] | None = None
+        self._last_healthy_queue_pass = 0.0
         self._stop = asyncio.Event()
         self._advance_lock = asyncio.Lock()
         self._owner = f"stripe-delivery-{id(self):x}"
@@ -197,13 +202,29 @@ class StripeDeliveryWorker:
         self,
         purchase_id: str | None = None,
     ) -> StripeDeliveryOperation | None:
-        if not self._writes_are_open():
+        polling = purchase_id is None
+        if getattr(self.settings,'vault_card_delivery_enabled',False):
+            protected_order=self.current_card_order()
+            if protected_order is None or purchase_id not in (None,protected_order.purchase_id):
+                self._last_healthy_queue_pass=0.0
+                return None
+            purchase_id=protected_order.purchase_id
+            try:
+                self.store.get(purchase_id)
+            except StripeDeliveryNotFound:
+                if polling:
+                    self._last_healthy_queue_pass=time.monotonic()
+                return None
+        elif not self._writes_are_open():
+            self._last_healthy_queue_pass = 0.0
             return None
         # Do not queue caller tasks behind slow provider work. Keep serialized
         # funding selection; each current advance has a deadline inside its lease.
         if self._advance_lock.locked():
             return None
         async with self._advance_lock:
+            if polling:
+                self._last_healthy_queue_pass = 0.0
             operation = (
                 self.store.claim(
                     purchase_id,
@@ -217,12 +238,17 @@ class StripeDeliveryWorker:
                 )
             )
             if operation is None or operation.state == FINALIZED:
+                if polling:
+                    self._last_healthy_queue_pass = time.monotonic()
                 return operation
             if not self._rail_is_enabled(operation):
                 return self.store.release_lease(operation.purchase_id)
             try:
                 async with asyncio.timeout(self.config.advance_timeout_seconds):
-                    return await self._advance(operation)
+                    advanced = await self._advance(operation)
+                    if polling and advanced is not None and not advanced.last_error:
+                        self._last_healthy_queue_pass = time.monotonic()
+                    return advanced
             except asyncio.CancelledError:
                 self.store.record_error(operation.purchase_id, 'Delivery observation interrupted; retain exact execution for recovery')
                 raise
@@ -247,6 +273,29 @@ class StripeDeliveryWorker:
                 )
                 return self.store.record_error(operation.purchase_id, str(exc))
 
+    def current_card_order(self):
+        from .vault_card_native import VaultCardNative
+        from .vault_card_store import VaultCardStore
+        s=self.settings
+        if not (getattr(s,'vault_card_delivery_enabled',False) and self.config.enabled
+            and not s.stripe_settlement_enabled and s.network=='testnet11'
+            and not s.protocol_fee_funding_enabled and not s.stripe_delivery_worker_enabled
+            and s.stripe_mode=='test' and not s.alpha_writes_enabled and not s.minting_enabled):
+            return None
+        native=VaultCardNative.configured(s)
+        order=VaultCardStore(s.payment_purchase_db_path).by_release(native.release_id)
+        if order and (order.network,order.mode,order.account_id,order.generation_id,order.generation_anchor_hash)==(
+            s.network,s.stripe_mode,s.stripe_account_id,s.deployment_generation_id,s.generation_chain_anchor_hash):
+            return order
+        return None
+
+    def recent_stripe_queue_pass(self) -> bool:
+        return bool(self._task and not self._task.done() and not self._stop.is_set()
+                    and (self.current_card_order() is not None if getattr(self.settings,"vault_card_delivery_enabled",False)
+                         else self._writes_are_open() and self.settings.stripe_settlement_enabled)
+                    and self._last_healthy_queue_pass > 0
+                    and 0 <= time.monotonic() - self._last_healthy_queue_pass < 30)
+
     def unavailable_detail(self):
         if not self._writes_are_open():
             return 'Delivery is paused. Your payment and progress are retained; recover this same purchase when service resumes.'
@@ -270,6 +319,9 @@ class StripeDeliveryWorker:
         return True
 
     def _rail_is_enabled(self, operation: StripeDeliveryOperation) -> bool:
+        if getattr(self.settings,'vault_card_delivery_enabled',False):
+            order=self.current_card_order()
+            return bool(order and order.purchase_id==operation.purchase_id and operation.payment_rail==PAYMENT_RAIL_STRIPE)
         if operation.payment_rail == PAYMENT_RAIL_STRIPE:
             return self.settings.stripe_settlement_enabled
         if operation.payment_rail == PAYMENT_RAIL_BASE_USDC:
@@ -280,6 +332,23 @@ class StripeDeliveryWorker:
         self,
         operation: StripeDeliveryOperation,
     ) -> StripeDeliveryOperation:
+        from . import vault_stripe_protection as cover
+        protected=cover.card(self,operation.purchase_id)
+        if not protected and operation.payment_rail==PAYMENT_RAIL_STRIPE:
+            from .vault_card_store import VaultCardStore
+            if VaultCardStore(self.settings.payment_purchase_db_path).get(operation.purchase_id):
+                raise StripeDeliveryManualReview("Vault card funding journal is unavailable")
+        if protected and protected["state"]=="DELIVERED":
+            confirmation=await self._delivery_confirmation(operation)
+            if not confirmation:
+                raise StripeDeliveryManualReview("Previously observed card delivery needs chain reconciliation")
+            return await self._record_delivery_confirmation(operation,confirmation)
+        if protected and protected["state"]=="RETURNING" and operation.state in (DELIVERY_PREPARED,DELIVERY_SUBMITTED):
+            confirmation=await self._delivery_confirmation(operation)
+            if confirmation:
+                return await self._record_delivery_confirmation(operation,confirmation)
+        if protected:
+            cover.paid(self,operation)
         if operation.state == PAYMENT_VERIFIED:
             return await self._prepare_receipt_funding(operation)
         if operation.state == RECEIPT_FUNDING_PREPARED:
@@ -428,6 +497,9 @@ class StripeDeliveryWorker:
         self,
         operation: StripeDeliveryOperation,
     ) -> StripeDeliveryOperation:
+        from . import vault_stripe_protection as cover
+        if cover.card(self,operation.purchase_id):
+            return await cover.card_receipt(self,operation)
         purchase, _receipt, terms = self._receipt_terms(operation)
         receipt_amount = (
             purchase.quantity if isinstance(purchase, PurchaseBatchV1) else 1
@@ -541,14 +613,23 @@ class StripeDeliveryWorker:
                 )
                 return await self.exact_executor.dispatch(request, prepared)
 
-            result = await self.submitter.prepare_and_dispatch(
-                operation.receipt_funding_bundle,
-                dispatch,
-            )
+            from . import vault_stripe_protection as cover
+            if cover.card(self,operation.purchase_id):
+                protected=await cover.prepare_stage(self,operation.purchase_id,"receipt_fee")
+                await cover.verify_paid_dispatch(self,operation,protected)
+                await dispatch(protected)
+                result=protected.to_json()
+            else:
+                result = await self.submitter.prepare_and_dispatch(
+                    operation.receipt_funding_bundle,
+                    dispatch,
+                )
         else:
             prepared = _prepared_from_binding(
                 operation.receipt_funding_exact_bundle
             )
+            from . import vault_stripe_protection as cover
+            await cover.verify_paid_dispatch(self,operation,prepared)
             await self.exact_executor.dispatch(request, prepared)
             result = prepared.to_json()
         return self.store.record_receipt_funding(
@@ -802,13 +883,19 @@ class StripeDeliveryWorker:
         receipt_coin: Coin,
         expected_rail: PaymentRail,
     ) -> StripeDeliveryOperation:
-        group = await _load_context_group(
-            self.settings,
-            self.provider,
-            operation.purchase_id,
-            require_live=False,
-            allowed_rails=(expected_rail,),
-        )
+        from .vault_stripe_protection import card
+        protected=card(self,operation.purchase_id)
+        if protected:
+            from .vault_card_settlement import group as current_group
+            group=await current_group(self,operation)
+        else:
+            group = await _load_context_group(
+                self.settings,
+                self.provider,
+                operation.purchase_id,
+                require_live=False,
+                allowed_rails=(expected_rail,),
+            )
         if group.batch != batch or len(group.contexts) != batch.quantity:
             raise StripeDeliveryManualReview(
                 "SmartDeed batch differs from its canonical inventory"
@@ -881,7 +968,8 @@ class StripeDeliveryWorker:
             credential_owner_auth_type=first.credential_owner_auth_type,
             credential_owner_key="0x" + first.credential_owner_key.hex(),
         )
-        quorum = await collect_stripe_settlement_quorum(self.settings, claim)
+        quorum = (await collect_stripe_settlement_quorum(self.settings,claim,current_generation=True)
+                  if protected else await collect_stripe_settlement_quorum(self.settings,claim))
         receipt_spend = build_purchase_batch_receipt_spend(
             receipt_coin=receipt_coin,
             terms=receipt_terms,
@@ -914,7 +1002,8 @@ class StripeDeliveryWorker:
                 if context.reservation is not None
             ),
         )
-        valid = primary.aggregate_offer.to_valid_spend()
+        stripe = operation.payment_rail == PAYMENT_RAIL_STRIPE
+        valid = primary.to_valid_spend() if stripe else primary.aggregate_offer.to_valid_spend()
         signed = WalletSpendBundle(
             valid.coin_spends,
             AugSchemeMPL.aggregate(
@@ -924,7 +1013,6 @@ class StripeDeliveryWorker:
         evaluated = EvaluatedBundleOutputs(signed)
         additions = evaluated.additions
         delivery_outputs: list[Coin] = []
-        treasury_outputs: list[Coin] = []
         for context in group.contexts:
             vault_full = SINGLETON_MOD.curry(
                 context.deed_struct,
@@ -941,18 +1029,20 @@ class StripeDeliveryWorker:
                 )
             except GovernedOutputConflict as exc:
                 raise StripeDeliveryManualReview(str(exc)) from exc
-            treasury_outputs.append(
+        if stripe:
+            treasury_outputs = _stripe_batch_treasury_outputs(
+                receipt_coin, group.contexts, signed, evaluated
+            )
+        else:
+            treasury_outputs = tuple(
                 _one_child_output(
                     additions,
                     parent_coin_id=context.deed_coin.name(),
-                    puzzle_hash=(
-                        receipt.result_authorization_puzzle_hash
-                        if operation.payment_rail == PAYMENT_RAIL_BASE_USDC
-                        else context.terms.protocol_puzhash
-                    ),
+                    puzzle_hash=receipt.result_authorization_puzzle_hash,
                     amount=1,
                     label="external settlement result",
                 )
+                for context in group.contexts
             )
         delivery_ids = tuple(_hex32(coin.name()) for coin in delivery_outputs)
         treasury_ids = tuple(_hex32(coin.name()) for coin in treasury_outputs)
@@ -1315,10 +1405,17 @@ class StripeDeliveryWorker:
                 )
                 return await self.exact_executor.dispatch(request, prepared)
 
-            result = await self.submitter.prepare_and_dispatch(
-                operation.delivery_bundle,
-                dispatch,
-            )
+            from . import vault_stripe_protection as cover
+            if cover.card(self,operation.purchase_id):
+                protected=await cover.prepare_stage(self,operation.purchase_id,"delivery_fee")
+                await cover.verify_paid_dispatch(self,operation,protected)
+                await dispatch(protected)
+                result=protected.to_json()
+            else:
+                result = await self.submitter.prepare_and_dispatch(
+                    operation.delivery_bundle,
+                    dispatch,
+                )
             refreshed = self.store.get(operation.purchase_id)
             if refreshed.delivery_exact_bundle is None:
                 raise StripeDeliveryManualReview(
@@ -1331,6 +1428,8 @@ class StripeDeliveryWorker:
             exact_prepared = _prepared_from_binding(
                 operation.delivery_exact_bundle
             )
+            from . import vault_stripe_protection as cover
+            await cover.verify_paid_dispatch(self,operation,exact_prepared)
             await self.exact_executor.dispatch(request, exact_prepared)
             result = exact_prepared.to_json()
         result_bundle_id = _normalize_hex32(str(result["spendBundleId"]))
@@ -1409,6 +1508,14 @@ class StripeDeliveryWorker:
             raise StripeDeliveryManualReview(
                 "governed outputs are not fully confirmed with the delivery"
             )
+        from . import vault_stripe_protection as cover
+        protected=cover.card(self,operation.purchase_id)
+        if protected:
+            exact_id=_hex32(_prepared_from_binding(operation.delivery_exact_bundle).bundle.name())
+            if operation.delivery_bundle_id not in (None,exact_id):
+                raise StripeDeliveryManualReview("Protected delivery bundle changed")
+            self.submitter.funding_store.cards.transition(operation.purchase_id,operation.evidence["paymentIntentId"],
+                {"PAID","RETURNING"},"DELIVERED",{"bundle":exact_id,"height":confirmation_height})
         confirmed = self.store.record_delivery_confirmed(
             operation.purchase_id,
             confirmation_height=confirmation_height,
@@ -1579,6 +1686,42 @@ def _one_output(
             f"delivery must create exactly one {label}; found {len(matches)}"
         )
     return matches[0]
+
+
+def _stripe_batch_treasury_outputs(
+    receipt: Coin,
+    contexts: tuple[NativePurchaseContext, ...],
+    bundle: WalletSpendBundle,
+    evaluated: EvaluatedBundleOutputs,
+) -> tuple[Coin, ...]:
+    """Follow the receipt's ordinary Offer settlement chain and bind each deed's payout."""
+    if not contexts or receipt.amount != len(contexts):
+        raise StripeDeliveryManualReview("Stripe receipt amount differs from the deed count")
+    spends = {spend.coin.name(): spend for spend in bundle.coin_spends}
+    created = set(evaluated.additions)
+    settlement = Coin(receipt.name(), OFFER_MOD_HASH, receipt.amount)
+    outputs = []
+    for context in contexts:
+        spend = spends.get(settlement.name())
+        if settlement not in created or spend is None or spend.coin != settlement:
+            raise StripeDeliveryManualReview("Stripe receipt settlement link is missing")
+        artifact = context.purchase
+        payment = CreateCoin(
+            context.terms.protocol_puzhash,
+            uint64(1),
+            [artifact.purchase_id, artifact.artifact_hash],
+        )
+        notarized = Offer.notarize_payments({None: [payment]}, [context.deed_coin])[None][0]
+        expected = Program.to((notarized.nonce, [notarized.as_condition_args()]))
+        groups = Program.from_bytes(bytes(spend.solution)).as_iter()
+        if sum(group == expected for group in groups) != 1:
+            raise StripeDeliveryManualReview("Stripe settlement differs from its exact deed payment")
+        payout = Coin(settlement.name(), payment.puzzle_hash, payment.amount)
+        if payout not in created or payout.name() in spends:
+            raise StripeDeliveryManualReview("Stripe treasury output is missing or already consumed")
+        outputs.append(payout)
+        settlement = Coin(settlement.name(), OFFER_MOD_HASH, uint64(settlement.amount - 1))
+    return tuple(outputs)
 
 
 def _one_child_output(

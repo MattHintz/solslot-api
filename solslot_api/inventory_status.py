@@ -228,7 +228,17 @@ def validated_recovery_receipt(snapshot, *, network, artifact=None):
                 heights.append(height)
             receipt = dict(kind="timeout-release", confirmationHeight=max(heights))
         if expired is not None:
-            _expiry_activation(expired, network)
+            release_id=stored.offer_artifact.get('vaultCardReleaseId')
+            if release_id is not None:
+                anchor=_hex(stored.offer_artifact['generationAnchorHash'])
+                generation=_hex(stored.offer_artifact['generationId'])
+                if (_hex(release_id)=='0x'+'0'*64 or expired['artifactHash']!=anchor or
+                        expired['activation']!={'schema':'solslot.vault-card-unused-authorization.v1',
+                        'releaseId':release_id,'generationId':generation,'generationAnchorHash':anchor,'network':network}
+                        or stored.rail!='stripe' or stored.purchase_intent_id!='vault-card-'+stored.purchase_id[2:]):
+                    raise ValueError('Retained native card recovery scope differs')
+            else:
+                _expiry_activation(expired, network)
             view = SimpleNamespace(get=lambda _: stored, inventory_items=lambda _: rows)
             expected = timeout_items(view, stored.purchase_id)
             previous = expired["snapshot"]

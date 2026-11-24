@@ -20,6 +20,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Optional
 
+from chia.consensus.default_constants import DEFAULT_CONSTANTS
 from chia.types.blockchain_format.coin import Coin
 from chia.types.blockchain_format.program import Program
 from chia.wallet.derive_keys import master_sk_to_wallet_sk_unhardened
@@ -73,9 +74,7 @@ def _puzzle_for_pk_threadsafe(public_key: G1Element) -> Program:
 # Network-specific AGG_SIG_ME additional data.
 # Pulled from chia.consensus.default_constants.DEFAULT_CONSTANTS / testnet11 overrides.
 AGG_SIG_ME_DATA = {
-    "mainnet": bytes.fromhex(
-        "ccd5bb71183532bff220ba46c268991a00000000000000000000000000000000"
-    ),
+    "mainnet": bytes(DEFAULT_CONSTANTS.AGG_SIG_ME_ADDITIONAL_DATA),
     "testnet11": bytes.fromhex(
         "37a90eb5185a9c4439a91ddc98bbadce7b4feba060d50116a067de66bf236615"
     ),

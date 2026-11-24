@@ -1,0 +1,28 @@
+{
+  "evidence": "Archived two original Testnet11 mint coin spends. Identity, release time and reservation simulation are local.",
+  "sourceMintHeight": 4887810,
+  "sourceMintBlockHash": "0x2e04bba0b9b81db80f6d3e679d014b6492a9202e14dbe80cd86b70e85ac3e604",
+  "network": "testnet11",
+  "generationId": "0x2219d1e2dba64ceb4df84e70ce14b6b2d8d94b0e99350664dd3371c2f3234d57",
+  "vaultLauncherId": "0xee7fc9daeb6b72a140439557ca1bf3cdfa4d946bad3f7afe050ede41a9e26eca",
+  "deedLauncherIds": [
+    "0x3b4798d99c17f7309e6fa7d07588ad62d296198fe281a9cecb59989a5a4b878d",
+    "0x6fb06c06b31466f45dde0a52ae9e1a5ad407b560a955503da11ec54a64e21f67"
+  ],
+  "originalCoinIds": [
+    "0x0768dc4bf2b7de42e5377f173ec3a336d4fc8cef49482f85441f799eb42d68fa",
+    "0x1765457f6c3cf9fb3738052d068f6852d4b9223f4522562b055a5a17a82988b2"
+  ],
+  "compiledUnsignedReserveOutputs": [
+    "0x9de42bfce7b397251e4dce3adc89cc680e175f9618c21d83bd7fa2459044e521",
+    "0x3f0f83bbeb8a793faf39f89e5caa9c854ed03ed969f797808cbaf757c63dc7d6"
+  ],
+  "baseAmountMinor": 600000,
+  "technologyFeeMinor": 6000,
+  "totalAmountMinor": 606000,
+  "currency": "usd",
+  "technologyFeePuzzleHash": "0x7ea99cba05fa4fd81abffdb2b2501d5b1b8c116d88e8e18c0c4ed2b0a80e8ad3",
+  "primaryProceedsPuzzleHash": "0x436a8de10b4cd2618b99f673d1688b3c7317f5372756ce32a01f84aa625d2a85",
+  "state": "AWAITING_RESERVATION",
+  "externalCalls": 0
+}

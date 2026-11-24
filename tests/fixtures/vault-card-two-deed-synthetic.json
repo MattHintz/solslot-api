@@ -1,0 +1,22 @@
+{
+  "schema": "solslot.vault-card-order.v1",
+  "state": "AWAITING_RESERVATION",
+  "network": "testnet11",
+  "mode": "test",
+  "generationId": "0x0101010101010101010101010101010101010101010101010101010101010101",
+  "collectionId": "0x0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+  "vaultLauncherId": "0x1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c",
+  "purchaseId": "0xa153c8d3371779668cbb682571455b9c56143a9c04e95a7e9bd93617ab6d2882",
+  "batchHash": "0x96d2701b8e06d52824b3fd6cf61d64c95d549d120379277fdb22d69e98eee215",
+  "destinationPuzzleHash": "0x30959db09e32abc0c9b5a8b511b64273657db5919cfd667a0434f070f1df4a83",
+  "deedLauncherIds": [
+    "0x10c479e51625c5f0d396345fe6518a9a80a614b050ac0c677ea7e564affebfff",
+    "0x23919910ada9ef562b27370efafb3ac95ee422c8fe7589b3de8150b0f2896762"
+  ],
+  "quantity": 2,
+  "amountMinor": 606000,
+  "currency": "usd",
+  "expiresAt": 1795538126,
+  "reservationRequested": false,
+  "paymentReceived": false
+}

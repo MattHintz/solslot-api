@@ -34,14 +34,26 @@ def test_active_admission_does_not_scan_expired_history(tmp_path,monkeypatch):
     with connect() as db:assert db.execute('SELECT count(*) FROM payment_purchase_admission').fetchone()[0]==50001
 
 
+async def require_delivery_started(entered, task):
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+    except TimeoutError:
+        if task.done():
+            task.result()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        pytest.fail('Delivery worker did not start advancing its isolated operation')
+
+
 @pytest.mark.asyncio
 async def test_slow_delivery_has_deadline_and_no_waiter_queue():
     worker=object.__new__(StripeDeliveryWorker)
     worker.config=StripeDeliveryWorkerConfig(enabled=True,advance_timeout_seconds=.05)
+    worker.settings=SimpleNamespace(vault_card_delivery_enabled=False)
     worker._advance_lock=asyncio.Lock();worker._owner='isolated'
     worker._writes_are_open=lambda:True;worker._rail_is_enabled=lambda _:True
-    a=SimpleNamespace(purchase_id='slow',state='PAYMENT_VERIFIED')
-    b=SimpleNamespace(purchase_id='next',state='PAYMENT_VERIFIED')
+    a=SimpleNamespace(purchase_id='slow',state='PAYMENT_VERIFIED',last_error=None)
+    b=SimpleNamespace(purchase_id='next',state='PAYMENT_VERIFIED',last_error=None)
     queue=[a,b];errors=[];entered=asyncio.Event()
     worker.store=SimpleNamespace(claim_next=lambda **kw:queue.pop(0),
         record_error=lambda purchase_id,error:errors.append((purchase_id,error)) or a)
@@ -50,7 +62,7 @@ async def test_slow_delivery_has_deadline_and_no_waiter_queue():
             entered.set();await asyncio.Event().wait()
         return op
     worker._advance=advance
-    task=asyncio.create_task(worker.reconcile_once());await entered.wait()
+    task=asyncio.create_task(worker.reconcile_once());await require_delivery_started(entered, task)
     # A busy caller does not wait behind the slow provider or claim another row.
     assert await asyncio.wait_for(worker.reconcile_once(),.02) is None
     assert await asyncio.wait_for(task,.2) is a and errors[0][0]=='slow'
@@ -65,11 +77,12 @@ async def test_slow_delivery_has_deadline_and_no_waiter_queue():
 @pytest.mark.asyncio
 async def test_delivery_cancellation_preserves_recovery_and_unlocks():
     worker=object.__new__(StripeDeliveryWorker);worker.config=StripeDeliveryWorkerConfig(enabled=True)
+    worker.settings=SimpleNamespace(vault_card_delivery_enabled=False)
     worker._advance_lock=asyncio.Lock();worker._owner='isolated';worker._writes_are_open=lambda:True
-    worker._rail_is_enabled=lambda _:True;op=SimpleNamespace(purchase_id='retained',state='DELIVERY_PREPARED')
+    worker._rail_is_enabled=lambda _:True;op=SimpleNamespace(purchase_id='retained',state='DELIVERY_PREPARED',last_error=None)
     errors=[];entered=asyncio.Event()
     worker.store=SimpleNamespace(claim_next=lambda **kw:op,record_error=lambda pid,error:errors.append(pid))
     async def advance(_):entered.set();await asyncio.Event().wait()
-    worker._advance=advance;task=asyncio.create_task(worker.reconcile_once());await entered.wait();task.cancel()
+    worker._advance=advance;task=asyncio.create_task(worker.reconcile_once());await require_delivery_started(entered, task);task.cancel()
     with pytest.raises(asyncio.CancelledError):await task
     assert errors==['retained'] and not worker._advance_lock.locked()

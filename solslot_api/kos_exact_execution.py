@@ -84,6 +84,18 @@ class KeyOfSolomonExactExecutor:
             else None
         )
 
+    async def release_ready(self, release_sha: str) -> bool:
+        """Read the exact executor's public release response without submitting an operation."""
+        if len(release_sha)!=40 or any(c not in "0123456789abcdef" for c in release_sha):
+            return False
+        try:
+            async with httpx.AsyncClient(verify=self.verify,cert=self.cert,timeout=self.timeout_seconds) as client:
+                response=await client.get(self.url+"/healthz")
+                response.raise_for_status()
+                return response.json()=={"status":"ok","releaseSha":release_sha,"executionMode":"exact-bundle-v2-only"}
+        except (httpx.HTTPError,ValueError):
+            return False
+
     async def dispatch(
         self,
         request: ExactExecutionRequest,

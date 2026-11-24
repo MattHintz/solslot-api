@@ -10,6 +10,7 @@ import json
 import re
 import ssl
 from pathlib import Path
+import httpx
 
 from .chia_provider import ChiaProvider, ChiaProviderConfig, ChiaProviderError
 from .coinset_client import CoinsetClient
@@ -60,6 +61,16 @@ class PrimaryReadClient(CoinsetClient):
     async def _post(self, path, body):
         checked_read(path.removeprefix('/'), body)
         return await super()._post(path, body)
+
+    async def card_pending_read(self, request):
+        if self.base_url != PRIMARY_READER_URL:
+            raise ValueError("Expected the enrolled private Testnet reader")
+        try:
+            response = await self._client.post("vault-card/pending", json=request)
+            response.raise_for_status()
+            return response.json()
+        except (httpx.HTTPError, ValueError):
+            raise ValueError("Private card primary observation unavailable") from None
 
 
 class ReadOnlyChiaProvider(ChiaProvider):
