@@ -36,7 +36,7 @@ from solslot_puzzles.holdings import HoldingKind, quorum
 from .faucet import AGG_SIG_ME_DATA
 from .generation_chain_evidence import resolve_generation_chain, current_evidence_unchanged, public_bill
 from .generation_coin_evidence import read_confirmed_coin
-from .generation_consents import ConsentRequest, restore_consent, consent_inputs_unchanged, _tip_document
+from .generation_consents import ConsentRequest, restore_consent, consent_inputs_unchanged, reviewed_statutes_bill, _tip_document
 from .generation_context import generation_bytes
 from .generation_execution import Hash, Model, ExpectedInputs
 from .generation_holder_evidence import resolve_holder_custody
@@ -205,13 +205,18 @@ def _record(record):return {'coin':record.coin.to_json_dict(),'confirmed_block_i
 def _context_record(record):return {'coin':_coin(record.coin),'confirmedHeight':record.confirmed_height,'spentHeight':record.spent_height}
 
 
-def _publication_bill(document):
+def _publication_bill(document,chain):
     request=ConsentRequest.model_validate(document['request']);proposal=document['review']['proposal']
     if request.proposal_kind=='UPGRADE':return Program.to([b'UPGRADE',proposal['registryNonce'],request.upgrade.plan().program()])
     if request.proposal_kind=='PARAMETERS':
         p=request.parameters;return Program.to([b'PARAMETERS',bytes32.from_hexstr(p.component_id),bytes32.from_hexstr(p.launcher_id),
             p.revision,bytes32.from_hexstr(p.previous_values_hash),list(p.values)])
     if request.proposal_kind=='REOPEN':return Program.to([b'REOPEN',proposal['pauseEpoch'],request.scope])
+    if request.proposal_kind=='STATUTES' and request.statutes.record_kind=='COLLECTION':
+        bill=reviewed_statutes_bill(request,chain)
+        if public_bill(bill)!=proposal:
+            raise ValueError('collection valuation differs from the approved publication')
+        return bill
     if request.proposal_kind=='MINT_TEST_ONLY':
         source=document['review'].get('mintSource')
         if (source is None or source['packageId']!=request.mint_review_id or source['generationId']!=request.generation_id):
@@ -252,7 +257,7 @@ async def prepare_holder_ballot(request,*,anchor,custodies,provider,store,consen
             consent=consents.document(request.consent_package_id)
             if consent['request']['kind']!='PUBLICATION_APPROVAL' or request.fee_cap_mojos>consent['request']['feeCapMojos']:
                 raise ValueError('opening changes the approved action or fee ceiling')
-            await consent_inputs_unchanged(consent,provider);bill=_publication_bill(consent)
+            await consent_inputs_unchanged(consent,provider);bill=_publication_bill(consent,chain)
             snapshot=tree;proposal=gov.proposal_id(bill,snapshot);closes=None;expires=consent['expiresAt']
             if gov.active or (reg.pause_mask&1 and bill.first().as_atom()!=b'REOPEN') or h(proposal)!=consent['review']['proposalId']:
                 raise ValueError('publication differs from the current proposal, pause or snapshot')
@@ -370,7 +375,7 @@ async def assemble_holder_ballot(identity,*,anchor,provider,store,consents,journ
             consentdoc=consents.document(request.consent_package_id);await consent_inputs_unchanged(consentdoc,provider)
             consent=restore_consent(consentdoc,anchor.administrator)
             publication=complete_administrator_action(consent,{r['slot']:bytes.fromhex(r['signature'][2:]) for r in consents.signatures(request.consent_package_id)})
-            built=open_proposal(gov,govtip,reg,regtip,holdings,_publication_bill(consentdoc),consent.administrator,
+            built=open_proposal(gov,govtip,reg,regtip,holdings,_publication_bill(consentdoc,chain),consent.administrator,
                 publication.spends,consentdoc['review']['issuedAt'],auths)
         else:
             if not gov.active or h(gov.active.proposal_id)!=request.proposal_id:raise ValueError('the original vote is no longer open')

@@ -267,6 +267,15 @@ def _challenge(challenge):
         'digest':h(challenge.digest),'publicKey':h(challenge.public_key),'typedData':challenge.typed_data()}
 
 
+def reviewed_statutes_bill(request, chain):
+    intent = request.statutes
+    history = chain.economic_components.get(bytes32.from_hexstr(intent.component_id))
+    expected = request.expected_inputs.components.get(intent.component_id)
+    if history is None or h(history.current.coin.name()) != expected:
+        raise ValueError('statutes input changed before review')
+    return intent.bill(history.state)
+
+
 async def consent_inputs_unchanged(document,provider):
     if (await provider.get_network_info_primary()).get('network_name')!='testnet11':
         raise ValueError('consent requires the primary Testnet11 node')
@@ -360,10 +369,7 @@ async def prepare_consent(request,*,anchor,provider,store,clock=time.time,settin
                         raise ValueError('parameter intent differs from the current authority')
                     bill=history.state.bill(p.values)
                 elif request.proposal_kind=='STATUTES':
-                    intent=request.statutes;history=chain.economic_components.get(bytes32.from_hexstr(intent.component_id))
-                    if history is None or h(history.current.coin.name())!=request.expected_inputs.components[intent.component_id]:
-                        raise ValueError('statutes input changed before review')
-                    bill=intent.bill(history.state)
+                    bill=reviewed_statutes_bill(request,chain)
                 elif request.proposal_kind=='MINT_TEST_ONLY':
                     bill=edition.bill()
                 elif request.proposal_kind=='FUND_REDEMPTION':
