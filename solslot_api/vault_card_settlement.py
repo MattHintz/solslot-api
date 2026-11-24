@@ -99,6 +99,7 @@ class CurrentCardSignerProof:
     async def bind_receipt(self, claim, provider):
         from chia_rs.sized_bytes import bytes32
         from .generation_coin_evidence import read_confirmed_coin
+        from .vault_card_pending_read import card_coin_pending
 
         self.require_claim(claim)
         cid = bytes32.from_hexstr(claim.receipt_coin_id)
@@ -106,10 +107,7 @@ class CurrentCardSignerProof:
         row = read_confirmed_coin(raw, cid)
         check(
             not row.spent_height
-            and await provider.primary.get_mempool_items_by_coin_name(
-                claim.receipt_coin_id
-            )
-            == [],
+            and not await card_coin_pending(provider.primary, self.evidence.order, claim.receipt_coin_id),
             "Current card receipt is spent, pending, or unavailable",
         )
         return replace(self, receipt_record=raw)

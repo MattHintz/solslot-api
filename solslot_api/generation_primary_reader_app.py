@@ -28,6 +28,8 @@ def create_primary_reader_app(*, provider):
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     active = asyncio.Semaphore(8)
+    from .vault_card_pending_read import register
+    register(app, provider, active)
 
     @app.get('/health')
     async def health(request: Request):

@@ -707,6 +707,15 @@ async def test_private_worker_construction_leaves_legacy_fee_and_queue_closed(
         worker.submitter.policy.maximum_mojos == 7
         and worker.current_card_order() == f.o
     )
+    cfg.vault_card_fee_key_kind = "master"
+    with pytest.raises(ValueError, match="funding address"):
+        build_worker(app, cfg, f.exact)
+    cfg.vault_card_fee_puzzle_hash = Faucet.from_master_private_key_hex("22" * 32, "testnet11").address_hex
+    assert build_worker(app, cfg, f.exact).faucet.address_hex == cfg.vault_card_fee_puzzle_hash
+    cfg.vault_card_fee_key_kind = "seed"
+    with pytest.raises(ValueError, match="funding address"):
+        build_worker(app, cfg, f.exact)
+    cfg.vault_card_fee_puzzle_hash = worker.faucet.address_hex
     assert not worker._writes_are_open()
     assert not worker.recent_stripe_queue_pass()
     import asyncio

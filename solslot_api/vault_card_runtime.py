@@ -76,9 +76,14 @@ def build_worker(app, settings, executor):
             or info.st_size > 128
         ):
             raise ValueError("Private operator card funding credential is unavailable")
-        till = Faucet.from_seed_hex(
-            source.read(129).strip().decode("ascii"), settings.network
-        )
+        encoded_key = source.read(129).strip().decode("ascii")
+        kind = getattr(settings, "vault_card_fee_key_kind", "seed")
+        if kind == "master":
+            till = Faucet.from_master_private_key_hex(encoded_key, settings.network)
+        elif kind == "seed":
+            till = Faucet.from_seed_hex(encoded_key, settings.network)
+        else:
+            raise ValueError("Unrecognized card funding credential format")
     if till.address_hex != settings.vault_card_fee_puzzle_hash:
         raise ValueError("Current card funding address differs")
     ordinary = getattr(app.state, "faucet", None)

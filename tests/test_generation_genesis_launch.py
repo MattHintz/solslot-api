@@ -171,6 +171,20 @@ async def test_full_atomic_launch_has_readable_pool_exact_rewards_and_conserved_
         generation_preparation_path=str(prep_file),generation_preparation_hash=c.prep.manifest_hash,
         generation_chain_anchor_path=str(anchor_file),generation_chain_anchor_hash='0x'+sha256(anchor_file.read_bytes()).hexdigest())
     read=load_generation_read_anchor(settings)
+    from dataclasses import replace
+    from solslot_api.vault_card_native import verified_read_anchor
+
+    reread = verified_read_anchor(settings, read)
+    assert reread is not read
+    assert reread.governance.inner() == read.governance.inner()
+    changed = SimpleNamespace(**vars(read))
+    changed.governance = replace(read.governance, nonce=read.governance.nonce + 1)
+    with pytest.raises(ValueError, match='Current generation launch anchor changed'):
+        verified_read_anchor(settings, changed)
+    changed.governance = read.governance
+    changed.economic_components = read.economic_components[:-1]
+    with pytest.raises(ValueError, match='Current generation launch anchor changed'):
+        verified_read_anchor(settings, changed)
     assert read.registry.inner()==built.anchor.registry.inner()
     assert (await resolve_generation_chain(read,provider=c.provider)).economic_components[pool.component_id].state.inner()==pool.inner()
 

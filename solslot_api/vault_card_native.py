@@ -77,6 +77,27 @@ class VaultCardEvidence:
     inventory: object
 
 
+def verified_read_anchor(settings, expected):
+    """Compare the canonical on-chain puzzles and use the independently verified file."""
+    selected = load_generation_read_anchor(settings)
+    if selected is expected:
+        return selected
+
+    def commitments(anchor):
+        return (
+            anchor.issuance,
+            anchor.registry,
+            anchor.administrator,
+            anchor.governance.inner().get_tree_hash(),
+            tuple((type(state), state.launcher_id, state.inner().get_tree_hash())
+                  for state in anchor.economic_components),
+        )
+
+    if commitments(selected) != commitments(expected):
+        raise ValueError('Current generation launch anchor changed')
+    return selected
+
+
 class VaultCardNative:
     def __init__(self,settings,scope,release_id):
         self.settings,self.scope,self.release_id=settings,scope,release_id
@@ -113,8 +134,7 @@ class VaultCardNative:
     async def from_primary(self,anchor,provider,snapshot=None):
         self.check_profile()
         s=self.scope
-        if load_generation_read_anchor(self.settings)!=anchor:
-            raise ValueError('Current generation launch anchor changed')
+        anchor = verified_read_anchor(self.settings, anchor)
         if (await provider.get_network_info_primary()).get('network_name')!=s.network:
             raise ValueError('Primary node network differs')
         b=bytes32.from_hexstr
@@ -166,8 +186,9 @@ class VaultCardNative:
 
     @staticmethod
     async def stage(evidence,provider):
+        from .vault_card_pending_read import card_coin_pending
         await unspent(provider,evidence.vault.coin)
-        if await provider.primary.get_mempool_items_by_coin_name(h(evidence.vault.coin.name()))!=[]:
+        if await card_coin_pending(provider.primary,evidence.order,h(evidence.vault.coin.name())):
             raise ValueError('Vault has a pending spend')
         stages=[]
         heights=set()
@@ -177,16 +198,14 @@ class VaultCardNative:
             if old.coin!=coin:
                 raise ValueError('Incorrect original coin')
             if not old.spent_height:
-                pending=await provider.primary.get_mempool_items_by_coin_name(h(coin.name()))
-                if not isinstance(pending,list):
-                    raise ValueError('Original coin status unavailable')
+                pending=await card_coin_pending(provider.primary,evidence.order,h(coin.name()))
                 stages.append('PENDING' if pending else 'AVAILABLE')
                 continue
             actual=_spend(await provider.get_puzzle_and_solution_primary(h(coin.name()),old.spent_height),coin)
             if actual != t.spend:
                 raise ValueError('Original deed went to another order')
             nxt=await unspent(provider,t.reserved_coin)
-            if nxt.confirmed_height!=old.spent_height or await provider.primary.get_mempool_items_by_coin_name(h(nxt.coin.name()))!=[]:
+            if nxt.confirmed_height!=old.spent_height or await card_coin_pending(provider.primary,evidence.order,h(nxt.coin.name())):
                 raise ValueError('Reservation no longer available')
             heights.add(nxt.confirmed_height)
             stages.append('CONFIRMED')

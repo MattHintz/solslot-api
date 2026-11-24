@@ -1292,6 +1292,7 @@ class Settings(BaseSettings):
     vault_card_checkout_enabled: bool = False
     vault_card_delivery_enabled: bool = False
     vault_card_fee_seed_file: Optional[str] = None
+    vault_card_fee_key_kind: Literal["seed", "master"] = "seed"
     vault_card_fee_puzzle_hash: Optional[str] = Field(default=None,pattern=r"^0x[0-9a-f]{64}$")
     vault_card_release_file: Optional[str] = None
     vault_card_release_sha256: Optional[str] = Field(default=None, pattern=r'^0x[0-9a-f]{64}$')
