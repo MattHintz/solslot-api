@@ -272,7 +272,7 @@ def create_validator_app(
             selected_current_identity_profile(signer_settings)
         if signer_settings.generation_customer_purchase_enabled:
             from .generation_customer_purchase_policy import selected_purchase_policy
-            selected_purchase_policy(signer_settings)
+            application.state.checkout_test_window = getattr(selected_purchase_policy(signer_settings), 'test_window', None)
         application.state.current_issuer=None
         if signer_settings.generation_customer_purchase_issuer_enabled:
             import time
@@ -332,6 +332,10 @@ def create_validator_app(
                     permitted.add(('POST','/v1/generation/purchase/atomic/sign'))
                 if current_settings().generation_customer_purchase_issuer_enabled:
                     permitted.add(('POST','/v1/generation/purchase/atomic/issuer-sign'))
+            if getattr(application.state, 'checkout_test_window', None) is not None:
+                permitted.difference_update({('POST', '/v1/generation/purchase/reservation/sign'),
+                                             ('POST', '/v1/generation/purchase/delivery/sign'),
+                                             ('POST', '/v1/generation/purchase/issuer/sign')})
             if (request.method, request.url.path) not in permitted:
                 return JSONResponse({'detail': 'CURRENT_SIGNER_ACTION_DISABLED'}, status_code=404)
         return await call_next(request)

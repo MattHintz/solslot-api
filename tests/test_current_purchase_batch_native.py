@@ -115,6 +115,11 @@ async def collection_checkout(c, settings, prior, inventory, store, service, tmp
         prior.proceeds_puzzle, prior.fee_puzzle, prior.issuer_public_key,
         frozenset(item.original.terms.deed_launcher_id for item in inventory.items),
         prior.maximum_gross_mojos, prior.test_usd_minor_per_txch, checkout_cats=getattr(c, "checkout_cats", ()))
+    if getattr(c, 'single_cat_window', False):
+        from dataclasses import replace
+        from solslot_api.generation_customer_cat_test_window import CatTestWindow
+        window = CatTestWindow(prior.buyer_vault, c.checkout_cats[0].asset_id, 3_030_000, now(), now()+3600)
+        policy = replace(policy, test_window=window).validate()
     # Reuse the existing runtime's empty ledger schema before the offline transition.
     async def unused_issuer(_):
         raise AssertionError('Staging must never call an issuer')
@@ -260,6 +265,18 @@ async def exercise_batch(c,ctx,built,inventory,vault,pay_coin,payment_key,synthe
     assert (await service.quote('one-customer-order',list(reversed(ids)),browser_hash=binding,**receiver))==review
     different_ids = ids[:1] if quantity > 1 else [h(selected[1].original.terms.deed_launcher_id)]
     with pytest.raises(ValueError):await service.quote('one-customer-order',different_ids,browser_hash=binding,**receiver)
+    if getattr(c, 'single_cat_window', False):
+        from solslot_api.generation_customer_purchase_batch import artifacts
+        window = service.policy.test_window
+        claim = service._saved(identity, binding)['reservationClaim']
+        with pytest.raises(ValueError, match='TEST_ORDER_ALREADY_USED'):
+            store.save_review(claim, browser_hash=binding, request_key='second-order',
+                              now=now(), buyer_paid=True, test_window=window)
+        with pytest.raises(ValueError, match='OUTSIDE_TEST_WINDOW'):
+            await service.quote('second-vault', ids, browser_hash=binding,
+                                **{**receiver, 'receiving_launcher': type(vault.launcher).zeros})
+        with pytest.raises(ValueError, match='OUTSIDE_TEST_WINDOW'):
+            window.require_artifacts(artifacts(claim), buyer_paid=False, now=now())
     assert store.reservation_request(identity,browser_hash=binding)is None
     if getattr(c, 'buyer_paid_settlement', False):
         from tests.test_buyer_paid_atomic_purchase import settle_in_simulator

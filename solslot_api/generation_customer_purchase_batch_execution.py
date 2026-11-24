@@ -82,7 +82,13 @@ async def quote_batch(s,request_key,deeds,browser_hash,receiving_launcher=None,r
     quote_started=start()
     verified = await verify_current_batch_reservation(claim,**s._arguments())
     quote_finished=start()
-    try:identity=s.store.save_review(claim,browser_hash=browser_hash,request_key=request_key,now=int(s.clock()), **({'buyer_paid':True} if buyer_paid else {}))
+    options = {'buyer_paid': True} if buyer_paid else {}
+    window = getattr(s.policy, 'test_window', None)
+    if window is not None:
+        options['test_window'] = window
+    try:
+        identity = s.store.save_review(claim, browser_hash=browser_hash, request_key=request_key,
+                                       now=int(s.clock()), **options)
     except ValueError as exc:
         if str(exc)!='CURRENT_CHECKOUT_RETRY_CHANGES_REVIEW':raise
         return await quote_batch(s,request_key,deeds,browser_hash,
