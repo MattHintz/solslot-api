@@ -33,7 +33,7 @@ from solslot_puzzles.vault_driver import puzzle_for_p2_vault, puzzle_hash_for_p2
 
 from solslot_api.faucet import AGG_SIG_ME_DATA
 from solslot_api.governed_output_index import EvaluatedBundleOutputs
-from solslot_api.stripe_delivery_worker import _stripe_batch_treasury_outputs
+from solslot_api.stripe_delivery_worker import _batch_settlement_outputs
 from solslot_api.vault_card_events import EvidenceMismatch, PAID, payment_evidence
 from solslot_api.vault_card_provider import metadata
 
@@ -187,7 +187,8 @@ def test_offline_mainnet_inventory_and_two_deed_card_receipt(version):
     received=[graph.find_exact_descendant(ancestor_coin_id=i.deed_coin.name(),
         puzzle_hash=SINGLETON_MOD.curry(i.struct,puzzle_for_p2_vault(batch.vault_launcher_id)).get_tree_hash(),
         amount=1,label='vault deed') for i in items]
-    payouts=_stripe_batch_treasury_outputs(coin,tuple(items),final,graph)
+    payouts=_batch_settlement_outputs(coin,tuple(items),final,graph,
+        result_puzzle_hash=receipt.result_authorization_puzzle_hash)
     assert all(p.puzzle_hash==digest('primary proceeds') and p.amount==1 for p in payouts)
     assert len({c.name() for c in (*received,*payouts)})==4
     assert not set(c.name() for c in (*received,*payouts)).intersection(c.name() for c in final.removals())
