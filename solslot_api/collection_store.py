@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from .generation_storage import connect_generation_sqlite
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -885,13 +886,33 @@ class CollectionStore:
         section: str,
         body: str,
         blocking: bool = True,
+        reviewed_draft: tuple[int, str] | None = None,
     ) -> dict[str, Any]:
         if not body.strip():
             raise ValueError("comment body is required")
         comment_id = "comment_" + uuid.uuid4().hex
         now = int(time.time())
         with self._lock, self._txn() as cur:
-            self._collection_row(collection_id, cur=cur)
+            collection = self._collection_row(collection_id, cur=cur)
+            if reviewed_draft is not None:
+                self._require_owner(collection, actor_subject)
+                note_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+                comment_id = "comment_" + note_hash[:32]
+                prior = cur.execute(
+                    "SELECT * FROM property_collection_comments WHERE id=?", (comment_id,)
+                ).fetchone()
+                if prior is not None:
+                    if (prior["collection_id"], prior["actor_subject"], prior["section"],
+                        prior["body"], bool(prior["blocking"])) != (
+                        collection_id, actor_subject.lower(), section, body, blocking
+                    ):
+                        raise CollectionConflict("This review identifier is already in use.")
+                    return self._render_comment(prior)
+                revision, expected_digest = reviewed_draft
+                self._require_revision(collection, revision)
+                canonical = _json(json.loads(collection["dossier_json"])).encode("utf-8")
+                if collection["state"] != "DRAFT" or hashlib.sha256(canonical).hexdigest() != expected_digest:
+                    raise CollectionConflict("The private draft has changed. Review the current edition.")
             cur.execute(
                 """
                 INSERT INTO property_collection_comments(
@@ -953,9 +974,22 @@ class CollectionStore:
         comment_id: str,
         *,
         actor_subject: str,
+        reviewed_note_digest: str | None = None,
     ) -> dict[str, Any]:
         with self._lock, self._txn() as cur:
-            self._collection_row(collection_id, cur=cur)
+            collection = self._collection_row(collection_id, cur=cur)
+            if reviewed_note_digest is not None:
+                self._require_owner(collection, actor_subject)
+                prior = cur.execute(
+                    "SELECT * FROM property_collection_comments WHERE id=? AND collection_id=?",
+                    (comment_id, collection_id),
+                ).fetchone()
+                if (prior is None or prior["actor_subject"] != actor_subject.lower()
+                        or prior["section"] != "review" or prior["blocking"]
+                        or hashlib.sha256(prior["body"].encode("utf-8")).hexdigest() != reviewed_note_digest):
+                    raise CollectionNotFound("The unsigned issuer review was not found.")
+                if prior["resolved"]:
+                    return self._render_comment(prior)
             changed = cur.execute(
                 """
                 UPDATE property_collection_comments

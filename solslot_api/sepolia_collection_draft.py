@@ -1,4 +1,6 @@
 """Prepare the private two-item Sepolia test edition from its reviewed sealed source."""
+import hashlib
+
 from .collection_store import CollectionConflict, CollectionForbidden, CollectionNotFound, CollectionStore
 from .test_collection_metadata import TEST_DISCLOSURE, TestPropertyDraftV1
 
@@ -9,6 +11,8 @@ SOURCE_REVISION = 14
 EDITION_ID = 'TEST-EASTMORELAND-SEPOLIA-QA-20261124'
 TITLE = '127 Eastmoreland St · Base Sepolia checkout test pair'
 REVIEW = '0x33a7848779aee94471000cdf729733a2e17a708ccf4b01357c94aa95a0155a75'
+DRAFT_DIGEST = 'ccf55d3e3819a3239398fe5d2ede597aeb491852e7842a54655c8d8def5efa32'
+ISSUER_NOTE_DIGEST = '7828065d04c929fa1c90f50dd8a0fd099c6abb803c879a72d1c1a333b7428e17'
 SUMMARY = (
     'Private checkout test for two SmartDeeds at 1.000000 Circle test USDC total on Base Sepolia '
     '(chain 84532, token 0x036CbD53842c5426634e7929541eC2318f3dCF7e). Each test deed costs '
@@ -49,3 +53,29 @@ def prepare(store: CollectionStore, *, source_id: str, revision: int, root: str,
                 or existing['dossier'] != expected):
             raise CollectionConflict('The saved test edition has changed. Open it from Properties.') from None
         return existing
+
+
+def require_issuer_note_owner(store, claims):
+    if store.network != 'testnet11' or store.generation_id != GENERATION:
+        raise CollectionConflict('This issuer review belongs to the private Testnet edition.')
+    if (claims.generation_id, claims.auth_type, claims.authority_slot) != (GENERATION, 'evm', 0):
+        raise CollectionForbidden('Sign in with the enrolled owner account for this review.')
+
+
+def save_issuer_note(store, claims, body):
+    require_issuer_note_owner(store, claims)
+    if (body.section != 'review' or body.blocking is not False
+            or hashlib.sha256(body.body.encode('utf-8')).hexdigest() != ISSUER_NOTE_DIGEST):
+        raise CollectionConflict('The note differs from the reviewed Eastmoreland issuance record.')
+    return store.add_comment(
+        EDITION_ID, actor_subject=claims.sub, section=body.section, body=body.body,
+        blocking=False, reviewed_draft=(1, DRAFT_DIGEST),
+    )
+
+
+def withdraw_issuer_note(store, claims):
+    require_issuer_note_owner(store, claims)
+    return store.resolve_comment(
+        EDITION_ID, 'comment_' + ISSUER_NOTE_DIGEST[:32], actor_subject=claims.sub,
+        reviewed_note_digest=ISSUER_NOTE_DIGEST,
+    )

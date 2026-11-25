@@ -505,6 +505,34 @@ class SepoliaPairSource(ApiModel):
     metadata_root: str = Field(alias='sourceMetadataRoot', pattern=r'^0x[0-9a-f]{64}$')
 
 
+class SepoliaIssuerNoteRequest(CommentRequest):
+    blocking: bool = Field(strict=True)
+
+
+class WithdrawSepoliaIssuerNoteRequest(ApiModel):
+    """The existing desk sends an empty object when resolving a review note."""
+
+
+@router.post('/admin/collections/test-editions/base-sepolia-pair/issuer-note',
+             dependencies=[Depends(require_collection_metadata), Depends(require_test_editions)])
+async def save_sepolia_issuer_note(
+    body: SepoliaIssuerNoteRequest, claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
+    store: Annotated[CollectionStore, Depends(get_collection_store)],
+) -> dict:
+    from .sepolia_collection_draft import save_issuer_note
+    return _store_call(lambda: save_issuer_note(store, claims, body))
+
+
+@router.post('/admin/collections/test-editions/base-sepolia-pair/issuer-note/withdraw',
+             dependencies=[Depends(require_collection_metadata), Depends(require_test_editions)])
+async def withdraw_sepolia_issuer_note(
+    body: WithdrawSepoliaIssuerNoteRequest, claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
+    store: Annotated[CollectionStore, Depends(get_collection_store)],
+) -> dict:
+    from .sepolia_collection_draft import withdraw_issuer_note
+    return _store_call(lambda: withdraw_issuer_note(store, claims))
+
+
 @router.post('/admin/collections/test-editions/base-sepolia-pair',
              dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata), Depends(require_test_editions)])
 async def prepare_sepolia_pair(body: SepoliaPairSource, response: Response,

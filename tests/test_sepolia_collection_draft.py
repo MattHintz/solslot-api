@@ -1,4 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
+import json
 
 import pytest
 
@@ -109,3 +111,122 @@ def test_http_parses_only_the_three_source_fields_and_applies_existing_guards(re
     assert client.post(path,json=body).json()['id'] == pair.EDITION_ID
     app.dependency_overrides[require_admin_jwt] = lambda: AdminClaims('other-admin','evm',1,2)
     assert client.post(path,json=body).status_code == 403
+
+
+@pytest.fixture
+def issuer_review(reviewed, monkeypatch):
+    from solslot_api.admin_auth import AdminClaims
+    from solslot_api.collection_endpoints import SepoliaIssuerNoteRequest
+
+    store, _ = reviewed
+    workspace = prepare(store)
+    text = 'Unsigned test issuance. Two test deeds for one test USDC.'
+    note = SepoliaIssuerNoteRequest(section='review', blocking=False, body=text)
+    canonical = json.dumps(workspace['dossier'], sort_keys=True, ensure_ascii=False, separators=(',', ':'))
+    monkeypatch.setattr(pair, 'DRAFT_DIGEST', sha256(canonical.encode()).hexdigest())
+    monkeypatch.setattr(pair, 'ISSUER_NOTE_DIGEST', sha256(text.encode()).hexdigest())
+    claims = AdminClaims('source-admin', 'evm', 1, 2, authority_slot=0, generation_id=pair.GENERATION)
+    return store, claims, note
+
+
+def test_private_note_has_one_receipt_across_independent_connections(issuer_review):
+    from solslot_api.collection_store import CollectionNotFound
+
+    store, claims, note = issuer_review
+    before = store.get(pair.EDITION_ID)
+    replica = CollectionStore(store.path, generation_id=pair.GENERATION, network='testnet11')
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            jobs = [pool.submit(pair.save_issuer_note, connection, claims, note) for connection in (store, replica)]
+            first, retry = [job.result() for job in jobs]
+        assert first == retry
+        assert first['id'] == 'comment_' + pair.ISSUER_NOTE_DIGEST[:32]
+        assert not first['blocking'] and not first['resolved']
+        after = replica.get(pair.EDITION_ID)
+        assert after['comments'] == [first]
+        assert [e['action'] for e in after['auditEvents']].count('COMMENT_ADDED') == 1
+        assert after['revision'] == before['revision'] and after['dossier'] == before['dossier']
+        assert not after['reviews'] and not after['firstProposalId']
+        with pytest.raises(CollectionNotFound):
+            replica.public_collection(pair.EDITION_ID)
+
+        withdrawn = pair.withdraw_issuer_note(replica, claims)
+        assert withdrawn['resolved'] and withdrawn['id'] == first['id']
+        assert pair.withdraw_issuer_note(store, claims) == withdrawn
+        assert pair.save_issuer_note(store, claims, note) == withdrawn
+        assert len(store.get(pair.EDITION_ID)['comments']) == 1
+    finally:
+        replica.close()
+
+
+@pytest.mark.parametrize('changes', [
+    {'body': 'An unrelated issuance.'}, {'section': 'sales'}, {'blocking': True},
+])
+def test_only_reviewed_text_and_desk_section_can_be_saved(issuer_review, changes):
+    store, claims, note = issuer_review
+    with pytest.raises(CollectionConflict):
+        pair.save_issuer_note(store, claims, note.model_copy(update=changes))
+    assert store.get(pair.EDITION_ID)['comments'] == []
+
+
+@pytest.mark.parametrize('field,value', [
+    ('sub', 'another-admin'), ('authority_slot', 1), ('auth_type', 'chia_bls'), ('generation_id', 'another-generation'),
+])
+def test_both_note_actions_require_the_enrolled_collection_owner(issuer_review, field, value):
+    from dataclasses import replace
+
+    store, claims, note = issuer_review
+    unauthorized = replace(claims, **{field: value})
+    with pytest.raises(CollectionForbidden):
+        pair.save_issuer_note(store, unauthorized, note)
+    pair.save_issuer_note(store, claims, note)
+    with pytest.raises(CollectionForbidden):
+        pair.withdraw_issuer_note(store, unauthorized)
+    assert not store.get(pair.EDITION_ID)['comments'][0]['resolved']
+
+
+def test_issuer_note_requires_reviewed_private_draft_and_testnet(issuer_review, monkeypatch):
+    store, claims, note = issuer_review
+    monkeypatch.setattr(pair, 'DRAFT_DIGEST', '0' * 64)
+    with pytest.raises(CollectionConflict):
+        pair.save_issuer_note(store, claims, note)
+    store.network = 'mainnet'
+    with pytest.raises(CollectionConflict):
+        pair.save_issuer_note(store, claims, note)
+    with pytest.raises(CollectionConflict):
+        pair.withdraw_issuer_note(store, claims)
+    assert [e['action'] for e in store.audit_events(pair.EDITION_ID)] == ['COLLECTION_CREATED']
+
+
+def test_issuer_note_http_round_trip_and_recovery_guard(issuer_review):
+    from fastapi import FastAPI, HTTPException
+    from fastapi.testclient import TestClient
+    from solslot_api.admin_auth import require_admin_jwt
+    from solslot_api.collection_endpoints import router, require_collection_metadata, require_test_editions
+    from solslot_api.collection_store import get_collection_store
+
+    store, claims, note = issuer_review
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[require_admin_jwt] = lambda: claims
+    app.dependency_overrides[get_collection_store] = lambda: store
+    app.dependency_overrides[require_test_editions] = lambda: None
+    client = TestClient(app)
+    url = '/admin/collections/test-editions/base-sepolia-pair/issuer-note'
+    body = note.model_dump()
+
+    def unavailable():
+        raise HTTPException(503, 'Recovery verification pending')
+    app.dependency_overrides[require_collection_metadata] = unavailable
+    assert client.post(url, json=body).status_code == 503
+    assert store.get(pair.EDITION_ID)['comments'] == []
+    app.dependency_overrides[require_collection_metadata] = lambda: None
+    assert client.post(url, json={**body, 'blocking': 0}).status_code == 422
+    assert client.post(url, json={**body, 'quantity': 3}).status_code == 422
+    assert client.post(url + '/withdraw', json={}).status_code == 404
+    saved = client.post(url, json=body)
+    assert saved.status_code == 200
+    readback = client.get('/admin/collections/' + pair.EDITION_ID)
+    assert readback.json()['comments'] == [saved.json()]
+    assert client.post(url + '/withdraw', json={'order': 1}).status_code == 422
+    assert client.post(url + '/withdraw', json={}).json()['resolved']
