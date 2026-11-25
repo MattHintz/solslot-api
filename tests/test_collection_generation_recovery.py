@@ -13,6 +13,7 @@ from solslot_api.collection_endpoints import router
 from solslot_api.collection_store import CollectionStore, get_collection_store
 from solslot_api.config import Settings, get_settings
 from solslot_api import collection_generation_recovery as recovery
+from solslot_api.generation_recovery_storage import DATABASES
 
 GEN = '0x' + 'ab' * 32
 SOURCE = '0x' + 'cd' * 32
@@ -25,7 +26,7 @@ def receipt(now=10000):
         'principalId': '6b6d66ae-e403-406e-8e2c-0f0b2709f1f4',
         'checkedAt': now, 'restoredAt': now, 'containerPrivate': True,
         'immutabilityVerified': True, 'createOnly': True, 'restoreMatches': True,
-        'inventoryInitialized': True, 'databaseCount': 21, 'restoredBytes': 1024,
+        'inventoryInitialized': True, 'databaseCount': len(DATABASES), 'restoredBytes': 1024,
         'restoreEvidenceSha256': 'ef' * 32,
         'manifest': {'blobName': f'generation-journals/{GEN[2:]}/' + 'aa'*32 + '.aesgcm.json',
                      'sha256': 'aa'*32, 'bytes': 128, 'etag': '"original"'}}
@@ -35,7 +36,7 @@ def receipt(now=10000):
     {'generationId': '0x'+'11'*32}, {'sourceHash': '0x'+'22'*32},
     {'purpose': 'SYNTHETIC_RESTORE_DRILL'}, {'network': 'mainnet'},
     {'checkedAt': 9399}, {'restoredAt': 9399}, {'checkedAt': True},
-    {'restoredAt': float('nan')}, {'databaseCount': 20}, {'databaseCount': True},
+    {'restoredAt': float('nan')}, {'databaseCount': 21}, {'databaseCount': len(DATABASES) + 1}, {'databaseCount': True},
     {'restoreMatches': False}, {'inventoryInitialized': False},
     {'principalId': 'other'}, {'extra': 'unreviewed'},
     {'restoredBytes': 0}, {'restoreEvidenceSha256': 'bad'},
