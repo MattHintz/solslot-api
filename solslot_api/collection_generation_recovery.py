@@ -1,6 +1,6 @@
 """Generation-scoped recovery admission for private property preparation.
 
-The existing 21-journal lane includes collections.sqlite and preview/review
+The generation recovery inventory includes collections.sqlite and preview/review
 records. It does not cover media bytes. Keep those two claims separate.
 """
 from __future__ import annotations
@@ -13,6 +13,8 @@ import stat
 import time
 
 from fastapi import HTTPException
+
+from .generation_recovery_storage import DATABASES
 
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 FIELDS = {
@@ -44,7 +46,7 @@ def validate_record_receipt(value, generation_id, source_hash, *, now=None):
     if any(type(value[k]) is not int or not now - 600 <= value[k] <= now + 30
            for k in ('checkedAt', 'restoredAt')) or value['restoredAt'] > value['checkedAt'] + 30:
         raise ValueError('COLLECTION_RECOVERY_STALE')
-    if (type(value['databaseCount']) is not int or value['databaseCount'] != 21
+    if (type(value['databaseCount']) is not int or value['databaseCount'] != len(DATABASES)
             or type(value['restoredBytes']) is not int or not 0 < value['restoredBytes'] <= 512 * 1024**2):
         raise ValueError('COLLECTION_RECOVERY_INCOMPLETE')
     record = value['manifest']
