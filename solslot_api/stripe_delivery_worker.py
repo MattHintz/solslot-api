@@ -1002,8 +1002,7 @@ class StripeDeliveryWorker:
                 if context.reservation is not None
             ),
         )
-        stripe = operation.payment_rail == PAYMENT_RAIL_STRIPE
-        valid = primary.to_valid_spend() if stripe else primary.aggregate_offer.to_valid_spend()
+        valid = primary.to_valid_spend()
         signed = WalletSpendBundle(
             valid.coin_spends,
             AugSchemeMPL.aggregate(
@@ -1011,7 +1010,6 @@ class StripeDeliveryWorker:
             ),
         )
         evaluated = EvaluatedBundleOutputs(signed)
-        additions = evaluated.additions
         delivery_outputs: list[Coin] = []
         for context in group.contexts:
             vault_full = SINGLETON_MOD.curry(
@@ -1029,21 +1027,10 @@ class StripeDeliveryWorker:
                 )
             except GovernedOutputConflict as exc:
                 raise StripeDeliveryManualReview(str(exc)) from exc
-        if stripe:
-            treasury_outputs = _stripe_batch_treasury_outputs(
-                receipt_coin, group.contexts, signed, evaluated
-            )
-        else:
-            treasury_outputs = tuple(
-                _one_child_output(
-                    additions,
-                    parent_coin_id=context.deed_coin.name(),
-                    puzzle_hash=receipt.result_authorization_puzzle_hash,
-                    amount=1,
-                    label="external settlement result",
-                )
-                for context in group.contexts
-            )
+        treasury_outputs = _batch_settlement_outputs(
+            receipt_coin, group.contexts, signed, evaluated,
+            result_puzzle_hash=receipt.result_authorization_puzzle_hash,
+        )
         delivery_ids = tuple(_hex32(coin.name()) for coin in delivery_outputs)
         treasury_ids = tuple(_hex32(coin.name()) for coin in treasury_outputs)
         self._prepare_governed_index(
@@ -1688,15 +1675,17 @@ def _one_output(
     return matches[0]
 
 
-def _stripe_batch_treasury_outputs(
+def _batch_settlement_outputs(
     receipt: Coin,
     contexts: tuple[NativePurchaseContext, ...],
     bundle: WalletSpendBundle,
     evaluated: EvaluatedBundleOutputs,
+    *,
+    result_puzzle_hash: bytes32,
 ) -> tuple[Coin, ...]:
     """Follow the receipt's ordinary Offer settlement chain and bind each deed's payout."""
     if not contexts or receipt.amount != len(contexts):
-        raise StripeDeliveryManualReview("Stripe receipt amount differs from the deed count")
+        raise StripeDeliveryManualReview("Batch receipt amount differs from the deed count")
     spends = {spend.coin.name(): spend for spend in bundle.coin_spends}
     created = set(evaluated.additions)
     settlement = Coin(receipt.name(), OFFER_MOD_HASH, receipt.amount)
@@ -1704,10 +1693,10 @@ def _stripe_batch_treasury_outputs(
     for context in contexts:
         spend = spends.get(settlement.name())
         if settlement not in created or spend is None or spend.coin != settlement:
-            raise StripeDeliveryManualReview("Stripe receipt settlement link is missing")
+            raise StripeDeliveryManualReview("Batch receipt settlement link is missing")
         artifact = context.purchase
         payment = CreateCoin(
-            context.terms.protocol_puzhash,
+            result_puzzle_hash if artifact.rail == PaymentRail.EVM_TEST_USD else context.terms.protocol_puzhash,
             uint64(1),
             [artifact.purchase_id, artifact.artifact_hash],
         )
@@ -1715,10 +1704,10 @@ def _stripe_batch_treasury_outputs(
         expected = Program.to((notarized.nonce, [notarized.as_condition_args()]))
         groups = Program.from_bytes(bytes(spend.solution)).as_iter()
         if sum(group == expected for group in groups) != 1:
-            raise StripeDeliveryManualReview("Stripe settlement differs from its exact deed payment")
+            raise StripeDeliveryManualReview("Batch settlement differs from its exact deed payment")
         payout = Coin(settlement.name(), payment.puzzle_hash, payment.amount)
         if payout not in created or payout.name() in spends:
-            raise StripeDeliveryManualReview("Stripe treasury output is missing or already consumed")
+            raise StripeDeliveryManualReview("Batch payment output is missing or already consumed")
         outputs.append(payout)
         settlement = Coin(settlement.name(), OFFER_MOD_HASH, uint64(settlement.amount - 1))
     return tuple(outputs)
