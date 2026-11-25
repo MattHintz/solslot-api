@@ -1,4 +1,4 @@
-"""Unsigned Stripe batches must settle each deed and its separate treasury receipt."""
+"""External payment batches must settle each deed and its exact receipt output."""
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -18,6 +18,7 @@ from solslot_puzzles.payment_artifacts_v3 import (
 )
 from solslot_puzzles.stripe_settlement_v1_driver import (
     InventoryReservationV1,
+    PRIMARY_PURCHASE_PROVIDER_ID,
     PurchaseBatchSettlementTermsV1,
     curry_purchase_batch_settlement_receipt,
     make_mint_offer_v5_inner,
@@ -26,20 +27,25 @@ from solslot_puzzles.vault_driver import puzzle_for_p2_vault
 
 from solslot_api import stripe_delivery_worker as worker_module
 from solslot_api.governed_output_index import EvaluatedBundleOutputs
-from solslot_api.stripe_delivery_store import PAYMENT_RAIL_STRIPE
+from solslot_api.stripe_delivery_store import PAYMENT_RAIL_BASE_USDC, PAYMENT_RAIL_STRIPE
 from tests.test_native_purchases import _b32, _context
 
 
-def _stripe_context(parent_seed):
+SEPOLIA_USDC = bytes32.from_hexstr("000000000000000000000000036cbd53842c5426634e7929541ec2318f3dcf7e")
+
+
+def _external_context(parent_seed, rail):
     public = G1Element.generator()
     # The underlying native checkout fixture only needs public keys.
     holders = [Mock(get_g1=Mock(return_value=p)) for p in (public, public + public, public + public + public)]
     context, _ = _context(holders[0], holders, deed_parent_seed=parent_seed, now=1_700_000_000)
     artifact = replace(
         context.purchase,
-        rail=PaymentRail.STRIPE,
-        rail_asset_decimals=2,
-        rail_amount=context.purchase.subtotal_minor,
+        rail=rail,
+        rail_chain_id=84532 if rail == PaymentRail.EVM_TEST_USD else 0,
+        rail_asset_id=SEPOLIA_USDC if rail == PaymentRail.EVM_TEST_USD else bytes32.zeros,
+        rail_asset_decimals=6 if rail == PaymentRail.EVM_TEST_USD else 2,
+        rail_amount=context.purchase.subtotal_minor * (10_000 if rail == PaymentRail.EVM_TEST_USD else 1),
         oracle_round_hash=bytes32.zeros,
         oracle_price_usd_minor_per_asset=0,
         source_evidence_root=bytes32.zeros,
@@ -55,21 +61,24 @@ def _stripe_context(parent_seed):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("parents", [(23,), (23, 27), (23, 27, 29)])
-async def test_stripe_worker_prepares_distinct_receipt_outputs(monkeypatch, parents):
+@pytest.mark.parametrize("rail", [PaymentRail.STRIPE, PaymentRail.EVM_TEST_USD])
+async def test_worker_prepares_distinct_receipt_outputs(monkeypatch, parents, rail):
     contexts = tuple(sorted(
-        (_stripe_context(parent) for parent in parents),
+        (_external_context(parent, rail) for parent in parents),
         key=lambda context: context.purchase.deed_launcher_id,
     ))
     batch = build_purchase_batch_v1(batch_nonce=_b32(32), artifacts=tuple(c.purchase for c in contexts))
     roster = contexts[0].terms.validator_pubkeys
+    is_base = rail == PaymentRail.EVM_TEST_USD
+    result_hash = _b32(41) if is_base else bytes32.zeros
     receipt = build_purchase_batch_settlement_receipt_v1(
-        batch=batch, provider_id=STRIPE_PAYMENT_PROVIDER_ID, external_reference_hash=_b32(33),
+        batch=batch, provider_id=PRIMARY_PURCHASE_PROVIDER_ID if is_base else STRIPE_PAYMENT_PROVIDER_ID, external_reference_hash=_b32(33),
         evidence_hash=_b32(34), observed_at=1_700_000_100, validator_pubkeys=roster,
-        collected_amount_minor=batch.total_rail_amount,
+        collected_amount_minor=batch.total_rail_amount, result_authorization_puzzle_hash=result_hash,
     )
     terms = PurchaseBatchSettlementTermsV1(receipt, roster)
     receipt_coin = Coin(_b32(35), curry_purchase_batch_settlement_receipt(terms).get_tree_hash(), len(contexts))
-    operation = SimpleNamespace(purchase_id='0x' + batch.purchase_id.hex(), payment_rail=PAYMENT_RAIL_STRIPE, evidence={})
+    operation = SimpleNamespace(purchase_id='0x' + batch.purchase_id.hex(), payment_rail=PAYMENT_RAIL_BASE_USDC if is_base else PAYMENT_RAIL_STRIPE, evidence={})
     group = SimpleNamespace(contexts=contexts, batch=batch, stored=SimpleNamespace(purchase_artifact=purchase_batch_to_json(batch)))
     monkeypatch.setattr(worker_module, '_load_context_group', AsyncMock(return_value=group))
     # Quorum networking is outside this unsigned CLVM/worker regression.
@@ -78,7 +87,7 @@ async def test_stripe_worker_prepares_distinct_receipt_outputs(monkeypatch, pare
     worker = Mock(settings=SimpleNamespace(network='testnet11'))
     await worker_module.StripeDeliveryWorker._prepare_smartdeed_batch_delivery(
         worker, operation=operation, batch=batch, receipt=receipt, receipt_terms=terms,
-        receipt_coin=receipt_coin, expected_rail=PaymentRail.STRIPE,
+        receipt_coin=receipt_coin, expected_rail=rail,
     )
     saved = worker.store.record_delivery_prepared.call_args.kwargs
     bundle = WalletSpendBundle.from_json_dict(saved['protocol_bundle'])
@@ -97,12 +106,13 @@ async def test_stripe_worker_prepares_distinct_receipt_outputs(monkeypatch, pare
     assert saved['delivery_output_coin_ids'] == tuple('0x' + coin.name().hex() for coin in expected_deeds)
     outputs = tuple(assets[bytes32.from_hexstr(value)] for value in saved['treasury_output_coin_ids'])
     assert len({coin.parent_coin_info for coin in outputs}) == len(contexts)
-    assert all(coin.puzzle_hash == contexts[0].terms.protocol_puzhash and coin.amount == 1 for coin in outputs)
+    destination = result_hash if is_base else contexts[0].terms.protocol_puzhash
+    assert all(coin.puzzle_hash == destination and coin.amount == 1 for coin in outputs)
 
     # These receipts share a destination and amount. Preserve the exact per-deed authorization.
     if len(contexts) > 1:
         with pytest.raises(worker_module.StripeDeliveryManualReview, match='exact deed payment'):
-            worker_module._stripe_batch_treasury_outputs(receipt_coin, tuple(reversed(contexts)), bundle, evaluated)
+            worker_module._batch_settlement_outputs(receipt_coin, tuple(reversed(contexts)), bundle, evaluated, result_puzzle_hash=result_hash)
     unrelated_receipt = Coin(_b32(36), receipt_coin.puzzle_hash, receipt_coin.amount)
     with pytest.raises(worker_module.StripeDeliveryManualReview, match='settlement link'):
-        worker_module._stripe_batch_treasury_outputs(unrelated_receipt, contexts, bundle, evaluated)
+        worker_module._batch_settlement_outputs(unrelated_receipt, contexts, bundle, evaluated, result_puzzle_hash=result_hash)
