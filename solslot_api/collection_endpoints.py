@@ -499,6 +499,25 @@ async def collection_source_summary(collection_id: str, settings: Annotated[Sett
         'generationId': settings.collection_source_archive_generation_id}
 
 
+class SepoliaPairSource(ApiModel):
+    collection_id: str = Field(alias='sourceCollectionId', min_length=1, max_length=120)
+    revision: int = Field(alias='sourceRevision', strict=True, ge=1)
+    metadata_root: str = Field(alias='sourceMetadataRoot', pattern=r'^0x[0-9a-f]{64}$')
+
+
+@router.post('/admin/collections/test-editions/base-sepolia-pair',
+             dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata), Depends(require_test_editions)])
+async def prepare_sepolia_pair(body: SepoliaPairSource, response: Response,
+                              claims: Annotated[AdminClaims, Depends(require_admin_jwt)],
+                              store: Annotated[CollectionStore, Depends(get_collection_store)]) -> dict:
+    from .sepolia_collection_draft import prepare
+    result = _store_call(lambda: prepare(
+        store, source_id=body.collection_id, revision=body.revision,
+        root=body.metadata_root, subject=claims.sub, auth_type=claims.auth_type,
+    ))
+    return _with_etag(response, result)
+
+
 @router.post('/admin/collections/test-editions', dependencies=[Depends(require_admin_jwt), Depends(require_collection_metadata), Depends(require_test_editions)])
 async def create_test_edition(body: CreateTestEditionRequest, response: Response,
                              settings: Annotated[Settings, Depends(get_settings)],
